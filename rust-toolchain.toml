@@ -1,0 +1,10 @@
+# rust-toolchain.toml
+# -----------------------------------------------------------------------------
+# Pinning the toolchain version means everyone who clones this repo gets the
+# *same* compiler. `rustup` reads this file automatically. If a newer Rust is
+# installed, `rustup` will install + use the version specified below for this
+# project only.
+# -----------------------------------------------------------------------------
+[toolchain]
+channel    = "stable"
+components = ["rustfmt", "clippy"]

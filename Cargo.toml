@@ -1,0 +1,183 @@
+# =============================================================================
+# Cargo.toml — On-Screen Notes
+# =============================================================================
+# This file tells Cargo (Rust's build tool) about our crate: its name, version,
+# the libraries (dependencies) we depend on, and how to build for release.
+#
+# Beginner notes:
+#   * `[package]` describes our crate (the program we ship).
+#   * `[dependencies]` lists the third-party libraries we pull from crates.io.
+#   * `[profile.release]` controls how `cargo build --release` produces the
+#     final binary. We tune for size + speed.
+# =============================================================================
+
+[package]
+name        = "on-screen-notes"
+version     = "0.1.0"
+edition     = "2021"               # Rust 2021 edition: stable, widely supported by all our deps.
+rust-version = "1.80"              # Minimum supported Rust version.
+description = "Cross-platform pressure-sensitive on-screen pen-annotation overlay."
+license     = "MIT OR Apache-2.0"
+default-run = "on-screen-notes"
+
+# A `[[bin]]` section explicitly declares our executable. Cargo would also infer
+# this from `src/main.rs`, but spelling it out is good practice.
+[[bin]]
+name = "on-screen-notes"
+path = "src/main.rs"
+
+# -----------------------------------------------------------------------------
+# Dependencies
+# -----------------------------------------------------------------------------
+# Each dependency is pinned to a major.minor version. Cargo will pick the
+# highest patch release compatible with the version we specify.
+# -----------------------------------------------------------------------------
+[dependencies]
+# eframe = the "easy framework" wrapper around egui that gives us a window,
+# event loop, and rendering backend. We enable both X11 and Wayland on Linux
+# so the same binary runs on both display servers.
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts", # ship a fallback font so text always renders
+    "wgpu",          # use wgpu backend. Picked over glow because on Windows
+                     # glow + transparent window often fails with
+                     # "GL config does not support it" on Intel/AMD drivers.
+                     # wgpu uses DXGI which always exposes alpha surfaces.
+    "wayland",       # Linux Wayland support
+    "x11",           # Linux X11 support
+] }
+
+# egui = the immediate-mode GUI library underneath eframe. We pull it directly
+# so we can use its types (Pos2, Color32, Painter, …) in our own modules.
+egui = "0.29"
+
+# egui_extras = optional widgets and image loaders. We enable `svg` so we can
+# bundle Lucide-style SVG icons via `include_image!` and tint them per state.
+# `all_loaders` would also include image/raster loaders we do not need.
+egui_extras = { version = "0.29", default-features = false, features = ["svg"] }
+
+# raw-window-handle: transitive of eframe; we re-export types for use in
+# our own platform-specific pen integration.
+raw-window-handle = "0.6"
+
+# Pen pressure on Windows: Wintab.
+#
+# We use `wintab_lite` (thin Rust types over Wintab32.dll) plus `libloading`
+# to dynamically load the DLL — Wintab32.dll only exists when the user has
+# a tablet driver installed (Wacom/Huion/XP-Pen). Loading dynamically lets
+# our app run on machines without a tablet driver too (we just disable
+# pressure in that case).
+#
+# Why Wintab instead of IRealTimeStylus / WM_POINTER?
+#   * Wintab is a polling API on the *main* thread. We call WTQueuePacketsEx
+#     once per frame; no COM event sinks or window-message hooks. That
+#     dodges the message-pump starvation we saw with octotablet's RTS path.
+#   * Practically every drawing tablet driver still ships Wintab support
+#     (Wacom, Huion, XP-Pen, Gaomon, …) for compatibility with Photoshop /
+#     Krita, so this is a safe pick for end-users.
+[target.'cfg(target_os = "windows")'.dependencies]
+wintab_lite = { version = "1", features = ["libloading"] }
+libloading  = "0.8"
+windows     = { version = "0.56", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    # AttachThreadInput lives under System::Threading in the windows
+    # crate's module tree — needed for the foreground-reclaim trick in
+    # src/platform/win32.rs.
+    "Win32_System_Threading",
+    # GetAsyncKeyState (for window-pick LMB polling) + GetCursorPos.
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+# tiny-skia = a small, pure-Rust 2D rasteriser. We use it to draw our
+# anti-aliased pressure-tapered strokes into a pixel buffer; that buffer is
+# then uploaded to egui as a texture and painted onto the screen.
+tiny-skia = "0.11"
+
+# xcap = cross-platform screenshot library. We use it to capture the screen
+# behind our overlay so the saved screenshot includes background + ink.
+xcap = "0.0.14"
+
+# global-hotkey = registers OS-level hotkeys (work even when our window is
+# unfocused). We use it for the screenshot shortcut.
+global-hotkey = "0.6"
+
+# serde + ron = serialise/deserialise our app state to a human-readable file
+# format on disk. RON is like JSON but more Rusty (and easier to debug by
+# opening the file in a text editor).
+serde = { version = "1", features = ["derive"] }
+ron    = "0.8"
+
+# anyhow = ergonomic error-handling. Lets us write `fn foo() -> Result<T>`
+# and `?` propagate errors with context. Beginner-friendly.
+anyhow = "1"
+
+# log + env_logger = standard logging facade + a simple env-var-controlled
+# backend. Run with `RUST_LOG=on_screen_notes=debug` to see internal logs.
+log         = "0.4"
+env_logger  = "0.11"
+
+# directories = cross-platform helper that returns the right "config" /
+# "data" directory for the current OS (e.g. %APPDATA% on Windows,
+# ~/.config on Linux, ~/Library/Application Support on macOS).
+directories = "5"
+
+# image = read/write image files. We use it to save the composited
+# screenshot as a PNG.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# lyon = sweep-line 2-D path tessellator. We use it for the Fill tool.
+#
+# Why lyon instead of a simpler ear-clipping triangulator (earcutr)?
+# Ear-clipping is *undefined* on self-intersecting polygons — when the
+# user's Fill stroke crosses itself (a loop-inside-a-loop, a figure-8,
+# an accidental cross-over while tracing) ear-clipping skips regions
+# and leaves visible holes inside the fill. lyon's `FillTessellator`
+# uses a sweep-line algorithm with proper edge-crossing detection and
+# honours the **non-zero winding rule**, so self-intersection regions
+# fill correctly. ~200 KB compiled; the right cost for a paint app.
+#
+# We pull only the two sub-crates we actually use to keep the dep
+# graph and binary size as small as we can.
+lyon_path        = "1"
+lyon_tessellation = "1"
+
+# gif = pure-Rust animated-GIF encoder used by the screen-recording
+# pipeline. Tiny (~80 KB) and fast enough for the 5-15 fps we capture
+# at. Quality is "fine" — frames go in palette-quantised, which is the
+# standard format Discord / Slack / browsers ingest. For higher-quality
+# encoding we'd swap in `gifski` later.
+gif = "0.13"
+
+# arboard = cross-platform clipboard. We use it to push the recorded
+# GIF bytes (and one day screenshot PNGs) into the system clipboard so
+# the user can paste straight into Slack / browsers. On Windows the
+# clipboard's GIF support is "first frame only" in most paste targets
+# — we still copy the full GIF for the apps that do honour the
+# `image/gif` format. Documented in the README.
+arboard = "3"
+
+# Platform-specific hint: on Windows, the binary should not open a console
+# window when launched from Explorer. We add the linker flag in main.rs via
+# `#![windows_subsystem = "windows"]` instead of doing it here, so debug
+# builds keep the console for `println!` output.
+
+# -----------------------------------------------------------------------------
+# Release profile — tuned for "smallest, still-fast" binary.
+# -----------------------------------------------------------------------------
+[profile.release]
+opt-level     = "z"      # "z" = optimise for binary size (vs "3" = max speed).
+lto           = "fat"    # Link-time optimisation across all crates. Slower
+                         # to link, but removes a lot of dead code.
+codegen-units = 1        # One codegen unit = better cross-module inlining.
+strip         = "symbols"# Strip debug symbols from the final binary.
+panic         = "abort"  # On panic, abort instead of unwinding the stack.
+                         # Smaller binary; we use Result<T,E> everywhere
+                         # so we don't rely on panic-unwind cleanup.
+incremental   = false    # Disable incremental compilation for release.
+
+# Dev profile keeps incremental compilation and debug info (faster edit-test
+# loop, slightly bigger binary — fine, we only ship release builds).
+[profile.dev]
+opt-level   = 1          # A little optimisation makes egui usable in debug.
+debug       = true
+incremental = true
