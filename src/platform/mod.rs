@@ -7,7 +7,7 @@
 pub mod win32;
 
 #[cfg(target_os = "windows")]
-pub use win32::{cursor_pos, lmb_down, reclaim_foreground, set_no_activate, set_window_capture_excluded, top_level_window_at, window_rect};
+pub use win32::{client_rect, cursor_pos, lmb_down, reclaim_foreground, set_no_activate, set_window_capture_excluded, top_level_window_at, window_rect};
 
 #[cfg(not(target_os = "windows"))]
 pub fn top_level_window_at(_x: i32, _y: i32) -> isize { 0 }
@@ -27,6 +27,9 @@ pub fn reclaim_foreground(_hwnd: isize) {}
 
 #[cfg(not(target_os = "windows"))]
 pub fn window_rect(_hwnd: isize) -> Option<(i32, i32, i32, i32)> { None }
+
+#[cfg(not(target_os = "windows"))]
+pub fn client_rect(_hwnd: isize) -> Option<(i32, i32, i32, i32)> { None }
 
 #[cfg(not(target_os = "windows"))]
 pub fn cursor_pos() -> Option<(i32, i32)> { None }

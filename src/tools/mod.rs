@@ -16,6 +16,7 @@ pub mod shape_tool;
 
 use crate::canvas::canvas::Canvas;
 use crate::canvas::shape::{BorderStyle, Shape};
+use crate::canvas::smoothing::SmoothingOptions;
 use crate::canvas::stroke::{PenSample, Stroke, StrokeStyle};
 use crate::config::AppConfig;
 use serde::{Deserialize, Serialize};
@@ -175,6 +176,12 @@ pub struct ActiveTool {
     /// appends; end closes the polygon and erases every stroke /
     /// shape on the active layer whose centroid lies inside.
     pub in_progress_lasso: Option<Vec<[f32; 2]>>,
+
+    /// Snapshot of the user's current smoothing options. Copied onto
+    /// each new stroke at pen-down so a mid-stroke UI change does not
+    /// retro-apply to ink already laid down. The app loop keeps this
+    /// in sync with `config.smoothing`.
+    pub smoothing: SmoothingOptions,
 }
 
 impl ActiveTool {
@@ -196,6 +203,7 @@ impl ActiveTool {
             pending_fill_at: None,
             spotlight_size: 120.0,
             in_progress_lasso: None,
+            smoothing: cfg.smoothing,
         }
     }
 
@@ -204,8 +212,12 @@ impl ActiveTool {
         match self.kind {
             ToolKind::Pen | ToolKind::FreehandArrow => {
                 // Pen + freehand arrow honour the current stroke style
-                // (Default / Pencil / Marker / Airbrush).
-                let mut s = Stroke::with_style(self.color, self.size, self.style);
+                // (Default / Pencil / Marker / Airbrush) AND the
+                // current smoothing options so the user's choice locks
+                // in at pen-down.
+                let mut s = Stroke::with_style_and_smoothing(
+                    self.color, self.size, self.style, self.smoothing,
+                );
                 s.push(sample);
                 self.in_progress_stroke = Some(s);
             }
@@ -221,7 +233,9 @@ impl ActiveTool {
                 // Eraser keeps the plain ribbon look for its visible
                 // trail — pencil styling would make the trail confusingly
                 // faint.
-                let mut s = Stroke::new(self.color, self.size);
+                let mut s = Stroke::with_style_and_smoothing(
+                    self.color, self.size, StrokeStyle::Default, self.smoothing,
+                );
                 s.push(sample);
                 self.in_progress_stroke = Some(s);
             }
@@ -232,7 +246,9 @@ impl ActiveTool {
                 // disappearing tool. Pressure is forced to 1.0 so the
                 // line has uniform width (a real laser dot does not
                 // taper).
-                let mut s = Stroke::new(self.color, self.size);
+                let mut s = Stroke::with_style_and_smoothing(
+                    self.color, self.size, StrokeStyle::Default, self.smoothing,
+                );
                 s.push(flatten_pressure(sample));
                 self.in_progress_stroke = Some(s);
             }
@@ -322,6 +338,11 @@ impl ActiveTool {
             ToolKind::Pen => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
                     s.push(sample);
+                    // Stabilizer mode keeps a rope-pull queue between
+                    // cursor and committed ink; on pen-up we drain the
+                    // queue so the trailing samples catch up to the
+                    // cursor. No-op for every other mode.
+                    s.finish();
                     // Pre-build the cache with the user's current
                     // smoothing budget; `Canvas::add_stroke` will
                     // happily skip its own default build because the
@@ -340,6 +361,7 @@ impl ActiveTool {
             ToolKind::FreehandArrow => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
                     s.push(sample);
+                    s.finish();
                     s.build_cache_with(self.position_passes);
                     canvas.add_stroke(s);
                     // Arrowhead width must match the rendered stroke
@@ -369,6 +391,7 @@ impl ActiveTool {
             ToolKind::Laser => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
                     s.push(flatten_pressure(sample));
+                    s.finish();
                     // Build the cache so the render path can reuse the
                     // same fast cached-polyline route Pen strokes use.
                     s.build_cache_with(self.position_passes);

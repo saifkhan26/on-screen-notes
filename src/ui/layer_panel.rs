@@ -14,7 +14,14 @@ const ROW_H: f32 = 22.0;
 const ROW_PAD: f32 = 3.0;
 
 /// Render the layer panel and route row interactions back into `canvas`.
-pub fn show(ctx: &egui::Context, canvas: &mut Canvas) {
+/// `cache` provides per-layer thumbnail textures used by the hover
+/// preview popup; `canvas_idx` keys those entries.
+pub fn show(
+    ctx: &egui::Context,
+    cache: &mut crate::ui::overlay::OverlayCache,
+    canvas_idx: usize,
+    canvas: &mut Canvas,
+) {
     egui::Area::new(egui::Id::new("osn_layer_panel"))
         .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(10.0, -10.0))
         .show(ctx, |ui| {
@@ -38,7 +45,7 @@ pub fn show(ctx: &egui::Context, canvas: &mut Canvas) {
                     let n = canvas.layers.len();
                     for ui_row in 0..n {
                         let li = n - 1 - ui_row;
-                        if let Some(a) = layer_row(ui, canvas, li) {
+                        if let Some(a) = layer_row(ui, cache, canvas_idx, canvas, li) {
                             action = Some(a);
                         }
                     }
@@ -68,7 +75,13 @@ pub fn show(ctx: &egui::Context, canvas: &mut Canvas) {
 /// One layer row — [eye] [↑] [↓] [✕]. Background highlights the
 /// currently-active layer; row body (outside the 4 icons) is clickable
 /// to select.
-fn layer_row(ui: &mut egui::Ui, canvas: &Canvas, li: usize) -> Option<LayerAction> {
+fn layer_row(
+    ui: &mut egui::Ui,
+    cache: &mut crate::ui::overlay::OverlayCache,
+    canvas_idx: usize,
+    canvas: &Canvas,
+    li: usize,
+) -> Option<LayerAction> {
     let layer = &canvas.layers[li];
     let active = canvas.active_layer == li;
     let mut action: Option<LayerAction> = None;
@@ -169,6 +182,26 @@ fn layer_row(ui: &mut egui::Ui, canvas: &Canvas, li: usize) -> Option<LayerActio
     // Bare row click (outside icons) selects the layer.
     if response.clicked() && !active {
         action = Some(LayerAction::Select(li));
+    }
+
+    // Hover preview: render the layer's content as a small image
+    // tooltip. `ensure_layer_thumb` reuses an already-uploaded
+    // texture when the layer's content hasn't changed since last
+    // render, so this is cheap to hover repeatedly.
+    let row_id = ui.id().with(("layer_row_hover", li));
+    let hovered = ui.rect_contains_pointer(rect);
+    if hovered {
+        let ctx = ui.ctx().clone();
+        if let Some(tex_id) = cache.ensure_layer_thumb(&ctx, canvas_idx, li, layer) {
+            egui::show_tooltip(&ctx, ui.layer_id(), row_id, |ui| {
+                ui.label(format!("Layer {} — {} strokes, {} shapes",
+                    li + 1, layer.strokes.len(), layer.shapes.len()));
+                let size = Vec2::new(240.0, 180.0);
+                ui.add(egui::Image::new((tex_id, size)).fit_to_exact_size(size));
+            });
+        } else {
+            egui::show_tooltip_text(&ctx, ui.layer_id(), row_id, "Empty layer");
+        }
     }
 
     action

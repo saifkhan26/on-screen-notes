@@ -22,9 +22,6 @@ use egui::{Color32, Margin, Rounding, Shadow, Stroke};
 // `from_white_alpha` is not `const fn` in epaint 0.29, so we expand
 // the premultiplied form inline: rgb == α for translucent white.
 pub const ACCENT: Color32 = Color32::from_rgba_premultiplied(38, 38, 38, 38);
-/// Slightly brighter translucent white for hover layering on the
-/// active item — gives a subtle "lit" feel without colour.
-pub const ACCENT_GLOW: Color32 = Color32::from_rgba_premultiplied(64, 64, 64, 64);
 
 /// Glass-panel fill — flat near-black at moderate alpha. Sits over
 /// arbitrary desktop content without colour cast.

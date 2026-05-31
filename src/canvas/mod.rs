@@ -12,6 +12,7 @@
 pub mod canvas;
 pub mod render;
 pub mod shape;
+pub mod smoothing;
 pub mod stroke;
 
 use crate::canvas::canvas::Canvas;
@@ -125,18 +126,69 @@ impl CanvasManager {
         // which `save_all` does on the next debounced tick.
     }
 
-    /// Save every canvas to disk and remove any orphaned files left behind
-    /// by deletes (e.g. user used to have 5 canvases, deleted two, now we
-    /// only persist 3 — files canvas_3.ron and canvas_4.ron from the old
-    /// state would be stale and need cleaning up).
-    pub fn save_all(&self) {
-        for (i, c) in self.canvases.iter().enumerate() {
-            if let Err(e) = crate::persistence::save_canvas(i, c) {
-                log::warn!("failed to save canvas {i}: {e}");
+    /// Save every dirty canvas to disk on a background thread. Skipped
+    /// canvases stay dirty for the next tick; written canvases clear
+    /// their flag.
+    ///
+    /// Why background: even one PNG-bearing canvas serialises to
+    /// multi-MB of RON. Doing that on the UI thread every debounce
+    /// stalled the overlay for ~1 s every 1.5 s. The save thread takes
+    /// a `Vec<(index, cloned_canvas)>` and writes them at its own
+    /// pace.
+    ///
+    /// Also cleans up orphaned files past `canvases.len()` so a deleted
+    /// canvas slot doesn't linger.
+    pub fn save_all(&mut self) {
+        // Collect dirty canvases as (index, clone). We need to clone
+        // because the worker thread owns them while serialising — the
+        // UI thread keeps drawing meanwhile. A clone of a PNG-bearing
+        // canvas is cheap relative to RON serialisation because it is
+        // just an `Arc`-less deep copy of bytes; serialisation
+        // formats those bytes into ASCII which is 5-10× larger.
+        let mut dirty: Vec<(usize, Canvas)> = Vec::new();
+        for (i, c) in self.canvases.iter_mut().enumerate() {
+            if c.dirty {
+                dirty.push((i, c.clone()));
+                c.dirty = false;
             }
         }
-        // Clean up files past current count. We try indices N..N+10 — if a
-        // gap appears the user must have manually messed with the dir.
+        let count = self.canvases.len();
+        if dirty.is_empty() {
+            // Nothing changed — skip the worker entirely. Most ticks
+            // hit this path; the heavy work only fires after a real
+            // edit.
+            return;
+        }
+        std::thread::spawn(move || {
+            for (i, c) in dirty {
+                if let Err(e) = crate::persistence::save_canvas(i, &c) {
+                    log::warn!("failed to save canvas {i}: {e}");
+                }
+            }
+            // Clean up stale files past the current count.
+            if let Ok(dir) = crate::persistence::paths::canvases_dir() {
+                for extra in count..(count + 10) {
+                    let p = dir.join(format!("canvas_{extra}.ron"));
+                    if p.exists() {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Synchronous variant used at app shutdown — blocks until every
+    /// dirty canvas hits disk so a forced kill after `on_exit` can't
+    /// drop edits.
+    pub fn save_all_blocking(&mut self) {
+        for (i, c) in self.canvases.iter_mut().enumerate() {
+            if !c.dirty { continue; }
+            if let Err(e) = crate::persistence::save_canvas(i, c) {
+                log::warn!("failed to save canvas {i}: {e}");
+            } else {
+                c.dirty = false;
+            }
+        }
         if let Ok(dir) = crate::persistence::paths::canvases_dir() {
             for extra in self.canvases.len()..(self.canvases.len() + 10) {
                 let p = dir.join(format!("canvas_{extra}.ron"));

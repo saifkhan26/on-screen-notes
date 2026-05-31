@@ -177,3 +177,32 @@ pub fn window_rect(hwnd_raw: isize) -> Option<(i32, i32, i32, i32)> {
     let ok = unsafe { GetWindowRect(HWND(hwnd_raw), &mut r).is_ok() };
     if ok { Some((r.left, r.top, r.right, r.bottom)) } else { None }
 }
+
+/// Client-area rect of `hwnd_raw` in screen-physical pixels as
+/// `(left, top, right, bottom)`.
+///
+/// Distinct from `window_rect` (the OUTER rect, which includes any
+/// DWM-managed shadow / resize border even on a borderless window).
+/// For the freeze-frame-to-layer feature we want the *content* area
+/// the user actually sees and draws into — using the outer rect
+/// captured a strip of pixels above-and-left of the visible content,
+/// which then rendered shifted up-left from the user's strokes.
+///
+/// Uses `GetClientRect` (returns client width/height with top-left at
+/// (0,0)) plus `ClientToScreen((0,0))` to translate the origin into
+/// screen coordinates.
+pub fn client_rect(hwnd_raw: isize) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+    if hwnd_raw == 0 { return None; }
+    let hwnd = HWND(hwnd_raw);
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: both calls write to the structures we pass and do not
+    // retain the pointers.
+    let ok = unsafe { GetClientRect(hwnd, &mut r).is_ok() };
+    if !ok { return None; }
+    let mut origin = POINT { x: 0, y: 0 };
+    let ok = unsafe { ClientToScreen(hwnd, &mut origin).as_bool() };
+    if !ok { return None; }
+    Some((origin.x, origin.y, origin.x + r.right, origin.y + r.bottom))
+}

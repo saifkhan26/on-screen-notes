@@ -53,9 +53,16 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
 
 /// Save a single canvas. We name files `canvas_<index>.ron` so the user can
 /// inspect / hand-edit them if desired.
+///
+/// Uses the **compact** RON encoder (not `to_string_pretty`). For a
+/// canvas with a freeze-frame layer, the embedded PNG `Vec<u8>` would
+/// otherwise be serialised as a multi-megabyte numeric-array literal
+/// with one element per line — 5-10× the size and far slower to
+/// format than the compact form. PNG bytes were never hand-readable
+/// regardless, so the prettiness loss is theoretical.
 pub fn save_canvas(index: usize, canvas: &Canvas) -> Result<()> {
     let path = paths::canvases_dir()?.join(format!("canvas_{index}.ron"));
-    let serialized = ron::ser::to_string_pretty(canvas, ron::ser::PrettyConfig::default())?;
+    let serialized = ron::ser::to_string(canvas)?;
     atomic_write(&path, serialized.as_bytes())
 }
 

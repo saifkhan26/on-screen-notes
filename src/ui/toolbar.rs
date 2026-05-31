@@ -6,6 +6,7 @@
 //! and ship inside the binary via `include_image!`.
 
 use crate::canvas::shape::BorderStyle;
+use crate::canvas::smoothing::{SmoothingOptions, SmoothingType};
 use crate::canvas::stroke::StrokeStyle;
 use crate::config::SmoothingLevel;
 use crate::tools::{ActiveTool, ToolKind};
@@ -21,6 +22,7 @@ pub fn show(
     bg_color: &mut [u8; 3],
     palette: &mut Vec<[u8; 4]>,
     smoothing: &mut SmoothingLevel,
+    smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
     pinned_hwnd: &mut Option<isize>,
     pin_picking: &mut bool,
@@ -83,7 +85,7 @@ pub fn show(
 
                     // Group 5: utilities (pin + settings + help)
                     interacted |= pin_btn(ui, pinned_hwnd, pin_picking);
-                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, pressure_curve);
+                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve);
                     interacted |= help_btn(ui);
                 });
             });
@@ -435,75 +437,21 @@ fn help_btn(ui: &mut egui::Ui) -> bool {
     false
 }
 
-/// Smoothing-level picker: three pill-shaped chips (Low / Med / High).
-/// Active chip uses the accent fill; the rest are flat. Click cycles the
-/// selection. Tooltip explains the trade-off.
+/// Smoothing-level picker: Low / Medium / High as inline
+/// `selectable_value` pills. Matches the Krita mode row visually so
+/// both selectors in the settings popup read as the same widget family.
 fn smoothing_widget(ui: &mut egui::Ui, level: &mut SmoothingLevel) -> bool {
     let mut interacted = false;
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-
-        // Reserve one wide rect for the segmented control so we can paint
-        // a unified rounded background underneath all three chips. This
-        // is what gives it the "iOS-style segmented control" feel rather
-        // than three floating buttons.
-        let opts = [SmoothingLevel::Low, SmoothingLevel::Medium, SmoothingLevel::High];
-        let chip_w = 36.0;
-        let group_size = Vec2::new(chip_w * opts.len() as f32, BTN_SIZE);
-        let (group_rect, _) = ui.allocate_exact_size(group_size, egui::Sense::hover());
-
-        let painter = ui.painter();
-        painter.rect_filled(
-            group_rect,
-            Rounding::same(BTN_ROUND),
-            Color32::from_white_alpha(14),
-        );
-
-        for (i, opt) in opts.into_iter().enumerate() {
-            let chip_rect = egui::Rect::from_min_size(
-                group_rect.min + egui::vec2(chip_w * i as f32, 0.0),
-                Vec2::new(chip_w, BTN_SIZE),
-            );
-            // Per-chip hit-testing area on top of the group background.
-            let resp = ui.interact(
-                chip_rect,
-                ui.id().with(("smoothing_chip", i)),
-                egui::Sense::click(),
-            );
-            let active = *level == opt;
-
-            if active {
-                ui.painter().rect_filled(
-                    chip_rect.shrink(2.0),
-                    Rounding::same(BTN_ROUND - 2.0),
-                    theme::ACCENT_GLOW,
-                );
-            } else if resp.hovered() {
-                ui.painter().rect_filled(
-                    chip_rect.shrink(2.0),
-                    Rounding::same(BTN_ROUND - 2.0),
-                    Color32::from_white_alpha(22),
-                );
-            }
-            let text_color = theme::TEXT_PRIMARY;
-            ui.painter().text(
-                chip_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                opt.label(),
-                egui::FontId::proportional(11.5),
-                text_color,
-            );
-
-            let resp = resp.on_hover_text(match opt {
-                SmoothingLevel::Low    => "Low smoothing — least lag, raw feel",
-                SmoothingLevel::Medium => "Medium smoothing — balanced default",
-                SmoothingLevel::High   => "High smoothing — cleanest lines, slight lag",
-            });
-            if resp.clicked() {
-                *level = opt;
-                interacted = true;
-            }
-            if resp.hovered() {
+    ui.horizontal_wrapped(|ui| {
+        for opt in [SmoothingLevel::Low, SmoothingLevel::Medium, SmoothingLevel::High] {
+            let resp = ui.selectable_value(level, opt, opt.label());
+            let tip = match opt {
+                SmoothingLevel::Low    => "Low — least lag, raw feel",
+                SmoothingLevel::Medium => "Medium — balanced default",
+                SmoothingLevel::High   => "High — cleanest lines, slight lag",
+            };
+            let resp = resp.on_hover_text(tip);
+            if resp.clicked() || resp.hovered() {
                 interacted = true;
             }
         }
@@ -650,6 +598,7 @@ fn settings_btn(
     bg_opacity: &mut f32,
     bg_color: &mut [u8; 3],
     smoothing: &mut SmoothingLevel,
+    smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
 ) -> bool {
     let size = Vec2::splat(BTN_SIZE);
@@ -760,6 +709,81 @@ fn settings_btn(
                 ui.horizontal(|ui| {
                     let _ = smoothing_widget(ui, smoothing);
                 });
+            });
+            ui.add_space(6.0);
+            // Krita-style smoothing mode selector + per-mode knobs.
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("Smoothing mode (Krita)")
+                        .small()
+                        .color(theme::TEXT_MUTED),
+                );
+                // Inline pill row — NOT a ComboBox. ComboBox opens a
+                // child popup, and egui treats that child popup as
+                // "outside" the settings popup → settings closes the
+                // instant the user clicks the dropdown. Same gotcha
+                // already documented above for the bg colour picker.
+                ui.horizontal_wrapped(|ui| {
+                    for opt in [
+                        SmoothingType::Adaptive,
+                        SmoothingType::None,
+                        SmoothingType::Simple,
+                        SmoothingType::Weighted,
+                        SmoothingType::Stabilizer,
+                    ] {
+                        let resp = ui.selectable_value(
+                            &mut smoothing_options.kind,
+                            opt,
+                            opt.label(),
+                        );
+                        resp.on_hover_text(opt.tooltip());
+                    }
+                });
+                // Per-mode controls. Only the relevant rows render so
+                // the popup stays compact.
+                match smoothing_options.kind {
+                    SmoothingType::Adaptive | SmoothingType::None | SmoothingType::Simple => {
+                        // Nothing to tune — Adaptive is driven by the
+                        // SmoothingLevel chips above; None/Simple have
+                        // no parameters in Krita either.
+                    }
+                    SmoothingType::Weighted => {
+                        ui.add(
+                            egui::Slider::new(&mut smoothing_options.smoothness_distance, 3.0..=80.0)
+                                .text("Distance px"),
+                        ).on_hover_text("Gaussian sigma · 3 — bigger = smoother + laggier");
+                        ui.add(
+                            egui::Slider::new(&mut smoothing_options.tail_aggressiveness, 0.0..=1.0)
+                                .text("Tail aggr."),
+                        ).on_hover_text("Penalises rising pressure to tighten lift-off");
+                        ui.checkbox(&mut smoothing_options.smooth_pressure, "Smooth pressure");
+                    }
+                    SmoothingType::Stabilizer => {
+                        ui.add(
+                            egui::Slider::new(&mut smoothing_options.smoothness_distance, 3.0..=80.0)
+                                .text("Sample size"),
+                        ).on_hover_text("Queue depth — bigger = more rope-pull lag");
+                        ui.checkbox(&mut smoothing_options.use_delay_distance, "Use delay distance");
+                        if smoothing_options.use_delay_distance {
+                            ui.add(
+                                egui::Slider::new(&mut smoothing_options.delay_distance, 1.0..=80.0)
+                                    .text("Delay px"),
+                            ).on_hover_text("Cursor must move farther than this before ink commits");
+                        }
+                        ui.checkbox(&mut smoothing_options.finish_stabilized_curve,
+                                    "Finish stabilized curve");
+                        ui.checkbox(&mut smoothing_options.stabilize_sensors,
+                                    "Stabilize sensors (pressure, tilt)");
+                    }
+                }
+                ui.add_space(4.0);
+                ui.checkbox(&mut smoothing_options.fan_corners, "Fan corners (render)");
+                if smoothing_options.fan_corners {
+                    ui.add(
+                        egui::Slider::new(&mut smoothing_options.fan_corners_step, 0.05..=0.80)
+                            .text("Corner step (rad)"),
+                    );
+                }
             });
             ui.add_space(6.0);
             // Pressure curve row.

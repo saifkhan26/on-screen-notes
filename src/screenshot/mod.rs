@@ -34,11 +34,27 @@ pub fn capture_primary_image() -> Result<RgbaImage> {
     Ok(img)
 }
 
-/// Capture the primary monitor, crop to the OSN window's screen
-/// rect, and encode as PNG. The cropped image lines up with the
-/// canvas-local origin so painting it at `[0, 0, logical_size]`
-/// covers exactly the area OSN sits over — anything outside the
-/// overlay is excluded.
+/// Capture the primary monitor, crop to the OSN window's **client**
+/// area, and encode as PNG. The cropped image is positioned at
+/// `(canvas_origin, logical_size)` so painting it covers exactly the
+/// area OSN sits over at the canvas's *current* pan and zoom —
+/// strokes drawn before the freeze stay in place; the captured pixels
+/// land precisely under the cursor regardless of how the user has
+/// panned or zoomed.
+///
+/// Why `client_rect` and not `window_rect`: `GetWindowRect` returns
+/// the OUTER rect, which on Win10/11 includes a DWM-managed border
+/// strip a few pixels wide even when the window is borderless. Using
+/// the outer rect made the captured image start a few pixels
+/// up-and-left of the visible content — strokes (in client coords)
+/// ended up offset bottom-right of the frozen content. `GetClientRect`
+/// + `ClientToScreen((0,0))` returns the actual content rectangle
+/// the user draws into.
+///
+/// We also clamp the crop to the captured monitor's bounds. If the
+/// OSN window straddles a secondary monitor (which xcap does not
+/// capture), the intersection with the primary monitor is what gets
+/// frozen — never a wild out-of-bounds slice.
 ///
 /// `pixels_per_point` is the overlay's DPI scale; we divide physical
 /// px by it to record the logical-size rect the renderer will draw
@@ -47,30 +63,39 @@ pub fn capture_primary_image() -> Result<RgbaImage> {
 pub fn capture_freeze_layer(
     pixels_per_point: f32,
     osn_hwnd: isize,
+    canvas_pan: [f32; 2],
+    canvas_zoom: f32,
 ) -> Result<crate::canvas::canvas::LayerImage> {
     let img = capture_primary_image()?;
     let full_w = img.width() as i32;
     let full_h = img.height() as i32;
 
-    // Resolve crop region in monitor-physical pixels. Falls back
-    // to the whole monitor if we cannot read the OSN rect.
-    let (cx, cy, cw, ch) = if osn_hwnd != 0 {
-        match crate::platform::window_rect(osn_hwnd) {
-            Some((l, t, r, b)) => {
-                let l = l.max(0);
-                let t = t.max(0);
-                let r = r.min(full_w);
-                let b = b.min(full_h);
-                if r > l && b > t {
-                    (l, t, r - l, b - t)
-                } else {
-                    (0, 0, full_w, full_h)
-                }
-            }
-            None => (0, 0, full_w, full_h),
-        }
+    // Resolve crop region in monitor-physical pixels. Prefer client
+    // rect over outer rect (see doc comment above). Falls back to the
+    // whole monitor if we cannot read either.
+    let raw_rect = if osn_hwnd != 0 {
+        crate::platform::client_rect(osn_hwnd)
+            .or_else(|| crate::platform::window_rect(osn_hwnd))
     } else {
-        (0, 0, full_w, full_h)
+        None
+    };
+    let (cx, cy, cw, ch) = match raw_rect {
+        Some((l, t, r, b)) => {
+            let l = l.clamp(0, full_w);
+            let t = t.clamp(0, full_h);
+            let r = r.clamp(0, full_w);
+            let b = b.clamp(0, full_h);
+            if r > l && b > t {
+                (l, t, r - l, b - t)
+            } else {
+                // Window sits entirely off the primary monitor (or
+                // shrank to zero). Fall back to whole monitor so the
+                // user still gets *something* recognisable rather
+                // than an empty layer.
+                (0, 0, full_w, full_h)
+            }
+        }
+        None => (0, 0, full_w, full_h),
     };
 
     let cropped = image::imageops::crop_imm(&img, cx as u32, cy as u32, cw as u32, ch as u32)
@@ -84,10 +109,18 @@ pub fn capture_freeze_layer(
             .context("encoding freeze PNG")?;
     }
     let ppp = pixels_per_point.max(0.01);
+    let zoom = canvas_zoom.max(0.001);
     Ok(crate::canvas::canvas::LayerImage {
         png: buf,
         size: [w, h],
-        logical_size: [w as f32 / ppp, h as f32 / ppp],
+        // Canvas-local extent = client logical px ÷ current zoom.
+        // The renderer multiplies this back by zoom on every paint,
+        // so the on-screen footprint is exactly the client area.
+        logical_size: [w as f32 / ppp / zoom, h as f32 / ppp / zoom],
+        // -pan/zoom places the image at canvas-local coords that
+        // map to the client top-left under the current view.
+        canvas_origin: [-canvas_pan[0] / zoom, -canvas_pan[1] / zoom],
+        capture_zoom: zoom,
     })
 }
 

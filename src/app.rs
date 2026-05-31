@@ -27,6 +27,9 @@ use crate::ui;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
+    /// Parsed user-editable hotkey bindings. Compiled once at app
+    /// start; per-event dispatch is then a flat compare.
+    hotkeys_cfg: crate::input::hotkeys_config::ParsedHotkeys,
     canvases: CanvasManager,
     tool: ActiveTool,
     pen: PenInput,
@@ -81,6 +84,12 @@ pub struct OnScreenNotesApp {
     /// Up after the picking Down is silently swallowed so the user
     /// does not leave ink behind while sampling.
     pen_picking: bool,
+
+    /// True while the layer-preview popup is open. Toggled by the
+    /// `canvas.preview_layer` hotkey; Esc closes. Renders a centred
+    /// large thumbnail of the active layer so the user can confirm
+    /// "what's on this layer" before drawing into it.
+    show_layer_preview: bool,
 
     /// Master visibility switch for floating UI (toolbar, status badge,
     /// layer panel, etc.). Toggled by the `Tab` shortcut so the user
@@ -233,7 +242,14 @@ impl OnScreenNotesApp {
             }
         };
 
-        let hotkeys = match Hotkeys::register(&config) {
+        // Load hand-edited hotkeys.toml (next-to-binary or fallback).
+        // Globals are registered immediately from its `global` section;
+        // tool / canvas bindings get parsed into compact `Binding`s and
+        // cached on the App for the in-overlay dispatcher.
+        let hotkeys_file = crate::input::hotkeys_config::HotkeysConfig::load_or_default();
+        let hotkeys_cfg = hotkeys_file.parsed();
+
+        let hotkeys = match Hotkeys::register(&hotkeys_file.global) {
             Ok(h) => Some(h),
             Err(e) => {
                 log::warn!("could not register global hotkeys: {e}");
@@ -272,6 +288,7 @@ impl OnScreenNotesApp {
 
         Self {
             config,
+            hotkeys_cfg,
             canvases,
             tool,
             pen,
@@ -288,6 +305,7 @@ impl OnScreenNotesApp {
             eraser_override,
             pen_using_eraser: false,
             pen_picking: false,
+            show_layer_preview: false,
             ui_visible: true,
             osn_hwnd,
             recorder: crate::recording::Recorder::default(),
@@ -364,7 +382,14 @@ impl OnScreenNotesApp {
     /// Capture the freeze frame and insert it as a new bottom layer.
     /// Toast on success / log on failure — never panics.
     fn do_freeze(&mut self, pixels_per_point: f32) {
-        match crate::screenshot::capture_freeze_layer(pixels_per_point, self.osn_hwnd) {
+        // Snapshot the active canvas's pan/zoom so the captured
+        // pixels can be positioned in canvas-local coords that land
+        // under the user's current view — without rewriting their
+        // pan/zoom state behind their back.
+        let canvas = self.canvases.active();
+        let pan  = canvas.pan;
+        let zoom = canvas.zoom;
+        match crate::screenshot::capture_freeze_layer(pixels_per_point, self.osn_hwnd, pan, zoom) {
             Ok(image) => {
                 let label = format!("Frozen frame {}", crate::screenshot::chrono_like_timestamp());
                 self.canvases.active_mut().add_image_layer_bottom(image, label);
@@ -546,24 +571,53 @@ impl eframe::App for OnScreenNotesApp {
         //   * `Move` is filtered + min-distance gated; samples that don't
         //     move enough are dropped.
         //   * `Up` is force-accepted so pen-up lands exactly.
+        // Sync the active tool's smoothing snapshot from the live
+        // config. A new stroke begun this frame will lock-in the
+        // current options at pen-down; an in-progress stroke keeps the
+        // snapshot it was started with.
+        self.tool.smoothing = self.config.smoothing;
+        // Push the render-side fan-corner toggle so the ribbon mesh
+        // builder can read it lock-free on the hot path.
+        crate::canvas::render::set_fan_corners(
+            self.config.smoothing.fan_corners,
+            self.config.smoothing.fan_corners_step,
+        );
+
         use crate::input::pen::PenEvent;
         let mut pen_events: Vec<PenEvent> = Vec::with_capacity(raw_pen_events.len());
+        // Krita modes (Stabilizer / Weighted / Simple / None) run their
+        // own algorithm on raw input — the upstream PenFilter would be
+        // a second-stage smoother the user did not ask for. Only
+        // Adaptive mode keeps it.
+        let use_pen_filter = self.config.smoothing.use_upstream_pen_filter();
         for ev in raw_pen_events {
             match ev {
                 PenEvent::Down(s) => {
                     self.pen_filter.reset();
-                    if let Some(fs) = self.pen_filter.filter(s, true) {
-                        pen_events.push(PenEvent::Down(fs));
+                    if use_pen_filter {
+                        if let Some(fs) = self.pen_filter.filter(s, true) {
+                            pen_events.push(PenEvent::Down(fs));
+                        }
+                    } else {
+                        pen_events.push(PenEvent::Down(s));
                     }
                 }
                 PenEvent::Move(s) => {
-                    if let Some(fs) = self.pen_filter.filter(s, false) {
-                        pen_events.push(PenEvent::Move(fs));
+                    if use_pen_filter {
+                        if let Some(fs) = self.pen_filter.filter(s, false) {
+                            pen_events.push(PenEvent::Move(fs));
+                        }
+                    } else {
+                        pen_events.push(PenEvent::Move(s));
                     }
                 }
                 PenEvent::Up(s) => {
-                    if let Some(fs) = self.pen_filter.filter(s, true) {
-                        pen_events.push(PenEvent::Up(fs));
+                    if use_pen_filter {
+                        if let Some(fs) = self.pen_filter.filter(s, true) {
+                            pen_events.push(PenEvent::Up(fs));
+                        }
+                    } else {
+                        pen_events.push(PenEvent::Up(s));
                     }
                 }
             }
@@ -585,6 +639,10 @@ impl eframe::App for OnScreenNotesApp {
                 self.pin_picking = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
             }
+        }
+        // Esc also closes the layer-preview popup.
+        if self.show_layer_preview && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_layer_preview = false;
         }
         if self.pin_picking {
             // Force click-through so the visible click lands on the
@@ -685,6 +743,7 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.config.bg_color,
                     &mut self.config.palette,
                     &mut self.config.smoothing_level,
+                    &mut self.config.smoothing,
                     &mut self.config.pressure_curve,
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
@@ -1025,29 +1084,25 @@ impl eframe::App for OnScreenNotesApp {
             }
 
             // ---- Keyboard shortcuts --------------------------------------
-            // Ctrl+0: reset canvas view. Handled via `consume_shortcut` so
-            // egui atomically matches modifier + key in one call, dodging
-            // the "events loop sees Num0 but Ctrl was already filtered out"
-            // failure mode we hit before with the per-event match below.
-            let reset_view = egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL,
-                egui::Key::Num0,
-            );
-            if ctx.input_mut(|i| i.consume_shortcut(&reset_view)) {
-                let c = self.canvases.active_mut();
-                c.zoom = 1.0;
-                c.pan  = [0.0, 0.0];
+            // Both Ctrl+0 (reset view) and Ctrl+Shift+F (freeze frame)
+            // used to be matched via `ctx.input_mut(consume_shortcut)`
+            // with hardcoded `KeyboardShortcut::new` values. They now
+            // come from `HotkeysConfig`, so we build the shortcut from
+            // the parsed binding and feed it to the same consumer —
+            // egui still does the atomic modifier+key match for us.
+            if let Some(b) = self.hotkeys_cfg.canvas.reset_view {
+                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
+                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                    let c = self.canvases.active_mut();
+                    c.zoom = 1.0;
+                    c.pan  = [0.0, 0.0];
+                }
             }
-            // Ctrl+Shift+F = freeze the screen behind OSN as a new
-            // bottom layer on the active canvas. Captured via the
-            // deferred-shot state machine so OSN's chrome does not
-            // appear in the frame.
-            let freeze_sc = egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                egui::Key::F,
-            );
-            if ctx.input_mut(|i| i.consume_shortcut(&freeze_sc)) {
-                self.queue_freeze(ctx.pixels_per_point());
+            if let Some(b) = self.hotkeys_cfg.canvas.freeze_frame {
+                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
+                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                    self.queue_freeze(ctx.pixels_per_point());
+                }
             }
 
             // Text tool steals keyboard input while a caret is open.
@@ -1058,8 +1113,11 @@ impl eframe::App for OnScreenNotesApp {
             let text_consumed = interaction::route_text_input(ctx, &mut self.tool, &mut self.canvases);
 
             ctx.input(|i| {
-                let shift = i.modifiers.shift;
-                let ctrl  = i.modifiers.ctrl || i.modifiers.command;
+                let mods = i.modifiers;
+                // Locals retained for the scroll handler below, which
+                // takes raw bools (not Modifiers).
+                let ctrl  = mods.ctrl || mods.command;
+                let shift = mods.shift;
                 if text_consumed {
                     // Still allow scroll-wheel events (handled below
                     // outside this for-loop) but drop key events.
@@ -1068,36 +1126,67 @@ impl eframe::App for OnScreenNotesApp {
                     // iterator.
                     return;
                 }
+                let keys = &self.hotkeys_cfg;
                 for ev in &i.events {
                     if let egui::Event::Key { key, pressed: true, .. } = ev {
                         // Tool switch shortcuts.
-                        interaction::react_tool_shortcut(*key, shift, &mut self.tool);
-                        // Canvas navigation (left / right).
-                        interaction::react_canvas_nav(*key, &mut self.canvases);
-                        // Layer navigation (up / down) on the active canvas.
-                        interaction::react_layer_nav(*key, &mut self.canvases);
-                        // Tab toggles every floating UI element off so
-                        // the user can view their drawing without
-                        // chrome. Strokes / shapes / cursor still
-                        // render normally.
-                        if *key == egui::Key::Tab && !ctrl && !shift {
-                            self.ui_visible = !self.ui_visible;
-                        }
-                        // Undo / redo / clear.
-                        if ctrl && *key == egui::Key::Z {
-                            if shift {
-                                self.canvases.active_mut().redo();
-                            } else {
-                                self.canvases.active_mut().undo();
+                        interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
+                        // Canvas + layer navigation.
+                        interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys);
+                        interaction::react_layer_nav (*key, mods, &mut self.canvases, keys);
+                        // Toggle floating UI chrome.
+                        if let Some(b) = keys.canvas.toggle_ui {
+                            if b.matches(*key, mods) {
+                                self.ui_visible = !self.ui_visible;
                             }
                         }
-                        if ctrl && *key == egui::Key::Delete {
-                            self.canvases.active_mut().clear();
+                        // Undo / redo / clear / delete-canvas.
+                        if let Some(b) = keys.canvas.undo {
+                            if b.matches(*key, mods) { self.canvases.active_mut().undo(); }
                         }
-                        // Ctrl+Shift+Backspace: delete the active canvas
-                        // (or clear it, if it's the only one).
-                        if ctrl && shift && *key == egui::Key::Backspace {
-                            self.canvases.delete_active();
+                        if let Some(b) = keys.canvas.redo {
+                            if b.matches(*key, mods) { self.canvases.active_mut().redo(); }
+                        }
+                        if let Some(b) = keys.canvas.clear_layer {
+                            if b.matches(*key, mods) { self.canvases.active_mut().clear(); }
+                        }
+                        if let Some(b) = keys.canvas.delete_canvas {
+                            if b.matches(*key, mods) { self.canvases.delete_active(); }
+                        }
+                        // Layer opacity: 1..9 set absolute N·10 %,
+                        // 0 sets 0 %. `-` / `=` step ±10 %. All
+                        // clamped to [0, 1]. Default bindings live in
+                        // `HotkeysConfig::CanvasSection::opacity_*`.
+                        for (n, b) in keys.canvas.opacity.iter().enumerate() {
+                            if let Some(b) = b {
+                                if b.matches(*key, mods) {
+                                    let v = (n as f32) * 0.10;
+                                    let c = self.canvases.active_mut();
+                                    c.active_layer_mut().opacity = v;
+                                    c.mark_dirty();
+                                }
+                            }
+                        }
+                        if let Some(b) = keys.canvas.opacity_dec {
+                            if b.matches(*key, mods) {
+                                let c = self.canvases.active_mut();
+                                let l = c.active_layer_mut();
+                                l.opacity = (l.opacity - 0.10).clamp(0.0, 1.0);
+                                c.mark_dirty();
+                            }
+                        }
+                        if let Some(b) = keys.canvas.opacity_inc {
+                            if b.matches(*key, mods) {
+                                let c = self.canvases.active_mut();
+                                let l = c.active_layer_mut();
+                                l.opacity = (l.opacity + 0.10).clamp(0.0, 1.0);
+                                c.mark_dirty();
+                            }
+                        }
+                        if let Some(b) = keys.canvas.preview_layer {
+                            if b.matches(*key, mods) {
+                                self.show_layer_preview = !self.show_layer_preview;
+                            }
                         }
                     }
                 }
@@ -1172,7 +1261,74 @@ impl eframe::App for OnScreenNotesApp {
                     click_through_now,
                     self.pen.is_active(),
                 );
-                ui::layer_panel::show(ctx, self.canvases.active_mut());
+                let canvas_idx = self.canvases.active_index();
+                ui::layer_panel::show(
+                    ctx,
+                    &mut self.overlay_cache,
+                    canvas_idx,
+                    self.canvases.active_mut(),
+                );
+            }
+            // Layer preview popup — large centred thumbnail of the
+            // active layer. Toggled by the `canvas.preview_layer`
+            // hotkey (`q` by default). Esc closes (handled earlier in
+            // this frame).
+            if self.show_layer_preview {
+                let canvas_idx = self.canvases.active_index();
+                let active_li = self.canvases.active().active_layer;
+                let layer_clone = self.canvases.active().layers[active_li].clone();
+                let tex = self.overlay_cache.ensure_layer_thumb(
+                    ctx, canvas_idx, active_li, &layer_clone,
+                );
+                let screen = ctx.screen_rect();
+                egui::Area::new(egui::Id::new("osn_layer_preview_popup"))
+                    .fixed_pos(egui::pos2(
+                        screen.center().x - 260.0,
+                        screen.center().y - 220.0,
+                    ))
+                    .show(ctx, |ui| {
+                        egui::Frame {
+                            inner_margin: egui::Margin::same(12.0),
+                            outer_margin: egui::Margin::ZERO,
+                            rounding: egui::Rounding::same(12.0),
+                            shadow: ui::theme::card_shadow(),
+                            fill: ui::theme::GLASS_FILL,
+                            stroke: egui::Stroke::NONE,
+                        }
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Layer {} — {} strokes · {} shapes",
+                                    active_li + 1,
+                                    layer_clone.strokes.len(),
+                                    layer_clone.shapes.len(),
+                                ))
+                                .color(ui::theme::TEXT_PRIMARY),
+                            );
+                            ui.add_space(6.0);
+                            match tex {
+                                Some(tex_id) => {
+                                    let size = egui::Vec2::new(480.0, 360.0);
+                                    ui.add(
+                                        egui::Image::new((tex_id, size))
+                                            .fit_to_exact_size(size),
+                                    );
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new("(empty layer)")
+                                            .color(ui::theme::TEXT_MUTED),
+                                    );
+                                }
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Esc or hotkey to close")
+                                    .small()
+                                    .color(ui::theme::TEXT_MUTED),
+                            );
+                        });
+                    });
             }
         }
 
@@ -1253,7 +1409,13 @@ impl eframe::App for OnScreenNotesApp {
         }
 
         // ---- Auto-save (debounced) ---------------------------------------
-        if self.last_save_at.elapsed() > Duration::from_millis(1500) {
+        // Bumped from 1500 ms to 5000 ms because the save itself is
+        // now (a) background-threaded, (b) dirty-gated so most ticks
+        // are no-ops, and (c) using compact RON. Worst-case data loss
+        // on a crash is now 5 s instead of 1.5 s — acceptable for an
+        // annotation tool, and the UI stays smooth even with 9+
+        // PNG-bearing canvases.
+        if self.last_save_at.elapsed() > Duration::from_millis(5000) {
             self.canvases.save_all();
             if let Err(e) = crate::persistence::save_config(&self.config) {
                 log::warn!("config save failed: {e}");
@@ -1277,7 +1439,9 @@ impl eframe::App for OnScreenNotesApp {
     /// With glow it would be `(&mut self, Option<&glow::Context>)`. Since we
     /// build with `wgpu` only, the no-arg form is correct.
     fn on_exit(&mut self) {
-        self.canvases.save_all();
+        // Shutdown path: block until every dirty canvas is on disk.
+        // The background variant would race with process exit.
+        self.canvases.save_all_blocking();
         if let Err(e) = crate::persistence::save_config(&self.config) {
             log::warn!("config save on exit failed: {e}");
         }

@@ -9,6 +9,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::canvas::smoothing::{
+    self, ModeState, SmoothingOptions, SmoothingType, StabilizerState, WeightedState,
+};
+
 /// A single pen reading at one instant in time.
 ///
 /// Position is stored in the canvas's own logical coordinates (not screen
@@ -102,6 +106,21 @@ pub struct Stroke {
     /// strokes loaded from disk that never receive new samples.
     #[serde(skip)]
     filter: Option<OneEuroFilter>,
+
+    /// Snapshot of the user's smoothing options at stroke begin. Held
+    /// per stroke so mid-stroke UI changes do not retro-apply to ink
+    /// already committed. `#[serde(skip)]` because it's pure runtime
+    /// state — committed strokes don't carry the parameters used to
+    /// build them.
+    #[serde(skip)]
+    pub smoothing: SmoothingOptions,
+
+    /// Per-mode transient state (Weighted history, Stabilizer deque, …).
+    /// `None` until the first sample arrives — that lets a deserialised
+    /// stroke skip the allocation entirely. Adaptive mode never touches
+    /// this field (it uses `filter` above).
+    #[serde(skip)]
+    mode_state: Option<ModeState>,
 }
 
 /// **Causal** forward EMA over positions
@@ -236,6 +255,88 @@ impl OneEuroFilter {
     }
 }
 
+/// **Bidirectional Gaussian smoothing** over polyline positions.
+///
+/// Unlike `smooth_positions_in_place` (causal forward EMA) this is a
+/// symmetric Gaussian convolution — every output sample averages a
+/// window of past *and* future samples. That makes it dramatically
+/// more effective at killing hand-tremor wiggle (~10 Hz), which a
+/// pure causal filter can only attenuate at the cost of lag.
+///
+/// We use it inside `build_cache_with` after the polyline is built:
+/// the stroke is **already complete** at that point, so there is no
+/// causality requirement — non-causal smoothing has zero perceptible
+/// downside and fixes the residual wiggle the causal EMA leaves
+/// behind.
+///
+/// `sigma` is in polyline-index units (one pen sample is ~8
+/// subdivided points after `build_cache_with`). σ = 3-6 typically
+/// kills tremor while preserving deliberate curvature.
+pub(crate) fn gaussian_smooth_positions_bidir(pts: &mut [[f32; 2]], sigma: f32) {
+    let n = pts.len();
+    if n < 3 || sigma <= 0.0 { return; }
+    // Kernel radius: 3σ covers 99.7 % of the Gaussian mass.
+    let radius = (sigma * 3.0).ceil() as isize;
+    let two_sigma2 = 2.0 * sigma * sigma;
+    let kernel_len = (2 * radius + 1) as usize;
+    let mut kernel: Vec<f32> = Vec::with_capacity(kernel_len);
+    let mut sum = 0.0_f32;
+    for i in -radius..=radius {
+        let w = (-((i * i) as f32) / two_sigma2).exp();
+        kernel.push(w);
+        sum += w;
+    }
+    // Normalise so the convolution preserves total weight.
+    for w in kernel.iter_mut() { *w /= sum; }
+
+    let mut out: Vec<[f32; 2]> = vec![[0.0; 2]; n];
+    for i in 0..n {
+        let mut ax = 0.0_f32;
+        let mut ay = 0.0_f32;
+        for k in -radius..=radius {
+            // Clamp at the ends so endpoints don't drift inward.
+            let idx = (i as isize + k).clamp(0, (n - 1) as isize) as usize;
+            let w = kernel[(k + radius) as usize];
+            ax += pts[idx][0] * w;
+            ay += pts[idx][1] * w;
+        }
+        out[i] = [ax, ay];
+    }
+    pts.copy_from_slice(&out);
+}
+
+/// Bidirectional Gaussian smoothing on widths — same idea as the
+/// position variant. Keeps the ribbon's width transitions matching
+/// the smoothed centerline so we don't get smooth geometry with
+/// jagged thickness.
+pub(crate) fn gaussian_smooth_widths_bidir(widths: &mut [f32], sigma: f32) {
+    let n = widths.len();
+    if n < 3 || sigma <= 0.0 { return; }
+    let radius = (sigma * 3.0).ceil() as isize;
+    let two_sigma2 = 2.0 * sigma * sigma;
+    let kernel_len = (2 * radius + 1) as usize;
+    let mut kernel: Vec<f32> = Vec::with_capacity(kernel_len);
+    let mut sum = 0.0_f32;
+    for i in -radius..=radius {
+        let w = (-((i * i) as f32) / two_sigma2).exp();
+        kernel.push(w);
+        sum += w;
+    }
+    for w in kernel.iter_mut() { *w /= sum; }
+
+    let mut out = vec![0.0_f32; n];
+    for i in 0..n {
+        let mut a = 0.0_f32;
+        for k in -radius..=radius {
+            let idx = (i as isize + k).clamp(0, (n - 1) as isize) as usize;
+            let w = kernel[(k + radius) as usize];
+            a += widths[idx] * w;
+        }
+        out[i] = a;
+    }
+    widths.copy_from_slice(&out);
+}
+
 /// One **causal** EMA pass over widths (`w[i] = α·w[i] + (1-α)·w[i-1]`).
 ///
 /// Each output width depends only on earlier widths — never on later
@@ -316,10 +417,6 @@ pub struct StrokeCache {
 }
 
 impl Stroke {
-    pub fn new(color: [u8; 4], base_width: f32) -> Self {
-        Self::with_style(color, base_width, StrokeStyle::Default)
-    }
-
     /// Build a stroke with a chosen visual style.
     pub fn with_style(color: [u8; 4], base_width: f32, style: StrokeStyle) -> Self {
         Self {
@@ -330,6 +427,30 @@ impl Stroke {
             filled: false,
             cache: None,
             filter: None,
+            smoothing: SmoothingOptions::default(),
+            mode_state: None,
+        }
+    }
+
+    /// Build a stroke with a chosen visual style **and** smoothing
+    /// snapshot. Use this when the caller (pen tool) wants to lock
+    /// the active `SmoothingOptions` into the stroke at pen-down.
+    pub fn with_style_and_smoothing(
+        color: [u8; 4],
+        base_width: f32,
+        style: StrokeStyle,
+        smoothing: SmoothingOptions,
+    ) -> Self {
+        Self {
+            samples: Vec::with_capacity(64),
+            color,
+            base_width,
+            style,
+            filled: false,
+            cache: None,
+            filter: None,
+            smoothing,
+            mode_state: None,
         }
     }
 
@@ -348,6 +469,8 @@ impl Stroke {
             filled: true,
             cache: None,
             filter: None,
+            smoothing: SmoothingOptions::default(),
+            mode_state: None,
         }
     }
 
@@ -373,7 +496,37 @@ impl Stroke {
     /// 1.0 px because OEF already kills the wobble that motivated the
     /// previous 1.5-px floor — the gate is now only a duplicate filter,
     /// not a primary smoother.
-    pub fn push(&mut self, mut sample: PenSample) {
+    pub fn push(&mut self, sample: PenSample) {
+        match self.smoothing.kind {
+            SmoothingType::Adaptive => self.push_adaptive(sample),
+            SmoothingType::None     => self.push_raw(sample),
+            SmoothingType::Simple   => self.push_simple(sample),
+            SmoothingType::Weighted => self.push_weighted(sample),
+            SmoothingType::Stabilizer => {
+                if let Some(out) = self.push_stabilizer(sample, false) {
+                    self.accept(out);
+                }
+            }
+        }
+    }
+
+    /// Drain remaining stabilizer queue on pen-up so the rope catches
+    /// up to the cursor. No-op for every other mode.
+    pub fn finish(&mut self) {
+        if !matches!(self.smoothing.kind, SmoothingType::Stabilizer) {
+            return;
+        }
+        let opts = self.smoothing;
+        let Some(ModeState::Stabilizer(state)) = self.mode_state.as_mut() else { return; };
+        let extras = smoothing::stabilizer_finish(state, &opts);
+        for s in extras {
+            self.accept(s);
+        }
+    }
+
+    /// Existing pipeline: in-stroke One Euro on positions + min-dist
+    /// gate. Preserves byte-for-byte legacy behaviour.
+    fn push_adaptive(&mut self, mut sample: PenSample) {
         let filter = self.filter.get_or_insert_with(OneEuroFilter::new);
         sample.pos = filter.filter(sample.pos);
 
@@ -385,6 +538,72 @@ impl Stroke {
             if d2 < min_dist * min_dist {
                 return;
             }
+        }
+        self.samples.push(sample);
+        self.cache = None;
+    }
+
+    /// Krita NO_SMOOTHING: raw sample, only the tiny duplicate gate so
+    /// idle digitiser ticks don't bloat the polyline.
+    fn push_raw(&mut self, sample: PenSample) {
+        if let Some(last) = self.samples.last() {
+            let dx = sample.pos[0] - last.pos[0];
+            let dy = sample.pos[1] - last.pos[1];
+            if dx * dx + dy * dy < 0.25 { return; }
+        }
+        self.accept(sample);
+    }
+
+    /// Krita SIMPLE_SMOOTHING: average against the previous raw sample.
+    fn push_simple(&mut self, sample: PenSample) {
+        let state = self.mode_state
+            .get_or_insert_with(|| ModeState::Simple { prev: None });
+        let out = if let ModeState::Simple { prev } = state {
+            smoothing::simple_step(prev, sample)
+        } else {
+            sample
+        };
+        self.accept(out);
+    }
+
+    /// Krita WEIGHTED_SMOOTHING: Gaussian-weighted history accumulation.
+    fn push_weighted(&mut self, sample: PenSample) {
+        let opts = self.smoothing;
+        let state = self.mode_state
+            .get_or_insert_with(|| ModeState::Weighted(WeightedState::new()));
+        let out = if let ModeState::Weighted(w) = state {
+            smoothing::weighted_step(w, sample, &opts)
+        } else {
+            sample
+        };
+        self.accept(out);
+    }
+
+    /// Krita STABILIZER: queue + delay-distance gate. Returns the
+    /// blended output (or `None` when the gate suppresses the sample).
+    fn push_stabilizer(&mut self, sample: PenSample, force: bool) -> Option<PenSample> {
+        let opts = self.smoothing;
+        let state = self.mode_state.get_or_insert_with(|| {
+            ModeState::Stabilizer(StabilizerState::new(
+                sample,
+                opts.smoothness_distance.max(3.0) as usize,
+            ))
+        });
+        if let ModeState::Stabilizer(s) = state {
+            smoothing::stabilizer_step(s, sample, &opts, force)
+        } else {
+            Some(sample)
+        }
+    }
+
+    /// Shared "accept this output sample" helper. Honours the same
+    /// min-distance dedup gate every explicit Krita mode wants — keeps
+    /// the polyline from accumulating near-coincident points.
+    fn accept(&mut self, sample: PenSample) {
+        if let Some(last) = self.samples.last() {
+            let dx = sample.pos[0] - last.pos[0];
+            let dy = sample.pos[1] - last.pos[1];
+            if dx * dx + dy * dy < 0.25 { return; }
         }
         self.samples.push(sample);
         self.cache = None;
@@ -403,6 +622,10 @@ impl Stroke {
     /// run over the polyline positions — the smoothing-level UI maps to
     /// this directly (Low=1, Medium=3, High=6).
     pub fn build_cache_with(&mut self, position_passes: usize) {
+        // Explicit Krita modes have already done the heavy smoothing
+        // per-sample; the cache builder defers to the mode's own
+        // budget instead of stacking another EMA on top.
+        let position_passes = self.smoothing.cache_passes(position_passes);
         if self.cache.is_some() { return; }
         // Hard ceiling: the slider + scroll handler already constrain
         // `base_width` to ≤ 80 px, but a stroke loaded from a corrupt /
@@ -510,6 +733,23 @@ impl Stroke {
         // get a single causal pass here so a pressure rise thickens
         // the stroke *where it happens* rather than ramping toward it.
         smooth_widths_causal(&mut widths);
+
+        // ---- Final non-causal Gaussian polish on the dense polyline.
+        // The stroke is complete at commit time, so we run a
+        // bidirectional Gaussian over the subdivided polyline — kills
+        // residual hand-tremor wiggle that causal EMA can't reach
+        // without prohibitive lag, with zero perceptible downside
+        // because lag doesn't apply to a finished stroke.
+        //
+        // Sigma scales with the polyline's own density (more substeps
+        // per sample = wider σ needed to cover the same physical
+        // distance). Floor at σ=3 even for Low so every committed
+        // stroke gets a baseline polish — eliminates the "smooth
+        // while drawing then wiggly on pen-up" feel the user
+        // reported.
+        let base_sigma = 3.0 + position_passes as f32 * 1.5;
+        gaussian_smooth_positions_bidir(&mut points, base_sigma);
+        gaussian_smooth_widths_bidir(&mut widths, base_sigma * 0.5);
 
         self.cache = Some(StrokeCache { points, widths });
     }
