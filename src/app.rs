@@ -137,6 +137,11 @@ pub struct OnScreenNotesApp {
     /// instead of being saved to disk.
     pending_freeze: Option<PendingShot>,
 
+    /// Deferred lasso-select capture state. Same chrome-hide + frame-
+    /// wait dance as `pending_freeze`, but only the pixels inside the
+    /// recorded polygon are kept (cropped to the selection bbox).
+    pending_lasso: Option<PendingLasso>,
+
     /// HWND of the window OSN is currently pinned to follow, stored
     /// as the platform-native integer. `None` = no pin. On Windows,
     /// each frame we read `GetWindowRect(hwnd)` and re-issue
@@ -173,6 +178,21 @@ struct PendingShot {
     /// later DPI change between request and capture doesn't break
     /// alignment.
     pixels_per_point: f32,
+}
+
+/// State held while a lasso-select capture is in flight. Carries the
+/// recorded polygon plus the pan/zoom snapshot taken at queue time so
+/// the masking math matches the view the lasso was drawn in even if
+/// the canvas is nudged during the 2-frame chrome-hide.
+struct PendingLasso {
+    ui_visible_before: bool,
+    bg_opacity_before: f32,
+    frames_to_wait: u32,
+    pixels_per_point: f32,
+    pan: [f32; 2],
+    zoom: f32,
+    /// Closed polygon in canvas-local coords.
+    polygon: Vec<[f32; 2]>,
 }
 
 impl OnScreenNotesApp {
@@ -312,6 +332,7 @@ impl OnScreenNotesApp {
             ui_visible_before_record: true,
             toast: None,
             pending_screenshot: None,
+            pending_lasso: None,
             loupe: None,
             pending_freeze: None,
             pinned_hwnd: None,
@@ -399,6 +420,54 @@ impl OnScreenNotesApp {
                 ));
             }
             Err(e) => log::warn!("freeze frame failed: {e}"),
+        }
+    }
+
+    /// Enqueue a deferred lasso-select capture. Snapshots the active
+    /// canvas's pan/zoom alongside the polygon, then runs the same
+    /// 2-frame chrome-hide as freeze so the captured pixels are the
+    /// pure desktop behind the overlay.
+    fn queue_lasso_capture(&mut self, polygon: Vec<[f32; 2]>, pixels_per_point: f32) {
+        if self.pending_lasso.is_some() { return; }
+        let canvas = self.canvases.active();
+        self.pending_lasso = Some(PendingLasso {
+            ui_visible_before: self.ui_visible,
+            bg_opacity_before: self.config.bg_opacity,
+            frames_to_wait: 2,
+            pixels_per_point,
+            pan: canvas.pan,
+            zoom: canvas.zoom,
+            polygon,
+        });
+        self.ui_visible = false;
+        self.config.bg_opacity = 0.0;
+    }
+
+    /// Capture the lasso region and insert it as a new bottom layer.
+    /// Toast on success / log on failure — never panics.
+    fn do_lasso_capture(
+        &mut self,
+        pixels_per_point: f32,
+        pan: [f32; 2],
+        zoom: f32,
+        polygon: &[[f32; 2]],
+    ) {
+        match crate::screenshot::capture_lasso_layer(
+            pixels_per_point,
+            self.osn_hwnd,
+            pan,
+            zoom,
+            polygon,
+        ) {
+            Ok(image) => {
+                let label = format!("Lasso region {}", crate::screenshot::chrono_like_timestamp());
+                self.canvases.active_mut().add_image_layer_bottom(image, label);
+                self.toast = Some((
+                    "Lasso region added as bottom layer".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            Err(e) => log::warn!("lasso capture failed: {e}"),
         }
     }
 
@@ -524,6 +593,32 @@ impl eframe::App for OnScreenNotesApp {
             self.ui_visible = ui_prev;
             self.config.bg_opacity = bg_prev;
             self.pending_freeze = None;
+        }
+
+        // Same state machine for the lasso-select capture. The polygon
+        // is owned (not Copy), so we `take()` the whole pending struct
+        // once the countdown elapses rather than copying fields out.
+        let do_lasso = self
+            .pending_lasso
+            .as_mut()
+            .map(|ps| {
+                if ps.frames_to_wait > 0 {
+                    ps.frames_to_wait -= 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if self.pending_lasso.is_some() && !do_lasso {
+            ctx.request_repaint();
+        }
+        if do_lasso {
+            if let Some(ps) = self.pending_lasso.take() {
+                self.do_lasso_capture(ps.pixels_per_point, ps.pan, ps.zoom, &ps.polygon);
+                self.ui_visible = ps.ui_visible_before;
+                self.config.bg_opacity = ps.bg_opacity_before;
+            }
         }
 
         // Recording capture+encode runs on a dedicated worker thread
@@ -871,7 +966,7 @@ impl eframe::App for OnScreenNotesApp {
                 // "precision aim" cue rather than a generic arrow.
                 let tool_wants_crosshair = matches!(
                     self.tool.kind,
-                    crate::tools::ToolKind::Fill,
+                    crate::tools::ToolKind::Fill | crate::tools::ToolKind::LassoSelect,
                 );
                 let hover = ctx.input(|i| i.pointer.hover_pos());
                 let on_ui = hover
@@ -930,6 +1025,28 @@ impl eframe::App for OnScreenNotesApp {
                     match ev {
                         PenEvent::Down(_) => {
                             if on_ui {
+                                self.pen_blocked = true;
+                                continue;
+                            }
+                            // Wintab runs a *system* context, so it hands
+                            // us pen-down packets even when the tip is over
+                            // another app's window — OSN is not
+                            // always-on-top, so another window may sit
+                            // above it (or we may be in Alt-passthrough).
+                            // Without this guard every such tap falls
+                            // through to `reclaim_foreground` below and
+                            // yanks focus back to OSN: the user clicks a
+                            // different app with the pen and OSN keeps
+                            // stealing focus. Compare the top-level window
+                            // under the pen tip against our own HWND; if
+                            // it's a real, different window the user is
+                            // drawing/clicking *there*, so swallow the
+                            // whole gesture (Move + Up too, via
+                            // `pen_blocked`) and don't reclaim.
+                            let sx = client_origin[0] + s.pos[0] as i32;
+                            let sy = client_origin[1] + s.pos[1] as i32;
+                            let win_under = crate::platform::top_level_window_at(sx, sy);
+                            if win_under != 0 && win_under != self.osn_hwnd {
                                 self.pen_blocked = true;
                                 continue;
                             }
@@ -1081,6 +1198,15 @@ impl eframe::App for OnScreenNotesApp {
                     }
                     crate::flood_fill::FillResult::Empty => {}
                 }
+            }
+
+            // ---- Deferred lasso-select capture ----------------------------
+            // The Lasso-Select tool stashes the closed polygon on pen-up;
+            // run the (chrome-hidden) screen capture here where the HWND +
+            // DPI are available, then insert the masked region as a bottom
+            // image layer.
+            if let Some(poly) = self.tool.pending_lasso_capture.take() {
+                self.queue_lasso_capture(poly, ctx.pixels_per_point());
             }
 
             // ---- Keyboard shortcuts --------------------------------------

@@ -826,7 +826,7 @@ fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutco
 /// winding order. Robust for lasso-erase hit-testing where the user
 /// path is rough; we don't try to handle exact-on-edge ties because
 /// real centroids almost never land on a path edge.
-fn point_in_polygon(p: [f32; 2], polygon: &[[f32; 2]]) -> bool {
+pub(crate) fn point_in_polygon(p: [f32; 2], polygon: &[[f32; 2]]) -> bool {
     let n = polygon.len();
     if n < 3 { return false; }
     let (x, y) = (p[0], p[1]);

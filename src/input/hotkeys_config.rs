@@ -222,6 +222,7 @@ pub struct ToolSection {
     #[serde(default = "d_text")]           pub text: String,
     #[serde(default = "d_spotlight")]      pub spotlight: String,
     #[serde(default = "d_lasso")]          pub lasso: String,
+    #[serde(default = "d_lasso_select")]   pub lasso_select: String,
     #[serde(default = "d_eyedropper")]     pub eyedropper: String,
     #[serde(default = "d_rect")]           pub rect: String,
     #[serde(default = "d_ellipse")]        pub ellipse: String,
@@ -235,6 +236,7 @@ impl Default for ToolSection {
             pen: d_pen(), pencil: d_pencil(), marker: d_marker(),
             airbrush: d_airbrush(), fill: d_fill(), laser: d_laser(),
             text: d_text(), spotlight: d_spotlight(), lasso: d_lasso(),
+            lasso_select: d_lasso_select(),
             eyedropper: d_eyedropper(), rect: d_rect(), ellipse: d_ellipse(),
             arrow: d_arrow(), freehand_arrow: d_freehand_arrow(),
         }
@@ -250,6 +252,7 @@ fn d_laser()          -> String { "l".into() }
 fn d_text()           -> String { "t".into() }
 fn d_spotlight()      -> String { "s".into() }
 fn d_lasso()          -> String { "x".into() }
+fn d_lasso_select()   -> String { "shift+x".into() }
 fn d_eyedropper()     -> String { "i".into() }
 fn d_rect()           -> String { "r".into() }
 fn d_ellipse()        -> String { "o".into() }
@@ -364,6 +367,7 @@ pub struct ToolBindings {
     pub text: Option<Binding>,
     pub spotlight: Option<Binding>,
     pub lasso: Option<Binding>,
+    pub lasso_select: Option<Binding>,
     pub eyedropper: Option<Binding>,
     pub rect: Option<Binding>,
     pub ellipse: Option<Binding>,
@@ -422,6 +426,7 @@ impl HotkeysConfig {
                 text:           p("tool.text",           &self.tool.text),
                 spotlight:      p("tool.spotlight",      &self.tool.spotlight),
                 lasso:          p("tool.lasso",          &self.tool.lasso),
+                lasso_select:   p("tool.lasso_select",   &self.tool.lasso_select),
                 eyedropper:     p("tool.eyedropper",     &self.tool.eyedropper),
                 rect:           p("tool.rect",           &self.tool.rect),
                 ellipse:        p("tool.ellipse",        &self.tool.ellipse),

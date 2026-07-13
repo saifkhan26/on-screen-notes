@@ -386,7 +386,7 @@ pub fn show(
             // canvas's pan/zoom. The first sample is also appended at
             // the end so the loop reads as closed during the drag —
             // gives the user a clear "what you'll cut" preview.
-            if matches!(tool.kind, ToolKind::LassoErase) {
+            if matches!(tool.kind, ToolKind::LassoErase | ToolKind::LassoSelect) {
                 if let Some(poly) = tool.in_progress_lasso.as_ref() {
                     if poly.len() >= 2 {
                         let canvas = manager.active();

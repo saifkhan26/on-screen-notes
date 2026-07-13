@@ -52,6 +52,7 @@ pub fn show(
                     interacted |= tool_btn(ui, tool, ToolKind::Text,          "Text — T  (click to place, Enter to commit, Shift+Enter newline)");
                     interacted |= tool_btn(ui, tool, ToolKind::Spotlight,     "Spotlight — S  (dim everything except a square around the cursor; wheel resizes)");
                     interacted |= tool_btn(ui, tool, ToolKind::LassoErase,    "Lasso erase — X  (draw a closed loop; ink whose centroid lands inside is removed)");
+                    interacted |= tool_btn(ui, tool, ToolKind::LassoSelect,   "Lasso select — Shift+X  (draw a closed loop; the screen pixels inside are captured into a bottom layer)");
                     spacer(ui);
 
                     // Group 2: shape tools
@@ -194,6 +195,9 @@ fn paint_icon(ui: &mut egui::Ui, rect: egui::Rect, kind: ToolKind, color: Color3
         ToolKind::Text          => egui::Image::new(egui::include_image!("../../assets/icons/text.svg")),
         ToolKind::Spotlight     => egui::Image::new(egui::include_image!("../../assets/icons/spotlight.svg")),
         ToolKind::LassoErase    => egui::Image::new(egui::include_image!("../../assets/icons/lasso.svg")),
+        // Reuses the lasso glyph for now; a dedicated lasso-select icon
+        // can be dropped into assets/icons/ later.
+        ToolKind::LassoSelect   => egui::Image::new(egui::include_image!("../../assets/icons/lasso.svg")),
     };
     img.tint(color)
         .fit_to_exact_size(rect.size())

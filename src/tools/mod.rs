@@ -74,6 +74,12 @@ pub enum ToolKind {
     /// than the point-radius eraser when cleaning up around dense
     /// ink.
     LassoErase,
+    /// Lasso select. Same freeform-polygon collection as `LassoErase`,
+    /// but on pen-up the on-screen pixels *inside* the polygon are
+    /// captured (like the freeze-frame feature) and inserted as a
+    /// bottom image layer. The capture itself runs in the app loop —
+    /// `end` only stashes the polygon in `pending_lasso_capture`.
+    LassoSelect,
 }
 
 impl ToolKind {
@@ -93,6 +99,7 @@ impl ToolKind {
             ToolKind::Text          => "T",
             ToolKind::Spotlight     => "S",
             ToolKind::LassoErase    => "X",
+            ToolKind::LassoSelect   => "Shift+X",
         }
     }
 }
@@ -176,6 +183,12 @@ pub struct ActiveTool {
     /// appends; end closes the polygon and erases every stroke /
     /// shape on the active layer whose centroid lies inside.
     pub in_progress_lasso: Option<Vec<[f32; 2]>>,
+    /// Pending lasso-select polygon (canvas-local coords). Set by the
+    /// `LassoSelect` tool on pen-up; the app loop picks it up next
+    /// frame and runs the deferred screen capture (it needs the HWND,
+    /// DPI, and the 2-frame chrome-hide that only the app has).
+    /// Cleared once consumed.
+    pub pending_lasso_capture: Option<Vec<[f32; 2]>>,
 
     /// Snapshot of the user's current smoothing options. Copied onto
     /// each new stroke at pen-down so a mid-stroke UI change does not
@@ -203,6 +216,7 @@ impl ActiveTool {
             pending_fill_at: None,
             spotlight_size: 120.0,
             in_progress_lasso: None,
+            pending_lasso_capture: None,
             smoothing: cfg.smoothing,
         }
     }
@@ -264,9 +278,11 @@ impl ActiveTool {
                 // dim overlay.
                 self.kind = ToolKind::Pen;
             }
-            ToolKind::LassoErase => {
+            ToolKind::LassoErase | ToolKind::LassoSelect => {
                 // Start a fresh lasso path. The render layer paints
                 // the in-progress polyline as a dashed grey loop.
+                // Erase and Select share the collection + preview;
+                // they only differ in what `end` does with the polygon.
                 self.in_progress_lasso = Some(vec![sample.pos]);
             }
             ToolKind::Rect | ToolKind::Ellipse | ToolKind::Line | ToolKind::Arrow => {
@@ -301,7 +317,7 @@ impl ActiveTool {
                 // Spotlight follows the cursor passively. Nothing to
                 // do on pen-move.
             }
-            ToolKind::LassoErase => {
+            ToolKind::LassoErase | ToolKind::LassoSelect => {
                 if let Some(poly) = self.in_progress_lasso.as_mut() {
                     // Skip duplicate samples (Wintab often re-emits the
                     // same coord at idle). Keeps the rendered polyline
@@ -437,6 +453,20 @@ impl ActiveTool {
                     // Need at least a triangle for a real polygon.
                     if poly.len() >= 3 {
                         canvas.erase_in_polygon(&poly);
+                    }
+                }
+            }
+            ToolKind::LassoSelect => {
+                // Same close-the-polygon step as erase, but instead of
+                // mutating the canvas we hand the polygon to the app
+                // loop, which captures the screen pixels inside it and
+                // inserts them as a bottom image layer. Canvas is
+                // untouched here.
+                let _ = canvas;
+                if let Some(mut poly) = self.in_progress_lasso.take() {
+                    poly.push(sample.pos);
+                    if poly.len() >= 3 {
+                        self.pending_lasso_capture = Some(poly);
                     }
                 }
             }
