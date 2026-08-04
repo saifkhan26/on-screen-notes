@@ -88,6 +88,9 @@ pub fn capture_freeze_layer(
         png: buf,
         size: [w, h],
         logical_size: [w as f32 / ppp, h as f32 / ppp],
+        // A freshly captured frame lines up with the canvas origin; it
+        // only moves once the user pans its layer.
+        pos: [0.0, 0.0],
     })
 }
 

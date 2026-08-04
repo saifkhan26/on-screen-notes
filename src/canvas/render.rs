@@ -90,6 +90,12 @@ pub fn paint_canvas_egui(
     // instead — letting callers re-render the canvas magnified
     // into a clipped region (e.g. the live loupe overlay).
     transform_override: Option<([f32; 2], f32)>,
+    // In-progress Shift+Space layer pan: `(layer index, canvas-local
+    // delta)`. The named layer paints shifted by the delta so the user
+    // sees the move live; nothing is written back to the canvas until
+    // the gesture ends, at which point `Canvas::move_layer_by` bakes the
+    // same delta into the layer's geometry. `None` outside a drag.
+    layer_drag: Option<(usize, [f32; 2])>,
 ) {
     // Pre-compute the pan-zoom transform as a closure so we don't
     // recompute the same maths inside every loop.
@@ -111,6 +117,18 @@ pub fn paint_canvas_egui(
         if !layer.visible { continue; }
         let op = layer.opacity.clamp(0.0, 1.0);
         if op <= 0.0 { continue; }
+        // Shadow the canvas-wide `to_screen` with one that folds in this
+        // layer's in-progress pan offset (zero for every layer but the
+        // one being dragged). Everything the layer owns — raster plate,
+        // shapes, strokes — goes through it, so the layer moves as a
+        // rigid unit.
+        let off = match layer_drag {
+            Some((di, d)) if di == li => d,
+            _ => [0.0, 0.0],
+        };
+        let to_screen = |p: [f32; 2]| {
+            egui::pos2(pan_x + (p[0] + off[0]) * zoom, pan_y + (p[1] + off[1]) * zoom)
+        };
         // Raster image (frozen frame) goes UNDER the layer's strokes
         // and shapes — it is the "background plate" the user is
         // annotating over.
@@ -125,8 +143,8 @@ pub fn paint_canvas_egui(
                 w = img.size[0] as f32;
                 h = img.size[1] as f32;
             }
-            let p0 = to_screen([0.0, 0.0]);
-            let p1 = to_screen([w, h]);
+            let p0 = to_screen(img.pos);
+            let p1 = to_screen([img.pos[0] + w, img.pos[1] + h]);
             let rect = egui::Rect::from_two_pos(p0, p1);
             let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, (op * 255.0) as u8);
             painter.image(*tex_id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
@@ -1158,7 +1176,14 @@ pub fn render_canvas(
                     let lh = if img.logical_size[1] > 0.0 { img.logical_size[1] } else { ih as f32 };
                     let sx = lw / iw as f32;
                     let sy = lh / ih as f32;
-                    let draw_t = Transform::from_scale(sx, sy).post_concat(t);
+                    // `pos` is the image's canvas-local anchor — non-zero
+                    // once the user has panned this layer. Apply it after
+                    // the physical→logical scale but before `t`, so it is
+                    // interpreted in canvas-local pixels like every other
+                    // coordinate the transform stack consumes.
+                    let draw_t = Transform::from_scale(sx, sy)
+                        .post_concat(Transform::from_translate(img.pos[0], img.pos[1]))
+                        .post_concat(t);
                     let opts = tiny_skia::PixmapPaint {
                         opacity: layer.opacity.clamp(0.0, 1.0),
                         blend_mode: tiny_skia::BlendMode::SourceOver,

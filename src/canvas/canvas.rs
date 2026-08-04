@@ -32,6 +32,12 @@ pub struct LayerImage {
     /// from the PNG header as a fallback).
     #[serde(default)]
     pub logical_size: [f32; 2],
+    /// Top-left canvas-local anchor of the image. Was implicitly the
+    /// canvas origin before per-layer panning existed, so
+    /// `#[serde(default)]` (`[0.0, 0.0]`) reproduces the old placement
+    /// for every existing save file.
+    #[serde(default)]
+    pub pos: [f32; 2],
 }
 
 /// One named layer of ink. Layers stack in the order they appear in
@@ -60,6 +66,14 @@ pub struct Layer {
     /// older saves loading without an image.
     #[serde(default)]
     pub image: Option<LayerImage>,
+    /// Running total of every per-layer pan baked into this layer's
+    /// geometry. Pure bookkeeping — the renderer and the hit-testers
+    /// never read it, because a layer pan rewrites the point data
+    /// rather than living as a transform. It exists so "reset layer
+    /// position" knows how far back to go. `#[serde(default)]` keeps
+    /// older saves loading as "never moved".
+    #[serde(default)]
+    pub moved_by: [f32; 2],
 }
 
 fn default_layer_opacity() -> f32 { 1.0 }
@@ -73,6 +87,25 @@ impl Default for Layer {
             strokes: Vec::new(),
             shapes: Vec::new(),
             image: None,
+            moved_by: [0.0, 0.0],
+        }
+    }
+}
+
+impl Layer {
+    /// Shift every piece of geometry this layer owns by `d` canvas-local
+    /// pixels — strokes, shapes, and the frozen-frame raster alike, so
+    /// the layer moves as one rigid unit.
+    pub fn translate(&mut self, d: [f32; 2]) {
+        for s in &mut self.strokes {
+            s.translate(d);
+        }
+        for s in &mut self.shapes {
+            s.translate(d);
+        }
+        if let Some(img) = self.image.as_mut() {
+            img.pos[0] += d[0];
+            img.pos[1] += d[1];
         }
     }
 }
@@ -114,6 +147,20 @@ pub struct Canvas {
     /// Redo stack — populated when the user undoes; cleared on a new edit.
     #[serde(skip)]
     pub redo_log: Vec<UndoEntry>,
+
+    /// "Has unsaved changes." Set by `CanvasManager::active_mut`, cleared
+    /// once the canvas is written to disk, so the debounced autosave can
+    /// skip canvases nobody has touched.
+    ///
+    /// Without this the autosave re-serialised *every* canvas every
+    /// 1.5 s. With frozen-frame layers (a full-screen PNG stored inline)
+    /// that is hundreds of megabytes of text per pass — a ~1 s freeze of
+    /// the UI thread, on repeat, even while completely idle.
+    ///
+    /// `#[serde(skip)]` deserialises to `false`: a canvas just read from
+    /// disk matches the file, so it needs no rewrite.
+    #[serde(skip)]
+    pub dirty: bool,
 }
 
 /// One reversible action. The `usize` is always the layer index the
@@ -136,6 +183,11 @@ pub enum UndoEntry {
     /// swaps `old` back in; redo swaps `new` back. Atomic — one
     /// Ctrl+Z step per lasso pass.
     ShapeReplaced(usize, usize, Shape, Shape),
+    /// Layer `usize` was panned by the given canvas-local delta
+    /// (Shift+Space drag). The translation is baked into the layer's
+    /// point data, so undo just translates back by `-delta` — no
+    /// geometry is cloned into the history.
+    LayerMoved(usize, [f32; 2]),
 }
 
 impl Default for Canvas {
@@ -149,6 +201,8 @@ impl Default for Canvas {
             zoom: 1.0,
             undo_log: Vec::new(),
             redo_log: Vec::new(),
+            // A freshly created canvas has no file behind it yet.
+            dirty: true,
         }
     }
 }
@@ -165,6 +219,9 @@ impl Canvas {
             l.shapes  = std::mem::take(&mut self.legacy_shapes);
             self.layers.push(l);
             self.active_layer = 0;
+            // The in-memory shape no longer matches the legacy file, so
+            // the migrated form needs writing back out.
+            self.dirty = true;
         } else {
             // Fresh-format save — drop any stray legacy data.
             self.legacy_strokes.clear();
@@ -284,6 +341,14 @@ impl Canvas {
                     }
                 }
             }
+            UndoEntry::LayerMoved(li, d) => {
+                if let Some(layer) = self.layers.get_mut(li) {
+                    layer.translate([-d[0], -d[1]]);
+                    layer.moved_by[0] -= d[0];
+                    layer.moved_by[1] -= d[1];
+                    self.redo_log.push(UndoEntry::LayerMoved(li, d));
+                }
+            }
         }
     }
 
@@ -342,6 +407,14 @@ impl Canvas {
                         layer.shapes[idx] = new.clone();
                         self.undo_log.push(UndoEntry::ShapeReplaced(li, idx, old, new));
                     }
+                }
+            }
+            UndoEntry::LayerMoved(li, d) => {
+                if let Some(layer) = self.layers.get_mut(li) {
+                    layer.translate(d);
+                    layer.moved_by[0] += d[0];
+                    layer.moved_by[1] += d[1];
+                    self.undo_log.push(UndoEntry::LayerMoved(li, d));
                 }
             }
         }
@@ -505,6 +578,28 @@ impl Canvas {
 
     // -- layer management -------------------------------------------------
 
+    /// Pan the layer at `li` by `d` canvas-local pixels, baking the
+    /// translation straight into its geometry.
+    ///
+    /// Baking (rather than storing a per-layer transform the renderer
+    /// applies) keeps `Stroke::samples` and `Shape` coordinates in the
+    /// single canvas-local space every other subsystem already assumes —
+    /// the eraser's hit-testing, the flood fill's rasterise/map-back
+    /// round trip, and the tiny-skia screenshot path all keep working
+    /// with no offset plumbing. The cost is one add per point, paid once
+    /// per gesture on pen-up rather than on every frame.
+    pub fn move_layer_by(&mut self, li: usize, d: [f32; 2]) {
+        // A Shift+Space click with no motion should not litter the undo
+        // history with a no-op entry.
+        if d[0] == 0.0 && d[1] == 0.0 { return; }
+        let Some(layer) = self.layers.get_mut(li) else { return };
+        layer.translate(d);
+        layer.moved_by[0] += d[0];
+        layer.moved_by[1] += d[1];
+        self.undo_log.push(UndoEntry::LayerMoved(li, d));
+        self.redo_log.clear();
+    }
+
     /// Insert a new image-backed layer at the *bottom* of the stack
     /// (index 0) so the frozen frame sits underneath every other
     /// layer's ink. Existing strokes' undo entries shift up one
@@ -518,6 +613,7 @@ impl Canvas {
             strokes: Vec::new(),
             shapes:  Vec::new(),
             image: Some(image),
+            moved_by: [0.0, 0.0],
         };
         self.layers.insert(0, l);
         // Keep the user pointing at whichever ink layer they were
@@ -539,6 +635,7 @@ impl Canvas {
             strokes: Vec::new(),
             shapes:  Vec::new(),
             image:   None,
+            moved_by: [0.0, 0.0],
         };
         let pos = (self.active_layer + 1).min(self.layers.len());
         self.layers.insert(pos, l);
@@ -634,7 +731,8 @@ fn layer_idx_of(e: &UndoEntry) -> usize {
         | UndoEntry::ShapeErased(li, _, _)
         | UndoEntry::Cleared(li, _, _)
         | UndoEntry::StrokePartiallyErased(li, _, _, _)
-        | UndoEntry::ShapeReplaced(li, _, _, _) => *li,
+        | UndoEntry::ShapeReplaced(li, _, _, _)
+        | UndoEntry::LayerMoved(li, _) => *li,
     }
 }
 

@@ -418,9 +418,11 @@ fn help_btn(ui: &mut egui::Ui) -> bool {
                     row(ui, "Temporary eraser",   "Hold Ctrl + draw");
                     row(ui, "Pick colour",        "Hold Shift + tap");
                     row(ui, "Pan canvas",         "Hold Space + drag");
+                    row(ui, "Pan active layer",   "Hold Shift + Space + drag");
                     row(ui, "Pen size (pen tool)","Scroll");
                     row(ui, "Zoom (other tools)", "Scroll");
                     row(ui, "Reset zoom + pan",   "Ctrl + 0");
+                    row(ui, "Reset layer position","Ctrl + Shift + 0");
                     row(ui, "Screenshot (bg+ink)","Ctrl + Shift + S");
                     row(ui, "Freeze frame → layer","Ctrl + Shift + F");
                     row(ui, "Pin to window",      "toolbar pin button");

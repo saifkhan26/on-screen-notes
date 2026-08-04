@@ -52,8 +52,18 @@ impl CanvasManager {
     }
 
     /// Mutable access to the active canvas (used by tools).
+    ///
+    /// This is the *only* way to obtain a `&mut Canvas` (the `canvases`
+    /// field is private), which makes it the single choke point for
+    /// "something changed" — so it is where the autosave's dirty flag
+    /// gets set. Marking on hand-out rather than on actual mutation
+    /// deliberately errs toward over-saving: a caller that takes `&mut`
+    /// and changes nothing costs one redundant write, whereas a missed
+    /// mark would silently lose the user's work.
     pub fn active_mut(&mut self) -> &mut Canvas {
-        &mut self.canvases[self.active]
+        let c = &mut self.canvases[self.active];
+        c.dirty = true;
+        c
     }
 
     /// Read-only access to the active canvas (used by renderer + screenshot).
@@ -120,6 +130,12 @@ impl CanvasManager {
         if self.active >= self.canvases.len() {
             self.active = self.canvases.len() - 1;
         }
+        // Removing a canvas shifts every later one down a file slot, so
+        // their existing files now hold the wrong content — everything
+        // has to be rewritten, not just the deleted index.
+        for c in &mut self.canvases {
+            c.dirty = true;
+        }
         // Best-effort: also remove the on-disk file for the removed slot,
         // and shift down everything past it. Simplest is to re-save all,
         // which `save_all` does on the next debounced tick.
@@ -129,10 +145,17 @@ impl CanvasManager {
     /// by deletes (e.g. user used to have 5 canvases, deleted two, now we
     /// only persist 3 — files canvas_3.ron and canvas_4.ron from the old
     /// state would be stale and need cleaning up).
-    pub fn save_all(&self) {
-        for (i, c) in self.canvases.iter().enumerate() {
-            if let Err(e) = crate::persistence::save_canvas(i, c) {
-                log::warn!("failed to save canvas {i}: {e}");
+    /// Canvases that have not changed since their last successful write
+    /// are skipped — see `Canvas::dirty`. A canvas whose write *fails*
+    /// keeps its flag so the next tick retries it.
+    pub fn save_all(&mut self) {
+        for (i, c) in self.canvases.iter_mut().enumerate() {
+            if !c.dirty {
+                continue;
+            }
+            match crate::persistence::save_canvas(i, c) {
+                Ok(()) => c.dirty = false,
+                Err(e) => log::warn!("failed to save canvas {i}: {e}"),
             }
         }
         // Clean up files past current count. We try indices N..N+10 — if a

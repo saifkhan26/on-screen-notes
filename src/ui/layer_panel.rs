@@ -6,6 +6,7 @@
 //! stack (Photoshop convention).
 
 use crate::canvas::canvas::Canvas;
+use crate::canvas::CanvasManager;
 use crate::ui::theme;
 use egui::{Color32, Rounding, Vec2};
 
@@ -13,8 +14,18 @@ const ICON: f32 = 18.0;
 const ROW_H: f32 = 22.0;
 const ROW_PAD: f32 = 3.0;
 
-/// Render the layer panel and route row interactions back into `canvas`.
-pub fn show(ctx: &egui::Context, canvas: &mut Canvas) {
+/// Render the layer panel and route row interactions back into the
+/// active canvas.
+///
+/// Takes the manager rather than a `&mut Canvas` so the mutable borrow
+/// can be deferred until the user actually clicks something. Drawing the
+/// panel is a read-only operation, and `CanvasManager::active_mut` is
+/// what flags a canvas for the autosave — taking it every frame just to
+/// paint would mark the canvas dirty ~60 times a second and put the
+/// autosave back into a permanent rewrite loop.
+pub fn show(ctx: &egui::Context, manager: &mut CanvasManager) {
+    let mut action: Option<LayerAction> = None;
+
     egui::Area::new(egui::Id::new("osn_layer_panel"))
         .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(10.0, -10.0))
         .show(ctx, |ui| {
@@ -31,10 +42,9 @@ pub fn show(ctx: &egui::Context, canvas: &mut Canvas) {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
                 ui.vertical(|ui| {
-                    // Action collected during iteration; applied after
-                    // the loop so we don't mutate during iteration.
-                    let mut action: Option<LayerAction> = None;
-
+                    // Painting only reads the canvas; the action is
+                    // collected here and applied after the panel closes.
+                    let canvas = manager.active();
                     let n = canvas.layers.len();
                     for ui_row in 0..n {
                         let li = n - 1 - ui_row;
@@ -47,22 +57,25 @@ pub fn show(ctx: &egui::Context, canvas: &mut Canvas) {
                     if add_row(ui).clicked() {
                         action = Some(LayerAction::Add);
                     }
-
-                    if let Some(a) = action {
-                        match a {
-                            LayerAction::Add               => canvas.add_layer(),
-                            LayerAction::Select(i)         => canvas.active_layer = i,
-                            LayerAction::ToggleVisible(i)  => canvas.toggle_layer_visible(i),
-                            LayerAction::Delete(i)         => canvas.delete_layer(i),
-                            LayerAction::MoveUp(i)         => canvas.move_layer(i, i + 1),
-                            LayerAction::MoveDown(i) => {
-                                if i > 0 { canvas.move_layer(i, i - 1); }
-                            }
-                        }
-                    }
                 });
             });
         });
+
+    // Only now take the mutable borrow — on the rare frame where the
+    // user actually clicked a row.
+    if let Some(a) = action {
+        let canvas = manager.active_mut();
+        match a {
+            LayerAction::Add               => canvas.add_layer(),
+            LayerAction::Select(i)         => canvas.active_layer = i,
+            LayerAction::ToggleVisible(i)  => canvas.toggle_layer_visible(i),
+            LayerAction::Delete(i)         => canvas.delete_layer(i),
+            LayerAction::MoveUp(i)         => canvas.move_layer(i, i + 1),
+            LayerAction::MoveDown(i) => {
+                if i > 0 { canvas.move_layer(i, i - 1); }
+            }
+        }
+    }
 }
 
 /// One layer row — [eye] [↑] [↓] [✕]. Background highlights the

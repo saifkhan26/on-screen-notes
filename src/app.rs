@@ -54,6 +54,18 @@ pub struct OnScreenNotesApp {
     /// and apply it to `canvas.pan`, then move the anchor forward.
     pan_drag_anchor: Option<egui::Pos2>,
 
+    /// Active **Shift**+Space layer pan: `(layer index, accumulated
+    /// canvas-local delta)`. `None` means the current Space drag pans the
+    /// whole canvas instead.
+    ///
+    /// The layer index is latched when the gesture starts, so switching
+    /// the active layer — or letting go of Shift — mid-drag cannot
+    /// redirect the move to a different layer. The delta accumulates in
+    /// canvas-local units (screen delta ÷ zoom) and is baked into the
+    /// layer's geometry by `Canvas::move_layer_by` when the drag ends;
+    /// until then it only shifts that layer at paint time.
+    layer_drag: Option<LayerDrag>,
+
     /// One Euro Filter state for incoming pen samples. Reset on every
     /// pen-down so a new stroke does not inherit the previous stroke's
     /// filter state. See `input::filter` for the algorithm rationale.
@@ -164,6 +176,21 @@ struct PendingShot {
     /// later DPI change between request and capture doesn't break
     /// alignment.
     pixels_per_point: f32,
+}
+
+/// An in-flight Shift+Space layer pan.
+///
+/// `canvas` and `layer` are latched when the gesture starts so the move
+/// lands where the user aimed it even if they switch sheets or layers
+/// before letting go. `delta` is canvas-local, and stays a preview-only
+/// offset until the gesture ends — see `Canvas::move_layer_by` for why
+/// the translation is baked into the geometry rather than kept as a
+/// per-layer transform.
+#[derive(Clone, Copy)]
+struct LayerDrag {
+    canvas: usize,
+    layer: usize,
+    delta: [f32; 2],
 }
 
 impl OnScreenNotesApp {
@@ -283,6 +310,7 @@ impl OnScreenNotesApp {
             last_save_at: Instant::now(),
             first_frame: true,
             pan_drag_anchor: None,
+            layer_drag: None,
             pen_filter: crate::input::filter::PenFilter::for_level(level),
             pen_blocked: false,
             eraser_override,
@@ -343,6 +371,62 @@ impl OnScreenNotesApp {
         });
         self.ui_visible = false;
         self.config.bg_opacity = 0.0;
+    }
+
+    // -- Space-drag gestures ---------------------------------------------
+
+    /// Begin a Space-drag. `layer_mode` is whether Shift was down at the
+    /// instant the pointer went down; latching it here (rather than
+    /// re-reading it every frame) means the gesture keeps doing what it
+    /// started doing even if the user's fingers slip off Shift halfway
+    /// through a drag.
+    fn begin_pan_gesture(&mut self, layer_mode: bool) {
+        self.layer_drag = layer_mode.then(|| LayerDrag {
+            canvas: self.canvases.active_index(),
+            layer: self.canvases.active().active_layer,
+            delta: [0.0, 0.0],
+        });
+    }
+
+    /// Apply one frame of drag motion, given in window-client pixels.
+    /// Routes to the layer delta or the canvas viewport depending on
+    /// which gesture is in flight.
+    fn apply_pan_delta(&mut self, dx: f32, dy: f32) {
+        let zoom = self.canvases.active().zoom.max(1e-6);
+        if let Some(drag) = self.layer_drag.as_mut() {
+            // A layer delta ends up added to canvas-local geometry, so
+            // the view zoom has to come back out of it — otherwise the
+            // layer would race ahead of the cursor at zoom > 1. Canvas
+            // `pan` needs no such division because it is applied
+            // *after* the zoom scale.
+            drag.delta[0] += dx / zoom;
+            drag.delta[1] += dy / zoom;
+        } else {
+            let c = self.canvases.active_mut();
+            c.pan[0] += dx;
+            c.pan[1] += dy;
+        }
+    }
+
+    /// End a layer drag, baking the accumulated delta into the layer's
+    /// geometry. No-op unless a layer drag is actually in flight, so it
+    /// is safe to call from every gesture-end path.
+    fn commit_layer_drag(&mut self) {
+        let Some(drag) = self.layer_drag.take() else { return };
+        // Canvas nav (←/→) is not gated on Space, so the user can walk
+        // off the sheet mid-gesture. The preview was showing on a
+        // canvas they have since left — drop the move rather than bake
+        // it into whichever sheet happens to be active now.
+        if drag.canvas != self.canvases.active_index() { return; }
+        self.canvases.active_mut().move_layer_by(drag.layer, drag.delta);
+    }
+
+    /// The in-flight layer drag in the form the renderer wants, or
+    /// `None` when there is no drag or it belongs to another canvas.
+    fn layer_drag_for_render(&self) -> Option<(usize, [f32; 2])> {
+        self.layer_drag
+            .filter(|d| d.canvas == self.canvases.active_index())
+            .map(|d| (d.layer, d.delta))
     }
 
     /// Enqueue a deferred freeze-frame. Same UI-hide dance as a
@@ -711,7 +795,16 @@ impl eframe::App for OnScreenNotesApp {
                 self.canvases.rebuild_all_caches(passes);
             }
 
-            // Render canvas + texture upload.
+            // Render canvas + texture upload. The layer-drag preview is
+            // resolved up front because `show` takes `&mut
+            // self.overlay_cache`, which rules out reading `self` again
+            // inside the argument list.
+            //
+            // Note this paint runs *before* the drag block below updates
+            // the delta, so the previewed layer trails the cursor by one
+            // frame — the same one-frame lag the canvas pan has always
+            // had.
+            let layer_drag = self.layer_drag_for_render();
             let canvas_rect = ui::overlay::show(
                 ctx,
                 &mut self.overlay_cache,
@@ -720,6 +813,7 @@ impl eframe::App for OnScreenNotesApp {
                 self.config.smoothing_level.position_passes(),
                 self.ui_visible,
                 self.loupe.as_ref(),
+                layer_drag,
             );
 
             // ---- Space-hold pan: consume drags before drawing -----------
@@ -736,7 +830,17 @@ impl eframe::App for OnScreenNotesApp {
             //   2. Mouse / trackpad via egui's pointer state. Used when
             //      there is no tablet (mouse fallback path).
             if space_held {
-                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                // Holding Shift as well retargets the drag from the
+                // viewport to the *active layer*: its ink slides while
+                // every other layer stays nailed down. The mode is
+                // latched at pointer-down by `begin_pan_gesture`, so
+                // this per-frame read only drives the cursor hint.
+                let layer_mode = ctx.input(|i| i.modifiers.shift);
+                ctx.set_cursor_icon(if layer_mode || self.layer_drag.is_some() {
+                    egui::CursorIcon::Move
+                } else {
+                    egui::CursorIcon::Grabbing
+                });
 
                 use crate::input::pen::PenEvent;
                 let mut had_pen = false;
@@ -750,48 +854,58 @@ impl eframe::App for OnScreenNotesApp {
                     let here = egui::pos2(s.pos[0], s.pos[1]);
                     match ev {
                         PenEvent::Down(_) => {
+                            self.begin_pan_gesture(layer_mode);
                             self.pan_drag_anchor = Some(here);
                         }
                         PenEvent::Move(_) => {
                             if let Some(anchor) = self.pan_drag_anchor {
-                                let c = self.canvases.active_mut();
-                                c.pan[0] += here.x - anchor.x;
-                                c.pan[1] += here.y - anchor.y;
+                                self.apply_pan_delta(here.x - anchor.x, here.y - anchor.y);
                             }
                             self.pan_drag_anchor = Some(here);
                         }
                         PenEvent::Up(_) => {
                             self.pan_drag_anchor = None;
+                            self.commit_layer_drag();
                         }
                     }
                 }
 
                 // Mouse path — only run when no pen events fired this frame
-                // so the two sources don't double-add motion.
+                // so the two sources don't double-add motion. The pointer
+                // state is read out of `ctx.input` first and acted on
+                // afterwards, so no canvas mutation happens while egui's
+                // input lock is held.
                 if !had_pen {
-                    ctx.input(|i| {
-                        let primary = i.pointer.primary_down();
-                        let cursor  = i.pointer
-                            .hover_pos()
-                            .or(i.pointer.interact_pos())
-                            .or(i.pointer.latest_pos());
-                        if primary {
-                            if let Some(p) = cursor {
-                                if let Some(anchor) = self.pan_drag_anchor {
-                                    let c = self.canvases.active_mut();
-                                    c.pan[0] += p.x - anchor.x;
-                                    c.pan[1] += p.y - anchor.y;
-                                }
-                                self.pan_drag_anchor = Some(p);
-                            }
-                        } else {
-                            self.pan_drag_anchor = None;
-                        }
+                    let (primary, cursor) = ctx.input(|i| {
+                        (
+                            i.pointer.primary_down(),
+                            i.pointer
+                                .hover_pos()
+                                .or(i.pointer.interact_pos())
+                                .or(i.pointer.latest_pos()),
+                        )
                     });
+                    if primary {
+                        if let Some(p) = cursor {
+                            match self.pan_drag_anchor {
+                                Some(anchor) => self.apply_pan_delta(p.x - anchor.x, p.y - anchor.y),
+                                // No anchor yet: the button just went
+                                // down, so this is the gesture start.
+                                None => self.begin_pan_gesture(layer_mode),
+                            }
+                            self.pan_drag_anchor = Some(p);
+                        }
+                    } else {
+                        self.pan_drag_anchor = None;
+                        self.commit_layer_drag();
+                    }
                 }
             } else {
                 // Pan released — drop anchor, restore default cursor.
                 self.pan_drag_anchor = None;
+                // Letting go of Space mid-drag still ends the gesture, so
+                // bake any pending layer move rather than losing it.
+                self.commit_layer_drag();
 
                 // Hide the OS cursor while the Pen / FreehandArrow tools
                 // are active so it doesn't sit on top of the pen tip and
@@ -1029,6 +1143,27 @@ impl eframe::App for OnScreenNotesApp {
             // egui atomically matches modifier + key in one call, dodging
             // the "events loop sees Num0 but Ctrl was already filtered out"
             // failure mode we hit before with the per-event match below.
+            //
+            // Ctrl+Shift+0 (reset the active layer's position) is tested
+            // *first* and deliberately so: `consume_shortcut` matches
+            // modifiers logically, i.e. a held Shift does not disqualify
+            // a Ctrl-only pattern. Checking Ctrl+0 first would let it
+            // swallow Ctrl+Shift+0 and reset the view instead.
+            //
+            // Layer pans are baked into the geometry, so "reset" is just
+            // a move by the negated running total — which also means it
+            // lands in the undo history like any other move.
+            let reset_layer = egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::Num0,
+            );
+            if ctx.input_mut(|i| i.consume_shortcut(&reset_layer)) {
+                let c = self.canvases.active_mut();
+                let li = c.active_layer;
+                if let Some(m) = c.layers.get(li).map(|l| l.moved_by) {
+                    c.move_layer_by(li, [-m[0], -m[1]]);
+                }
+            }
             let reset_view = egui::KeyboardShortcut::new(
                 egui::Modifiers::CTRL,
                 egui::Key::Num0,
@@ -1172,7 +1307,7 @@ impl eframe::App for OnScreenNotesApp {
                     click_through_now,
                     self.pen.is_active(),
                 );
-                ui::layer_panel::show(ctx, self.canvases.active_mut());
+                ui::layer_panel::show(ctx, &mut self.canvases);
             }
         }
 

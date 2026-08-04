@@ -125,6 +125,10 @@ pub fn show(
     position_passes: usize,
     chrome_visible: bool,
     loupe: Option<&LoupeState>,
+    // In-progress Shift+Space layer pan — `(layer index, canvas-local
+    // delta)`. Forwarded straight to the renderer so the dragged layer
+    // previews at its new position before the move is committed.
+    layer_drag: Option<(usize, [f32; 2])>,
 ) -> egui::Rect {
     // Pre-build per-layer image-texture IDs for the active canvas
     // before opening the panel so the borrow on `cache` is released
@@ -221,6 +225,7 @@ pub fn show(
                 &layer_image_textures,
                 &shape_textures,
                 None,
+                layer_drag,
             );
 
             // Live preview of the in-progress text edit. Painted via
@@ -404,6 +409,7 @@ pub fn show(
                             &layer_image_textures,
                             &shape_textures,
                             Some(([pan_x_new, pan_y_new], new_zoom)),
+                            layer_drag,
                         );
                     }
                     ctx.request_repaint();

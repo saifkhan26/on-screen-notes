@@ -390,6 +390,27 @@ impl Stroke {
         self.cache = None;
     }
 
+    /// Shift every sample by `d` canvas-local pixels.
+    ///
+    /// The render cache is shifted in place rather than invalidated:
+    /// `StrokeCache::points` is canvas-local by definition (no pan, no
+    /// zoom), so translating it is exactly equivalent to rebuilding it
+    /// from the translated samples — and skips the O(samples ×
+    /// SUBSTEPS) Catmull-Rom pass. Widths are position-independent and
+    /// stay untouched.
+    pub fn translate(&mut self, d: [f32; 2]) {
+        for s in &mut self.samples {
+            s.pos[0] += d[0];
+            s.pos[1] += d[1];
+        }
+        if let Some(c) = self.cache.as_mut() {
+            for p in &mut c.points {
+                p[0] += d[0];
+                p[1] += d[1];
+            }
+        }
+    }
+
     /// Build the cache with the *default* smoothing budget (3 position
     /// passes). Use `build_cache_with` to override.
     pub fn build_cache(&mut self) {

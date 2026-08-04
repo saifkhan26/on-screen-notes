@@ -55,7 +55,17 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
 /// inspect / hand-edit them if desired.
 pub fn save_canvas(index: usize, canvas: &Canvas) -> Result<()> {
     let path = paths::canvases_dir()?.join(format!("canvas_{index}.ron"));
-    let serialized = ron::ser::to_string_pretty(canvas, ron::ser::PrettyConfig::default())?;
+    // `compact_arrays` keeps `Vec<u8>` payloads on a single line. It
+    // matters enormously here: a frozen-frame layer holds a full-screen
+    // PNG inline, and the default pretty printer emits *one decimal
+    // number per line* — a newline plus indentation for every byte,
+    // inflating a few MB of image into tens of MB of text and making
+    // every autosave a multi-hundred-millisecond stall on the UI
+    // thread. Structure stays pretty-printed and hand-editable; only
+    // the byte blobs collapse. RON parses both layouts, so existing
+    // save files keep loading and no migration is needed.
+    let cfg = ron::ser::PrettyConfig::default().compact_arrays(true);
+    let serialized = ron::ser::to_string_pretty(canvas, cfg)?;
     atomic_write(&path, serialized.as_bytes())
 }
 

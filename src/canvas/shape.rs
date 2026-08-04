@@ -121,4 +121,24 @@ impl Shape {
             Shape::Raster  { color, .. } => *color,
         }
     }
+
+    /// Shift this shape by `d` canvas-local pixels. Control points move;
+    /// sizes, colours and stroke widths do not.
+    pub fn translate(&mut self, d: [f32; 2]) {
+        let shift = |p: &mut [f32; 2]| {
+            p[0] += d[0];
+            p[1] += d[1];
+        };
+        match self {
+            Shape::Rect    { a, b, .. }
+            | Shape::Ellipse { a, b, .. }
+            | Shape::Line    { a, b, .. }
+            | Shape::Arrow   { a, b, .. } => {
+                shift(a);
+                shift(b);
+            }
+            Shape::Text   { pos, .. } => shift(pos),
+            Shape::Raster { pos, .. } => shift(pos),
+        }
+    }
 }
