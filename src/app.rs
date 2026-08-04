@@ -27,6 +27,9 @@ use crate::ui;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
+    /// Parsed user-editable hotkey bindings. Compiled once at app
+    /// start; per-event dispatch is then a flat compare.
+    hotkeys_cfg: crate::input::hotkeys_config::ParsedHotkeys,
     canvases: CanvasManager,
     tool: ActiveTool,
     pen: PenInput,
@@ -94,6 +97,12 @@ pub struct OnScreenNotesApp {
     /// does not leave ink behind while sampling.
     pen_picking: bool,
 
+    /// True while the layer-preview popup is open. Toggled by the
+    /// `canvas.preview_layer` hotkey; Esc closes. Renders a centred
+    /// large thumbnail of the active layer so the user can confirm
+    /// "what's on this layer" before drawing into it.
+    show_layer_preview: bool,
+
     /// Master visibility switch for floating UI (toolbar, status badge,
     /// layer panel, etc.). Toggled by the `Tab` shortcut so the user
     /// can hide the chrome and view their drawing un-occluded.
@@ -140,6 +149,17 @@ pub struct OnScreenNotesApp {
     /// instead of being saved to disk.
     pending_freeze: Option<PendingShot>,
 
+    /// Deferred lasso-select capture state. Same chrome-hide + frame-
+    /// wait dance as `pending_freeze`, but only the pixels inside the
+    /// recorded polygon are kept (cropped to the selection bbox).
+    pending_lasso: Option<PendingLasso>,
+
+    /// Active screenshot region selection. `Some` while the user drags out
+    /// the capture rectangle after pressing the screenshot hotkey; on
+    /// release it becomes a region `pending_screenshot`. Suppresses drawing
+    /// dispatch while set.
+    region_select: Option<RegionSelect>,
+
     /// HWND of the window OSN is currently pinned to follow, stored
     /// as the platform-native integer. `None` = no pin. On Windows,
     /// each frame we read `GetWindowRect(hwnd)` and re-issue
@@ -167,15 +187,49 @@ pub struct OnScreenNotesApp {
 struct PendingShot {
     ui_visible_before: bool,
     bg_opacity_before: f32,
-    /// Frames remaining before we trigger `capture_and_save`. We
-    /// need to wait at least one frame so the OS compositor has
-    /// time to repaint after the chrome was hidden, otherwise xcap
-    /// still picks up the toolbar.
+    /// Frames remaining before we trigger the capture. We need to wait at
+    /// least one frame so the OS compositor has time to repaint after the
+    /// chrome was hidden, otherwise xcap still picks up the toolbar.
     frames_to_wait: u32,
     /// DPI scale captured at the moment the hotkey fired so a
     /// later DPI change between request and capture doesn't break
     /// alignment.
     pixels_per_point: f32,
+    /// Overlay tint at request time. For a region shot we re-composite this
+    /// (`bg_color` at `bg_opacity_before`) in software, since the capture
+    /// dropped the real window opacity to 0 for a clean grab.
+    bg_color: [u8; 3],
+    /// `Some([min_x, min_y, max_x, max_y])` in egui points → capture only
+    /// that region (respecting the tint above). `None` → full-screen shot.
+    region_rect: Option<[f32; 4]>,
+}
+
+/// In-flight screenshot region selection: the user is dragging out the
+/// capture rectangle (in egui screen points) after pressing the screenshot
+/// hotkey. Drawing dispatch is suppressed while this is `Some`.
+#[derive(Clone, Copy)]
+struct RegionSelect {
+    /// Drag anchor; `None` until the primary button first goes down.
+    start: Option<egui::Pos2>,
+    /// Latest pointer position (the moving corner while dragging).
+    current: egui::Pos2,
+    /// `ui_visible` at selection start, restored if the user cancels.
+    ui_visible_before: bool,
+}
+
+/// State held while a lasso-select capture is in flight. Carries the
+/// recorded polygon plus the pan/zoom snapshot taken at queue time so
+/// the masking math matches the view the lasso was drawn in even if
+/// the canvas is nudged during the 2-frame chrome-hide.
+struct PendingLasso {
+    ui_visible_before: bool,
+    bg_opacity_before: f32,
+    frames_to_wait: u32,
+    pixels_per_point: f32,
+    pan: [f32; 2],
+    zoom: f32,
+    /// Closed polygon in canvas-local coords.
+    polygon: Vec<[f32; 2]>,
 }
 
 /// An in-flight Shift+Space layer pan.
@@ -260,7 +314,14 @@ impl OnScreenNotesApp {
             }
         };
 
-        let hotkeys = match Hotkeys::register(&config) {
+        // Load hand-edited hotkeys.toml (next-to-binary or fallback).
+        // Globals are registered immediately from its `global` section;
+        // tool / canvas bindings get parsed into compact `Binding`s and
+        // cached on the App for the in-overlay dispatcher.
+        let hotkeys_file = crate::input::hotkeys_config::HotkeysConfig::load_or_default();
+        let hotkeys_cfg = hotkeys_file.parsed();
+
+        let hotkeys = match Hotkeys::register(&hotkeys_file.global) {
             Ok(h) => Some(h),
             Err(e) => {
                 log::warn!("could not register global hotkeys: {e}");
@@ -299,6 +360,7 @@ impl OnScreenNotesApp {
 
         Self {
             config,
+            hotkeys_cfg,
             canvases,
             tool,
             pen,
@@ -316,12 +378,15 @@ impl OnScreenNotesApp {
             eraser_override,
             pen_using_eraser: false,
             pen_picking: false,
+            show_layer_preview: false,
             ui_visible: true,
             osn_hwnd,
             recorder: crate::recording::Recorder::default(),
             ui_visible_before_record: true,
             toast: None,
             pending_screenshot: None,
+            pending_lasso: None,
+            region_select: None,
             loupe: None,
             pending_freeze: None,
             pinned_hwnd: None,
@@ -332,15 +397,26 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// Take a screenshot if the user pressed the screenshot hotkey or
-    /// menu button. Logs success/failure but never panics.
-    ///
-    /// `pixels_per_point` is forwarded so the canvas rasteriser scales
-    /// stroke coordinates from egui logical pixels into the physical
-    /// pixel space of the xcap-captured background.
-    fn maybe_screenshot(&mut self, pixels_per_point: f32) {
-        match crate::screenshot::capture_and_save(self.canvases.active(), &self.config, pixels_per_point) {
-            Ok(r)  => {
+    /// Run the deferred screenshot once its frame countdown elapses. A
+    /// `region_rect` captures only the user-selected rectangle (compositing
+    /// the overlay tint back in); otherwise the whole primary monitor is
+    /// grabbed. Logs success/failure but never panics.
+    fn do_screenshot(&mut self, ps: &PendingShot) {
+        let res = if let Some(rect) = ps.region_rect {
+            crate::screenshot::capture_region_and_save(
+                self.canvases.active(),
+                &self.config,
+                ps.pixels_per_point,
+                self.osn_hwnd,
+                rect,
+                ps.bg_color,
+                ps.bg_opacity_before,
+            )
+        } else {
+            crate::screenshot::capture_and_save(self.canvases.active(), &self.config, ps.pixels_per_point)
+        };
+        match res {
+            Ok(r) => {
                 log::info!("screenshot saved to {:?} (clipboard={})", r.path, r.clipboard);
                 let msg = if r.clipboard {
                     format!("Screenshot saved: {} · clipboard ✓", r.path.display())
@@ -353,24 +429,140 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// Enqueue a deferred screenshot. Hides the floating UI + drops
-    /// the background tint so xcap's monitor capture (which happens
-    /// two frames from now) does not pick up the OSN toolbar or its
-    /// dimming overlay. The prior state is captured here and
-    /// restored after the capture lands.
-    fn queue_screenshot(&mut self, pixels_per_point: f32) {
-        if self.pending_screenshot.is_some() { return; }
-        self.pending_screenshot = Some(PendingShot {
+    /// Begin an interactive screenshot region selection. Hides the floating
+    /// UI so it stays out of the way (and out of the capture); the actual
+    /// grab is deferred until the user drags out a rectangle, handled in
+    /// `update_region_select`. The background tint is left alone so the user
+    /// aims over a still-visible desktop — it is dropped only at the moment
+    /// the region is confirmed, then re-composited into the saved image.
+    fn begin_region_select(&mut self) {
+        if self.region_select.is_some() || self.pending_screenshot.is_some() {
+            return;
+        }
+        self.region_select = Some(RegionSelect {
+            start: None,
+            current: egui::Pos2::ZERO,
             ui_visible_before: self.ui_visible,
-            bg_opacity_before: self.config.bg_opacity,
-            // Two frames: one to clear chrome, one for the OS to
-            // composite the cleared frame. Empirically one is
-            // sometimes enough but two is reliable on Win11.
-            frames_to_wait: 2,
-            pixels_per_point,
         });
         self.ui_visible = false;
-        self.config.bg_opacity = 0.0;
+    }
+
+    /// Handle the interactive region-selection overlay for one frame: read
+    /// the drag, draw the dimmed rubber-band, and on release turn the
+    /// selection into a region `pending_screenshot` (or cancel). No-op when
+    /// no selection is active.
+    fn update_region_select(&mut self, ctx: &egui::Context) {
+        let Some(mut rs) = self.region_select else { return };
+
+        let (pressed, released, esc, pos) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_released(),
+                i.key_pressed(egui::Key::Escape),
+                i.pointer.latest_pos().or(i.pointer.interact_pos()),
+            )
+        });
+
+        // Esc cancels: restore the chrome, leave the tint untouched.
+        if esc {
+            self.ui_visible = rs.ui_visible_before;
+            self.region_select = None;
+            return;
+        }
+
+        if let Some(p) = pos {
+            rs.current = p;
+            if pressed {
+                rs.start = Some(p);
+            }
+        }
+
+        if released {
+            if let Some(start) = rs.start {
+                let sel = egui::Rect::from_two_pos(start, rs.current);
+                let ppp = ctx.pixels_per_point().max(0.01);
+                // Reject a too-small drag (a stray click) — treat as cancel.
+                if sel.width() * ppp >= 4.0 && sel.height() * ppp >= 4.0 {
+                    self.pending_screenshot = Some(PendingShot {
+                        ui_visible_before: rs.ui_visible_before,
+                        bg_opacity_before: self.config.bg_opacity,
+                        frames_to_wait: 2,
+                        pixels_per_point: ppp,
+                        bg_color: self.config.bg_color,
+                        region_rect: Some([sel.min.x, sel.min.y, sel.max.x, sel.max.y]),
+                    });
+                    // Drop the live tint so xcap grabs a clean desktop; the
+                    // capture re-applies `bg_color` at the stored opacity.
+                    self.config.bg_opacity = 0.0;
+                } else {
+                    self.ui_visible = rs.ui_visible_before;
+                }
+                self.region_select = None;
+                return;
+            }
+        }
+
+        // Still selecting — persist state and draw the overlay on top.
+        self.region_select = Some(rs);
+        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("osn_region_select"),
+        ));
+        let screen = ctx.screen_rect();
+        let dim = egui::Color32::from_black_alpha(110);
+        if let Some(start) = rs.start {
+            let sel = egui::Rect::from_two_pos(start, rs.current);
+            // Four dim bands around the selection (the selection stays clear).
+            painter.rect_filled(
+                egui::Rect::from_min_max(screen.left_top(), egui::pos2(screen.right(), sel.top())),
+                0.0,
+                dim,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(screen.left(), sel.bottom()), screen.right_bottom()),
+                0.0,
+                dim,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(screen.left(), sel.top()), egui::pos2(sel.left(), sel.bottom())),
+                0.0,
+                dim,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(sel.right(), sel.top()), egui::pos2(screen.right(), sel.bottom())),
+                0.0,
+                dim,
+            );
+            // Animated dashed border (reuses the marching-ants walker).
+            let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+            let pts = [sel.left_top(), sel.right_top(), sel.right_bottom(), sel.left_bottom(), sel.left_top()];
+            crate::canvas::render::paint_dashed_polyline(&painter, &pts, stroke, 1.0);
+            // Dimension label in physical pixels (what the PNG will be).
+            let ppp = ctx.pixels_per_point().max(0.01);
+            let wpx = (sel.width() * ppp).round() as i32;
+            let hpx = (sel.height() * ppp).round() as i32;
+            let label_pos = egui::pos2(sel.left(), (sel.top() - 6.0).max(screen.top() + 2.0));
+            painter.text(
+                label_pos,
+                egui::Align2::LEFT_BOTTOM,
+                format!("{wpx} × {hpx}"),
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
+        } else {
+            // Before the first drag: dim everything + a hint.
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(70));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drag to select a screenshot region  ·  Esc to cancel",
+                egui::FontId::proportional(18.0),
+                egui::Color32::WHITE,
+            );
+        }
+        // Keep the frame live for the dashed animation + drag tracking.
+        ctx.request_repaint();
     }
 
     // -- Space-drag gestures ---------------------------------------------
@@ -440,6 +632,8 @@ impl OnScreenNotesApp {
             bg_opacity_before: self.config.bg_opacity,
             frames_to_wait: 2,
             pixels_per_point,
+            bg_color: self.config.bg_color,
+            region_rect: None,
         });
         self.ui_visible = false;
         self.config.bg_opacity = 0.0;
@@ -448,7 +642,14 @@ impl OnScreenNotesApp {
     /// Capture the freeze frame and insert it as a new bottom layer.
     /// Toast on success / log on failure — never panics.
     fn do_freeze(&mut self, pixels_per_point: f32) {
-        match crate::screenshot::capture_freeze_layer(pixels_per_point, self.osn_hwnd) {
+        // Snapshot the active canvas's pan/zoom so the captured
+        // pixels can be positioned in canvas-local coords that land
+        // under the user's current view — without rewriting their
+        // pan/zoom state behind their back.
+        let canvas = self.canvases.active();
+        let pan  = canvas.pan;
+        let zoom = canvas.zoom;
+        match crate::screenshot::capture_freeze_layer(pixels_per_point, self.osn_hwnd, pan, zoom) {
             Ok(image) => {
                 let label = format!("Frozen frame {}", crate::screenshot::chrono_like_timestamp());
                 self.canvases.active_mut().add_image_layer_bottom(image, label);
@@ -458,6 +659,54 @@ impl OnScreenNotesApp {
                 ));
             }
             Err(e) => log::warn!("freeze frame failed: {e}"),
+        }
+    }
+
+    /// Enqueue a deferred lasso-select capture. Snapshots the active
+    /// canvas's pan/zoom alongside the polygon, then runs the same
+    /// 2-frame chrome-hide as freeze so the captured pixels are the
+    /// pure desktop behind the overlay.
+    fn queue_lasso_capture(&mut self, polygon: Vec<[f32; 2]>, pixels_per_point: f32) {
+        if self.pending_lasso.is_some() { return; }
+        let canvas = self.canvases.active();
+        self.pending_lasso = Some(PendingLasso {
+            ui_visible_before: self.ui_visible,
+            bg_opacity_before: self.config.bg_opacity,
+            frames_to_wait: 2,
+            pixels_per_point,
+            pan: canvas.pan,
+            zoom: canvas.zoom,
+            polygon,
+        });
+        self.ui_visible = false;
+        self.config.bg_opacity = 0.0;
+    }
+
+    /// Capture the lasso region and insert it as a new bottom layer.
+    /// Toast on success / log on failure — never panics.
+    fn do_lasso_capture(
+        &mut self,
+        pixels_per_point: f32,
+        pan: [f32; 2],
+        zoom: f32,
+        polygon: &[[f32; 2]],
+    ) {
+        match crate::screenshot::capture_lasso_layer(
+            pixels_per_point,
+            self.osn_hwnd,
+            pan,
+            zoom,
+            polygon,
+        ) {
+            Ok(image) => {
+                let label = format!("Lasso region {}", crate::screenshot::chrono_like_timestamp());
+                self.canvases.active_mut().add_image_layer_bottom(image, label);
+                self.toast = Some((
+                    "Lasso region added as bottom layer".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            Err(e) => log::warn!("lasso capture failed: {e}"),
         }
     }
 
@@ -531,13 +780,12 @@ impl eframe::App for OnScreenNotesApp {
 
         // 2) Global hotkey events.
         if let Some(h) = self.hotkeys.as_ref() {
-            // Capture DPI scale once per frame so multiple screenshots
-            // fired in the same frame don't re-read the value.
-            let ppp = ctx.pixels_per_point();
             for ev in h.poll() {
                 match ev {
                     HotkeyId::ToggleOverlay => self.overlay_visible = !self.overlay_visible,
-                    HotkeyId::Screenshot   => self.queue_screenshot(ppp),
+                    // Screenshot: enter interactive region-select; the grab
+                    // is deferred until the user drags out a rectangle.
+                    HotkeyId::Screenshot   => self.begin_region_select(),
                     HotkeyId::ToggleRecord => self.toggle_record(),
                     HotkeyId::TogglePauseRecord => self.recorder.toggle_pause(),
                 }
@@ -552,18 +800,19 @@ impl eframe::App for OnScreenNotesApp {
             if ps.frames_to_wait > 0 {
                 ps.frames_to_wait -= 1;
                 ctx.request_repaint();
-                None
+                false
             } else {
-                Some((ps.pixels_per_point, ps.ui_visible_before, ps.bg_opacity_before))
+                true
             }
         } else {
-            None
+            false
         };
-        if let Some((ppp, ui_prev, bg_prev)) = do_capture {
-            self.maybe_screenshot(ppp);
-            self.ui_visible = ui_prev;
-            self.config.bg_opacity = bg_prev;
-            self.pending_screenshot = None;
+        if do_capture {
+            if let Some(ps) = self.pending_screenshot.take() {
+                self.do_screenshot(&ps);
+                self.ui_visible = ps.ui_visible_before;
+                self.config.bg_opacity = ps.bg_opacity_before;
+            }
         }
 
         // Same state machine for the freeze-frame-to-layer action.
@@ -583,6 +832,32 @@ impl eframe::App for OnScreenNotesApp {
             self.ui_visible = ui_prev;
             self.config.bg_opacity = bg_prev;
             self.pending_freeze = None;
+        }
+
+        // Same state machine for the lasso-select capture. The polygon
+        // is owned (not Copy), so we `take()` the whole pending struct
+        // once the countdown elapses rather than copying fields out.
+        let do_lasso = self
+            .pending_lasso
+            .as_mut()
+            .map(|ps| {
+                if ps.frames_to_wait > 0 {
+                    ps.frames_to_wait -= 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if self.pending_lasso.is_some() && !do_lasso {
+            ctx.request_repaint();
+        }
+        if do_lasso {
+            if let Some(ps) = self.pending_lasso.take() {
+                self.do_lasso_capture(ps.pixels_per_point, ps.pan, ps.zoom, &ps.polygon);
+                self.ui_visible = ps.ui_visible_before;
+                self.config.bg_opacity = ps.bg_opacity_before;
+            }
         }
 
         // Recording capture+encode runs on a dedicated worker thread
@@ -630,24 +905,53 @@ impl eframe::App for OnScreenNotesApp {
         //   * `Move` is filtered + min-distance gated; samples that don't
         //     move enough are dropped.
         //   * `Up` is force-accepted so pen-up lands exactly.
+        // Sync the active tool's smoothing snapshot from the live
+        // config. A new stroke begun this frame will lock-in the
+        // current options at pen-down; an in-progress stroke keeps the
+        // snapshot it was started with.
+        self.tool.smoothing = self.config.smoothing;
+        // Push the render-side fan-corner toggle so the ribbon mesh
+        // builder can read it lock-free on the hot path.
+        crate::canvas::render::set_fan_corners(
+            self.config.smoothing.fan_corners,
+            self.config.smoothing.fan_corners_step,
+        );
+
         use crate::input::pen::PenEvent;
         let mut pen_events: Vec<PenEvent> = Vec::with_capacity(raw_pen_events.len());
+        // Krita modes (Stabilizer / Weighted / Simple / None) run their
+        // own algorithm on raw input — the upstream PenFilter would be
+        // a second-stage smoother the user did not ask for. Only
+        // Adaptive mode keeps it.
+        let use_pen_filter = self.config.smoothing.use_upstream_pen_filter();
         for ev in raw_pen_events {
             match ev {
                 PenEvent::Down(s) => {
                     self.pen_filter.reset();
-                    if let Some(fs) = self.pen_filter.filter(s, true) {
-                        pen_events.push(PenEvent::Down(fs));
+                    if use_pen_filter {
+                        if let Some(fs) = self.pen_filter.filter(s, true) {
+                            pen_events.push(PenEvent::Down(fs));
+                        }
+                    } else {
+                        pen_events.push(PenEvent::Down(s));
                     }
                 }
                 PenEvent::Move(s) => {
-                    if let Some(fs) = self.pen_filter.filter(s, false) {
-                        pen_events.push(PenEvent::Move(fs));
+                    if use_pen_filter {
+                        if let Some(fs) = self.pen_filter.filter(s, false) {
+                            pen_events.push(PenEvent::Move(fs));
+                        }
+                    } else {
+                        pen_events.push(PenEvent::Move(s));
                     }
                 }
                 PenEvent::Up(s) => {
-                    if let Some(fs) = self.pen_filter.filter(s, true) {
-                        pen_events.push(PenEvent::Up(fs));
+                    if use_pen_filter {
+                        if let Some(fs) = self.pen_filter.filter(s, true) {
+                            pen_events.push(PenEvent::Up(fs));
+                        }
+                    } else {
+                        pen_events.push(PenEvent::Up(s));
                     }
                 }
             }
@@ -669,6 +973,10 @@ impl eframe::App for OnScreenNotesApp {
                 self.pin_picking = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
             }
+        }
+        // Esc also closes the layer-preview popup.
+        if self.show_layer_preview && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_layer_preview = false;
         }
         if self.pin_picking {
             // Force click-through so the visible click lands on the
@@ -769,6 +1077,7 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.config.bg_color,
                     &mut self.config.palette,
                     &mut self.config.smoothing_level,
+                    &mut self.config.smoothing,
                     &mut self.config.pressure_curve,
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
@@ -815,6 +1124,13 @@ impl eframe::App for OnScreenNotesApp {
                 self.loupe.as_ref(),
                 layer_drag,
             );
+
+            // ---- Screenshot region selection --------------------------------
+            // Draws the dimmed rubber-band over the canvas and, on release,
+            // turns the drag into a deferred region capture. While active it
+            // suppresses the pen/mouse drawing dispatch below (guarded on
+            // `region_select.is_none()`).
+            self.update_region_select(ctx);
 
             // ---- Space-hold pan: consume drags before drawing -----------
             // While Space is held, the cursor turns into a grab hand and any
@@ -926,7 +1242,7 @@ impl eframe::App for OnScreenNotesApp {
                 // "precision aim" cue rather than a generic arrow.
                 let tool_wants_crosshair = matches!(
                     self.tool.kind,
-                    crate::tools::ToolKind::Fill,
+                    crate::tools::ToolKind::Fill | crate::tools::ToolKind::LassoSelect,
                 );
                 let hover = ctx.input(|i| i.pointer.hover_pos());
                 let on_ui = hover
@@ -954,7 +1270,7 @@ impl eframe::App for OnScreenNotesApp {
             // and stay blocked until the next Up so the gesture cannot
             // accidentally start a stroke half-way through tapping a
             // menu item.
-            if !space_held && self.loupe.is_none() {
+            if !space_held && self.loupe.is_none() && self.region_select.is_none() {
                 // Mirror the current tool's size onto the eraser
                 // override so the temporary erase uses the same brush
                 // size as the active pen — feels natural while letting
@@ -985,6 +1301,28 @@ impl eframe::App for OnScreenNotesApp {
                     match ev {
                         PenEvent::Down(_) => {
                             if on_ui {
+                                self.pen_blocked = true;
+                                continue;
+                            }
+                            // Wintab runs a *system* context, so it hands
+                            // us pen-down packets even when the tip is over
+                            // another app's window — OSN is not
+                            // always-on-top, so another window may sit
+                            // above it (or we may be in Alt-passthrough).
+                            // Without this guard every such tap falls
+                            // through to `reclaim_foreground` below and
+                            // yanks focus back to OSN: the user clicks a
+                            // different app with the pen and OSN keeps
+                            // stealing focus. Compare the top-level window
+                            // under the pen tip against our own HWND; if
+                            // it's a real, different window the user is
+                            // drawing/clicking *there*, so swallow the
+                            // whole gesture (Move + Up too, via
+                            // `pen_blocked`) and don't reclaim.
+                            let sx = client_origin[0] + s.pos[0] as i32;
+                            let sy = client_origin[1] + s.pos[1] as i32;
+                            let win_under = crate::platform::top_level_window_at(sx, sy);
+                            if win_under != 0 && win_under != self.osn_hwnd {
                                 self.pen_blocked = true;
                                 continue;
                             }
@@ -1053,7 +1391,9 @@ impl eframe::App for OnScreenNotesApp {
             }
 
             // ---- Mouse fallback (only when tablet absent) ----------------
-            if !space_held && !self.pen.is_active() && !click_through_now && !toolbar_clicked {
+            if !space_held && !self.pen.is_active() && !click_through_now && !toolbar_clicked
+                && self.region_select.is_none()
+            {
                 // Shift + click = colour pick. Resolve here so the
                 // sampling click does not also start a fallback stroke.
                 let (shift_held, primary_now) = ctx.input(|i| {
@@ -1138,51 +1478,55 @@ impl eframe::App for OnScreenNotesApp {
                 }
             }
 
+            // ---- Deferred lasso-select capture ----------------------------
+            // The Lasso-Select tool stashes the closed polygon on pen-up;
+            // run the (chrome-hidden) screen capture here where the HWND +
+            // DPI are available, then insert the masked region as a bottom
+            // image layer.
+            if let Some(poly) = self.tool.pending_lasso_capture.take() {
+                self.queue_lasso_capture(poly, ctx.pixels_per_point());
+            }
+
             // ---- Keyboard shortcuts --------------------------------------
-            // Ctrl+0: reset canvas view. Handled via `consume_shortcut` so
-            // egui atomically matches modifier + key in one call, dodging
-            // the "events loop sees Num0 but Ctrl was already filtered out"
-            // failure mode we hit before with the per-event match below.
+            // Both Ctrl+0 (reset view) and Ctrl+Shift+F (freeze frame)
+            // used to be matched via `ctx.input_mut(consume_shortcut)`
+            // with hardcoded `KeyboardShortcut::new` values. They now
+            // come from `HotkeysConfig`, so we build the shortcut from
+            // the parsed binding and feed it to the same consumer —
+            // egui still does the atomic modifier+key match for us.
             //
-            // Ctrl+Shift+0 (reset the active layer's position) is tested
-            // *first* and deliberately so: `consume_shortcut` matches
-            // modifiers logically, i.e. a held Shift does not disqualify
-            // a Ctrl-only pattern. Checking Ctrl+0 first would let it
-            // swallow Ctrl+Shift+0 and reset the view instead.
+            // `reset_layer_pos` (Ctrl+Shift+0) is tested *before*
+            // `reset_view` (Ctrl+0) and deliberately so: `consume_shortcut`
+            // matches modifiers logically, i.e. a held Shift does not
+            // disqualify a Ctrl-only pattern. Checking Ctrl+0 first would
+            // let it swallow Ctrl+Shift+0 and reset the view instead.
             //
             // Layer pans are baked into the geometry, so "reset" is just
             // a move by the negated running total — which also means it
             // lands in the undo history like any other move.
-            let reset_layer = egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                egui::Key::Num0,
-            );
-            if ctx.input_mut(|i| i.consume_shortcut(&reset_layer)) {
-                let c = self.canvases.active_mut();
-                let li = c.active_layer;
-                if let Some(m) = c.layers.get(li).map(|l| l.moved_by) {
-                    c.move_layer_by(li, [-m[0], -m[1]]);
+            if let Some(b) = self.hotkeys_cfg.canvas.reset_layer_pos {
+                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
+                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                    let c = self.canvases.active_mut();
+                    let li = c.active_layer;
+                    if let Some(m) = c.layers.get(li).map(|l| l.moved_by) {
+                        c.move_layer_by(li, [-m[0], -m[1]]);
+                    }
                 }
             }
-            let reset_view = egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL,
-                egui::Key::Num0,
-            );
-            if ctx.input_mut(|i| i.consume_shortcut(&reset_view)) {
-                let c = self.canvases.active_mut();
-                c.zoom = 1.0;
-                c.pan  = [0.0, 0.0];
+            if let Some(b) = self.hotkeys_cfg.canvas.reset_view {
+                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
+                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                    let c = self.canvases.active_mut();
+                    c.zoom = 1.0;
+                    c.pan  = [0.0, 0.0];
+                }
             }
-            // Ctrl+Shift+F = freeze the screen behind OSN as a new
-            // bottom layer on the active canvas. Captured via the
-            // deferred-shot state machine so OSN's chrome does not
-            // appear in the frame.
-            let freeze_sc = egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                egui::Key::F,
-            );
-            if ctx.input_mut(|i| i.consume_shortcut(&freeze_sc)) {
-                self.queue_freeze(ctx.pixels_per_point());
+            if let Some(b) = self.hotkeys_cfg.canvas.freeze_frame {
+                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
+                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                    self.queue_freeze(ctx.pixels_per_point());
+                }
             }
 
             // Text tool steals keyboard input while a caret is open.
@@ -1193,8 +1537,11 @@ impl eframe::App for OnScreenNotesApp {
             let text_consumed = interaction::route_text_input(ctx, &mut self.tool, &mut self.canvases);
 
             ctx.input(|i| {
-                let shift = i.modifiers.shift;
-                let ctrl  = i.modifiers.ctrl || i.modifiers.command;
+                let mods = i.modifiers;
+                // Locals retained for the scroll handler below, which
+                // takes raw bools (not Modifiers).
+                let ctrl  = mods.ctrl || mods.command;
+                let shift = mods.shift;
                 if text_consumed {
                     // Still allow scroll-wheel events (handled below
                     // outside this for-loop) but drop key events.
@@ -1203,36 +1550,67 @@ impl eframe::App for OnScreenNotesApp {
                     // iterator.
                     return;
                 }
+                let keys = &self.hotkeys_cfg;
                 for ev in &i.events {
                     if let egui::Event::Key { key, pressed: true, .. } = ev {
                         // Tool switch shortcuts.
-                        interaction::react_tool_shortcut(*key, shift, &mut self.tool);
-                        // Canvas navigation (left / right).
-                        interaction::react_canvas_nav(*key, &mut self.canvases);
-                        // Layer navigation (up / down) on the active canvas.
-                        interaction::react_layer_nav(*key, &mut self.canvases);
-                        // Tab toggles every floating UI element off so
-                        // the user can view their drawing without
-                        // chrome. Strokes / shapes / cursor still
-                        // render normally.
-                        if *key == egui::Key::Tab && !ctrl && !shift {
-                            self.ui_visible = !self.ui_visible;
-                        }
-                        // Undo / redo / clear.
-                        if ctrl && *key == egui::Key::Z {
-                            if shift {
-                                self.canvases.active_mut().redo();
-                            } else {
-                                self.canvases.active_mut().undo();
+                        interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
+                        // Canvas + layer navigation.
+                        interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys);
+                        interaction::react_layer_nav (*key, mods, &mut self.canvases, keys);
+                        // Toggle floating UI chrome.
+                        if let Some(b) = keys.canvas.toggle_ui {
+                            if b.matches(*key, mods) {
+                                self.ui_visible = !self.ui_visible;
                             }
                         }
-                        if ctrl && *key == egui::Key::Delete {
-                            self.canvases.active_mut().clear();
+                        // Undo / redo / clear / delete-canvas.
+                        if let Some(b) = keys.canvas.undo {
+                            if b.matches(*key, mods) { self.canvases.active_mut().undo(); }
                         }
-                        // Ctrl+Shift+Backspace: delete the active canvas
-                        // (or clear it, if it's the only one).
-                        if ctrl && shift && *key == egui::Key::Backspace {
-                            self.canvases.delete_active();
+                        if let Some(b) = keys.canvas.redo {
+                            if b.matches(*key, mods) { self.canvases.active_mut().redo(); }
+                        }
+                        if let Some(b) = keys.canvas.clear_layer {
+                            if b.matches(*key, mods) { self.canvases.active_mut().clear(); }
+                        }
+                        if let Some(b) = keys.canvas.delete_canvas {
+                            if b.matches(*key, mods) { self.canvases.delete_active(); }
+                        }
+                        // Layer opacity: 1..9 set absolute N·10 %,
+                        // 0 sets 0 %. `-` / `=` step ±10 %. All
+                        // clamped to [0, 1]. Default bindings live in
+                        // `HotkeysConfig::CanvasSection::opacity_*`.
+                        for (n, b) in keys.canvas.opacity.iter().enumerate() {
+                            if let Some(b) = b {
+                                if b.matches(*key, mods) {
+                                    let v = (n as f32) * 0.10;
+                                    let c = self.canvases.active_mut();
+                                    c.active_layer_mut().opacity = v;
+                                    c.mark_dirty();
+                                }
+                            }
+                        }
+                        if let Some(b) = keys.canvas.opacity_dec {
+                            if b.matches(*key, mods) {
+                                let c = self.canvases.active_mut();
+                                let l = c.active_layer_mut();
+                                l.opacity = (l.opacity - 0.10).clamp(0.0, 1.0);
+                                c.mark_dirty();
+                            }
+                        }
+                        if let Some(b) = keys.canvas.opacity_inc {
+                            if b.matches(*key, mods) {
+                                let c = self.canvases.active_mut();
+                                let l = c.active_layer_mut();
+                                l.opacity = (l.opacity + 0.10).clamp(0.0, 1.0);
+                                c.mark_dirty();
+                            }
+                        }
+                        if let Some(b) = keys.canvas.preview_layer {
+                            if b.matches(*key, mods) {
+                                self.show_layer_preview = !self.show_layer_preview;
+                            }
                         }
                     }
                 }
@@ -1307,7 +1685,78 @@ impl eframe::App for OnScreenNotesApp {
                     click_through_now,
                     self.pen.is_active(),
                 );
-                ui::layer_panel::show(ctx, &mut self.canvases);
+                let canvas_idx = self.canvases.active_index();
+                // Pass the manager, not `active_mut()`: taking the mutable
+                // canvas borrow every frame just to paint would flag it
+                // dirty ~60×/s and put the autosave back into a permanent
+                // rewrite loop. The panel takes it only on a real click.
+                ui::layer_panel::show(
+                    ctx,
+                    &mut self.overlay_cache,
+                    canvas_idx,
+                    &mut self.canvases,
+                );
+            }
+            // Layer preview popup — large centred thumbnail of the
+            // active layer. Toggled by the `canvas.preview_layer`
+            // hotkey (`q` by default). Esc closes (handled earlier in
+            // this frame).
+            if self.show_layer_preview {
+                let canvas_idx = self.canvases.active_index();
+                let active_li = self.canvases.active().active_layer;
+                let layer_clone = self.canvases.active().layers[active_li].clone();
+                let tex = self.overlay_cache.ensure_layer_thumb(
+                    ctx, canvas_idx, active_li, &layer_clone,
+                );
+                let screen = ctx.screen_rect();
+                egui::Area::new(egui::Id::new("osn_layer_preview_popup"))
+                    .fixed_pos(egui::pos2(
+                        screen.center().x - 260.0,
+                        screen.center().y - 220.0,
+                    ))
+                    .show(ctx, |ui| {
+                        egui::Frame {
+                            inner_margin: egui::Margin::same(12.0),
+                            outer_margin: egui::Margin::ZERO,
+                            rounding: egui::Rounding::same(12.0),
+                            shadow: ui::theme::card_shadow(),
+                            fill: ui::theme::GLASS_FILL,
+                            stroke: egui::Stroke::NONE,
+                        }
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Layer {} — {} strokes · {} shapes",
+                                    active_li + 1,
+                                    layer_clone.strokes.len(),
+                                    layer_clone.shapes.len(),
+                                ))
+                                .color(ui::theme::TEXT_PRIMARY),
+                            );
+                            ui.add_space(6.0);
+                            match tex {
+                                Some(tex_id) => {
+                                    let size = egui::Vec2::new(480.0, 360.0);
+                                    ui.add(
+                                        egui::Image::new((tex_id, size))
+                                            .fit_to_exact_size(size),
+                                    );
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new("(empty layer)")
+                                            .color(ui::theme::TEXT_MUTED),
+                                    );
+                                }
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Esc or hotkey to close")
+                                    .small()
+                                    .color(ui::theme::TEXT_MUTED),
+                            );
+                        });
+                    });
             }
         }
 
@@ -1388,7 +1837,13 @@ impl eframe::App for OnScreenNotesApp {
         }
 
         // ---- Auto-save (debounced) ---------------------------------------
-        if self.last_save_at.elapsed() > Duration::from_millis(1500) {
+        // Bumped from 1500 ms to 5000 ms because the save itself is
+        // now (a) background-threaded, (b) dirty-gated so most ticks
+        // are no-ops, and (c) using compact RON. Worst-case data loss
+        // on a crash is now 5 s instead of 1.5 s — acceptable for an
+        // annotation tool, and the UI stays smooth even with 9+
+        // PNG-bearing canvases.
+        if self.last_save_at.elapsed() > Duration::from_millis(5000) {
             self.canvases.save_all();
             if let Err(e) = crate::persistence::save_config(&self.config) {
                 log::warn!("config save failed: {e}");
@@ -1412,7 +1867,9 @@ impl eframe::App for OnScreenNotesApp {
     /// With glow it would be `(&mut self, Option<&glow::Context>)`. Since we
     /// build with `wgpu` only, the no-arg form is correct.
     fn on_exit(&mut self) {
-        self.canvases.save_all();
+        // Shutdown path: block until every dirty canvas is on disk.
+        // The background variant would race with process exit.
+        self.canvases.save_all_blocking();
         if let Err(e) = crate::persistence::save_config(&self.config) {
             log::warn!("config save on exit failed: {e}");
         }

@@ -8,6 +8,7 @@
 
 pub mod filter;
 pub mod hotkeys;
+pub mod hotkeys_config;
 pub mod modifiers;
 pub mod pen;
 pub mod picker;

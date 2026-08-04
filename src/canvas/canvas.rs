@@ -32,13 +32,28 @@ pub struct LayerImage {
     /// from the PNG header as a fallback).
     #[serde(default)]
     pub logical_size: [f32; 2],
-    /// Top-left canvas-local anchor of the image. Was implicitly the
-    /// canvas origin before per-layer panning existed, so
-    /// `#[serde(default)]` (`[0.0, 0.0]`) reproduces the old placement
-    /// for every existing save file.
-    #[serde(default)]
-    pub pos: [f32; 2],
+    /// Canvas-local top-left of the image. Zero for older saves and
+    /// for any image captured at default `(pan = 0, zoom = 1)`. When
+    /// the user freezes a frame after panning or zooming the canvas,
+    /// we record `-pan / zoom` here so the captured pixels land
+    /// exactly on the client area the user saw — independent of the
+    /// canvas's current pan/zoom. Per-layer panning shifts it further,
+    /// so it doubles as the image's live anchor.
+    ///
+    /// `alias = "pos"` keeps saves written before this field was
+    /// renamed loading with their panned position intact.
+    #[serde(default, alias = "pos")]
+    pub canvas_origin: [f32; 2],
+    /// Zoom factor in effect at the moment of capture. Used together
+    /// with `canvas_origin` to keep the image's screen footprint
+    /// stable: the canvas-local extent we render into is
+    /// `logical_size / capture_zoom`. Defaults to `1.0` so older
+    /// saves continue to render at their physical-to-logical scale.
+    #[serde(default = "default_capture_zoom")]
+    pub capture_zoom: f32,
 }
+
+fn default_capture_zoom() -> f32 { 1.0 }
 
 /// One named layer of ink. Layers stack in the order they appear in
 /// `Canvas::layers` — earlier indices paint underneath later ones.
@@ -104,8 +119,8 @@ impl Layer {
             s.translate(d);
         }
         if let Some(img) = self.image.as_mut() {
-            img.pos[0] += d[0];
-            img.pos[1] += d[1];
+            img.canvas_origin[0] += d[0];
+            img.canvas_origin[1] += d[1];
         }
     }
 }
@@ -251,6 +266,7 @@ impl Canvas {
         self.layers[li].strokes.push(stroke);
         self.undo_log.push(UndoEntry::StrokeAdded(li));
         self.redo_log.clear();
+        self.dirty = true;
     }
 
     /// Append a shape and record an undo entry.
@@ -259,6 +275,7 @@ impl Canvas {
         self.layers[li].shapes.push(shape);
         self.undo_log.push(UndoEntry::ShapeAdded(li));
         self.redo_log.clear();
+        self.dirty = true;
     }
 
     /// Remove all strokes and shapes from the active layer.
@@ -270,11 +287,13 @@ impl Canvas {
         let prev_shapes  = std::mem::take(&mut self.layers[li].shapes);
         self.undo_log.push(UndoEntry::Cleared(li, prev_strokes, prev_shapes));
         self.redo_log.clear();
+        self.dirty = true;
     }
 
     /// Undo the most recent edit if any. Pushes inverse onto redo log.
     pub fn undo(&mut self) {
         let Some(entry) = self.undo_log.pop() else { return };
+        self.dirty = true;
         match entry {
             UndoEntry::StrokeAdded(li) => {
                 if let Some(layer) = self.layers.get_mut(li) {
@@ -355,6 +374,7 @@ impl Canvas {
     /// Redo the most recently undone edit if any.
     pub fn redo(&mut self) {
         let Some(entry) = self.redo_log.pop() else { return };
+        self.dirty = true;
         match entry {
             UndoEntry::StrokeAdded(li) => self.undo_log.push(UndoEntry::StrokeAdded(li)),
             UndoEntry::ShapeAdded(li)  => self.undo_log.push(UndoEntry::ShapeAdded(li)),
@@ -424,6 +444,11 @@ impl Canvas {
     /// contain `point` (canvas-local). Returns true if anything was
     /// erased. Strokes / shapes on other layers are left alone, even
     /// when they sit visually under the eraser tip.
+    /// Mark this canvas dirty without other side effects. Use when a
+    /// mutation lives outside the canvas methods (e.g. layer-opacity
+    /// edits via a slider or hotkey).
+    pub fn mark_dirty(&mut self) { self.dirty = true; }
+
     pub fn erase_at(&mut self, point: [f32; 2], radius: f32) -> bool {
         let li = self.active_layer;
         let mut erased_any = false;
@@ -621,6 +646,7 @@ impl Canvas {
         self.active_layer = (self.active_layer + 1).min(self.layers.len() - 1);
         self.undo_log.clear();
         self.redo_log.clear();
+        self.dirty = true;
     }
 
     /// Insert a new blank layer directly above the active one and make
@@ -640,6 +666,7 @@ impl Canvas {
         let pos = (self.active_layer + 1).min(self.layers.len());
         self.layers.insert(pos, l);
         self.active_layer = pos;
+        self.dirty = true;
     }
 
     /// Remove the layer at `index`. Refuses to remove the last layer
@@ -661,6 +688,7 @@ impl Canvas {
         let cur_len = self.layers.len();
         self.undo_log.retain(|e| layer_idx_of(e) < cur_len);
         self.redo_log.retain(|e| layer_idx_of(e) < cur_len);
+        self.dirty = true;
     }
 
     /// Move the layer at `index` to `new_index`, clamping the
@@ -685,12 +713,14 @@ impl Canvas {
         // them rather than chase rewrites.
         self.undo_log.clear();
         self.redo_log.clear();
+        self.dirty = true;
     }
 
     /// Toggle visibility of the layer at `index`.
     pub fn toggle_layer_visible(&mut self, index: usize) {
         if let Some(l) = self.layers.get_mut(index) {
             l.visible = !l.visible;
+            self.dirty = true;
         }
     }
 
@@ -878,7 +908,7 @@ fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutco
 /// winding order. Robust for lasso-erase hit-testing where the user
 /// path is rough; we don't try to handle exact-on-edge ties because
 /// real centroids almost never land on a path edge.
-fn point_in_polygon(p: [f32; 2], polygon: &[[f32; 2]]) -> bool {
+pub(crate) fn point_in_polygon(p: [f32; 2], polygon: &[[f32; 2]]) -> bool {
     let n = polygon.len();
     if n < 3 { return false; }
     let (x, y) = (p[0], p[1]);

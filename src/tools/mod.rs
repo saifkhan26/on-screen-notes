@@ -16,6 +16,7 @@ pub mod shape_tool;
 
 use crate::canvas::canvas::Canvas;
 use crate::canvas::shape::{BorderStyle, Shape};
+use crate::canvas::smoothing::SmoothingOptions;
 use crate::canvas::stroke::{PenSample, Stroke, StrokeStyle};
 use crate::config::AppConfig;
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,12 @@ pub enum ToolKind {
     /// than the point-radius eraser when cleaning up around dense
     /// ink.
     LassoErase,
+    /// Lasso select. Same freeform-polygon collection as `LassoErase`,
+    /// but on pen-up the on-screen pixels *inside* the polygon are
+    /// captured (like the freeze-frame feature) and inserted as a
+    /// bottom image layer. The capture itself runs in the app loop —
+    /// `end` only stashes the polygon in `pending_lasso_capture`.
+    LassoSelect,
 }
 
 impl ToolKind {
@@ -92,6 +99,7 @@ impl ToolKind {
             ToolKind::Text          => "T",
             ToolKind::Spotlight     => "S",
             ToolKind::LassoErase    => "X",
+            ToolKind::LassoSelect   => "Shift+X",
         }
     }
 }
@@ -175,6 +183,18 @@ pub struct ActiveTool {
     /// appends; end closes the polygon and erases every stroke /
     /// shape on the active layer whose centroid lies inside.
     pub in_progress_lasso: Option<Vec<[f32; 2]>>,
+    /// Pending lasso-select polygon (canvas-local coords). Set by the
+    /// `LassoSelect` tool on pen-up; the app loop picks it up next
+    /// frame and runs the deferred screen capture (it needs the HWND,
+    /// DPI, and the 2-frame chrome-hide that only the app has).
+    /// Cleared once consumed.
+    pub pending_lasso_capture: Option<Vec<[f32; 2]>>,
+
+    /// Snapshot of the user's current smoothing options. Copied onto
+    /// each new stroke at pen-down so a mid-stroke UI change does not
+    /// retro-apply to ink already laid down. The app loop keeps this
+    /// in sync with `config.smoothing`.
+    pub smoothing: SmoothingOptions,
 }
 
 impl ActiveTool {
@@ -196,6 +216,8 @@ impl ActiveTool {
             pending_fill_at: None,
             spotlight_size: 120.0,
             in_progress_lasso: None,
+            pending_lasso_capture: None,
+            smoothing: cfg.smoothing,
         }
     }
 
@@ -204,8 +226,12 @@ impl ActiveTool {
         match self.kind {
             ToolKind::Pen | ToolKind::FreehandArrow => {
                 // Pen + freehand arrow honour the current stroke style
-                // (Default / Pencil / Marker / Airbrush).
-                let mut s = Stroke::with_style(self.color, self.size, self.style);
+                // (Default / Pencil / Marker / Airbrush) AND the
+                // current smoothing options so the user's choice locks
+                // in at pen-down.
+                let mut s = Stroke::with_style_and_smoothing(
+                    self.color, self.size, self.style, self.smoothing,
+                );
                 s.push(sample);
                 self.in_progress_stroke = Some(s);
             }
@@ -221,7 +247,9 @@ impl ActiveTool {
                 // Eraser keeps the plain ribbon look for its visible
                 // trail — pencil styling would make the trail confusingly
                 // faint.
-                let mut s = Stroke::new(self.color, self.size);
+                let mut s = Stroke::with_style_and_smoothing(
+                    self.color, self.size, StrokeStyle::Default, self.smoothing,
+                );
                 s.push(sample);
                 self.in_progress_stroke = Some(s);
             }
@@ -232,7 +260,9 @@ impl ActiveTool {
                 // disappearing tool. Pressure is forced to 1.0 so the
                 // line has uniform width (a real laser dot does not
                 // taper).
-                let mut s = Stroke::new(self.color, self.size);
+                let mut s = Stroke::with_style_and_smoothing(
+                    self.color, self.size, StrokeStyle::Default, self.smoothing,
+                );
                 s.push(flatten_pressure(sample));
                 self.in_progress_stroke = Some(s);
             }
@@ -248,9 +278,11 @@ impl ActiveTool {
                 // dim overlay.
                 self.kind = ToolKind::Pen;
             }
-            ToolKind::LassoErase => {
+            ToolKind::LassoErase | ToolKind::LassoSelect => {
                 // Start a fresh lasso path. The render layer paints
                 // the in-progress polyline as a dashed grey loop.
+                // Erase and Select share the collection + preview;
+                // they only differ in what `end` does with the polygon.
                 self.in_progress_lasso = Some(vec![sample.pos]);
             }
             ToolKind::Rect | ToolKind::Ellipse | ToolKind::Line | ToolKind::Arrow => {
@@ -285,7 +317,7 @@ impl ActiveTool {
                 // Spotlight follows the cursor passively. Nothing to
                 // do on pen-move.
             }
-            ToolKind::LassoErase => {
+            ToolKind::LassoErase | ToolKind::LassoSelect => {
                 if let Some(poly) = self.in_progress_lasso.as_mut() {
                     // Skip duplicate samples (Wintab often re-emits the
                     // same coord at idle). Keeps the rendered polyline
@@ -322,6 +354,11 @@ impl ActiveTool {
             ToolKind::Pen => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
                     s.push(sample);
+                    // Stabilizer mode keeps a rope-pull queue between
+                    // cursor and committed ink; on pen-up we drain the
+                    // queue so the trailing samples catch up to the
+                    // cursor. No-op for every other mode.
+                    s.finish();
                     // Pre-build the cache with the user's current
                     // smoothing budget; `Canvas::add_stroke` will
                     // happily skip its own default build because the
@@ -340,6 +377,7 @@ impl ActiveTool {
             ToolKind::FreehandArrow => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
                     s.push(sample);
+                    s.finish();
                     s.build_cache_with(self.position_passes);
                     canvas.add_stroke(s);
                     // Arrowhead width must match the rendered stroke
@@ -369,6 +407,7 @@ impl ActiveTool {
             ToolKind::Laser => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
                     s.push(flatten_pressure(sample));
+                    s.finish();
                     // Build the cache so the render path can reuse the
                     // same fast cached-polyline route Pen strokes use.
                     s.build_cache_with(self.position_passes);
@@ -414,6 +453,20 @@ impl ActiveTool {
                     // Need at least a triangle for a real polygon.
                     if poly.len() >= 3 {
                         canvas.erase_in_polygon(&poly);
+                    }
+                }
+            }
+            ToolKind::LassoSelect => {
+                // Same close-the-polygon step as erase, but instead of
+                // mutating the canvas we hand the polygon to the app
+                // loop, which captures the screen pixels inside it and
+                // inserts them as a bottom image layer. Canvas is
+                // untouched here.
+                let _ = canvas;
+                if let Some(mut poly) = self.in_progress_lasso.take() {
+                    poly.push(sample.pos);
+                    if poly.len() >= 3 {
+                        self.pending_lasso_capture = Some(poly);
                     }
                 }
             }

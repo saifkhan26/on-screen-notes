@@ -34,11 +34,27 @@ pub fn capture_primary_image() -> Result<RgbaImage> {
     Ok(img)
 }
 
-/// Capture the primary monitor, crop to the OSN window's screen
-/// rect, and encode as PNG. The cropped image lines up with the
-/// canvas-local origin so painting it at `[0, 0, logical_size]`
-/// covers exactly the area OSN sits over — anything outside the
-/// overlay is excluded.
+/// Capture the primary monitor, crop to the OSN window's **client**
+/// area, and encode as PNG. The cropped image is positioned at
+/// `(canvas_origin, logical_size)` so painting it covers exactly the
+/// area OSN sits over at the canvas's *current* pan and zoom —
+/// strokes drawn before the freeze stay in place; the captured pixels
+/// land precisely under the cursor regardless of how the user has
+/// panned or zoomed.
+///
+/// Why `client_rect` and not `window_rect`: `GetWindowRect` returns
+/// the OUTER rect, which on Win10/11 includes a DWM-managed border
+/// strip a few pixels wide even when the window is borderless. Using
+/// the outer rect made the captured image start a few pixels
+/// up-and-left of the visible content — strokes (in client coords)
+/// ended up offset bottom-right of the frozen content. `GetClientRect`
+/// + `ClientToScreen((0,0))` returns the actual content rectangle
+/// the user draws into.
+///
+/// We also clamp the crop to the captured monitor's bounds. If the
+/// OSN window straddles a secondary monitor (which xcap does not
+/// capture), the intersection with the primary monitor is what gets
+/// frozen — never a wild out-of-bounds slice.
 ///
 /// `pixels_per_point` is the overlay's DPI scale; we divide physical
 /// px by it to record the logical-size rect the renderer will draw
@@ -47,30 +63,39 @@ pub fn capture_primary_image() -> Result<RgbaImage> {
 pub fn capture_freeze_layer(
     pixels_per_point: f32,
     osn_hwnd: isize,
+    canvas_pan: [f32; 2],
+    canvas_zoom: f32,
 ) -> Result<crate::canvas::canvas::LayerImage> {
     let img = capture_primary_image()?;
     let full_w = img.width() as i32;
     let full_h = img.height() as i32;
 
-    // Resolve crop region in monitor-physical pixels. Falls back
-    // to the whole monitor if we cannot read the OSN rect.
-    let (cx, cy, cw, ch) = if osn_hwnd != 0 {
-        match crate::platform::window_rect(osn_hwnd) {
-            Some((l, t, r, b)) => {
-                let l = l.max(0);
-                let t = t.max(0);
-                let r = r.min(full_w);
-                let b = b.min(full_h);
-                if r > l && b > t {
-                    (l, t, r - l, b - t)
-                } else {
-                    (0, 0, full_w, full_h)
-                }
-            }
-            None => (0, 0, full_w, full_h),
-        }
+    // Resolve crop region in monitor-physical pixels. Prefer client
+    // rect over outer rect (see doc comment above). Falls back to the
+    // whole monitor if we cannot read either.
+    let raw_rect = if osn_hwnd != 0 {
+        crate::platform::client_rect(osn_hwnd)
+            .or_else(|| crate::platform::window_rect(osn_hwnd))
     } else {
-        (0, 0, full_w, full_h)
+        None
+    };
+    let (cx, cy, cw, ch) = match raw_rect {
+        Some((l, t, r, b)) => {
+            let l = l.clamp(0, full_w);
+            let t = t.clamp(0, full_h);
+            let r = r.clamp(0, full_w);
+            let b = b.clamp(0, full_h);
+            if r > l && b > t {
+                (l, t, r - l, b - t)
+            } else {
+                // Window sits entirely off the primary monitor (or
+                // shrank to zero). Fall back to whole monitor so the
+                // user still gets *something* recognisable rather
+                // than an empty layer.
+                (0, 0, full_w, full_h)
+            }
+        }
+        None => (0, 0, full_w, full_h),
     };
 
     let cropped = image::imageops::crop_imm(&img, cx as u32, cy as u32, cw as u32, ch as u32)
@@ -84,13 +109,154 @@ pub fn capture_freeze_layer(
             .context("encoding freeze PNG")?;
     }
     let ppp = pixels_per_point.max(0.01);
+    let zoom = canvas_zoom.max(0.001);
     Ok(crate::canvas::canvas::LayerImage {
         png: buf,
         size: [w, h],
-        logical_size: [w as f32 / ppp, h as f32 / ppp],
-        // A freshly captured frame lines up with the canvas origin; it
-        // only moves once the user pans its layer.
-        pos: [0.0, 0.0],
+        // Canvas-local extent = client logical px ÷ current zoom.
+        // The renderer multiplies this back by zoom on every paint,
+        // so the on-screen footprint is exactly the client area.
+        logical_size: [w as f32 / ppp / zoom, h as f32 / ppp / zoom],
+        // -pan/zoom places the image at canvas-local coords that
+        // map to the client top-left under the current view.
+        canvas_origin: [-canvas_pan[0] / zoom, -canvas_pan[1] / zoom],
+        capture_zoom: zoom,
+    })
+}
+
+/// Like [`capture_freeze_layer`], but keeps only the pixels *inside*
+/// `polygon` (a closed loop in canvas-local coords, as collected by the
+/// Lasso-Select tool). Everything outside the polygon is made fully
+/// transparent and the result is cropped tight to the selection's
+/// bounding box, so the inserted layer is sized to what the user drew.
+///
+/// Coordinate mapping is the exact inverse of how the renderer places a
+/// `LayerImage`: the captured client image covers canvas-local
+/// `[canvas_origin, canvas_origin + logical_size]`, so pixel `(px,py)`
+/// maps back to that range linearly. Because the renderer paints
+/// strokes (and freeze layers) through the same transform, this lands
+/// the mask in the same space the polygon was recorded in.
+pub fn capture_lasso_layer(
+    pixels_per_point: f32,
+    osn_hwnd: isize,
+    canvas_pan: [f32; 2],
+    canvas_zoom: f32,
+    polygon: &[[f32; 2]],
+) -> Result<crate::canvas::canvas::LayerImage> {
+    let img = capture_primary_image()?;
+    let full_w = img.width() as i32;
+    let full_h = img.height() as i32;
+
+    // Same crop region as the freeze path: prefer client rect, fall
+    // back to window rect, then to the whole monitor.
+    let raw_rect = if osn_hwnd != 0 {
+        crate::platform::client_rect(osn_hwnd).or_else(|| crate::platform::window_rect(osn_hwnd))
+    } else {
+        None
+    };
+    let (cx, cy, cw, ch) = match raw_rect {
+        Some((l, t, r, b)) => {
+            let l = l.clamp(0, full_w);
+            let t = t.clamp(0, full_h);
+            let r = r.clamp(0, full_w);
+            let b = b.clamp(0, full_h);
+            if r > l && b > t { (l, t, r - l, b - t) } else { (0, 0, full_w, full_h) }
+        }
+        None => (0, 0, full_w, full_h),
+    };
+
+    let mut cropped =
+        image::imageops::crop_imm(&img, cx as u32, cy as u32, cw as u32, ch as u32).to_image();
+    let (w, h) = (cropped.width(), cropped.height());
+    if w == 0 || h == 0 {
+        return Err(crate::error::anyhow!("empty client area for lasso capture"));
+    }
+
+    let ppp = pixels_per_point.max(0.01);
+    let zoom = canvas_zoom.max(0.001);
+    // Canvas-local extent of the full client capture — identical to the
+    // freeze-frame math.
+    let logical_size = [w as f32 / ppp / zoom, h as f32 / ppp / zoom];
+    let canvas_origin = [-canvas_pan[0] / zoom, -canvas_pan[1] / zoom];
+
+    // pixel center -> canvas-local coord.
+    let px_to_canvas = |px: u32, py: u32| -> [f32; 2] {
+        [
+            canvas_origin[0] + ((px as f32 + 0.5) / w as f32) * logical_size[0],
+            canvas_origin[1] + ((py as f32 + 0.5) / h as f32) * logical_size[1],
+        ]
+    };
+    // canvas-local coord -> fractional pixel index (inverse of above).
+    let cx_to_px = |clx: f32| (clx - canvas_origin[0]) / logical_size[0] * w as f32;
+    let cy_to_px = |cly: f32| (cly - canvas_origin[1]) / logical_size[1] * h as f32;
+
+    // Bound the (per-pixel) point-in-polygon test to the polygon's
+    // pixel-space bounding box. Pixels outside it can never be inside
+    // the polygon, so they are simply excluded from the final crop.
+    let (mut pminx, mut pminy, mut pmaxx, mut pmaxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in polygon {
+        pminx = pminx.min(p[0]);
+        pminy = pminy.min(p[1]);
+        pmaxx = pmaxx.max(p[0]);
+        pmaxy = pmaxy.max(p[1]);
+    }
+    let x_lo = cx_to_px(pminx).floor().clamp(0.0, (w - 1) as f32) as u32;
+    let x_hi = cx_to_px(pmaxx).ceil().clamp(0.0, (w - 1) as f32) as u32;
+    let y_lo = cy_to_px(pminy).floor().clamp(0.0, (h - 1) as f32) as u32;
+    let y_hi = cy_to_px(pmaxy).ceil().clamp(0.0, (h - 1) as f32) as u32;
+
+    // Mask outside-polygon pixels to alpha 0, and track the bounding
+    // box of the pixels we keep so we can crop tight afterwards.
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (w, h, 0u32, 0u32);
+    let mut any = false;
+    for py in y_lo..=y_hi {
+        for px in x_lo..=x_hi {
+            if crate::canvas::canvas::point_in_polygon(px_to_canvas(px, py), polygon) {
+                any = true;
+                if px < min_x { min_x = px; }
+                if py < min_y { min_y = py; }
+                if px > max_x { max_x = px; }
+                if py > max_y { max_y = py; }
+            } else {
+                cropped.get_pixel_mut(px, py).0[3] = 0;
+            }
+        }
+    }
+    if !any {
+        return Err(crate::error::anyhow!("lasso selection contains no pixels"));
+    }
+
+    // Crop tight to the kept bounding box.
+    let bw = max_x - min_x + 1;
+    let bh = max_y - min_y + 1;
+    let masked = image::imageops::crop_imm(&cropped, min_x, min_y, bw, bh).to_image();
+
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        masked
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .context("encoding lasso PNG")?;
+    }
+
+    // Canvas-local placement of the cropped sub-rect: logical_size is
+    // proportional to pixel size, so scale by (bw/w, bh/h) and shift the
+    // origin by the bbox offset (also in canvas-local units).
+    let sub_logical = [
+        bw as f32 / w as f32 * logical_size[0],
+        bh as f32 / h as f32 * logical_size[1],
+    ];
+    let sub_origin = [
+        canvas_origin[0] + (min_x as f32 / w as f32) * logical_size[0],
+        canvas_origin[1] + (min_y as f32 / h as f32) * logical_size[1],
+    ];
+
+    Ok(crate::canvas::canvas::LayerImage {
+        png: buf,
+        size: [bw, bh],
+        logical_size: sub_logical,
+        canvas_origin: sub_origin,
+        capture_zoom: zoom,
     })
 }
 
@@ -143,7 +309,101 @@ pub fn capture_and_save(canvas: &Canvas, cfg: &AppConfig, pixels_per_point: f32)
     let mut bg = bg_image; // already RgbaImage
     compositor::alpha_blend(&mut bg, &fg);
 
-    // 6) Compose output filename and save.
+    // 6) Save + push to clipboard (shared with the region-capture path).
+    save_and_clipboard(bg, cfg)
+}
+
+/// Capture the primary monitor, crop to the user-selected rectangle,
+/// composite the overlay background tint + the active canvas's ink on top,
+/// write a PNG, and push it to the clipboard.
+///
+/// `rect_points` is the selection rectangle in egui **logical** (point)
+/// coordinates relative to the OSN window's client top-left, as
+/// `[min_x, min_y, max_x, max_y]`. We map it into monitor-physical pixels
+/// with the client origin (`GetClientRect` + `ClientToScreen`, same as the
+/// freeze path) times `pixels_per_point`.
+///
+/// `bg_color` / `bg_opacity` are the overlay window's configured tint. The
+/// deferred capture drops the real window opacity to 0 so xcap grabs a
+/// clean desktop; we re-apply the tint here in software so the saved image
+/// matches what the user sees *through* the semi-transparent overlay.
+pub fn capture_region_and_save(
+    canvas: &Canvas,
+    cfg: &AppConfig,
+    pixels_per_point: f32,
+    osn_hwnd: isize,
+    rect_points: [f32; 4],
+    bg_color: [u8; 3],
+    bg_opacity: f32,
+) -> Result<ShotResult> {
+    let monitors = xcap::Monitor::all().context("listing monitors")?;
+    let monitor = monitors
+        .iter()
+        .find(|m| m.is_primary())
+        .unwrap_or(&monitors[0]);
+    let bg_image = monitor.capture_image().context("capturing screen")?;
+    let (w, h) = (bg_image.width(), bg_image.height());
+
+    // Client-area origin in monitor-physical pixels (prefer client rect,
+    // fall back to window rect, then to (0,0)) — same as the freeze path.
+    let origin = if osn_hwnd != 0 {
+        crate::platform::client_rect(osn_hwnd).or_else(|| crate::platform::window_rect(osn_hwnd))
+    } else {
+        None
+    };
+    let (ox, oy) = match origin {
+        Some((l, t, _, _)) => (l as f32, t as f32),
+        None => (0.0, 0.0),
+    };
+
+    let ppp = pixels_per_point.max(0.01);
+    // Selection rect → monitor-physical pixels, clamped to the capture.
+    let x0 = (ox + rect_points[0] * ppp).floor().clamp(0.0, w as f32) as u32;
+    let y0 = (oy + rect_points[1] * ppp).floor().clamp(0.0, h as f32) as u32;
+    let x1 = (ox + rect_points[2] * ppp).ceil().clamp(0.0, w as f32) as u32;
+    let y1 = (oy + rect_points[3] * ppp).ceil().clamp(0.0, h as f32) as u32;
+    let cw = x1.saturating_sub(x0);
+    let ch = y1.saturating_sub(y0);
+    if cw == 0 || ch == 0 {
+        return Err(crate::error::anyhow!("empty screenshot region"));
+    }
+
+    // Rasterise the annotation canvas full-screen at the same scale, then
+    // un-premultiply to straight alpha (identical to the full-screen path).
+    let mut pixmap = tiny_skia::Pixmap::new(w, h)
+        .ok_or_else(|| crate::error::anyhow!("could not allocate pixmap"))?;
+    {
+        let mut view = pixmap.as_mut();
+        render::render_canvas(&mut view, canvas, None, None, ppp);
+    }
+    let raw = pixmap.data().to_vec();
+    let mut fg = RgbaImage::from_raw(w, h, raw)
+        .ok_or_else(|| crate::error::anyhow!("invalid pixmap data"))?;
+    unpremultiply(&mut fg);
+
+    // Crop the desktop and the ink to the selection.
+    let mut region = image::imageops::crop_imm(&bg_image, x0, y0, cw, ch).to_image();
+    let ink = image::imageops::crop_imm(&fg, x0, y0, cw, ch).to_image();
+
+    // Respect the overlay background: paint the tint (bg_color at
+    // bg_opacity) over the desktop crop BEFORE the ink, so the saved region
+    // carries the same wash the live overlay shows.
+    let a = (bg_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    if a > 0 {
+        let tint = RgbaImage::from_pixel(cw, ch, image::Rgba([bg_color[0], bg_color[1], bg_color[2], a]));
+        compositor::alpha_blend(&mut region, &tint);
+    }
+    // Ink on top.
+    compositor::alpha_blend(&mut region, &ink);
+
+    save_and_clipboard(region, cfg)
+}
+
+/// Write `bg` (straight-alpha, opaque RGBA) to the screenshot directory as
+/// a timestamped PNG and push it to the system clipboard. Clipboard failure
+/// is non-fatal — the file still lands on disk. Shared by the full-screen
+/// and region capture paths.
+fn save_and_clipboard(bg: RgbaImage, cfg: &AppConfig) -> Result<ShotResult> {
     let dir = cfg
         .screenshot_dir
         .clone()
@@ -153,12 +413,7 @@ pub fn capture_and_save(canvas: &Canvas, cfg: &AppConfig, pixels_per_point: f32)
     let path = dir.join(format!("on-screen-notes_{now}.png"));
     bg.save(&path).with_context(|| format!("saving {path:?}"))?;
 
-    // Push the composited image to the system clipboard so the user
-    // can paste straight into Discord / Slack / Photoshop without
-    // opening the saved file. arboard wants straight-alpha RGBA, and
-    // `bg` already is — we unpremultiplied the foreground before
-    // alpha-blending into it. Failure is non-fatal; we still keep the
-    // file on disk.
+    // arboard wants straight-alpha RGBA, and `bg` already is.
     let clipboard = match arboard::Clipboard::new() {
         Ok(mut cb) => {
             let (w, h) = (bg.width(), bg.height());

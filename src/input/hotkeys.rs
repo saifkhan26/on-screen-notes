@@ -4,8 +4,8 @@
 //! it for the screenshot trigger so the user can capture the current
 //! screen without first clicking on our overlay.
 
-use crate::config::AppConfig;
 use crate::error::Result;
+use crate::input::hotkeys_config::{self, GlobalSection};
 use global_hotkey::{
     hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager,
 };
@@ -32,55 +32,39 @@ pub struct Hotkeys {
 }
 
 impl Hotkeys {
-    /// Try to register both hotkeys. Failure on any single one is logged but
-    /// not fatal: the rest of the app still runs, the user just doesn't get
-    /// that particular shortcut. This makes the app robust to other
-    /// applications already grabbing the same combo.
-    pub fn register(cfg: &AppConfig) -> Result<Self> {
+    /// Register the four global hotkeys defined in `HotkeysConfig`.
+    /// Each registration is independent — failure on one (e.g. another
+    /// app already owns the combo, or the user's binding is malformed)
+    /// is logged + skipped, the rest still register.
+    pub fn register(global: &GlobalSection) -> Result<Self> {
         let manager = GlobalHotKeyManager::new()?;
 
-        // Try parsing then registering each hotkey. Both errors are non-fatal.
-        let mut toggle_id = 0;
-        match cfg.hotkey_toggle_overlay.parse::<HotKey>() {
-            Ok(hk) => match manager.register(hk) {
-                Ok(()) => toggle_id = hk.id(),
-                Err(e) => log::warn!("could not register toggle hotkey: {e}"),
-            },
-            Err(e) => log::warn!("toggle hotkey parse error: {e}"),
-        }
+        // Helper: translate our friendly string → global-hotkey format,
+        // parse, register, return the assigned id (0 on failure).
+        let register_one = |label: &str, raw: &str| -> u32 {
+            let Some(s) = hotkeys_config::to_global_hotkey_format(raw) else {
+                log::warn!("{label} binding '{raw}' has unrecognised token");
+                return 0;
+            };
+            match s.parse::<HotKey>() {
+                Ok(hk) => match manager.register(hk) {
+                    Ok(()) => hk.id(),
+                    Err(e) => {
+                        log::warn!("could not register {label} hotkey: {e}");
+                        0
+                    }
+                },
+                Err(e) => {
+                    log::warn!("{label} hotkey parse error ({s}): {e}");
+                    0
+                }
+            }
+        };
 
-        let mut screenshot_id = 0;
-        match cfg.hotkey_screenshot.parse::<HotKey>() {
-            Ok(hk) => match manager.register(hk) {
-                Ok(()) => screenshot_id = hk.id(),
-                Err(e) => log::warn!("could not register screenshot hotkey: {e}"),
-            },
-            Err(e) => log::warn!("screenshot hotkey parse error: {e}"),
-        }
-
-        // Record toggle is hard-coded for now — no config field yet.
-        // `ctrl+shift+KeyR` matches the format the other entries use
-        // (parsed by `global_hotkey`).
-        let mut record_id = 0;
-        match "ctrl+shift+KeyR".parse::<HotKey>() {
-            Ok(hk) => match manager.register(hk) {
-                Ok(()) => record_id = hk.id(),
-                Err(e) => log::warn!("could not register record hotkey: {e}"),
-            },
-            Err(e) => log::warn!("record hotkey parse error: {e}"),
-        }
-
-        // Pause / resume the in-flight recording. Distinct from
-        // start/stop so the user can do both without modifier
-        // gymnastics. Ctrl+Shift+P is free in the existing table.
-        let mut pause_record_id = 0;
-        match "ctrl+shift+KeyP".parse::<HotKey>() {
-            Ok(hk) => match manager.register(hk) {
-                Ok(()) => pause_record_id = hk.id(),
-                Err(e) => log::warn!("could not register pause-record hotkey: {e}"),
-            },
-            Err(e) => log::warn!("pause-record hotkey parse error: {e}"),
-        }
+        let toggle_id       = register_one("toggle_overlay", &global.toggle_overlay);
+        let screenshot_id   = register_one("screenshot",     &global.screenshot);
+        let record_id       = register_one("start_record",   &global.start_record);
+        let pause_record_id = register_one("pause_record",   &global.pause_record);
 
         Ok(Self { _manager: manager, toggle_id, screenshot_id, record_id, pause_record_id })
     }

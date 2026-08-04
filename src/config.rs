@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::canvas::smoothing::SmoothingOptions;
 use crate::canvas::stroke::StrokeStyle;
 
 /// Pen-input smoothing preset.
@@ -131,6 +132,13 @@ pub struct AppConfig {
     /// auto-falls-back to GIF when `ffmpeg` is missing.
     #[serde(default)]
     pub recording_format: RecordingFormat,
+
+    /// Krita-style smoothing options. Default `kind = Adaptive` keeps
+    /// the legacy pipeline; other modes route through the new
+    /// per-stroke algorithms in `canvas::smoothing`. `#[serde(default)]`
+    /// keeps older config files loading without the field.
+    #[serde(default)]
+    pub smoothing: SmoothingOptions,
 }
 
 fn default_pressure_curve() -> f32 { 1.0 }
@@ -172,6 +180,7 @@ impl Default for AppConfig {
             default_stroke_style: StrokeStyle::Default,
             pressure_curve: 1.0,
             recording_format: RecordingFormat::default(),
+            smoothing: SmoothingOptions::default(),
         }
     }
 }

@@ -23,9 +23,27 @@
 use crate::canvas::canvas::Canvas;
 use crate::canvas::shape::{BorderStyle, Shape};
 use crate::canvas::stroke::{Stroke, StrokeStyle};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use tiny_skia::{
     Color, FillRule, Paint, PathBuilder, PixmapMut, Stroke as TsStroke, StrokeDash, Transform,
 };
+
+// ---- Fan-corner globals -----------------------------------------------
+//
+// The ribbon mesh builder consults these atomics each time it paints a
+// stroke. App reads `config.smoothing` once per frame and pushes the
+// flag + step (in radians) here so render code does not need to thread
+// an extra parameter through every paint helper. Atomic = lock-free
+// read on the hot path.
+static FAN_CORNERS_ENABLED:   AtomicBool = AtomicBool::new(false);
+static FAN_CORNERS_STEP_BITS: AtomicU32  = AtomicU32::new(0x3E4CCCCD); // ≈ 0.20 rad
+
+/// Push the user's fan-corner setting into render-side globals. Called
+/// once per frame from the app loop before any stroke is painted.
+pub fn set_fan_corners(enabled: bool, step_rad: f32) {
+    FAN_CORNERS_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    FAN_CORNERS_STEP_BITS.store(step_rad.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Marching-ants dash speed in canvas-local pixels per second.
 const DASH_SPEED_PX_PER_SEC: f32 = 30.0;
@@ -143,8 +161,13 @@ pub fn paint_canvas_egui(
                 w = img.size[0] as f32;
                 h = img.size[1] as f32;
             }
-            let p0 = to_screen(img.pos);
-            let p1 = to_screen([img.pos[0] + w, img.pos[1] + h]);
+            // Anchor at the recorded canvas origin (zero for older
+            // saves) so a freeze captured under a panned/zoomed
+            // canvas lands at the visible client area, not at the
+            // canvas-local origin.
+            let o = img.canvas_origin;
+            let p0 = to_screen(o);
+            let p1 = to_screen([o[0] + w, o[1] + h]);
             let rect = egui::Rect::from_two_pos(p0, p1);
             let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, (op * 255.0) as u8);
             painter.image(*tex_id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
@@ -625,6 +648,35 @@ fn paint_polyline_grouped(
     const FEATHER: f32 = 1.0;
     let trans = egui::Color32::from_rgba_premultiplied(0, 0, 0, 0);
 
+    // ---- Round caps painted BEFORE the ribbon mesh -------------
+    // Painting discs first then the ribbon on top ensures the ribbon's
+    // anti-aliased fringe overdraws the disc's auto-AA halo cleanly.
+    // The disc's center half is invisible under the ribbon's solid
+    // interior; only its backward hemisphere remains visible — which
+    // is exactly the round-cap silhouette we want.
+    //
+    // We also shrink each disc by `FEATHER` so its halo lands INSIDE
+    // the ribbon's solid interior instead of stacking with the
+    // ribbon's outer feather strip. Without that shrink, the user
+    // sees a darker bead at every endpoint because the two AA
+    // gradients overlay in the same perpendicular pixel band.
+    let (j0, jn) = match style {
+        StrokeStyle::Default | StrokeStyle::Marker => (1.0_f32, 1.0_f32),
+        StrokeStyle::Pencil  => (
+            0.78 + 0.32 * hash01(0),
+            0.78 + 0.32 * hash01((n - 1) as u32),
+        ),
+        StrokeStyle::Airbrush => (1.0_f32, 1.0_f32),
+    };
+    let r0 = (widths[0]     * 0.5 * j0 * zoom - FEATHER * 0.5).max(0.4);
+    let rn = (widths[n - 1] * 0.5 * jn * zoom - FEATHER * 0.5).max(0.4);
+    if r0 >= 0.4 {
+        painter.circle_filled(to_screen(points[0]), r0, color);
+    }
+    if rn >= 0.4 {
+        painter.circle_filled(to_screen(points[n - 1]), rn, color);
+    }
+
     let mut mesh = egui::Mesh::default();
     mesh.vertices.reserve(n * 4);
     mesh.indices.reserve((n - 1) * 18);
@@ -679,24 +731,37 @@ fn paint_polyline_grouped(
     }
     painter.add(egui::Shape::mesh(mesh));
 
-    // Round caps: a full disc at each endpoint covers the butt edge
-    // left by the triangle strip. Two discs total per stroke — does
-    // not stack fringes.
-    let (j0, jn) = match style {
-        StrokeStyle::Default | StrokeStyle::Marker => (1.0_f32, 1.0_f32),
-        StrokeStyle::Pencil  => (
-            0.78 + 0.32 * hash01(0),
-            0.78 + 0.32 * hash01((n - 1) as u32),
-        ),
-        StrokeStyle::Airbrush => (1.0_f32, 1.0_f32),
-    };
-    let r0 = widths[0]     * 0.5 * j0 * zoom;
-    let rn = widths[n - 1] * 0.5 * jn * zoom;
-    if r0 >= 0.4 {
-        painter.circle_filled(to_screen(points[0]), r0, color);
-    }
-    if rn >= 0.4 {
-        painter.circle_filled(to_screen(points[n - 1]), rn, color);
+    // Fan-corner discs — Krita's `paintFan` analogue. At each
+    // interior polyline vertex whose tangent rotates by more than
+    // `fan_corners_step` radians, stamp a filled disc the size of
+    // the local stroke width. The disc fills the outer wedge that
+    // the miter joint would otherwise leave behind and covers the
+    // inner-side bowtie self-overlap. Cheaper than synthesising
+    // angular triangle fans and visually identical to Krita's
+    // own implementation. Only fires when the caller opted in.
+    //
+    // Same `FEATHER` shrink as the endpoint caps: keeps the disc's
+    // AA halo inside the ribbon body so the user doesn't see a bead
+    // at every painted corner.
+    if FAN_CORNERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        let step = f32::from_bits(
+            FAN_CORNERS_STEP_BITS.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        for i in 1..(n - 1) {
+            let pa = points[i - 1];
+            let pb = points[i];
+            let pc = points[i + 1];
+            let d1 = [pb[0] - pa[0], pb[1] - pa[1]];
+            let d2 = [pc[0] - pb[0], pc[1] - pb[1]];
+            let l1 = (d1[0] * d1[0] + d1[1] * d1[1]).sqrt().max(1.0e-6);
+            let l2 = (d2[0] * d2[0] + d2[1] * d2[1]).sqrt().max(1.0e-6);
+            let cos_t = (d1[0] * d2[0] + d1[1] * d2[1]) / (l1 * l2);
+            let theta = cos_t.clamp(-1.0, 1.0).acos();
+            if theta > step {
+                let r = (widths[i] * 0.5 * zoom - FEATHER * 0.5).max(0.4);
+                painter.circle_filled(to_screen(points[i]), r, color);
+            }
+        }
     }
 }
 
@@ -712,68 +777,18 @@ fn paint_stroke_live(
     position_passes: usize,
     layer_opacity: f32,
 ) {
-    let n = stroke.samples.len();
     let color = col(stroke.color, layer_opacity);
 
-    // Pre-smooth raw sample positions before Catmull-Rom subdivision —
-    // matches `Stroke::build_cache_with`. See that function for why
-    // smoothing must run in sample-space, not on the subdivided
-    // polyline.
-    let mut ctrl: Vec<[f32; 2]> = stroke.samples.iter().map(|s| s.pos).collect();
-    for _ in 0..position_passes {
-        crate::canvas::stroke::smooth_positions_in_place(&mut ctrl);
-    }
-
-    let mut points: Vec<[f32; 2]> = Vec::with_capacity(n * 8);
-    let mut widths: Vec<f32>      = Vec::with_capacity(n * 8);
-
-    // Quadratic Bezier midpoint scheme — matches build_cache_with.
-    // See that function for the rationale (kills CR overshoot at
-    // sharp turns).
-    let midpoint = |a: [f32; 2], b: [f32; 2]| -> [f32; 2] {
-        [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
-    };
-
-    for i in 0..n {
-        let p_pos = ctrl[i];
-        let p_pr  = stroke.samples[i].pressure;
-        let m_start = if i == 0 { p_pos } else { midpoint(ctrl[i - 1], p_pos) };
-        let m_end   = if i + 1 == n { p_pos } else { midpoint(p_pos, ctrl[i + 1]) };
-        let pr_start = if i == 0 {
-            p_pr
-        } else {
-            0.5 * (stroke.samples[i - 1].pressure + p_pr)
-        };
-        let pr_end = if i + 1 == n {
-            p_pr
-        } else {
-            0.5 * (p_pr + stroke.samples[i + 1].pressure)
-        };
-
-        let dx = m_end[0] - m_start[0];
-        let dy = m_end[1] - m_start[1];
-        let chord = (dx * dx + dy * dy).sqrt();
-        let avg_w = stroke.base_width * 0.5 * (pr_start + pr_end).max(0.1);
-        let target_gap = (avg_w * 0.4).max(2.0);
-        let substeps = ((chord / target_gap).ceil() as usize).clamp(2, 24);
-
-        let start = if i == 0 { 0 } else { 1 };
-        for step in start..=substeps {
-            let t = step as f32 / substeps as f32;
-            let u = 1.0 - t;
-            let pos = [
-                u * u * m_start[0] + 2.0 * u * t * p_pos[0] + t * t * m_end[0],
-                u * u * m_start[1] + 2.0 * u * t * p_pos[1] + t * t * m_end[1],
-            ];
-            let pressure = u * u * pr_start + 2.0 * u * t * p_pr + t * t * pr_end;
-            let w = (stroke.base_width * pressure.clamp(0.05, 1.0)).max(0.8);
-            points.push(pos);
-            widths.push(w);
-        }
-    }
-
-    // Widths only — positions already smoothed at the raw-sample level.
-    crate::canvas::stroke::smooth_widths_causal(&mut widths);
+    // Same geometry as the committed cache: the shared ribbon-spine builder
+    // (centripetal Catmull-Rom + adaptive arc-length / turn-angle
+    // decimation). Rebuilding it fresh each frame is cheap for a single
+    // in-progress stroke and guarantees the live preview matches the
+    // committed stroke exactly (WYSIWYG on pen-up).
+    let position_passes = stroke.smoothing.cache_passes(position_passes);
+    let cache =
+        crate::canvas::stroke::build_spine(&stroke.samples, stroke.base_width, position_passes);
+    let points = cache.points;
+    let widths = cache.widths;
 
     let paint_color = match stroke.style {
         StrokeStyle::Default => color,
@@ -1112,6 +1127,146 @@ fn hash01(i: u32) -> f32 {
 // 2) Tiny-skia path: kept ONLY for the screenshot PNG pipeline.
 // =============================================================================
 
+/// Render a single layer into a small RGBA buffer for use as a
+/// preview thumbnail.
+///
+/// Returns straight (un-premultiplied) RGBA so the caller can upload
+/// it as an `egui::ColorImage` without further conversion. Returns
+/// `None` when the layer has nothing renderable — the caller can
+/// then skip the texture upload + show an "empty layer" placeholder
+/// instead.
+///
+/// Bounds are inferred from the union of every stroke / shape / image
+/// rect on the layer. The thumbnail is rendered at the largest scale
+/// that fits the requested `out_w × out_h` while preserving aspect.
+pub fn render_layer_thumbnail(
+    layer: &crate::canvas::canvas::Layer,
+    out_w: u32,
+    out_h: u32,
+) -> Option<image::RgbaImage> {
+    // 1) Find canvas-local bounds of every renderable.
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut update = |bb: [f32; 4]| {
+        if bb[0] < min_x { min_x = bb[0]; }
+        if bb[1] < min_y { min_y = bb[1]; }
+        if bb[2] > max_x { max_x = bb[2]; }
+        if bb[3] > max_y { max_y = bb[3]; }
+    };
+    if let Some(img) = layer.image.as_ref() {
+        let (w, h) = if img.logical_size[0] > 0.0 && img.logical_size[1] > 0.0 {
+            (img.logical_size[0], img.logical_size[1])
+        } else {
+            (img.size[0] as f32, img.size[1] as f32)
+        };
+        update([img.canvas_origin[0], img.canvas_origin[1],
+                img.canvas_origin[0] + w, img.canvas_origin[1] + h]);
+    }
+    for s in &layer.strokes {
+        if let Some(bb) = s.bounds() { update(bb); }
+    }
+    for shape in &layer.shapes {
+        let bb = match shape {
+            Shape::Rect    { a, b, stroke_width, .. }
+            | Shape::Ellipse { a, b, stroke_width, .. }
+            | Shape::Line    { a, b, stroke_width, .. }
+            | Shape::Arrow   { a, b, stroke_width, .. } => {
+                let pad = *stroke_width;
+                [a[0].min(b[0]) - pad, a[1].min(b[1]) - pad,
+                 a[0].max(b[0]) + pad, a[1].max(b[1]) + pad]
+            }
+            Shape::Text { pos, content, font_size, .. } => {
+                let lines: Vec<&str> = content.split('\n').collect();
+                let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
+                let w = (font_size * 0.6 * max_chars).max(*font_size);
+                let h = (font_size * 1.25 * lines.len() as f32).max(*font_size);
+                [pos[0], pos[1], pos[0] + w, pos[1] + h]
+            }
+            Shape::Raster { pos, size, .. } => {
+                [pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]]
+            }
+        };
+        update(bb);
+    }
+    if !min_x.is_finite() { return None; }
+    let bw = (max_x - min_x).max(1.0);
+    let bh = (max_y - min_y).max(1.0);
+
+    // 2) Scale to fit out_w × out_h preserving aspect, centred.
+    let sx = out_w as f32 / bw;
+    let sy = out_h as f32 / bh;
+    let scale = sx.min(sy).max(1.0e-3);
+    let used_w = bw * scale;
+    let used_h = bh * scale;
+    let ox = (out_w as f32 - used_w) * 0.5 - min_x * scale;
+    let oy = (out_h as f32 - used_h) * 0.5 - min_y * scale;
+
+    let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h)?;
+    pixmap.fill(Color::from_rgba8(20, 20, 24, 220));
+    let t = Transform::from_translate(ox, oy).post_scale(scale, scale);
+
+    // 3) Reuse the regular draw paths. They are agnostic of the
+    // outer canvas's pan/zoom — they operate in whatever transform
+    // we hand them.
+    if let Some(img) = layer.image.as_ref() {
+        if let Ok(decoded) = image::load_from_memory(&img.png) {
+            let rgba = decoded.to_rgba8();
+            let (iw, ih) = (rgba.width(), rgba.height());
+            if let Some(mut src) = tiny_skia::Pixmap::new(iw, ih) {
+                for (px, dst) in rgba.pixels().zip(src.pixels_mut()) {
+                    let [r, g, b, a] = px.0;
+                    let af = a as f32 / 255.0;
+                    *dst = tiny_skia::PremultipliedColorU8::from_rgba(
+                        (r as f32 * af) as u8,
+                        (g as f32 * af) as u8,
+                        (b as f32 * af) as u8,
+                        a,
+                    ).unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0,0,0,0).unwrap());
+                }
+                let (w, h) = if img.logical_size[0] > 0.0 && img.logical_size[1] > 0.0 {
+                    (img.logical_size[0], img.logical_size[1])
+                } else {
+                    (iw as f32, ih as f32)
+                };
+                let sx = w / iw as f32;
+                let sy = h / ih as f32;
+                let draw_t = Transform::from_scale(sx, sy)
+                    .post_translate(img.canvas_origin[0], img.canvas_origin[1])
+                    .post_concat(t);
+                let opts = tiny_skia::PixmapPaint {
+                    opacity: 1.0,
+                    blend_mode: tiny_skia::BlendMode::SourceOver,
+                    quality: tiny_skia::FilterQuality::Bilinear,
+                };
+                pixmap.as_mut().draw_pixmap(0, 0, src.as_ref(), &opts, draw_t, None);
+            }
+        }
+    }
+    let mut view = pixmap.as_mut();
+    for shape in &layer.shapes {
+        draw_shape(&mut view, shape, t);
+    }
+    for stroke in &layer.strokes {
+        draw_stroke(&mut view, stroke, t);
+    }
+
+    // 4) tiny-skia outputs premultiplied; unpremultiply to straight
+    //    so the egui ColorImage upload doesn't double-darken.
+    let raw = pixmap.data().to_vec();
+    let mut img = image::RgbaImage::from_raw(out_w, out_h, raw)?;
+    for px in img.pixels_mut() {
+        let a = px.0[3];
+        if a == 0 || a == 255 { continue; }
+        let af = a as f32 / 255.0;
+        for c in 0..3 {
+            px.0[c] = (px.0[c] as f32 / af).min(255.0) as u8;
+        }
+    }
+    Some(img)
+}
+
 /// Rasterise a canvas into the given mutable pixmap.
 ///
 /// `pixels_per_point` scales canvas-local logical coordinates into the
@@ -1176,13 +1331,15 @@ pub fn render_canvas(
                     let lh = if img.logical_size[1] > 0.0 { img.logical_size[1] } else { ih as f32 };
                     let sx = lw / iw as f32;
                     let sy = lh / ih as f32;
-                    // `pos` is the image's canvas-local anchor — non-zero
-                    // once the user has panned this layer. Apply it after
-                    // the physical→logical scale but before `t`, so it is
-                    // interpreted in canvas-local pixels like every other
-                    // coordinate the transform stack consumes.
+                    // `canvas_origin` is the image's canvas-local anchor —
+                    // set at capture time and shifted further once the user
+                    // pans this layer. Apply it after the physical→logical
+                    // scale but before `t`, so it is interpreted in
+                    // canvas-local pixels like every other coordinate the
+                    // transform stack consumes, and screenshots line up the
+                    // same way the live overlay does.
                     let draw_t = Transform::from_scale(sx, sy)
-                        .post_concat(Transform::from_translate(img.pos[0], img.pos[1]))
+                        .post_translate(img.canvas_origin[0], img.canvas_origin[1])
                         .post_concat(t);
                     let opts = tiny_skia::PixmapPaint {
                         opacity: layer.opacity.clamp(0.0, 1.0),

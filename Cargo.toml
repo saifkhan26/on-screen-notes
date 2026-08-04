@@ -86,6 +86,8 @@ windows     = { version = "0.56", features = [
     "Win32_System_Threading",
     # GetAsyncKeyState (for window-pick LMB polling) + GetCursorPos.
     "Win32_UI_Input_KeyboardAndMouse",
+    # ClientToScreen for freeze-frame client-area resolution.
+    "Win32_Graphics_Gdi",
 ] }
 
 # tiny-skia = a small, pure-Rust 2D rasteriser. We use it to draw our
@@ -106,6 +108,13 @@ global-hotkey = "0.6"
 # opening the file in a text editor).
 serde = { version = "1", features = ["derive"] }
 ron    = "0.8"
+
+# toml = hand-edited hotkeys file format. We pick TOML over YAML
+# because YAML's indent-significance is a constant footgun for hand-
+# edited config and `serde_yaml` was archived in 2024. TOML is the
+# format Cargo itself uses so users already know the syntax, and the
+# `toml` crate is stable + maintained.
+toml = "0.8"
 
 # anyhow = ergonomic error-handling. Lets us write `fn foo() -> Result<T>`
 # and `?` propagate errors with context. Beginner-friendly.

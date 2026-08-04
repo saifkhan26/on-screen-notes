@@ -27,10 +27,59 @@ pub struct OverlayCache {
     /// `(canvas, layer, shape_index)`; value carries the cached PNG
     /// length as a fingerprint for invalidation.
     shape_images: HashMap<(usize, usize, usize), (usize, egui::TextureHandle)>,
+    /// Per-layer preview thumbnails — keyed by `(canvas, layer)`. The
+    /// `(usize, usize, usize)` fingerprint is `(strokes_len,
+    /// shapes_len, image_png_len)` and is cheap to recompute every
+    /// frame; mismatch triggers a re-render + re-upload.
+    layer_thumbs: HashMap<(usize, usize), ((usize, usize, usize), egui::TextureHandle)>,
 }
 
 impl OverlayCache {
     pub fn new() -> Self { Self::default() }
+
+    /// Ensure a thumbnail texture exists for the given layer. Returns
+    /// `None` for empty layers (no strokes / shapes / image) so the
+    /// hover popup can render a placeholder instead. Fingerprint =
+    /// (strokes_len, shapes_len, image_png_len) — cheap to compute
+    /// each frame and re-renders only when the layer actually changed.
+    pub fn ensure_layer_thumb(
+        &mut self,
+        ctx: &egui::Context,
+        canvas_idx: usize,
+        layer_idx: usize,
+        layer: &crate::canvas::canvas::Layer,
+    ) -> Option<egui::TextureId> {
+        let fp = (
+            layer.strokes.len(),
+            layer.shapes.len(),
+            layer.image.as_ref().map(|i| i.png.len()).unwrap_or(0),
+        );
+        let key = (canvas_idx, layer_idx);
+        let cached_ok = match self.layer_thumbs.get(&key) {
+            Some((cached_fp, _)) => *cached_fp == fp,
+            None => false,
+        };
+        if cached_ok {
+            return Some(self.layer_thumbs[&key].1.id());
+        }
+        // 240×180 = 4:3, big enough to read, small enough to render
+        // in <5 ms on the UI thread.
+        let img = crate::canvas::render::render_layer_thumbnail(layer, 240, 180)?;
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let pixels: Vec<egui::Color32> = img
+            .into_raw()
+            .chunks_exact(4)
+            .map(|c| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
+            .collect();
+        let tex = ctx.load_texture(
+            format!("osn_layer_thumb_{canvas_idx}_{layer_idx}"),
+            egui::ColorImage { size: [w, h], pixels },
+            egui::TextureOptions::LINEAR,
+        );
+        let id = tex.id();
+        self.layer_thumbs.insert(key, (fp, tex));
+        Some(id)
+    }
 
     /// Ensure a texture exists for the given layer's image. Uploads
     /// (or re-uploads on size mismatch) when needed. Returns a
@@ -342,7 +391,7 @@ pub fn show(
             // canvas's pan/zoom. The first sample is also appended at
             // the end so the loop reads as closed during the drag —
             // gives the user a clear "what you'll cut" preview.
-            if matches!(tool.kind, ToolKind::LassoErase) {
+            if matches!(tool.kind, ToolKind::LassoErase | ToolKind::LassoSelect) {
                 if let Some(poly) = tool.in_progress_lasso.as_ref() {
                     if poly.len() >= 2 {
                         let canvas = manager.active();

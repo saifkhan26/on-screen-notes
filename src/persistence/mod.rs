@@ -53,6 +53,11 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
 
 /// Save a single canvas. We name files `canvas_<index>.ron` so the user can
 /// inspect / hand-edit them if desired.
+///
+/// Pretty-prints the structure but with `compact_arrays` so the embedded
+/// PNG `Vec<u8>` of a freeze-frame layer stays on one line instead of
+/// becoming a multi-megabyte one-number-per-line literal. Those bytes
+/// were never hand-readable anyway; everything else remains inspectable.
 pub fn save_canvas(index: usize, canvas: &Canvas) -> Result<()> {
     let path = paths::canvases_dir()?.join(format!("canvas_{index}.ron"));
     // `compact_arrays` keeps `Vec<u8>` payloads on a single line. It
