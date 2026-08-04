@@ -759,82 +759,18 @@ fn paint_stroke_live(
     position_passes: usize,
     layer_opacity: f32,
 ) {
-    let n = stroke.samples.len();
     let color = col(stroke.color, layer_opacity);
 
-    // Translate the user's level via the same mapping
-    // `build_cache_with` will use at commit time, so the live preview
-    // and the committed stroke look identical. Without this the user
-    // sees a smooth preview while drawing then a wiggly line on
-    // pen-up (or vice versa) depending on the active Krita mode.
+    // Same geometry as the committed cache: the shared ribbon-spine builder
+    // (centripetal Catmull-Rom + adaptive arc-length / turn-angle
+    // decimation). Rebuilding it fresh each frame is cheap for a single
+    // in-progress stroke and guarantees the live preview matches the
+    // committed stroke exactly (WYSIWYG on pen-up).
     let position_passes = stroke.smoothing.cache_passes(position_passes);
-
-    // Pre-smooth raw sample positions before Catmull-Rom subdivision —
-    // matches `Stroke::build_cache_with`. See that function for why
-    // smoothing must run in sample-space, not on the subdivided
-    // polyline.
-    let mut ctrl: Vec<[f32; 2]> = stroke.samples.iter().map(|s| s.pos).collect();
-    for _ in 0..position_passes {
-        crate::canvas::stroke::smooth_positions_in_place(&mut ctrl);
-    }
-
-    let mut points: Vec<[f32; 2]> = Vec::with_capacity(n * 8);
-    let mut widths: Vec<f32>      = Vec::with_capacity(n * 8);
-
-    // Quadratic Bezier midpoint scheme — matches build_cache_with.
-    // See that function for the rationale (kills CR overshoot at
-    // sharp turns).
-    let midpoint = |a: [f32; 2], b: [f32; 2]| -> [f32; 2] {
-        [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
-    };
-
-    for i in 0..n {
-        let p_pos = ctrl[i];
-        let p_pr  = stroke.samples[i].pressure;
-        let m_start = if i == 0 { p_pos } else { midpoint(ctrl[i - 1], p_pos) };
-        let m_end   = if i + 1 == n { p_pos } else { midpoint(p_pos, ctrl[i + 1]) };
-        let pr_start = if i == 0 {
-            p_pr
-        } else {
-            0.5 * (stroke.samples[i - 1].pressure + p_pr)
-        };
-        let pr_end = if i + 1 == n {
-            p_pr
-        } else {
-            0.5 * (p_pr + stroke.samples[i + 1].pressure)
-        };
-
-        let dx = m_end[0] - m_start[0];
-        let dy = m_end[1] - m_start[1];
-        let chord = (dx * dx + dy * dy).sqrt();
-        let avg_w = stroke.base_width * 0.5 * (pr_start + pr_end).max(0.1);
-        let target_gap = (avg_w * 0.4).max(2.0);
-        let substeps = ((chord / target_gap).ceil() as usize).clamp(2, 24);
-
-        let start = if i == 0 { 0 } else { 1 };
-        for step in start..=substeps {
-            let t = step as f32 / substeps as f32;
-            let u = 1.0 - t;
-            let pos = [
-                u * u * m_start[0] + 2.0 * u * t * p_pos[0] + t * t * m_end[0],
-                u * u * m_start[1] + 2.0 * u * t * p_pos[1] + t * t * m_end[1],
-            ];
-            let pressure = u * u * pr_start + 2.0 * u * t * p_pr + t * t * pr_end;
-            let w = (stroke.base_width * pressure.clamp(0.05, 1.0)).max(0.8);
-            points.push(pos);
-            widths.push(w);
-        }
-    }
-
-    // Widths only — positions already smoothed at the raw-sample level.
-    crate::canvas::stroke::smooth_widths_causal(&mut widths);
-
-    // Match `build_cache_with`'s final non-causal Gaussian polish so
-    // the live preview looks identical to the committed stroke —
-    // user does NOT see a smoothness change on pen-up.
-    let base_sigma = 3.0 + position_passes as f32 * 1.5;
-    crate::canvas::stroke::gaussian_smooth_positions_bidir(&mut points, base_sigma);
-    crate::canvas::stroke::gaussian_smooth_widths_bidir(&mut widths, base_sigma * 0.5);
+    let cache =
+        crate::canvas::stroke::build_spine(&stroke.samples, stroke.base_width, position_passes);
+    let points = cache.points;
+    let widths = cache.widths;
 
     let paint_color = match stroke.style {
         StrokeStyle::Default => color,

@@ -309,7 +309,101 @@ pub fn capture_and_save(canvas: &Canvas, cfg: &AppConfig, pixels_per_point: f32)
     let mut bg = bg_image; // already RgbaImage
     compositor::alpha_blend(&mut bg, &fg);
 
-    // 6) Compose output filename and save.
+    // 6) Save + push to clipboard (shared with the region-capture path).
+    save_and_clipboard(bg, cfg)
+}
+
+/// Capture the primary monitor, crop to the user-selected rectangle,
+/// composite the overlay background tint + the active canvas's ink on top,
+/// write a PNG, and push it to the clipboard.
+///
+/// `rect_points` is the selection rectangle in egui **logical** (point)
+/// coordinates relative to the OSN window's client top-left, as
+/// `[min_x, min_y, max_x, max_y]`. We map it into monitor-physical pixels
+/// with the client origin (`GetClientRect` + `ClientToScreen`, same as the
+/// freeze path) times `pixels_per_point`.
+///
+/// `bg_color` / `bg_opacity` are the overlay window's configured tint. The
+/// deferred capture drops the real window opacity to 0 so xcap grabs a
+/// clean desktop; we re-apply the tint here in software so the saved image
+/// matches what the user sees *through* the semi-transparent overlay.
+pub fn capture_region_and_save(
+    canvas: &Canvas,
+    cfg: &AppConfig,
+    pixels_per_point: f32,
+    osn_hwnd: isize,
+    rect_points: [f32; 4],
+    bg_color: [u8; 3],
+    bg_opacity: f32,
+) -> Result<ShotResult> {
+    let monitors = xcap::Monitor::all().context("listing monitors")?;
+    let monitor = monitors
+        .iter()
+        .find(|m| m.is_primary())
+        .unwrap_or(&monitors[0]);
+    let bg_image = monitor.capture_image().context("capturing screen")?;
+    let (w, h) = (bg_image.width(), bg_image.height());
+
+    // Client-area origin in monitor-physical pixels (prefer client rect,
+    // fall back to window rect, then to (0,0)) — same as the freeze path.
+    let origin = if osn_hwnd != 0 {
+        crate::platform::client_rect(osn_hwnd).or_else(|| crate::platform::window_rect(osn_hwnd))
+    } else {
+        None
+    };
+    let (ox, oy) = match origin {
+        Some((l, t, _, _)) => (l as f32, t as f32),
+        None => (0.0, 0.0),
+    };
+
+    let ppp = pixels_per_point.max(0.01);
+    // Selection rect → monitor-physical pixels, clamped to the capture.
+    let x0 = (ox + rect_points[0] * ppp).floor().clamp(0.0, w as f32) as u32;
+    let y0 = (oy + rect_points[1] * ppp).floor().clamp(0.0, h as f32) as u32;
+    let x1 = (ox + rect_points[2] * ppp).ceil().clamp(0.0, w as f32) as u32;
+    let y1 = (oy + rect_points[3] * ppp).ceil().clamp(0.0, h as f32) as u32;
+    let cw = x1.saturating_sub(x0);
+    let ch = y1.saturating_sub(y0);
+    if cw == 0 || ch == 0 {
+        return Err(crate::error::anyhow!("empty screenshot region"));
+    }
+
+    // Rasterise the annotation canvas full-screen at the same scale, then
+    // un-premultiply to straight alpha (identical to the full-screen path).
+    let mut pixmap = tiny_skia::Pixmap::new(w, h)
+        .ok_or_else(|| crate::error::anyhow!("could not allocate pixmap"))?;
+    {
+        let mut view = pixmap.as_mut();
+        render::render_canvas(&mut view, canvas, None, None, ppp);
+    }
+    let raw = pixmap.data().to_vec();
+    let mut fg = RgbaImage::from_raw(w, h, raw)
+        .ok_or_else(|| crate::error::anyhow!("invalid pixmap data"))?;
+    unpremultiply(&mut fg);
+
+    // Crop the desktop and the ink to the selection.
+    let mut region = image::imageops::crop_imm(&bg_image, x0, y0, cw, ch).to_image();
+    let ink = image::imageops::crop_imm(&fg, x0, y0, cw, ch).to_image();
+
+    // Respect the overlay background: paint the tint (bg_color at
+    // bg_opacity) over the desktop crop BEFORE the ink, so the saved region
+    // carries the same wash the live overlay shows.
+    let a = (bg_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    if a > 0 {
+        let tint = RgbaImage::from_pixel(cw, ch, image::Rgba([bg_color[0], bg_color[1], bg_color[2], a]));
+        compositor::alpha_blend(&mut region, &tint);
+    }
+    // Ink on top.
+    compositor::alpha_blend(&mut region, &ink);
+
+    save_and_clipboard(region, cfg)
+}
+
+/// Write `bg` (straight-alpha, opaque RGBA) to the screenshot directory as
+/// a timestamped PNG and push it to the system clipboard. Clipboard failure
+/// is non-fatal — the file still lands on disk. Shared by the full-screen
+/// and region capture paths.
+fn save_and_clipboard(bg: RgbaImage, cfg: &AppConfig) -> Result<ShotResult> {
     let dir = cfg
         .screenshot_dir
         .clone()
@@ -319,12 +413,7 @@ pub fn capture_and_save(canvas: &Canvas, cfg: &AppConfig, pixels_per_point: f32)
     let path = dir.join(format!("on-screen-notes_{now}.png"));
     bg.save(&path).with_context(|| format!("saving {path:?}"))?;
 
-    // Push the composited image to the system clipboard so the user
-    // can paste straight into Discord / Slack / Photoshop without
-    // opening the saved file. arboard wants straight-alpha RGBA, and
-    // `bg` already is — we unpremultiplied the foreground before
-    // alpha-blending into it. Failure is non-fatal; we still keep the
-    // file on disk.
+    // arboard wants straight-alpha RGBA, and `bg` already is.
     let clipboard = match arboard::Clipboard::new() {
         Ok(mut cb) => {
             let (w, h) = (bg.width(), bg.height());

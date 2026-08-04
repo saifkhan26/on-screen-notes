@@ -272,6 +272,12 @@ impl OneEuroFilter {
 /// `sigma` is in polyline-index units (one pen sample is ~8
 /// subdivided points after `build_cache_with`). σ = 3-6 typically
 /// kills tremor while preserving deliberate curvature.
+///
+/// Currently unused: the ribbon-spine builder produces a sparse,
+/// already-smooth polyline (centripetal spline + decimation), so an
+/// index-space Gaussian would round deliberate corners. Kept for
+/// optional future polish tuning.
+#[allow(dead_code)]
 pub(crate) fn gaussian_smooth_positions_bidir(pts: &mut [[f32; 2]], sigma: f32) {
     let n = pts.len();
     if n < 3 || sigma <= 0.0 { return; }
@@ -309,6 +315,10 @@ pub(crate) fn gaussian_smooth_positions_bidir(pts: &mut [[f32; 2]], sigma: f32) 
 /// position variant. Keeps the ribbon's width transitions matching
 /// the smoothed centerline so we don't get smooth geometry with
 /// jagged thickness.
+///
+/// Currently unused (see `gaussian_smooth_positions_bidir`); kept for
+/// optional future polish tuning.
+#[allow(dead_code)]
 pub(crate) fn gaussian_smooth_widths_bidir(widths: &mut [f32], sigma: f32) {
     let n = widths.len();
     if n < 3 || sigma <= 0.0 { return; }
@@ -627,131 +637,12 @@ impl Stroke {
         // budget instead of stacking another EMA on top.
         let position_passes = self.smoothing.cache_passes(position_passes);
         if self.cache.is_some() { return; }
-        // Hard ceiling: the slider + scroll handler already constrain
-        // `base_width` to ≤ 80 px, but a stroke loaded from a corrupt /
-        // older RON file could carry an arbitrary value. Clamp here so the
-        // renderer never has to paint a 10 000-px-wide quad.
-        const MAX_WIDTH: f32 = 80.0;
-        let base_width = self.base_width.clamp(0.5, MAX_WIDTH);
-        let curve = pressure_curve();
-
-        let n = self.samples.len();
-        if n == 0 {
-            self.cache = Some(StrokeCache { points: Vec::new(), widths: Vec::new() });
-            return;
-        }
-        if n == 1 {
-            // A single tap: cache contains just that one point.
-            let s = self.samples[0];
-            let w = (base_width * apply_curve(s.pressure, curve).max(0.1)).max(0.8);
-            self.cache = Some(StrokeCache { points: vec![s.pos], widths: vec![w] });
-            return;
-        }
-
-        // ---- Pre-smooth raw sample positions ----------------------
-        // We run the symmetric MA passes here, on the raw control
-        // points, *before* Catmull-Rom subdivision. Smoothing strength
-        // (effective kernel σ ≈ √passes) is then expressed in
-        // sample-space — independent of the adaptive substep count
-        // below — so a "High" smoothing level actually feels heavier
-        // than "Low", which was the bug the user reported.
-        let mut ctrl: Vec<[f32; 2]> = self.samples.iter().map(|s| s.pos).collect();
-        for _ in 0..position_passes {
-            smooth_positions_in_place(&mut ctrl);
-        }
-
-        let mut points: Vec<[f32; 2]> = Vec::with_capacity(n * 8);
-        let mut widths: Vec<f32>      = Vec::with_capacity(n * 8);
-
-        // ---- Quadratic Bezier through midpoints --------------------
-        // For each sample p_i, draw a quadratic Bezier from
-        // m(p_{i-1}, p_i) to m(p_i, p_{i+1}) using p_i as the control
-        // point. Endpoints clamp m(-1, 0) := p_0 and m(n-1, n) := p_{n-1}.
-        //
-        // Why not Catmull-Rom: the spline passes through every sample
-        // *and* overshoots at sharp curvature peaks, producing the
-        // small bumps the user sees at hand-drawn turning points. The
-        // midpoint quadratic instead anchors at midpoints (which sit
-        // inside the convex hull of consecutive samples) and curves
-        // toward the actual sample as control. No overshoot. This is
-        // the technique Windows Sticky Notes, Krita freehand, and
-        // Adobe sketch apps use.
-        //
-        // Trade-off: rendered curve does *not* exactly pass through
-        // samples — it can sit up to one inter-sample gap inside the
-        // turn. At our Wintab sample rate (≈200 Hz) this is sub-pixel
-        // for slow motion and perceptually invisible for fast motion.
-        let midpoint = |a: [f32; 2], b: [f32; 2]| -> [f32; 2] {
-            [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
-        };
-
-        for i in 0..n {
-            let p_pos = ctrl[i];
-            let p_pr  = apply_curve(self.samples[i].pressure, curve);
-            let m_start = if i == 0 { p_pos } else { midpoint(ctrl[i - 1], p_pos) };
-            let m_end   = if i + 1 == n { p_pos } else { midpoint(p_pos, ctrl[i + 1]) };
-            let pr_start = if i == 0 {
-                p_pr
-            } else {
-                0.5 * (apply_curve(self.samples[i - 1].pressure, curve) + p_pr)
-            };
-            let pr_end = if i + 1 == n {
-                p_pr
-            } else {
-                0.5 * (p_pr + apply_curve(self.samples[i + 1].pressure, curve))
-            };
-
-            // Adaptive substep count based on chord length of this
-            // curve segment. Polyline gap stays well below half a
-            // stroke width so the ribbon mesh has no visible scallop
-            // at fast pen speeds.
-            let dx = m_end[0] - m_start[0];
-            let dy = m_end[1] - m_start[1];
-            let chord = (dx * dx + dy * dy).sqrt();
-            let avg_w = base_width * 0.5 * (pr_start + pr_end).max(0.1);
-            let target_gap = (avg_w * 0.4).max(2.0);
-            let substeps = ((chord / target_gap).ceil() as usize).clamp(2, 24);
-
-            // Push step 0 only for the very first segment so adjacent
-            // segments don't duplicate their shared midpoint.
-            let start = if i == 0 { 0 } else { 1 };
-            for step in start..=substeps {
-                let t = step as f32 / substeps as f32;
-                let u = 1.0 - t;
-                let pos = [
-                    u * u * m_start[0] + 2.0 * u * t * p_pos[0] + t * t * m_end[0],
-                    u * u * m_start[1] + 2.0 * u * t * p_pos[1] + t * t * m_end[1],
-                ];
-                let pressure = u * u * pr_start + 2.0 * u * t * p_pr + t * t * pr_end;
-                let w = (base_width * pressure.clamp(0.05, 1.0)).max(0.8);
-                points.push(pos);
-                widths.push(w);
-            }
-        }
-
-        // Position passes already ran on raw samples above. Widths
-        // get a single causal pass here so a pressure rise thickens
-        // the stroke *where it happens* rather than ramping toward it.
-        smooth_widths_causal(&mut widths);
-
-        // ---- Final non-causal Gaussian polish on the dense polyline.
-        // The stroke is complete at commit time, so we run a
-        // bidirectional Gaussian over the subdivided polyline — kills
-        // residual hand-tremor wiggle that causal EMA can't reach
-        // without prohibitive lag, with zero perceptible downside
-        // because lag doesn't apply to a finished stroke.
-        //
-        // Sigma scales with the polyline's own density (more substeps
-        // per sample = wider σ needed to cover the same physical
-        // distance). Floor at σ=3 even for Low so every committed
-        // stroke gets a baseline polish — eliminates the "smooth
-        // while drawing then wiggly on pen-up" feel the user
-        // reported.
-        let base_sigma = 3.0 + position_passes as f32 * 1.5;
-        gaussian_smooth_positions_bidir(&mut points, base_sigma);
-        gaussian_smooth_widths_bidir(&mut widths, base_sigma * 0.5);
-
-        self.cache = Some(StrokeCache { points, widths });
+        // Geometry is the shared ribbon-spine builder (centripetal
+        // Catmull-Rom + adaptive arc-length / turn-angle decimation). The
+        // live-preview path (`paint_stroke_live`) calls the same
+        // `build_spine`, so an in-progress stroke matches its committed
+        // form exactly.
+        self.cache = Some(build_spine(&self.samples, self.base_width, position_passes));
     }
 
     // -- pressure curve global --------------------------------------------
@@ -810,4 +701,230 @@ pub fn set_pressure_curve(c: f32) {
 /// Apply the curve to a raw pressure reading.
 pub fn apply_curve(raw: f32, curve: f32) -> f32 {
     raw.clamp(0.0, 1.0).powf(curve)
+}
+
+// ---- Ribbon spine builder ---------------------------------------------
+//
+// Shared geometry core for both the committed cache (`build_cache_with`)
+// and the live in-progress preview (`paint_stroke_live`). Ported from the
+// "ribbon" stroke engine's input model, adapted to this app's vector
+// renderer: we emit a `StrokeCache { points, widths }` that the existing
+// mesh renderer consumes unchanged — no pixel buffer, no coverage buffer.
+//
+// The curve is a **centripetal Catmull-Rom** spline through the (already
+// smoothed) control points, evaluated densely and then greedily
+// **decimated** into spine nodes: a node is emitted when the arc length
+// since the last node passes the node spacing, OR when the curve tangent
+// has turned past ~10°. Arc-length spacing keeps node count low on straight
+// runs; the turn-angle trigger keeps tight curls faceting-free with large
+// brushes. Because the vector renderer rebuilds the whole spine every
+// frame, the raster engine's incremental one-sample-lag / overlay
+// machinery is unnecessary here.
+
+/// Emit a spine node when the tangent has turned more than this since the
+/// last node, regardless of arc length. `cos(10°)`.
+const ANGLE_COS: f32 = 0.984_807_75;
+
+/// Build the ribbon spine for a stroke: centripetal Catmull-Rom through the
+/// pre-smoothed sample positions, adaptively decimated into
+/// `StrokeCache { points, widths }`. `position_passes` is how many causal
+/// MA passes pre-smooth the control points (already mapped through the
+/// active Krita mode by the caller). Widths are `base_width` modulated by
+/// the pressure curve; Marker (constant-width) overrides them at paint time.
+pub fn build_spine(samples: &[PenSample], base_width: f32, position_passes: usize) -> StrokeCache {
+    const MAX_WIDTH: f32 = 80.0;
+    let base_width = base_width.clamp(0.5, MAX_WIDTH);
+    let curve = pressure_curve();
+
+    let n = samples.len();
+    if n == 0 {
+        return StrokeCache { points: Vec::new(), widths: Vec::new() };
+    }
+    // Width at a node: base_width scaled by (curved) pressure, floored so a
+    // near-zero-pressure sample still paints a hairline rather than nothing.
+    let width_at = |pr: f32| (base_width * pr.clamp(0.05, 1.0)).max(0.8);
+    if n == 1 {
+        let s = samples[0];
+        let w = (base_width * apply_curve(s.pressure, curve).max(0.1)).max(0.8);
+        return StrokeCache { points: vec![s.pos], widths: vec![w] };
+    }
+
+    // Pre-smooth raw control positions in sample-space (matches the old
+    // path). Index 0 is left untouched by the causal EMA, so the spine
+    // still lands its first node exactly on the pen-down point.
+    let mut ctrl: Vec<[f32; 2]> = samples.iter().map(|s| s.pos).collect();
+    for _ in 0..position_passes {
+        smooth_positions_in_place(&mut ctrl);
+    }
+    // Curved pressures, one per control point.
+    let pr: Vec<f32> = samples.iter().map(|s| apply_curve(s.pressure, curve)).collect();
+
+    let radius = base_width * 0.5;
+    // Node spacing: a fraction of the radius, never below 1px.
+    let spacing = (radius * 0.3).max(1.0);
+    // Dense-eval step size along each segment: keep sub-node samples well
+    // under the radius so arc length / turn angle are measured finely.
+    let eval_gap = (radius * 0.25).max(0.5);
+
+    let mut points: Vec<[f32; 2]> = Vec::with_capacity(n * 2);
+    let mut widths: Vec<f32> = Vec::with_capacity(n * 2);
+
+    // First node = pen-down point (instant dot, zero lag).
+    points.push(ctrl[0]);
+    widths.push(width_at(pr[0]));
+
+    let mut arc_since = 0.0_f32;
+    let mut last_dir: Option<[f32; 2]> = None;
+    let mut last_pt = ctrl[0];
+
+    // Walk each Catmull-Rom segment ctrl[i-1] -> ctrl[i], with ctrl[i-2]
+    // and ctrl[i+1] as the outer control points (clamped at the ends).
+    for i in 1..n {
+        let p0 = ctrl[i.saturating_sub(2)];
+        let p1 = ctrl[i - 1];
+        let p2 = ctrl[i];
+        let p3 = ctrl[(i + 1).min(n - 1)];
+        let pr1 = pr[i - 1];
+        let pr2 = pr[i];
+
+        let dx = p2[0] - p1[0];
+        let dy = p2[1] - p1[1];
+        let chord = (dx * dx + dy * dy).sqrt();
+        if chord <= 0.0 {
+            continue;
+        }
+        let steps = ((chord / eval_gap).ceil() as usize).max(2);
+
+        for step in 1..=steps {
+            let t = step as f32 / steps as f32;
+            let pos = catmull_rom(p0, p1, p2, p3, t);
+            // Pressure varies linearly across the segment (already
+            // low-frequency after smoothing / curve).
+            let pressure = pr1 + (pr2 - pr1) * t;
+
+            let ex = pos[0] - last_pt[0];
+            let ey = pos[1] - last_pt[1];
+            let ds = (ex * ex + ey * ey).sqrt();
+            if ds <= 1e-6 {
+                continue;
+            }
+            arc_since += ds;
+            let dir = [ex / ds, ey / ds];
+            let turned = match last_dir {
+                Some(l) => l[0] * dir[0] + l[1] * dir[1] < ANGLE_COS,
+                None => false,
+            };
+            if arc_since >= spacing || turned {
+                points.push(pos);
+                widths.push(width_at(pressure));
+                arc_since = 0.0;
+                last_dir = Some(dir);
+            }
+            last_pt = pos;
+        }
+    }
+
+    // Pin the exact end point so the stroke lands where the pen lifted,
+    // even if the last decimated node fell short of it.
+    let end = ctrl[n - 1];
+    let need_end = points
+        .last()
+        .map(|p| (p[0] - end[0]).abs() > 0.01 || (p[1] - end[1]).abs() > 0.01)
+        .unwrap_or(true);
+    if need_end {
+        points.push(end);
+        widths.push(width_at(pr[n - 1]));
+    }
+
+    // Causal width smoothing only — positions are already smooth by
+    // construction (centripetal spline + pre-smoothed controls), so no
+    // extra Gaussian pass is applied to the sparse spine (it would round
+    // deliberate corners across the few decimated nodes).
+    smooth_widths_causal(&mut widths);
+
+    StrokeCache { points, widths }
+}
+
+#[cfg(test)]
+mod spine_tests {
+    use super::*;
+
+    fn sample(x: f32, y: f32, p: f32) -> PenSample {
+        PenSample { pos: [x, y], pressure: p, tilt: [0.0, 0.0] }
+    }
+
+    #[test]
+    fn empty_and_single_sample() {
+        let c = build_spine(&[], 6.0, 3);
+        assert!(c.points.is_empty() && c.widths.is_empty());
+
+        let c = build_spine(&[sample(10.0, 10.0, 1.0)], 6.0, 3);
+        assert_eq!(c.points.len(), 1);
+        assert_eq!(c.points[0], [10.0, 10.0]);
+        assert!(c.widths[0] > 0.0);
+    }
+
+    #[test]
+    fn straight_line_spacing_and_endpoints() {
+        // Straight horizontal drag: nodes should be spaced ~max(radius*0.3,1)
+        // apart, monotone in x, and land on the endpoints.
+        let samples: Vec<PenSample> = (0..=20).map(|i| sample(i as f32 * 5.0, 0.0, 1.0)).collect();
+        let base_width = 6.0;
+        let c = build_spine(&samples, base_width, 0);
+        assert!(c.points.len() >= 2);
+        // First and last cache points land on the drag ends.
+        assert!((c.points[0][0] - 0.0).abs() < 0.5);
+        assert!((c.points.last().unwrap()[0] - 100.0).abs() < 0.5);
+        // Monotone non-decreasing x (a straight rightward drag never backs up).
+        for w in c.points.windows(2) {
+            assert!(w[1][0] >= w[0][0] - 0.01, "x went backwards: {:?}", w);
+        }
+        // Interior spacing is bounded below by the node spacing (minus slack
+        // for the dense-eval granularity).
+        let spacing = (base_width * 0.5 * 0.3).max(1.0);
+        let mut gaps = 0;
+        for w in c.points.windows(2) {
+            let d = ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt();
+            if d > 0.01 {
+                assert!(d <= spacing + base_width, "gap too large: {d}");
+                gaps += 1;
+            }
+        }
+        assert!(gaps > 0);
+    }
+
+    #[test]
+    fn deterministic() {
+        let samples: Vec<PenSample> =
+            (0..30).map(|i| sample(i as f32 * 3.0, (i as f32 * 0.5).sin() * 20.0, 1.0)).collect();
+        let a = build_spine(&samples, 8.0, 3);
+        let b = build_spine(&samples, 8.0, 3);
+        assert_eq!(a.points, b.points);
+        assert_eq!(a.widths, b.widths);
+    }
+
+    #[test]
+    fn sharp_corner_emits_extra_node() {
+        // An L-shape with a hard 90° turn must place a node near the corner
+        // (turn-angle trigger), so a straight-line-only decimation can't skip
+        // it. Compare node count against a straight line of the same length.
+        let mut corner = Vec::new();
+        for i in 0..=10 {
+            corner.push(sample(i as f32 * 10.0, 0.0, 1.0));
+        }
+        for i in 1..=10 {
+            corner.push(sample(100.0, i as f32 * 10.0, 1.0));
+        }
+        let straight: Vec<PenSample> = (0..=20).map(|i| sample(i as f32 * 10.0, 0.0, 1.0)).collect();
+        let c = build_spine(&corner, 6.0, 0);
+        let s = build_spine(&straight, 6.0, 0);
+        // The corner path bends 90°, so it needs more nodes than a straight
+        // path of equal arc length.
+        assert!(
+            c.points.len() > s.points.len(),
+            "corner {} should exceed straight {}",
+            c.points.len(),
+            s.points.len()
+        );
+    }
 }

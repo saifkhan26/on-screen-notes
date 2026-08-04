@@ -142,6 +142,12 @@ pub struct OnScreenNotesApp {
     /// recorded polygon are kept (cropped to the selection bbox).
     pending_lasso: Option<PendingLasso>,
 
+    /// Active screenshot region selection. `Some` while the user drags out
+    /// the capture rectangle after pressing the screenshot hotkey; on
+    /// release it becomes a region `pending_screenshot`. Suppresses drawing
+    /// dispatch while set.
+    region_select: Option<RegionSelect>,
+
     /// HWND of the window OSN is currently pinned to follow, stored
     /// as the platform-native integer. `None` = no pin. On Windows,
     /// each frame we read `GetWindowRect(hwnd)` and re-issue
@@ -169,15 +175,34 @@ pub struct OnScreenNotesApp {
 struct PendingShot {
     ui_visible_before: bool,
     bg_opacity_before: f32,
-    /// Frames remaining before we trigger `capture_and_save`. We
-    /// need to wait at least one frame so the OS compositor has
-    /// time to repaint after the chrome was hidden, otherwise xcap
-    /// still picks up the toolbar.
+    /// Frames remaining before we trigger the capture. We need to wait at
+    /// least one frame so the OS compositor has time to repaint after the
+    /// chrome was hidden, otherwise xcap still picks up the toolbar.
     frames_to_wait: u32,
     /// DPI scale captured at the moment the hotkey fired so a
     /// later DPI change between request and capture doesn't break
     /// alignment.
     pixels_per_point: f32,
+    /// Overlay tint at request time. For a region shot we re-composite this
+    /// (`bg_color` at `bg_opacity_before`) in software, since the capture
+    /// dropped the real window opacity to 0 for a clean grab.
+    bg_color: [u8; 3],
+    /// `Some([min_x, min_y, max_x, max_y])` in egui points → capture only
+    /// that region (respecting the tint above). `None` → full-screen shot.
+    region_rect: Option<[f32; 4]>,
+}
+
+/// In-flight screenshot region selection: the user is dragging out the
+/// capture rectangle (in egui screen points) after pressing the screenshot
+/// hotkey. Drawing dispatch is suppressed while this is `Some`.
+#[derive(Clone, Copy)]
+struct RegionSelect {
+    /// Drag anchor; `None` until the primary button first goes down.
+    start: Option<egui::Pos2>,
+    /// Latest pointer position (the moving corner while dragging).
+    current: egui::Pos2,
+    /// `ui_visible` at selection start, restored if the user cancels.
+    ui_visible_before: bool,
 }
 
 /// State held while a lasso-select capture is in flight. Carries the
@@ -333,6 +358,7 @@ impl OnScreenNotesApp {
             toast: None,
             pending_screenshot: None,
             pending_lasso: None,
+            region_select: None,
             loupe: None,
             pending_freeze: None,
             pinned_hwnd: None,
@@ -343,15 +369,26 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// Take a screenshot if the user pressed the screenshot hotkey or
-    /// menu button. Logs success/failure but never panics.
-    ///
-    /// `pixels_per_point` is forwarded so the canvas rasteriser scales
-    /// stroke coordinates from egui logical pixels into the physical
-    /// pixel space of the xcap-captured background.
-    fn maybe_screenshot(&mut self, pixels_per_point: f32) {
-        match crate::screenshot::capture_and_save(self.canvases.active(), &self.config, pixels_per_point) {
-            Ok(r)  => {
+    /// Run the deferred screenshot once its frame countdown elapses. A
+    /// `region_rect` captures only the user-selected rectangle (compositing
+    /// the overlay tint back in); otherwise the whole primary monitor is
+    /// grabbed. Logs success/failure but never panics.
+    fn do_screenshot(&mut self, ps: &PendingShot) {
+        let res = if let Some(rect) = ps.region_rect {
+            crate::screenshot::capture_region_and_save(
+                self.canvases.active(),
+                &self.config,
+                ps.pixels_per_point,
+                self.osn_hwnd,
+                rect,
+                ps.bg_color,
+                ps.bg_opacity_before,
+            )
+        } else {
+            crate::screenshot::capture_and_save(self.canvases.active(), &self.config, ps.pixels_per_point)
+        };
+        match res {
+            Ok(r) => {
                 log::info!("screenshot saved to {:?} (clipboard={})", r.path, r.clipboard);
                 let msg = if r.clipboard {
                     format!("Screenshot saved: {} · clipboard ✓", r.path.display())
@@ -364,24 +401,140 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// Enqueue a deferred screenshot. Hides the floating UI + drops
-    /// the background tint so xcap's monitor capture (which happens
-    /// two frames from now) does not pick up the OSN toolbar or its
-    /// dimming overlay. The prior state is captured here and
-    /// restored after the capture lands.
-    fn queue_screenshot(&mut self, pixels_per_point: f32) {
-        if self.pending_screenshot.is_some() { return; }
-        self.pending_screenshot = Some(PendingShot {
+    /// Begin an interactive screenshot region selection. Hides the floating
+    /// UI so it stays out of the way (and out of the capture); the actual
+    /// grab is deferred until the user drags out a rectangle, handled in
+    /// `update_region_select`. The background tint is left alone so the user
+    /// aims over a still-visible desktop — it is dropped only at the moment
+    /// the region is confirmed, then re-composited into the saved image.
+    fn begin_region_select(&mut self) {
+        if self.region_select.is_some() || self.pending_screenshot.is_some() {
+            return;
+        }
+        self.region_select = Some(RegionSelect {
+            start: None,
+            current: egui::Pos2::ZERO,
             ui_visible_before: self.ui_visible,
-            bg_opacity_before: self.config.bg_opacity,
-            // Two frames: one to clear chrome, one for the OS to
-            // composite the cleared frame. Empirically one is
-            // sometimes enough but two is reliable on Win11.
-            frames_to_wait: 2,
-            pixels_per_point,
         });
         self.ui_visible = false;
-        self.config.bg_opacity = 0.0;
+    }
+
+    /// Handle the interactive region-selection overlay for one frame: read
+    /// the drag, draw the dimmed rubber-band, and on release turn the
+    /// selection into a region `pending_screenshot` (or cancel). No-op when
+    /// no selection is active.
+    fn update_region_select(&mut self, ctx: &egui::Context) {
+        let Some(mut rs) = self.region_select else { return };
+
+        let (pressed, released, esc, pos) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_released(),
+                i.key_pressed(egui::Key::Escape),
+                i.pointer.latest_pos().or(i.pointer.interact_pos()),
+            )
+        });
+
+        // Esc cancels: restore the chrome, leave the tint untouched.
+        if esc {
+            self.ui_visible = rs.ui_visible_before;
+            self.region_select = None;
+            return;
+        }
+
+        if let Some(p) = pos {
+            rs.current = p;
+            if pressed {
+                rs.start = Some(p);
+            }
+        }
+
+        if released {
+            if let Some(start) = rs.start {
+                let sel = egui::Rect::from_two_pos(start, rs.current);
+                let ppp = ctx.pixels_per_point().max(0.01);
+                // Reject a too-small drag (a stray click) — treat as cancel.
+                if sel.width() * ppp >= 4.0 && sel.height() * ppp >= 4.0 {
+                    self.pending_screenshot = Some(PendingShot {
+                        ui_visible_before: rs.ui_visible_before,
+                        bg_opacity_before: self.config.bg_opacity,
+                        frames_to_wait: 2,
+                        pixels_per_point: ppp,
+                        bg_color: self.config.bg_color,
+                        region_rect: Some([sel.min.x, sel.min.y, sel.max.x, sel.max.y]),
+                    });
+                    // Drop the live tint so xcap grabs a clean desktop; the
+                    // capture re-applies `bg_color` at the stored opacity.
+                    self.config.bg_opacity = 0.0;
+                } else {
+                    self.ui_visible = rs.ui_visible_before;
+                }
+                self.region_select = None;
+                return;
+            }
+        }
+
+        // Still selecting — persist state and draw the overlay on top.
+        self.region_select = Some(rs);
+        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("osn_region_select"),
+        ));
+        let screen = ctx.screen_rect();
+        let dim = egui::Color32::from_black_alpha(110);
+        if let Some(start) = rs.start {
+            let sel = egui::Rect::from_two_pos(start, rs.current);
+            // Four dim bands around the selection (the selection stays clear).
+            painter.rect_filled(
+                egui::Rect::from_min_max(screen.left_top(), egui::pos2(screen.right(), sel.top())),
+                0.0,
+                dim,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(screen.left(), sel.bottom()), screen.right_bottom()),
+                0.0,
+                dim,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(screen.left(), sel.top()), egui::pos2(sel.left(), sel.bottom())),
+                0.0,
+                dim,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(sel.right(), sel.top()), egui::pos2(screen.right(), sel.bottom())),
+                0.0,
+                dim,
+            );
+            // Animated dashed border (reuses the marching-ants walker).
+            let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+            let pts = [sel.left_top(), sel.right_top(), sel.right_bottom(), sel.left_bottom(), sel.left_top()];
+            crate::canvas::render::paint_dashed_polyline(&painter, &pts, stroke, 1.0);
+            // Dimension label in physical pixels (what the PNG will be).
+            let ppp = ctx.pixels_per_point().max(0.01);
+            let wpx = (sel.width() * ppp).round() as i32;
+            let hpx = (sel.height() * ppp).round() as i32;
+            let label_pos = egui::pos2(sel.left(), (sel.top() - 6.0).max(screen.top() + 2.0));
+            painter.text(
+                label_pos,
+                egui::Align2::LEFT_BOTTOM,
+                format!("{wpx} × {hpx}"),
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
+        } else {
+            // Before the first drag: dim everything + a hint.
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(70));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drag to select a screenshot region  ·  Esc to cancel",
+                egui::FontId::proportional(18.0),
+                egui::Color32::WHITE,
+            );
+        }
+        // Keep the frame live for the dashed animation + drag tracking.
+        ctx.request_repaint();
     }
 
     /// Enqueue a deferred freeze-frame. Same UI-hide dance as a
@@ -395,6 +548,8 @@ impl OnScreenNotesApp {
             bg_opacity_before: self.config.bg_opacity,
             frames_to_wait: 2,
             pixels_per_point,
+            bg_color: self.config.bg_color,
+            region_rect: None,
         });
         self.ui_visible = false;
         self.config.bg_opacity = 0.0;
@@ -541,13 +696,12 @@ impl eframe::App for OnScreenNotesApp {
 
         // 2) Global hotkey events.
         if let Some(h) = self.hotkeys.as_ref() {
-            // Capture DPI scale once per frame so multiple screenshots
-            // fired in the same frame don't re-read the value.
-            let ppp = ctx.pixels_per_point();
             for ev in h.poll() {
                 match ev {
                     HotkeyId::ToggleOverlay => self.overlay_visible = !self.overlay_visible,
-                    HotkeyId::Screenshot   => self.queue_screenshot(ppp),
+                    // Screenshot: enter interactive region-select; the grab
+                    // is deferred until the user drags out a rectangle.
+                    HotkeyId::Screenshot   => self.begin_region_select(),
                     HotkeyId::ToggleRecord => self.toggle_record(),
                     HotkeyId::TogglePauseRecord => self.recorder.toggle_pause(),
                 }
@@ -562,18 +716,19 @@ impl eframe::App for OnScreenNotesApp {
             if ps.frames_to_wait > 0 {
                 ps.frames_to_wait -= 1;
                 ctx.request_repaint();
-                None
+                false
             } else {
-                Some((ps.pixels_per_point, ps.ui_visible_before, ps.bg_opacity_before))
+                true
             }
         } else {
-            None
+            false
         };
-        if let Some((ppp, ui_prev, bg_prev)) = do_capture {
-            self.maybe_screenshot(ppp);
-            self.ui_visible = ui_prev;
-            self.config.bg_opacity = bg_prev;
-            self.pending_screenshot = None;
+        if do_capture {
+            if let Some(ps) = self.pending_screenshot.take() {
+                self.do_screenshot(&ps);
+                self.ui_visible = ps.ui_visible_before;
+                self.config.bg_opacity = ps.bg_opacity_before;
+            }
         }
 
         // Same state machine for the freeze-frame-to-layer action.
@@ -876,6 +1031,13 @@ impl eframe::App for OnScreenNotesApp {
                 self.loupe.as_ref(),
             );
 
+            // ---- Screenshot region selection --------------------------------
+            // Draws the dimmed rubber-band over the canvas and, on release,
+            // turns the drag into a deferred region capture. While active it
+            // suppresses the pen/mouse drawing dispatch below (guarded on
+            // `region_select.is_none()`).
+            self.update_region_select(ctx);
+
             // ---- Space-hold pan: consume drags before drawing -----------
             // While Space is held, the cursor turns into a grab hand and any
             // primary-button drag (pen OR mouse) pans the canvas. Drawing
@@ -994,7 +1156,7 @@ impl eframe::App for OnScreenNotesApp {
             // and stay blocked until the next Up so the gesture cannot
             // accidentally start a stroke half-way through tapping a
             // menu item.
-            if !space_held && self.loupe.is_none() {
+            if !space_held && self.loupe.is_none() && self.region_select.is_none() {
                 // Mirror the current tool's size onto the eraser
                 // override so the temporary erase uses the same brush
                 // size as the active pen — feels natural while letting
@@ -1115,7 +1277,9 @@ impl eframe::App for OnScreenNotesApp {
             }
 
             // ---- Mouse fallback (only when tablet absent) ----------------
-            if !space_held && !self.pen.is_active() && !click_through_now && !toolbar_clicked {
+            if !space_held && !self.pen.is_active() && !click_through_now && !toolbar_clicked
+                && self.region_select.is_none()
+            {
                 // Shift + click = colour pick. Resolve here so the
                 // sampling click does not also start a fallback stroke.
                 let (shift_held, primary_now) = ctx.input(|i| {
