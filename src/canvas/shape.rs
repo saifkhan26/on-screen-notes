@@ -141,4 +141,39 @@ impl Shape {
             Shape::Raster { pos, .. } => shift(pos),
         }
     }
+
+    /// Apply the similarity transform `p → a * p + b` in canvas-local
+    /// pixels. Unlike `translate`, everything with a length scales:
+    /// stroke widths, font sizes, and the raster sticker's canvas-local
+    /// extent — so a scaled shape keeps its proportions instead of
+    /// growing a relatively heavier outline as it shrinks.
+    ///
+    /// `Raster::px_size` is left alone: it describes the PNG payload,
+    /// not the canvas footprint, and the renderer stretches the decoded
+    /// bytes into `size`.
+    pub fn transform(&mut self, a: f32, b: [f32; 2]) {
+        let map = |p: &mut [f32; 2]| {
+            p[0] = a * p[0] + b[0];
+            p[1] = a * p[1] + b[1];
+        };
+        match self {
+            Shape::Rect    { a: p, b: q, stroke_width, .. }
+            | Shape::Ellipse { a: p, b: q, stroke_width, .. }
+            | Shape::Line    { a: p, b: q, stroke_width, .. }
+            | Shape::Arrow   { a: p, b: q, stroke_width, .. } => {
+                map(p);
+                map(q);
+                *stroke_width *= a;
+            }
+            Shape::Text { pos, font_size, .. } => {
+                map(pos);
+                *font_size *= a;
+            }
+            Shape::Raster { pos, size, .. } => {
+                map(pos);
+                size[0] *= a;
+                size[1] *= a;
+            }
+        }
+    }
 }

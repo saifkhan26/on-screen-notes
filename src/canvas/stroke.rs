@@ -574,6 +574,33 @@ impl Stroke {
         }
     }
 
+    /// Apply the similarity transform `p → a * p + b` to every sample,
+    /// in canvas-local pixels.
+    ///
+    /// Widths scale with `a` as well — a stroke shrunk to half size has
+    /// to get half as thick, or the layer would visibly fatten as it
+    /// scales down. `base_width` is the source of truth (cache rebuilds
+    /// derive widths from it), and the cache's own points / widths are
+    /// scaled in place for the same reason `translate` shifts them:
+    /// doing so is exactly equivalent to rebuilding, minus the
+    /// Catmull-Rom pass.
+    pub fn transform(&mut self, a: f32, b: [f32; 2]) {
+        for s in &mut self.samples {
+            s.pos[0] = a * s.pos[0] + b[0];
+            s.pos[1] = a * s.pos[1] + b[1];
+        }
+        self.base_width *= a;
+        if let Some(c) = self.cache.as_mut() {
+            for p in &mut c.points {
+                p[0] = a * p[0] + b[0];
+                p[1] = a * p[1] + b[1];
+            }
+            for w in &mut c.widths {
+                *w *= a;
+            }
+        }
+    }
+
     /// Krita NO_SMOOTHING: raw sample, only the tiny duplicate gate so
     /// idle digitiser ticks don't bloat the polyline.
     fn push_raw(&mut self, sample: PenSample) {

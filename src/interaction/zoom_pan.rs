@@ -6,6 +6,11 @@
 //!   * Pen-style tool     → adjust pen size.
 //!   * Any other tool     → zoom the canvas around the cursor.
 //!
+//! `Shift + Space + wheel` (zoom the active *layer*) never reaches this
+//! function — the app intercepts it while Space is held, because the
+//! gesture accumulates in app-side state until the user lets go of
+//! Space rather than mutating the canvas per notch.
+//!
 //! All branches are driven by a **notch count** (signed integer: +1 per
 //! wheel-up notch, -1 per wheel-down). The caller is responsible for
 //! collapsing the platform-specific raw delta into this notch count so

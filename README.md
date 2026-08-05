@@ -29,7 +29,8 @@ input.
 - **Lasso erase** — draw a closed loop, ink inside gets removed (with undo)
 - **Text labels** — click to place, type, Enter to commit
 - **Multiple canvases**, persistent on disk via RON
-- **Multiple layers per canvas** (independent visibility + opacity)
+- **Multiple layers per canvas** (independent visibility + opacity, and
+  each layer can be panned / zoomed on its own with `Shift+Space`)
 - **Click-through** while holding `Alt`
 - **Global hotkey screenshot** — saved PNG contains background + ink
 - **Screen recording** — GIF (built-in) or MP4 (if ffmpeg on PATH)
@@ -205,10 +206,12 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Previous / next layer | `↓` / `↑` |
 | Reset pan + zoom | `Ctrl+0` |
 | Reset active layer position | `Ctrl+Shift+0` |
+| Reset active layer zoom | `Ctrl+Shift+9` |
 | Freeze frame → layer | `Ctrl+Shift+F` |
 | Click-through (passthrough) | hold `Alt` |
 | Pan canvas | hold `Space` + drag |
 | Pan active layer | hold `Shift+Space` + drag |
+| Zoom active layer | hold `Shift+Space` + scroll |
 | Active layer opacity — absolute | `1`=10 % … `9`=90 %, `0`=0 % |
 | Active layer opacity — step | `-` −10 %, `=` +10 % |
 | Layer preview popup (active layer) | `Q` (toggle) |
@@ -273,6 +276,7 @@ clear_layer   = "ctrl+delete"
 delete_canvas = "ctrl+shift+backspace"
 reset_view    = "ctrl+0"
 reset_layer_pos = "ctrl+shift+0"
+reset_layer_zoom = "ctrl+shift+9"
 freeze_frame  = "ctrl+shift+f"
 prev_canvas   = "arrowleft"
 next_canvas   = "arrowright"
@@ -297,7 +301,8 @@ preview_layer = "q"
 ```
 
 Modifier-key gestures stay hard-coded (they are not shortcuts):
-`Ctrl` (eraser), `Alt` (passthrough), `Space` (pan).
+`Ctrl` (eraser), `Alt` (passthrough), `Space` (pan), `Shift+Space`
+(pan / zoom the active layer instead of the view).
 
 ---
 
@@ -309,6 +314,7 @@ Modifier-key gestures stay hard-coded (they are not shortcuts):
 | Spotlight active | scroll | Resize spotlight square |
 | Any other tool | scroll | Canvas zoom |
 | Any tool | `Shift` + scroll | Active layer opacity |
+| Any tool | `Shift+Space` + scroll | Active layer zoom (about the cursor) |
 
 Right-click a palette swatch to recolour it. Mouse fallback works for
 every tool when no tablet driver is present.

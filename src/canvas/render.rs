@@ -108,12 +108,14 @@ pub fn paint_canvas_egui(
     // instead — letting callers re-render the canvas magnified
     // into a clipped region (e.g. the live loupe overlay).
     transform_override: Option<([f32; 2], f32)>,
-    // In-progress Shift+Space layer pan: `(layer index, canvas-local
-    // delta)`. The named layer paints shifted by the delta so the user
-    // sees the move live; nothing is written back to the canvas until
-    // the gesture ends, at which point `Canvas::move_layer_by` bakes the
-    // same delta into the layer's geometry. `None` outside a drag.
-    layer_drag: Option<(usize, [f32; 2])>,
+    // In-progress Shift+Space layer gesture: `(layer index, scale,
+    // canvas-local offset)`, i.e. the similarity `p → a · p + b` the
+    // named layer previews under. A drag only fills `b`; the wheel adds
+    // scale about the cursor. Nothing is written back to the canvas
+    // until the gesture ends, at which point `Canvas::transform_layer`
+    // bakes the same similarity into the layer's geometry. `None`
+    // outside a gesture.
+    layer_xform: Option<(usize, f32, [f32; 2])>,
 ) {
     // Pre-compute the pan-zoom transform as a closure so we don't
     // recompute the same maths inside every loop.
@@ -136,17 +138,26 @@ pub fn paint_canvas_egui(
         let op = layer.opacity.clamp(0.0, 1.0);
         if op <= 0.0 { continue; }
         // Shadow the canvas-wide `to_screen` with one that folds in this
-        // layer's in-progress pan offset (zero for every layer but the
-        // one being dragged). Everything the layer owns — raster plate,
-        // shapes, strokes — goes through it, so the layer moves as a
-        // rigid unit.
-        let off = match layer_drag {
-            Some((di, d)) if di == li => d,
-            _ => [0.0, 0.0],
+        // layer's in-progress gesture transform (identity for every
+        // layer but the one being dragged / zoomed). Everything the
+        // layer owns — raster plate, shapes, strokes — goes through it,
+        // so the layer moves and scales as a rigid unit.
+        let (lscale, off) = match layer_xform {
+            Some((di, a, b)) if di == li => (a, b),
+            _ => (1.0, [0.0, 0.0]),
         };
         let to_screen = |p: [f32; 2]| {
-            egui::pos2(pan_x + (p[0] + off[0]) * zoom, pan_y + (p[1] + off[1]) * zoom)
+            egui::pos2(
+                pan_x + (lscale * p[0] + off[0]) * zoom,
+                pan_y + (lscale * p[1] + off[1]) * zoom,
+            )
         };
+        // Widths, font sizes and dash patterns are scaled by the `zoom`
+        // the paint helpers receive rather than by `to_screen`, so the
+        // previewed layer needs its gesture scale folded in here too —
+        // otherwise a layer shrinking under the wheel would keep
+        // full-thickness ink until the gesture committed.
+        let zoom = zoom * lscale;
         // Raster image (frozen frame) goes UNDER the layer's strokes
         // and shapes — it is the "background plate" the user is
         // annotating over.
@@ -1144,53 +1155,8 @@ pub fn render_layer_thumbnail(
     out_w: u32,
     out_h: u32,
 ) -> Option<image::RgbaImage> {
-    // 1) Find canvas-local bounds of every renderable.
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    let mut update = |bb: [f32; 4]| {
-        if bb[0] < min_x { min_x = bb[0]; }
-        if bb[1] < min_y { min_y = bb[1]; }
-        if bb[2] > max_x { max_x = bb[2]; }
-        if bb[3] > max_y { max_y = bb[3]; }
-    };
-    if let Some(img) = layer.image.as_ref() {
-        let (w, h) = if img.logical_size[0] > 0.0 && img.logical_size[1] > 0.0 {
-            (img.logical_size[0], img.logical_size[1])
-        } else {
-            (img.size[0] as f32, img.size[1] as f32)
-        };
-        update([img.canvas_origin[0], img.canvas_origin[1],
-                img.canvas_origin[0] + w, img.canvas_origin[1] + h]);
-    }
-    for s in &layer.strokes {
-        if let Some(bb) = s.bounds() { update(bb); }
-    }
-    for shape in &layer.shapes {
-        let bb = match shape {
-            Shape::Rect    { a, b, stroke_width, .. }
-            | Shape::Ellipse { a, b, stroke_width, .. }
-            | Shape::Line    { a, b, stroke_width, .. }
-            | Shape::Arrow   { a, b, stroke_width, .. } => {
-                let pad = *stroke_width;
-                [a[0].min(b[0]) - pad, a[1].min(b[1]) - pad,
-                 a[0].max(b[0]) + pad, a[1].max(b[1]) + pad]
-            }
-            Shape::Text { pos, content, font_size, .. } => {
-                let lines: Vec<&str> = content.split('\n').collect();
-                let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
-                let w = (font_size * 0.6 * max_chars).max(*font_size);
-                let h = (font_size * 1.25 * lines.len() as f32).max(*font_size);
-                [pos[0], pos[1], pos[0] + w, pos[1] + h]
-            }
-            Shape::Raster { pos, size, .. } => {
-                [pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]]
-            }
-        };
-        update(bb);
-    }
-    if !min_x.is_finite() { return None; }
+    // 1) Canvas-local bounds of every renderable on the layer.
+    let [min_x, min_y, max_x, max_y] = layer.content_bounds()?;
     let bw = (max_x - min_x).max(1.0);
     let bh = (max_y - min_y).max(1.0);
 

@@ -271,6 +271,14 @@ pub struct CanvasSection {
     /// a strict superset of `reset_view`'s modifiers (it is checked
     /// first) or `reset_view` swallows it — see the dispatch site.
     #[serde(default = "d_reset_layer_pos")] pub reset_layer_pos: String,
+    /// Undoes every per-layer zoom applied to the active layer, in
+    /// place (the layer keeps its centre). Same modifier-superset rule
+    /// as `reset_layer_pos` — it is checked before `reset_view`.
+    ///
+    /// The default deliberately avoids `Alt`: holding Alt is the
+    /// click-through gesture, and on AltGr layouts `Ctrl+Alt+<digit>`
+    /// types a character instead of reaching us.
+    #[serde(default = "d_reset_layer_zoom")] pub reset_layer_zoom: String,
     #[serde(default = "d_freeze_frame")]  pub freeze_frame: String,
     #[serde(default = "d_prev_canvas")]   pub prev_canvas: String,
     #[serde(default = "d_next_canvas")]   pub next_canvas: String,
@@ -308,6 +316,7 @@ impl Default for CanvasSection {
             undo: d_undo(), redo: d_redo(),
             clear_layer: d_clear_layer(), delete_canvas: d_delete_canvas(),
             reset_view: d_reset_view(), reset_layer_pos: d_reset_layer_pos(),
+            reset_layer_zoom: d_reset_layer_zoom(),
             freeze_frame: d_freeze_frame(),
             prev_canvas: d_prev_canvas(), next_canvas: d_next_canvas(),
             prev_layer: d_prev_layer(), next_layer: d_next_layer(),
@@ -330,6 +339,7 @@ fn d_clear_layer()   -> String { "ctrl+delete".into() }
 fn d_delete_canvas() -> String { "ctrl+shift+backspace".into() }
 fn d_reset_view()    -> String { "ctrl+0".into() }
 fn d_reset_layer_pos() -> String { "ctrl+shift+0".into() }
+fn d_reset_layer_zoom() -> String { "ctrl+shift+9".into() }
 fn d_freeze_frame()  -> String { "ctrl+shift+f".into() }
 fn d_prev_canvas()   -> String { "arrowleft".into() }
 fn d_next_canvas()   -> String { "arrowright".into() }
@@ -389,6 +399,7 @@ pub struct CanvasBindings {
     pub delete_canvas: Option<Binding>,
     pub reset_view: Option<Binding>,
     pub reset_layer_pos: Option<Binding>,
+    pub reset_layer_zoom: Option<Binding>,
     pub freeze_frame: Option<Binding>,
     pub prev_canvas: Option<Binding>,
     pub next_canvas: Option<Binding>,
@@ -447,6 +458,7 @@ impl HotkeysConfig {
                 delete_canvas: p("canvas.delete_canvas", &self.canvas.delete_canvas),
                 reset_view:    p("canvas.reset_view",    &self.canvas.reset_view),
                 reset_layer_pos: p("canvas.reset_layer_pos", &self.canvas.reset_layer_pos),
+                reset_layer_zoom: p("canvas.reset_layer_zoom", &self.canvas.reset_layer_zoom),
                 freeze_frame:  p("canvas.freeze_frame",  &self.canvas.freeze_frame),
                 prev_canvas:   p("canvas.prev_canvas",   &self.canvas.prev_canvas),
                 next_canvas:   p("canvas.next_canvas",   &self.canvas.next_canvas),

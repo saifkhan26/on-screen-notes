@@ -57,17 +57,18 @@ pub struct OnScreenNotesApp {
     /// and apply it to `canvas.pan`, then move the anchor forward.
     pan_drag_anchor: Option<egui::Pos2>,
 
-    /// Active **Shift**+Space layer pan: `(layer index, accumulated
-    /// canvas-local delta)`. `None` means the current Space drag pans the
-    /// whole canvas instead.
+    /// Active **Shift**+Space layer gesture — a drag pans the layer, the
+    /// wheel zooms it, and both accumulate into one similarity
+    /// transform. `None` means the current Space drag pans the whole
+    /// canvas and the wheel zooms the whole canvas instead.
     ///
     /// The layer index is latched when the gesture starts, so switching
-    /// the active layer — or letting go of Shift — mid-drag cannot
-    /// redirect the move to a different layer. The delta accumulates in
-    /// canvas-local units (screen delta ÷ zoom) and is baked into the
-    /// layer's geometry by `Canvas::move_layer_by` when the drag ends;
-    /// until then it only shifts that layer at paint time.
-    layer_drag: Option<LayerDrag>,
+    /// the active layer — or letting go of Shift — mid-gesture cannot
+    /// redirect it to a different layer. The transform accumulates in
+    /// canvas-local units and is baked into the layer's geometry by
+    /// `Canvas::transform_layer` when the gesture ends; until then it
+    /// only moves / scales that layer at paint time.
+    layer_xform: Option<LayerXform>,
 
     /// One Euro Filter state for incoming pen samples. Reset on every
     /// pen-down so a new stroke does not inherit the previous stroke's
@@ -232,20 +233,58 @@ struct PendingLasso {
     polygon: Vec<[f32; 2]>,
 }
 
-/// An in-flight Shift+Space layer pan.
+/// An in-flight Shift+Space layer pan / zoom.
 ///
-/// `canvas` and `layer` are latched when the gesture starts so the move
-/// lands where the user aimed it even if they switch sheets or layers
-/// before letting go. `delta` is canvas-local, and stays a preview-only
-/// offset until the gesture ends — see `Canvas::move_layer_by` for why
-/// the translation is baked into the geometry rather than kept as a
+/// `canvas` and `layer` are latched when the gesture starts so the
+/// transform lands where the user aimed it even if they switch sheets
+/// or layers before letting go. `scale` and `offset` are the `a` and
+/// `b` of the canvas-local similarity `p → a · p + b`, and stay
+/// preview-only until the gesture ends — see `Canvas::transform_layer`
+/// for why the result is baked into the geometry rather than kept as a
 /// per-layer transform.
+///
+/// Keeping one similarity (rather than a delta plus a separate scale +
+/// pivot) is what lets a single gesture mix dragging and wheeling: each
+/// new step composes onto the pair, and the pivot of every wheel notch
+/// is remembered implicitly inside `offset`.
 #[derive(Clone, Copy)]
-struct LayerDrag {
+struct LayerXform {
     canvas: usize,
     layer: usize,
-    delta: [f32; 2],
+    scale: f32,
+    offset: [f32; 2],
 }
+
+impl LayerXform {
+    fn new(canvas: usize, layer: usize) -> Self {
+        Self { canvas, layer, scale: 1.0, offset: [0.0, 0.0] }
+    }
+
+    /// Slide the layer by `d` canvas-local pixels. Translation applies
+    /// *after* the accumulated scale, so it lands on `offset` alone and
+    /// the layer tracks the cursor 1:1 however far it has been zoomed.
+    fn pan(&mut self, d: [f32; 2]) {
+        self.offset[0] += d[0];
+        self.offset[1] += d[1];
+    }
+
+    /// Zoom the layer by `s` about the canvas-local point `pivot`,
+    /// composing `p → s · (p − pivot) + pivot` onto what the gesture has
+    /// accumulated so far.
+    fn zoom(&mut self, s: f32, pivot: [f32; 2]) {
+        self.scale *= s;
+        self.offset[0] = s * self.offset[0] + (1.0 - s) * pivot[0];
+        self.offset[1] = s * self.offset[1] + (1.0 - s) * pivot[1];
+    }
+}
+
+/// Zoom bounds for a single layer, as a multiple of the layer's
+/// original size. Wider than the canvas view's 0.1–16 range is pointless
+/// — beyond this the ink is either a dot or unusably huge — and the
+/// clamp also keeps `scaled_by` away from values whose reciprocal
+/// rounds badly when the user resets.
+const LAYER_ZOOM_MIN: f32 = 0.05;
+const LAYER_ZOOM_MAX: f32 = 20.0;
 
 impl OnScreenNotesApp {
     /// Constructed by `eframe` once on startup. We capture the OS handles
@@ -372,7 +411,7 @@ impl OnScreenNotesApp {
             last_save_at: Instant::now(),
             first_frame: true,
             pan_drag_anchor: None,
-            layer_drag: None,
+            layer_xform: None,
             pen_filter: crate::input::filter::PenFilter::for_level(level),
             pen_blocked: false,
             eraser_override,
@@ -573,26 +612,41 @@ impl OnScreenNotesApp {
     /// started doing even if the user's fingers slip off Shift halfway
     /// through a drag.
     fn begin_pan_gesture(&mut self, layer_mode: bool) {
-        self.layer_drag = layer_mode.then(|| LayerDrag {
-            canvas: self.canvases.active_index(),
-            layer: self.canvases.active().active_layer,
-            delta: [0.0, 0.0],
-        });
+        if !layer_mode {
+            // A plain Space drag pans the viewport. Anything the user
+            // already aimed at the layer (a wheel zoom before touching
+            // the pen) is a finished gesture — bake it rather than
+            // dropping it on the floor.
+            self.commit_layer_xform();
+            return;
+        }
+        let canvas = self.canvases.active_index();
+        let layer = self.canvases.active().active_layer;
+        match self.layer_xform {
+            // Wheel-zoomed first, now dragging: same target, so keep
+            // accumulating into the gesture already in flight instead
+            // of throwing its scale away.
+            Some(x) if x.canvas == canvas && x.layer == layer => {}
+            Some(_) => {
+                self.commit_layer_xform();
+                self.layer_xform = Some(LayerXform::new(canvas, layer));
+            }
+            None => self.layer_xform = Some(LayerXform::new(canvas, layer)),
+        }
     }
 
     /// Apply one frame of drag motion, given in window-client pixels.
-    /// Routes to the layer delta or the canvas viewport depending on
+    /// Routes to the layer transform or the canvas viewport depending on
     /// which gesture is in flight.
     fn apply_pan_delta(&mut self, dx: f32, dy: f32) {
         let zoom = self.canvases.active().zoom.max(1e-6);
-        if let Some(drag) = self.layer_drag.as_mut() {
+        if let Some(x) = self.layer_xform.as_mut() {
             // A layer delta ends up added to canvas-local geometry, so
             // the view zoom has to come back out of it — otherwise the
             // layer would race ahead of the cursor at zoom > 1. Canvas
             // `pan` needs no such division because it is applied
             // *after* the zoom scale.
-            drag.delta[0] += dx / zoom;
-            drag.delta[1] += dy / zoom;
+            x.pan([dx / zoom, dy / zoom]);
         } else {
             let c = self.canvases.active_mut();
             c.pan[0] += dx;
@@ -600,25 +654,60 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// End a layer drag, baking the accumulated delta into the layer's
-    /// geometry. No-op unless a layer drag is actually in flight, so it
-    /// is safe to call from every gesture-end path.
-    fn commit_layer_drag(&mut self) {
-        let Some(drag) = self.layer_drag.take() else { return };
-        // Canvas nav (←/→) is not gated on Space, so the user can walk
-        // off the sheet mid-gesture. The preview was showing on a
-        // canvas they have since left — drop the move rather than bake
-        // it into whichever sheet happens to be active now.
-        if drag.canvas != self.canvases.active_index() { return; }
-        self.canvases.active_mut().move_layer_by(drag.layer, drag.delta);
+    /// Zoom the gesture's layer by `s` about `pivot` (canvas-local),
+    /// starting a gesture on the active layer if the wheel arrived
+    /// before any drag. The accumulated scale is clamped so the preview
+    /// can't run away past what `transform_layer` will accept.
+    fn apply_layer_zoom(&mut self, s: f32, pivot: [f32; 2]) {
+        if self.layer_xform.is_none() {
+            let canvas = self.canvases.active_index();
+            let layer = self.canvases.active().active_layer;
+            self.layer_xform = Some(LayerXform::new(canvas, layer));
+        }
+        let Some(x) = self.layer_xform.as_mut() else { return };
+        // Clamp against the layer's *total* scale, not just this
+        // gesture's, so ten gestures of 2× stop at the same ceiling one
+        // long gesture would.
+        let already = self
+            .canvases
+            .active()
+            .layers
+            .get(x.layer)
+            .map(|l| l.scaled_by)
+            .unwrap_or(1.0)
+            .max(1e-6);
+        let want = (already * x.scale * s).clamp(LAYER_ZOOM_MIN, LAYER_ZOOM_MAX);
+        let s = want / (already * x.scale).max(1e-6);
+        if (s - 1.0).abs() < 1e-6 { return; }
+        x.zoom(s, pivot);
     }
 
-    /// The in-flight layer drag in the form the renderer wants, or
-    /// `None` when there is no drag or it belongs to another canvas.
-    fn layer_drag_for_render(&self) -> Option<(usize, [f32; 2])> {
-        self.layer_drag
-            .filter(|d| d.canvas == self.canvases.active_index())
-            .map(|d| (d.layer, d.delta))
+    /// End a layer gesture, baking the accumulated transform into the
+    /// layer's geometry. No-op unless a gesture is actually in flight,
+    /// so it is safe to call from every gesture-end path.
+    fn commit_layer_xform(&mut self) {
+        let Some(x) = self.layer_xform.take() else { return };
+        // Canvas nav (←/→) is not gated on Space, so the user can walk
+        // off the sheet mid-gesture. The preview was showing on a
+        // canvas they have since left — drop the transform rather than
+        // bake it into whichever sheet happens to be active now.
+        if x.canvas != self.canvases.active_index() { return; }
+        if (x.scale - 1.0).abs() < 1e-6 {
+            // Pure pan: keep it in the history as a `LayerMoved` so
+            // "reset layer position" and the existing undo path see
+            // exactly what they saw before layer zoom existed.
+            self.canvases.active_mut().move_layer_by(x.layer, x.offset);
+        } else {
+            self.canvases.active_mut().transform_layer(x.layer, x.scale, x.offset);
+        }
+    }
+
+    /// The in-flight layer gesture in the form the renderer wants, or
+    /// `None` when there is no gesture or it belongs to another canvas.
+    fn layer_xform_for_render(&self) -> Option<(usize, f32, [f32; 2])> {
+        self.layer_xform
+            .filter(|x| x.canvas == self.canvases.active_index())
+            .map(|x| (x.layer, x.scale, x.offset))
     }
 
     /// Enqueue a deferred freeze-frame. Same UI-hide dance as a
@@ -1113,7 +1202,7 @@ impl eframe::App for OnScreenNotesApp {
             // the delta, so the previewed layer trails the cursor by one
             // frame — the same one-frame lag the canvas pan has always
             // had.
-            let layer_drag = self.layer_drag_for_render();
+            let layer_xform = self.layer_xform_for_render();
             let canvas_rect = ui::overlay::show(
                 ctx,
                 &mut self.overlay_cache,
@@ -1122,7 +1211,7 @@ impl eframe::App for OnScreenNotesApp {
                 self.config.smoothing_level.position_passes(),
                 self.ui_visible,
                 self.loupe.as_ref(),
-                layer_drag,
+                layer_xform,
             );
 
             // ---- Screenshot region selection --------------------------------
@@ -1152,7 +1241,7 @@ impl eframe::App for OnScreenNotesApp {
                 // latched at pointer-down by `begin_pan_gesture`, so
                 // this per-frame read only drives the cursor hint.
                 let layer_mode = ctx.input(|i| i.modifiers.shift);
-                ctx.set_cursor_icon(if layer_mode || self.layer_drag.is_some() {
+                ctx.set_cursor_icon(if layer_mode || self.layer_xform.is_some() {
                     egui::CursorIcon::Move
                 } else {
                     egui::CursorIcon::Grabbing
@@ -1180,8 +1269,14 @@ impl eframe::App for OnScreenNotesApp {
                             self.pan_drag_anchor = Some(here);
                         }
                         PenEvent::Up(_) => {
-                            self.pan_drag_anchor = None;
-                            self.commit_layer_drag();
+                            // Only a real drag ends here. A wheel-only
+                            // layer zoom stays open until Space is
+                            // released, so a stray pen tap mid-zoom
+                            // doesn't chop the gesture into two undo
+                            // steps.
+                            if self.pan_drag_anchor.take().is_some() {
+                                self.commit_layer_xform();
+                            }
                         }
                     }
                 }
@@ -1211,17 +1306,21 @@ impl eframe::App for OnScreenNotesApp {
                             }
                             self.pan_drag_anchor = Some(p);
                         }
-                    } else {
-                        self.pan_drag_anchor = None;
-                        self.commit_layer_drag();
+                    } else if self.pan_drag_anchor.take().is_some() {
+                        // Button-up ends a drag; same reasoning as the
+                        // pen path — a wheel-only zoom keeps going
+                        // until Space is released.
+                        self.commit_layer_xform();
                     }
                 }
             } else {
                 // Pan released — drop anchor, restore default cursor.
                 self.pan_drag_anchor = None;
-                // Letting go of Space mid-drag still ends the gesture, so
-                // bake any pending layer move rather than losing it.
-                self.commit_layer_drag();
+                // Letting go of Space mid-gesture still ends it, so bake
+                // any pending layer move / zoom rather than losing it.
+                // This is also the only end-point a wheel-only layer
+                // zoom has.
+                self.commit_layer_xform();
 
                 // Hide the OS cursor while the Pen / FreehandArrow tools
                 // are active so it doesn't sit on top of the pen tip and
@@ -1514,6 +1613,31 @@ impl eframe::App for OnScreenNotesApp {
                     }
                 }
             }
+            // Layer zooms bake into the geometry the same way pans do,
+            // so "reset" divides the running total back out. The pivot
+            // is the layer's own bounding-box centre, which keeps the
+            // layer where the user can see it — scaling about the
+            // canvas origin instead would fling a far-from-origin layer
+            // off-screen. `moved_by` is rewritten by the same maths, so
+            // a later `reset_layer_pos` still lands on the layer's
+            // original coordinates exactly.
+            if let Some(b) = self.hotkeys_cfg.canvas.reset_layer_zoom {
+                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
+                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                    let c = self.canvases.active_mut();
+                    let li = c.active_layer;
+                    if let Some(layer) = c.layers.get(li) {
+                        let a = layer.scaled_by;
+                        if a > 1e-6 && (a - 1.0).abs() > 1e-6 {
+                            let pivot = layer
+                                .content_bounds()
+                                .map(|bb| [(bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5])
+                                .unwrap_or([0.0, 0.0]);
+                            c.scale_layer_about(li, 1.0 / a, pivot);
+                        }
+                    }
+                }
+            }
             if let Some(b) = self.hotkeys_cfg.canvas.reset_view {
                 let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
                 if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
@@ -1654,6 +1778,21 @@ impl eframe::App for OnScreenNotesApp {
                     if let Some(l) = self.loupe.as_mut() {
                         if notches != 0 {
                             l.zoom = (l.zoom + notches as f32 * 0.25).clamp(1.5, 12.0);
+                        }
+                    } else if space_held && shift {
+                        // Shift+Space + wheel zooms the *active layer*
+                        // about the cursor — the wheel counterpart of
+                        // the Shift+Space drag that pans it. Same
+                        // 1.10×-per-raw-unit feel as the canvas zoom so
+                        // one notch is ≈ ±10 % either way.
+                        if raw_delta_y.abs() >= 0.001 {
+                            let c = self.canvases.active();
+                            let cursor = i.pointer.hover_pos().unwrap_or_default();
+                            let pivot = [
+                                ((cursor.x - canvas_rect.min.x) - c.pan[0]) / c.zoom,
+                                ((cursor.y - canvas_rect.min.y) - c.pan[1]) / c.zoom,
+                            ];
+                            self.apply_layer_zoom(1.10_f32.powf(raw_delta_y), pivot);
                         }
                     } else {
                         let cursor = i.pointer.hover_pos().unwrap_or_default();

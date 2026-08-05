@@ -37,8 +37,9 @@ pub struct LayerImage {
     /// the user freezes a frame after panning or zooming the canvas,
     /// we record `-pan / zoom` here so the captured pixels land
     /// exactly on the client area the user saw — independent of the
-    /// canvas's current pan/zoom. Per-layer panning shifts it further,
-    /// so it doubles as the image's live anchor.
+    /// canvas's current pan/zoom. Per-layer panning and zooming move it
+    /// further (zoom also scales `logical_size`), so it doubles as the
+    /// image's live anchor.
     ///
     /// `alias = "pos"` keeps saves written before this field was
     /// renamed loading with their panned position intact.
@@ -81,15 +82,28 @@ pub struct Layer {
     /// older saves loading without an image.
     #[serde(default)]
     pub image: Option<LayerImage>,
-    /// Running total of every per-layer pan baked into this layer's
-    /// geometry. Pure bookkeeping — the renderer and the hit-testers
-    /// never read it, because a layer pan rewrites the point data
-    /// rather than living as a transform. It exists so "reset layer
-    /// position" knows how far back to go. `#[serde(default)]` keeps
-    /// older saves loading as "never moved".
+    /// Translation part of every per-layer pan / zoom baked into this
+    /// layer's geometry — the `b` of the accumulated
+    /// `p → scaled_by · p + moved_by` similarity. Pure bookkeeping: the
+    /// renderer and the hit-testers never read it, because a layer
+    /// transform rewrites the point data rather than living as a
+    /// transform. It exists so "reset layer position" knows how far
+    /// back to go. `#[serde(default)]` keeps older saves loading as
+    /// "never moved".
     #[serde(default)]
     pub moved_by: [f32; 2],
+    /// Running product of every per-layer zoom baked into this layer's
+    /// geometry — the `a` of the accumulated `p → a · p + moved_by`
+    /// similarity that maps the layer's original points to where they
+    /// sit now. Same bookkeeping-only role as `moved_by`: nothing reads
+    /// it at paint time, it exists so "reset layer zoom" knows what to
+    /// divide out. `#[serde(default)]` keeps older saves loading as
+    /// "never scaled".
+    #[serde(default = "default_layer_scale")]
+    pub scaled_by: f32,
 }
+
+fn default_layer_scale() -> f32 { 1.0 }
 
 fn default_layer_opacity() -> f32 { 1.0 }
 
@@ -103,6 +117,7 @@ impl Default for Layer {
             shapes: Vec::new(),
             image: None,
             moved_by: [0.0, 0.0],
+            scaled_by: 1.0,
         }
     }
 }
@@ -121,6 +136,106 @@ impl Layer {
         if let Some(img) = self.image.as_mut() {
             img.canvas_origin[0] += d[0];
             img.canvas_origin[1] += d[1];
+        }
+    }
+
+    /// Apply `p → a · p + b` to every piece of geometry this layer owns.
+    /// The uniform-scale counterpart of `translate`: strokes, shapes and
+    /// the frozen-frame raster all scale about the same point, so the
+    /// layer resizes as one rigid unit.
+    ///
+    /// The frozen frame's `logical_size` is what the renderer uses as
+    /// the canvas-local extent to stretch the decoded PNG into, so
+    /// scaling it (rather than the physical `size`) resizes the plate
+    /// without touching the payload.
+    pub fn transform(&mut self, a: f32, b: [f32; 2]) {
+        for s in &mut self.strokes {
+            s.transform(a, b);
+        }
+        for s in &mut self.shapes {
+            s.transform(a, b);
+        }
+        if let Some(img) = self.image.as_mut() {
+            img.canvas_origin[0] = a * img.canvas_origin[0] + b[0];
+            img.canvas_origin[1] = a * img.canvas_origin[1] + b[1];
+            if img.logical_size[0] > 0.0 && img.logical_size[1] > 0.0 {
+                img.logical_size[0] *= a;
+                img.logical_size[1] *= a;
+            } else {
+                // Older save with no logical size: the renderer falls
+                // back to the physical dimensions, so seed the logical
+                // size from those to make the scale stick.
+                img.logical_size = [img.size[0] as f32 * a, img.size[1] as f32 * a];
+            }
+        }
+    }
+
+    /// Canvas-local bounding box `[x0, y0, x1, y1]` of everything this
+    /// layer paints, or `None` when the layer is empty. Used both by
+    /// the thumbnail renderer (to frame the preview) and by "reset
+    /// layer zoom" (to pick a pivot that keeps the layer where it sits
+    /// instead of flinging it toward the canvas origin).
+    pub fn content_bounds(&self) -> Option<[f32; 4]> {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut update = |bb: [f32; 4]| {
+            if bb[0] < min_x { min_x = bb[0]; }
+            if bb[1] < min_y { min_y = bb[1]; }
+            if bb[2] > max_x { max_x = bb[2]; }
+            if bb[3] > max_y { max_y = bb[3]; }
+        };
+        if let Some(img) = self.image.as_ref() {
+            let (w, h) = if img.logical_size[0] > 0.0 && img.logical_size[1] > 0.0 {
+                (img.logical_size[0], img.logical_size[1])
+            } else {
+                (img.size[0] as f32, img.size[1] as f32)
+            };
+            update([
+                img.canvas_origin[0],
+                img.canvas_origin[1],
+                img.canvas_origin[0] + w,
+                img.canvas_origin[1] + h,
+            ]);
+        }
+        for s in &self.strokes {
+            if let Some(bb) = s.bounds() { update(bb); }
+        }
+        for shape in &self.shapes {
+            update(shape_bounds(shape));
+        }
+        if !min_x.is_finite() { return None; }
+        Some([min_x, min_y, max_x, max_y])
+    }
+}
+
+/// Canvas-local bounding box of one shape, padded by its stroke width
+/// where that matters. Text is measured coarsely (the real layout only
+/// happens at paint time) — good enough for hit-testing and framing.
+pub fn shape_bounds(shape: &Shape) -> [f32; 4] {
+    match shape {
+        Shape::Rect    { a, b, stroke_width, .. }
+        | Shape::Ellipse { a, b, stroke_width, .. }
+        | Shape::Line    { a, b, stroke_width, .. }
+        | Shape::Arrow   { a, b, stroke_width, .. } => {
+            let pad = *stroke_width;
+            [
+                a[0].min(b[0]) - pad,
+                a[1].min(b[1]) - pad,
+                a[0].max(b[0]) + pad,
+                a[1].max(b[1]) + pad,
+            ]
+        }
+        Shape::Text { pos, content, font_size, .. } => {
+            let lines: Vec<&str> = content.split('\n').collect();
+            let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
+            let w = (font_size * 0.6 * max_chars).max(*font_size);
+            let h = (font_size * 1.25 * lines.len() as f32).max(*font_size);
+            [pos[0], pos[1], pos[0] + w, pos[1] + h]
+        }
+        Shape::Raster { pos, size, .. } => {
+            [pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]]
         }
     }
 }
@@ -203,6 +318,13 @@ pub enum UndoEntry {
     /// point data, so undo just translates back by `-delta` — no
     /// geometry is cloned into the history.
     LayerMoved(usize, [f32; 2]),
+    /// Layer `usize` was scaled (Shift+Space wheel) by the similarity
+    /// `p → a · p + b`, where `a` is the zoom factor and `b` folds in
+    /// the pivot offset — plus any pan that shared the same gesture.
+    /// Like `LayerMoved` the transform is baked into the point data,
+    /// so undo applies the exact inverse `p → (p - b) / a` and no
+    /// geometry is cloned into the history.
+    LayerScaled(usize, f32, [f32; 2]),
 }
 
 impl Default for Canvas {
@@ -368,6 +490,12 @@ impl Canvas {
                     self.redo_log.push(UndoEntry::LayerMoved(li, d));
                 }
             }
+            UndoEntry::LayerScaled(li, a, b) => {
+                if a.abs() > 1e-6 {
+                    apply_layer_xform(&mut self.layers, li, 1.0 / a, [-b[0] / a, -b[1] / a]);
+                    self.redo_log.push(UndoEntry::LayerScaled(li, a, b));
+                }
+            }
         }
     }
 
@@ -436,6 +564,10 @@ impl Canvas {
                     layer.moved_by[1] += d[1];
                     self.undo_log.push(UndoEntry::LayerMoved(li, d));
                 }
+            }
+            UndoEntry::LayerScaled(li, a, b) => {
+                apply_layer_xform(&mut self.layers, li, a, b);
+                self.undo_log.push(UndoEntry::LayerScaled(li, a, b));
             }
         }
     }
@@ -625,6 +757,39 @@ impl Canvas {
         self.redo_log.clear();
     }
 
+    /// Apply the similarity `p → a · p + b` to the layer at `li`,
+    /// baking it into the geometry for exactly the reasons
+    /// `move_layer_by` bakes translations: every other subsystem
+    /// (eraser hit-tests, flood fill, tiny-skia screenshots) assumes
+    /// one canvas-local space, so a per-layer transform sitting in the
+    /// renderer would need offset plumbing everywhere.
+    ///
+    /// Callers normally want `scale_layer_about`; this is the raw form
+    /// the Shift+Space gesture commits, because a gesture that both
+    /// pans and zooms collapses into a single `a`/`b` pair.
+    pub fn transform_layer(&mut self, li: usize, a: f32, b: [f32; 2]) {
+        // Identity: a wheel-less Shift+Space tap should not litter the
+        // undo history. `a <= 0` would mirror or collapse the layer —
+        // no gesture produces it, and inverting it on undo is
+        // undefined, so refuse.
+        if a <= 0.0 { return; }
+        if (a - 1.0).abs() < 1e-6 && b[0] == 0.0 && b[1] == 0.0 { return; }
+        if self.layers.get(li).is_none() { return; }
+        apply_layer_xform(&mut self.layers, li, a, b);
+        self.undo_log.push(UndoEntry::LayerScaled(li, a, b));
+        self.redo_log.clear();
+        self.dirty = true;
+    }
+
+    /// Zoom the layer at `li` by `s` about the canvas-local point
+    /// `pivot` — the wheel-cursor position, so the ink under the
+    /// pointer stays put while the rest of the layer grows away from
+    /// it. Same maths as the canvas-level zoom-around-cursor, folded
+    /// into the `p → a · p + b` form the layer bakes.
+    pub fn scale_layer_about(&mut self, li: usize, s: f32, pivot: [f32; 2]) {
+        self.transform_layer(li, s, [(1.0 - s) * pivot[0], (1.0 - s) * pivot[1]]);
+    }
+
     /// Insert a new image-backed layer at the *bottom* of the stack
     /// (index 0) so the frozen frame sits underneath every other
     /// layer's ink. Existing strokes' undo entries shift up one
@@ -639,6 +804,7 @@ impl Canvas {
             shapes:  Vec::new(),
             image: Some(image),
             moved_by: [0.0, 0.0],
+            scaled_by: 1.0,
         };
         self.layers.insert(0, l);
         // Keep the user pointing at whichever ink layer they were
@@ -662,6 +828,7 @@ impl Canvas {
             shapes:  Vec::new(),
             image:   None,
             moved_by: [0.0, 0.0],
+            scaled_by: 1.0,
         };
         let pos = (self.active_layer + 1).min(self.layers.len());
         self.layers.insert(pos, l);
@@ -753,6 +920,21 @@ impl Canvas {
     }
 }
 
+/// Apply `p → a · p + b` to the layer at `li` and keep its running
+/// `scaled_by` / `moved_by` totals in step. Those two describe the
+/// composed transform from the layer's original geometry to where it
+/// sits now — composing `p → a · p + b` on top of `p → A · p + B`
+/// gives `a·A` and `a·B + b`, which is what "reset layer zoom /
+/// position" divides back out. Shared by the forward path and by
+/// undo/redo so the bookkeeping can never drift from the geometry.
+fn apply_layer_xform(layers: &mut [Layer], li: usize, a: f32, b: [f32; 2]) {
+    let Some(layer) = layers.get_mut(li) else { return };
+    layer.transform(a, b);
+    layer.scaled_by *= a;
+    layer.moved_by[0] = a * layer.moved_by[0] + b[0];
+    layer.moved_by[1] = a * layer.moved_by[1] + b[1];
+}
+
 fn layer_idx_of(e: &UndoEntry) -> usize {
     match e {
         UndoEntry::StrokeAdded(li)
@@ -762,7 +944,8 @@ fn layer_idx_of(e: &UndoEntry) -> usize {
         | UndoEntry::Cleared(li, _, _)
         | UndoEntry::StrokePartiallyErased(li, _, _, _)
         | UndoEntry::ShapeReplaced(li, _, _, _)
-        | UndoEntry::LayerMoved(li, _) => *li,
+        | UndoEntry::LayerMoved(li, _)
+        | UndoEntry::LayerScaled(li, _, _) => *li,
     }
 }
 
@@ -925,4 +1108,80 @@ pub(crate) fn point_in_polygon(p: [f32; 2], polygon: &[[f32; 2]]) -> bool {
         j = i;
     }
     inside
+}
+
+#[cfg(test)]
+mod layer_xform_tests {
+    use super::*;
+    use crate::canvas::stroke::{PenSample, Stroke, StrokeStyle};
+
+    fn canvas_with_dot(x: f32, y: f32) -> Canvas {
+        let mut c = Canvas::default();
+        let mut s = Stroke::with_style([255, 0, 0, 255], 8.0, StrokeStyle::Default);
+        s.samples.push(PenSample { pos: [x, y], pressure: 1.0, tilt: [0.0, 0.0] });
+        c.layers[0].strokes.push(s);
+        c
+    }
+
+    fn dot(c: &Canvas) -> [f32; 2] { c.layers[0].strokes[0].samples[0].pos }
+    fn width(c: &Canvas) -> f32 { c.layers[0].strokes[0].base_width }
+
+    #[test]
+    fn scale_about_pivot_pins_the_pivot_and_scales_width() {
+        let mut c = canvas_with_dot(30.0, 10.0);
+        c.scale_layer_about(0, 2.0, [10.0, 10.0]);
+        // Distance from the pivot doubles; the pivot itself is fixed.
+        assert!((dot(&c)[0] - 50.0).abs() < 1e-3);
+        assert!((dot(&c)[1] - 10.0).abs() < 1e-3);
+        assert!((width(&c) - 16.0).abs() < 1e-3);
+        assert!((c.layers[0].scaled_by - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn undo_redo_restores_geometry() {
+        let mut c = canvas_with_dot(30.0, 10.0);
+        c.scale_layer_about(0, 2.5, [4.0, -7.0]);
+        c.undo();
+        assert!((dot(&c)[0] - 30.0).abs() < 1e-3);
+        assert!((dot(&c)[1] - 10.0).abs() < 1e-3);
+        assert!((width(&c) - 8.0).abs() < 1e-3);
+        assert!((c.layers[0].scaled_by - 1.0).abs() < 1e-6);
+        c.redo();
+        assert!((dot(&c)[0] - 69.0).abs() < 1e-3);
+        assert!((c.layers[0].scaled_by - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reset_zoom_then_position_lands_on_the_original() {
+        // Mixed history: pan, zoom about one pivot, pan again, zoom
+        // about another. Resetting scale (about any pivot) and then
+        // translation must return the exact original geometry — that
+        // invariant is what `scaled_by` / `moved_by` exist to keep.
+        let mut c = canvas_with_dot(30.0, 10.0);
+        c.move_layer_by(0, [12.0, -3.0]);
+        c.scale_layer_about(0, 1.5, [0.0, 40.0]);
+        c.move_layer_by(0, [-5.0, 9.0]);
+        c.scale_layer_about(0, 0.8, [100.0, 100.0]);
+
+        let a = c.layers[0].scaled_by;
+        c.scale_layer_about(0, 1.0 / a, [17.0, 23.0]);
+        let m = c.layers[0].moved_by;
+        c.move_layer_by(0, [-m[0], -m[1]]);
+
+        assert!((dot(&c)[0] - 30.0).abs() < 1e-2, "x = {}", dot(&c)[0]);
+        assert!((dot(&c)[1] - 10.0).abs() < 1e-2, "y = {}", dot(&c)[1]);
+        assert!((width(&c) - 8.0).abs() < 1e-2);
+        assert!((c.layers[0].scaled_by - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn identity_transform_writes_no_history() {
+        let mut c = canvas_with_dot(30.0, 10.0);
+        c.scale_layer_about(0, 1.0, [10.0, 10.0]);
+        assert!(c.undo_log.is_empty());
+        // A mirroring / collapsing factor is refused outright.
+        c.scale_layer_about(0, -1.0, [10.0, 10.0]);
+        assert!(c.undo_log.is_empty());
+        assert!((dot(&c)[0] - 30.0).abs() < 1e-6);
+    }
 }
