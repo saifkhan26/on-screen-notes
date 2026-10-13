@@ -27,7 +27,7 @@
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::System::Threading::AttachThreadInput;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
@@ -112,6 +112,21 @@ pub fn lmb_down() -> bool {
     // a per-thread keyboard state. No pointers involved.
     unsafe {
         (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0
+    }
+}
+
+/// True while Ctrl and V are both physically held.
+///
+/// egui-winit turns Ctrl+V into a `Paste(text)` event and swallows the
+/// key press itself — and emits nothing at all when the clipboard holds
+/// no text. A copied screenshot is exactly that case, so pasting an
+/// image has to notice the chord some other way.
+pub fn paste_chord_down() -> bool {
+    const VK_V: i32 = 0x56;
+    // SAFETY: same as `lmb_down` — plain key-state reads.
+    unsafe {
+        (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+            && (GetAsyncKeyState(VK_V) as u16 & 0x8000) != 0
     }
 }
 

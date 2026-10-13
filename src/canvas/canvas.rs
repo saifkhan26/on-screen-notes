@@ -9,7 +9,10 @@
 //! Rendering lives in `render.rs`; tools live in `crate::tools`. This
 //! separation makes each part easier to read and test.
 
-use crate::canvas::{shape::Shape, stroke::Stroke};
+use crate::canvas::affine::Affine;
+use crate::canvas::hit;
+use crate::canvas::shape::{RasterKind, Shape};
+use crate::canvas::stroke::Stroke;
 use serde::{Deserialize, Serialize};
 
 /// Raster image payload of a frozen-frame layer. PNG bytes are
@@ -56,6 +59,19 @@ pub struct LayerImage {
 
 fn default_capture_zoom() -> f32 { 1.0 }
 
+impl LayerImage {
+    /// Canvas-local `[width, height]` the image is painted into. Older
+    /// saves carry no logical size; for those the renderer falls back
+    /// to the physical pixel dimensions, and so does this.
+    pub fn extent(&self) -> [f32; 2] {
+        if self.logical_size[0] > 0.0 && self.logical_size[1] > 0.0 {
+            self.logical_size
+        } else {
+            [self.size[0] as f32, self.size[1] as f32]
+        }
+    }
+}
+
 /// One named layer of ink. Layers stack in the order they appear in
 /// `Canvas::layers` — earlier indices paint underneath later ones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +117,12 @@ pub struct Layer {
     /// "never scaled".
     #[serde(default = "default_layer_scale")]
     pub scaled_by: f32,
+    /// Bumped whenever an object on this layer is edited in place
+    /// (moved, rotated, restyled, reordered). Such edits leave the
+    /// stroke / shape counts unchanged, so this is what tells the
+    /// thumbnail cache its picture is stale. Runtime-only.
+    #[serde(skip)]
+    pub rev: u64,
 }
 
 fn default_layer_scale() -> f32 { 1.0 }
@@ -118,6 +140,7 @@ impl Default for Layer {
             image: None,
             moved_by: [0.0, 0.0],
             scaled_by: 1.0,
+            rev: 0,
         }
     }
 }
@@ -213,31 +236,18 @@ impl Layer {
 /// Canvas-local bounding box of one shape, padded by its stroke width
 /// where that matters. Text is measured coarsely (the real layout only
 /// happens at paint time) — good enough for hit-testing and framing.
+/// A rotated shape reports the axis-aligned box around its turned
+/// corners.
 pub fn shape_bounds(shape: &Shape) -> [f32; 4] {
-    match shape {
-        Shape::Rect    { a, b, stroke_width, .. }
-        | Shape::Ellipse { a, b, stroke_width, .. }
-        | Shape::Line    { a, b, stroke_width, .. }
-        | Shape::Arrow   { a, b, stroke_width, .. } => {
-            let pad = *stroke_width;
-            [
-                a[0].min(b[0]) - pad,
-                a[1].min(b[1]) - pad,
-                a[0].max(b[0]) + pad,
-                a[1].max(b[1]) + pad,
-            ]
-        }
-        Shape::Text { pos, content, font_size, .. } => {
-            let lines: Vec<&str> = content.split('\n').collect();
-            let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
-            let w = (font_size * 0.6 * max_chars).max(*font_size);
-            let h = (font_size * 1.25 * lines.len() as f32).max(*font_size);
-            [pos[0], pos[1], pos[0] + w, pos[1] + h]
-        }
-        Shape::Raster { pos, size, .. } => {
-            [pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]]
-        }
-    }
+    let bb = shape.obb().aabb();
+    let pad = match shape {
+        Shape::Rect    { stroke_width, .. }
+        | Shape::Ellipse { stroke_width, .. }
+        | Shape::Line    { stroke_width, .. }
+        | Shape::Arrow   { stroke_width, .. } => *stroke_width,
+        Shape::Text { .. } | Shape::Raster { .. } => 0.0,
+    };
+    [bb[0] - pad, bb[1] - pad, bb[2] + pad, bb[3] + pad]
 }
 
 /// `Canvas` owns a stack of layers and a view transform. The on-disk
@@ -325,6 +335,35 @@ pub enum UndoEntry {
     /// so undo applies the exact inverse `p → (p - b) / a` and no
     /// geometry is cloned into the history.
     LayerScaled(usize, f32, [f32; 2]),
+    /// Objects on layer `usize` were edited in place — moved, rotated,
+    /// resized or restyled as a selection. Each element is `(index,
+    /// before, after)`; undo writes `before` back, redo writes `after`.
+    /// Snapshots rather than a stored transform because a shape's
+    /// rotation / size cannot be recovered exactly by inverting an
+    /// affine, and raster shapes share their PNG so a snapshot is cheap.
+    ObjectsReplaced(usize, Vec<(usize, Stroke, Stroke)>, Vec<(usize, Shape, Shape)>),
+    /// Objects were removed from layer `usize` in one step (Delete /
+    /// cut). Each element is `(index it sat at, object)`, ascending, so
+    /// re-inserting them in order puts every one back where it was.
+    ObjectsRemoved(usize, Vec<(usize, Stroke)>, Vec<(usize, Shape)>),
+    /// Objects were inserted into layer `usize` in one step (duplicate /
+    /// paste). Same payload shape as `ObjectsRemoved`; the two are each
+    /// other's inverse.
+    ObjectsInserted(usize, Vec<(usize, Stroke)>, Vec<(usize, Shape)>),
+    /// The stroke list and / or shape list of layer `usize` was
+    /// re-ordered (bring to front / send to back): `new[i] =
+    /// old[perm[i]]`. An empty permutation means that list was left
+    /// alone. Undo applies the inverse permutation.
+    ObjectsReordered(usize, Vec<usize>, Vec<usize>),
+    /// Layer `usize`'s background plate was turned into an ordinary
+    /// image object at the bottom of its shape list (see
+    /// `Canvas::promote_plate`). The `f32` is the plate's
+    /// `capture_zoom`, kept only so undo can rebuild the plate exactly.
+    ///
+    /// The picture looks the same either way, so on its own this step
+    /// would be a Ctrl+Z that appears to do nothing. Undo and redo
+    /// therefore pass straight through it to the next entry.
+    PlatePromoted(usize, f32),
 }
 
 impl Default for Canvas {
@@ -496,6 +535,32 @@ impl Canvas {
                     self.redo_log.push(UndoEntry::LayerScaled(li, a, b));
                 }
             }
+            UndoEntry::ObjectsReplaced(li, strokes, shapes) => {
+                if let Some(layer) = self.layers.get_mut(li) {
+                    for (i, before, _) in &strokes {
+                        if let Some(s) = layer.strokes.get_mut(*i) { *s = before.clone(); }
+                    }
+                    for (i, before, _) in &shapes {
+                        if let Some(s) = layer.shapes.get_mut(*i) { *s = before.clone(); }
+                    }
+                    layer.rev += 1;
+                    self.redo_log.push(UndoEntry::ObjectsReplaced(li, strokes, shapes));
+                }
+            }
+            entry @ (UndoEntry::ObjectsRemoved(..)
+            | UndoEntry::ObjectsInserted(..)
+            | UndoEntry::ObjectsReordered(..)) => {
+                if let Some(inverse) = invert_object_entry(&mut self.layers, entry) {
+                    self.redo_log.push(inverse);
+                }
+            }
+            UndoEntry::PlatePromoted(li, capture_zoom) => {
+                if demote_plate(&mut self.layers, li, capture_zoom) {
+                    self.redo_log.push(UndoEntry::PlatePromoted(li, capture_zoom));
+                }
+                // Invisible step: carry on to the edit before it.
+                self.undo();
+            }
         }
     }
 
@@ -569,18 +634,57 @@ impl Canvas {
                 apply_layer_xform(&mut self.layers, li, a, b);
                 self.undo_log.push(UndoEntry::LayerScaled(li, a, b));
             }
+            UndoEntry::ObjectsReplaced(li, strokes, shapes) => {
+                if let Some(layer) = self.layers.get_mut(li) {
+                    for (i, _, after) in &strokes {
+                        if let Some(s) = layer.strokes.get_mut(*i) { *s = after.clone(); }
+                    }
+                    for (i, _, after) in &shapes {
+                        if let Some(s) = layer.shapes.get_mut(*i) { *s = after.clone(); }
+                    }
+                    layer.rev += 1;
+                    self.undo_log.push(UndoEntry::ObjectsReplaced(li, strokes, shapes));
+                }
+            }
+            // These three record what the *undo* just did, so redoing
+            // is the same "apply the inverse" step undo uses.
+            entry @ (UndoEntry::ObjectsRemoved(..)
+            | UndoEntry::ObjectsInserted(..)
+            | UndoEntry::ObjectsReordered(..)) => {
+                if let Some(inverse) = invert_object_entry(&mut self.layers, entry) {
+                    self.undo_log.push(inverse);
+                }
+            }
+            UndoEntry::PlatePromoted(li, _) => {
+                if let Some(capture_zoom) = promote_plate_in(&mut self.layers, li) {
+                    self.undo_log.push(UndoEntry::PlatePromoted(li, capture_zoom));
+                }
+                // Invisible step: carry on to the edit after it.
+                self.redo();
+            }
         }
     }
 
-    /// Erase all strokes/shapes on the **active** layer whose bounds
-    /// contain `point` (canvas-local). Returns true if anything was
-    /// erased. Strokes / shapes on other layers are left alone, even
-    /// when they sit visually under the eraser tip.
     /// Mark this canvas dirty without other side effects. Use when a
     /// mutation lives outside the canvas methods (e.g. layer-opacity
     /// edits via a slider or hotkey).
     pub fn mark_dirty(&mut self) { self.dirty = true; }
 
+    /// Erase every stroke / shape on the **active** layer whose ink the
+    /// eraser disc at `point` (canvas-local) actually touches. Returns
+    /// true if anything was erased. Strokes / shapes on other layers
+    /// are left alone, even when they sit visually under the eraser tip.
+    ///
+    /// "Touches the ink" is a distance test against the drawn line (see
+    /// `canvas::hit`), not against the bounding box — a long diagonal
+    /// stroke is no longer erased by a tip passing through the empty
+    /// corner of its box. Two raster cases differ:
+    /// * an `Image` (screen capture, pasted picture) is never erased —
+    ///   here or by the lasso eraser. The user is rubbing out ink drawn
+    ///   over it; the picture itself is removed with the Select tool.
+    /// * a `Fill` sticker keeps the bounding-box test: telling which of
+    ///   its pixels are transparent would mean decoding the PNG on every
+    ///   pen sample.
     pub fn erase_at(&mut self, point: [f32; 2], radius: f32) -> bool {
         let li = self.active_layer;
         let mut erased_any = false;
@@ -589,48 +693,21 @@ impl Canvas {
         let mut i = layer.strokes.len();
         while i > 0 {
             i -= 1;
-            if let Some(b) = layer.strokes[i].bounds() {
-                if rect_contains_circle(b, point, radius) {
-                    let s = layer.strokes.remove(i);
-                    self.undo_log.push(UndoEntry::StrokeErased(li, i, s));
-                    erased_any = true;
-                }
+            if hit::stroke_hit(&layer.strokes[i], point, radius) {
+                let s = layer.strokes.remove(i);
+                self.undo_log.push(UndoEntry::StrokeErased(li, i, s));
+                erased_any = true;
             }
         }
         let mut i = layer.shapes.len();
         while i > 0 {
             i -= 1;
-            let bb = match &layer.shapes[i] {
-                Shape::Rect    { a, b, stroke_width, .. }
-                | Shape::Ellipse { a, b, stroke_width, .. }
-                | Shape::Line    { a, b, stroke_width, .. }
-                | Shape::Arrow   { a, b, stroke_width, .. } => {
-                    let pad = *stroke_width;
-                    [
-                        a[0].min(b[0]) - pad,
-                        a[1].min(b[1]) - pad,
-                        a[0].max(b[0]) + pad,
-                        a[1].max(b[1]) + pad,
-                    ]
-                }
-                Shape::Text { pos, content, font_size, .. } => {
-                    // Coarse bounding box: each line is at most
-                    // `font_size * 0.6 * len_chars` wide, and there are
-                    // (newline count + 1) lines. Overestimates a bit so
-                    // a wide eraser still hits the text. Good enough
-                    // for hit-testing — the actual layout happens at
-                    // render time.
-                    let lines: Vec<&str> = content.split('\n').collect();
-                    let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
-                    let w = (font_size * 0.6 * max_chars).max(*font_size);
-                    let h = (font_size * 1.25 * lines.len() as f32).max(*font_size);
-                    [pos[0], pos[1], pos[0] + w, pos[1] + h]
-                }
-                Shape::Raster { pos, size, .. } => {
-                    [pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]]
-                }
+            let touched = match &layer.shapes[i] {
+                Shape::Raster { kind: RasterKind::Image, .. } => false,
+                s @ Shape::Raster { .. } => rect_contains_circle(shape_bounds(s), point, radius),
+                s => hit::shape_hit(s, point, radius),
             };
-            if rect_contains_circle(bb, point, radius) {
+            if touched {
                 let s = layer.shapes.remove(i);
                 self.undo_log.push(UndoEntry::ShapeErased(li, i, s));
                 erased_any = true;
@@ -684,7 +761,13 @@ impl Canvas {
         let mut i = layer.shapes.len();
         while i > 0 {
             i -= 1;
-            // Raster shapes get a per-pixel partial erase so the
+            // Pictures are what the user is annotating, not ink: neither
+            // eraser touches them (see `erase_at`). Looping ink drawn
+            // over a screenshot must not punch a hole in the screenshot.
+            if let Shape::Raster { kind: RasterKind::Image, .. } = &layer.shapes[i] {
+                continue;
+            }
+            // Fill stickers get a per-pixel partial erase so the
             // lasso clips out only the bit of the fill the user
             // looped, leaving the rest intact.
             if let Shape::Raster { .. } = &layer.shapes[i] {
@@ -704,23 +787,7 @@ impl Canvas {
                 }
                 continue;
             }
-            let bb = match &layer.shapes[i] {
-                Shape::Rect    { a, b, .. }
-                | Shape::Ellipse { a, b, .. }
-                | Shape::Line    { a, b, .. }
-                | Shape::Arrow   { a, b, .. } => {
-                    [a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])]
-                }
-                Shape::Text { pos, content, font_size, .. } => {
-                    let lines: Vec<&str> = content.split('\n').collect();
-                    let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
-                    let w = (font_size * 0.6 * max_chars).max(*font_size);
-                    let h = (font_size * 1.25 * lines.len() as f32).max(*font_size);
-                    [pos[0], pos[1], pos[0] + w, pos[1] + h]
-                }
-                Shape::Raster { .. } => unreachable!("Raster handled above"),
-            };
-            let center = [(bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5];
+            let center = layer.shapes[i].obb().center;
             if point_in_polygon(center, polygon) {
                 let removed = layer.shapes.remove(i);
                 self.undo_log.push(UndoEntry::ShapeErased(li, i, removed));
@@ -731,6 +798,220 @@ impl Canvas {
             self.redo_log.clear();
         }
         erased_any
+    }
+
+    /// Turn layer `li`'s background plate (a frozen frame, or a lasso
+    /// capture made before captures became objects) into an ordinary
+    /// image object, so the Select tool can move, resize, rotate or
+    /// delete it like any other. Returns the new object's index in the
+    /// layer's shape list, or `None` if the layer has no plate.
+    ///
+    /// The image keeps its place and its position in the paint order.
+    /// Every shape already on the layer moves up one index, which is
+    /// why this is recorded in the undo history rather than done
+    /// quietly: earlier entries refer to shapes by index, and they
+    /// stay correct because undoing back past this point puts the
+    /// plate — and the old indices — back first.
+    pub fn promote_plate(&mut self, li: usize) -> Option<usize> {
+        let capture_zoom = promote_plate_in(&mut self.layers, li)?;
+        self.undo_log.push(UndoEntry::PlatePromoted(li, capture_zoom));
+        self.redo_log.clear();
+        self.dirty = true;
+        Some(0)
+    }
+
+    // -- selection edits --------------------------------------------------
+    //
+    // Everything the Select tool does to a set of objects. Each call is
+    // one undo step. Index slices are expected ascending and unique
+    // (`hit::Selection` keeps them that way); indices past the end of
+    // a list are skipped rather than trusted.
+
+    /// Run `edit_stroke` / `edit_shape` over the chosen objects on layer
+    /// `li`, recording before / after snapshots as one undo entry.
+    /// Returns false when nothing was touched.
+    fn edit_objects(
+        &mut self,
+        li: usize,
+        strokes: &[usize],
+        shapes: &[usize],
+        mut edit_stroke: impl FnMut(&mut Stroke),
+        mut edit_shape: impl FnMut(&mut Shape),
+    ) -> bool {
+        let Some(layer) = self.layers.get_mut(li) else { return false };
+        let mut stroke_log = Vec::with_capacity(strokes.len());
+        let mut shape_log = Vec::with_capacity(shapes.len());
+        for &i in strokes {
+            if let Some(s) = layer.strokes.get_mut(i) {
+                let before = s.clone();
+                edit_stroke(s);
+                stroke_log.push((i, before, s.clone()));
+            }
+        }
+        for &i in shapes {
+            if let Some(s) = layer.shapes.get_mut(i) {
+                let before = s.clone();
+                edit_shape(s);
+                shape_log.push((i, before, s.clone()));
+            }
+        }
+        if stroke_log.is_empty() && shape_log.is_empty() { return false; }
+        layer.rev += 1;
+        self.undo_log.push(UndoEntry::ObjectsReplaced(li, stroke_log, shape_log));
+        self.redo_log.clear();
+        self.dirty = true;
+        true
+    }
+
+    /// Move / rotate / resize the chosen objects by `m`. Baked into the
+    /// geometry for the same reason layer transforms are (see
+    /// `move_layer_by`): every other subsystem assumes one canvas-local
+    /// space.
+    pub fn transform_objects(&mut self, li: usize, strokes: &[usize], shapes: &[usize], m: &Affine) {
+        if m.is_identity() { return; }
+        self.edit_objects(li, strokes, shapes, |s| s.apply_affine(m), |s| s.apply_affine(m));
+    }
+
+    /// Recolour and / or re-width the chosen objects.
+    ///
+    /// `merge_into_last` folds this change into the undo entry on top of
+    /// the history instead of adding one, provided that entry is an
+    /// in-place edit of exactly these objects. The size slider fires on
+    /// every pixel of a drag; merging turns that stream into a single
+    /// Ctrl+Z step back to the width the objects started with. The
+    /// caller is responsible for only asking when the top entry is its
+    /// own previous restyle.
+    pub fn restyle_objects(
+        &mut self,
+        li: usize,
+        strokes: &[usize],
+        shapes: &[usize],
+        color: Option<[u8; 4]>,
+        width: Option<f32>,
+        merge_into_last: bool,
+    ) {
+        let edit_stroke = |s: &mut Stroke| {
+            if let Some(c) = color { s.color = c; }
+            if let Some(w) = width { s.set_base_width(w); }
+        };
+        let edit_shape = |s: &mut Shape| s.restyle(color, width);
+
+        if merge_into_last {
+            let layer = self.layers.get_mut(li);
+            if let (Some(layer), Some(UndoEntry::ObjectsReplaced(l, stroke_log, shape_log))) =
+                (layer, self.undo_log.last_mut())
+            {
+                let same = *l == li
+                    && stroke_log.iter().map(|e| e.0).eq(strokes.iter().copied())
+                    && shape_log.iter().map(|e| e.0).eq(shapes.iter().copied());
+                if same {
+                    for (i, _, after) in stroke_log.iter_mut() {
+                        if let Some(s) = layer.strokes.get_mut(*i) {
+                            edit_stroke(s);
+                            *after = s.clone();
+                        }
+                    }
+                    for (i, _, after) in shape_log.iter_mut() {
+                        if let Some(s) = layer.shapes.get_mut(*i) {
+                            edit_shape(s);
+                            *after = s.clone();
+                        }
+                    }
+                    layer.rev += 1;
+                    self.dirty = true;
+                    return;
+                }
+            }
+        }
+        self.edit_objects(li, strokes, shapes, edit_stroke, edit_shape);
+    }
+
+    /// Remove the chosen objects in one undo step.
+    pub fn delete_objects(&mut self, li: usize, strokes: &[usize], shapes: &[usize]) {
+        let Some(layer) = self.layers.get_mut(li) else { return };
+        let removed_strokes = remove_at(&mut layer.strokes, strokes);
+        let removed_shapes = remove_at(&mut layer.shapes, shapes);
+        if removed_strokes.is_empty() && removed_shapes.is_empty() { return; }
+        layer.rev += 1;
+        self.undo_log.push(UndoEntry::ObjectsRemoved(li, removed_strokes, removed_shapes));
+        self.redo_log.clear();
+        self.dirty = true;
+    }
+
+    /// Append objects to layer `li` in one undo step (duplicate /
+    /// paste). Returns where they landed, ready to become the new
+    /// selection.
+    pub fn insert_objects(
+        &mut self,
+        li: usize,
+        strokes: Vec<Stroke>,
+        shapes: Vec<Shape>,
+    ) -> hit::Selection {
+        let mut placed = hit::Selection::default();
+        let Some(layer) = self.layers.get_mut(li) else { return placed };
+        if strokes.is_empty() && shapes.is_empty() { return placed; }
+        let mut stroke_log = Vec::with_capacity(strokes.len());
+        for mut s in strokes {
+            // No-op when the stroke already carries its cache (a clone
+            // of a painted stroke does).
+            s.build_cache();
+            let i = layer.strokes.len();
+            layer.strokes.push(s.clone());
+            stroke_log.push((i, s));
+            placed.strokes.push(i);
+        }
+        let mut shape_log = Vec::with_capacity(shapes.len());
+        for s in shapes {
+            let i = layer.shapes.len();
+            layer.shapes.push(s.clone());
+            shape_log.push((i, s));
+            placed.shapes.push(i);
+        }
+        layer.rev += 1;
+        self.undo_log.push(UndoEntry::ObjectsInserted(li, stroke_log, shape_log));
+        self.redo_log.clear();
+        self.dirty = true;
+        placed
+    }
+
+    /// Bring the chosen objects to the front of their list (painted
+    /// last, so on top) or send them to the back. Strokes only move
+    /// among strokes and shapes among shapes — a layer paints all its
+    /// shapes before any stroke, and that order is part of the save
+    /// format. Returns where the objects sit afterwards.
+    pub fn reorder_objects(
+        &mut self,
+        li: usize,
+        strokes: &[usize],
+        shapes: &[usize],
+        to_front: bool,
+    ) -> hit::Selection {
+        let mut placed = hit::Selection { strokes: strokes.to_vec(), shapes: shapes.to_vec() };
+        let Some(layer) = self.layers.get_mut(li) else { return placed };
+        let identity = |perm: &[usize]| perm.iter().enumerate().all(|(i, &p)| i == p);
+        // An empty permutation is the entry's way of saying "this list
+        // was not touched".
+        let perm_for = |len: usize, picked: &[usize]| {
+            if picked.is_empty() { return Vec::new(); }
+            let perm = regroup_perm(len, picked, to_front);
+            if identity(&perm) { Vec::new() } else { perm }
+        };
+        let stroke_perm = perm_for(layer.strokes.len(), strokes);
+        let shape_perm = perm_for(layer.shapes.len(), shapes);
+        let landing = |len: usize, picked: &[usize]| -> Vec<usize> {
+            let n = picked.iter().filter(|&&i| i < len).count();
+            if to_front { (len - n..len).collect() } else { (0..n).collect() }
+        };
+        placed.strokes = landing(layer.strokes.len(), strokes);
+        placed.shapes = landing(layer.shapes.len(), shapes);
+        if stroke_perm.is_empty() && shape_perm.is_empty() { return placed; }
+        permute(&mut layer.strokes, &stroke_perm);
+        permute(&mut layer.shapes, &shape_perm);
+        layer.rev += 1;
+        self.undo_log.push(UndoEntry::ObjectsReordered(li, stroke_perm, shape_perm));
+        self.redo_log.clear();
+        self.dirty = true;
+        placed
     }
 
     // -- layer management -------------------------------------------------
@@ -805,6 +1086,7 @@ impl Canvas {
             image: Some(image),
             moved_by: [0.0, 0.0],
             scaled_by: 1.0,
+            rev: 0,
         };
         self.layers.insert(0, l);
         // Keep the user pointing at whichever ink layer they were
@@ -829,6 +1111,7 @@ impl Canvas {
             image:   None,
             moved_by: [0.0, 0.0],
             scaled_by: 1.0,
+            rev: 0,
         };
         let pos = (self.active_layer + 1).min(self.layers.len());
         self.layers.insert(pos, l);
@@ -945,7 +1228,149 @@ fn layer_idx_of(e: &UndoEntry) -> usize {
         | UndoEntry::StrokePartiallyErased(li, _, _, _)
         | UndoEntry::ShapeReplaced(li, _, _, _)
         | UndoEntry::LayerMoved(li, _)
-        | UndoEntry::LayerScaled(li, _, _) => *li,
+        | UndoEntry::LayerScaled(li, _, _)
+        | UndoEntry::ObjectsReplaced(li, _, _)
+        | UndoEntry::ObjectsRemoved(li, _, _)
+        | UndoEntry::ObjectsInserted(li, _, _)
+        | UndoEntry::ObjectsReordered(li, _, _)
+        | UndoEntry::PlatePromoted(li, _) => *li,
+    }
+}
+
+/// Turn layer `li`'s background plate into an image object at the front
+/// of its shape list, returning the plate's `capture_zoom`. A layer
+/// paints its plate first and then its shapes in order, so shape 0
+/// lands exactly where the plate was, under everything else on the
+/// layer — nothing on screen moves.
+fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
+    let layer = layers.get_mut(li)?;
+    let img = layer.image.take()?;
+    let size = img.extent();
+    layer.shapes.insert(0, Shape::Raster {
+        pos: img.canvas_origin,
+        size,
+        png: std::sync::Arc::new(img.png),
+        px_size: img.size,
+        color: [0, 0, 0, 0],
+        rotation: 0.0,
+        kind: RasterKind::Image,
+    });
+    layer.rev += 1;
+    Some(img.capture_zoom)
+}
+
+/// Exact inverse of `promote_plate_in`. Refuses (returns false) unless
+/// the layer is in the state a promotion leaves it in — no plate, and
+/// an unrotated image as shape 0 — which is what the undo history
+/// guarantees by the time this entry is reached.
+fn demote_plate(layers: &mut [Layer], li: usize, capture_zoom: f32) -> bool {
+    let Some(layer) = layers.get_mut(li) else { return false };
+    let promoted = matches!(
+        layer.shapes.first(),
+        Some(Shape::Raster { kind: RasterKind::Image, rotation, .. }) if *rotation == 0.0
+    );
+    if layer.image.is_some() || !promoted { return false; }
+    let Shape::Raster { pos, size, png, px_size, .. } = layer.shapes.remove(0) else { return false };
+    layer.image = Some(LayerImage {
+        // Normally the only owner by now; a copy is made only if some
+        // clone of the shape (clipboard, redo snapshot) still shares it.
+        png: std::sync::Arc::try_unwrap(png).unwrap_or_else(|shared| (*shared).clone()),
+        size: px_size,
+        logical_size: size,
+        canvas_origin: pos,
+        capture_zoom,
+    });
+    layer.rev += 1;
+    true
+}
+
+/// Remove the items at `indices` (ascending, unique) and return them as
+/// `(index, item)` in the same ascending order — the form
+/// `insert_at` takes to put them back.
+fn remove_at<T>(list: &mut Vec<T>, indices: &[usize]) -> Vec<(usize, T)> {
+    let mut out = Vec::with_capacity(indices.len());
+    // Highest index first, so removing one never shifts those still to go.
+    for &i in indices.iter().rev() {
+        if i < list.len() {
+            out.push((i, list.remove(i)));
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// Insert `(index, item)` pairs given in ascending index order. Each
+/// index is the item's position in the finished list, which is where
+/// it lands because everything below it has already been placed.
+fn insert_at<T: Clone>(list: &mut Vec<T>, items: &[(usize, T)]) {
+    for (i, item) in items {
+        list.insert((*i).min(list.len()), item.clone());
+    }
+}
+
+/// Re-order `list` so that `new[i] = old[perm[i]]`. Ignored unless
+/// `perm` really is a permutation of the list's indices.
+fn permute<T>(list: &mut Vec<T>, perm: &[usize]) {
+    if perm.len() != list.len() { return; }
+    let mut seen = vec![false; perm.len()];
+    for &p in perm {
+        if p >= seen.len() || std::mem::replace(&mut seen[p], true) { return; }
+    }
+    let mut old: Vec<Option<T>> = std::mem::take(list).into_iter().map(Some).collect();
+    list.extend(perm.iter().filter_map(|&p| old[p].take()));
+}
+
+fn inverse_perm(perm: &[usize]) -> Vec<usize> {
+    let mut inv = vec![0; perm.len()];
+    for (new_i, &old_i) in perm.iter().enumerate() {
+        if old_i < inv.len() { inv[old_i] = new_i; }
+    }
+    inv
+}
+
+/// Undo one of the insert / remove / re-order entries and return the
+/// entry that would undo *that*. Shared by `undo` and `redo`: for these
+/// three, redoing is just undoing the undo.
+fn invert_object_entry(layers: &mut [Layer], entry: UndoEntry) -> Option<UndoEntry> {
+    match entry {
+        UndoEntry::ObjectsRemoved(li, strokes, shapes) => {
+            let layer = layers.get_mut(li)?;
+            insert_at(&mut layer.strokes, &strokes);
+            insert_at(&mut layer.shapes, &shapes);
+            layer.rev += 1;
+            Some(UndoEntry::ObjectsInserted(li, strokes, shapes))
+        }
+        UndoEntry::ObjectsInserted(li, strokes, shapes) => {
+            let layer = layers.get_mut(li)?;
+            let si: Vec<usize> = strokes.iter().map(|e| e.0).collect();
+            let hi: Vec<usize> = shapes.iter().map(|e| e.0).collect();
+            remove_at(&mut layer.strokes, &si);
+            remove_at(&mut layer.shapes, &hi);
+            layer.rev += 1;
+            Some(UndoEntry::ObjectsRemoved(li, strokes, shapes))
+        }
+        UndoEntry::ObjectsReordered(li, stroke_perm, shape_perm) => {
+            let layer = layers.get_mut(li)?;
+            let (si, hi) = (inverse_perm(&stroke_perm), inverse_perm(&shape_perm));
+            permute(&mut layer.strokes, &si);
+            permute(&mut layer.shapes, &hi);
+            layer.rev += 1;
+            Some(UndoEntry::ObjectsReordered(li, si, hi))
+        }
+        _ => None,
+    }
+}
+
+/// Permutation that moves the `selected` indices (ascending) of a list
+/// of length `len` to its end (`to_front`, painted last = on top) or
+/// its start, keeping both groups in their existing order.
+fn regroup_perm(len: usize, selected: &[usize], to_front: bool) -> Vec<usize> {
+    let picked: Vec<usize> = selected.iter().copied().filter(|&i| i < len).collect();
+    let rest = (0..len).filter(|i| picked.binary_search(i).is_err());
+    if to_front {
+        rest.chain(picked.iter().copied()).collect()
+    } else {
+        picked.iter().copied().chain(rest).collect()
     }
 }
 
@@ -1005,9 +1430,29 @@ enum RasterEraseOutcome {
 /// lies inside `polygon`. Returns one of `Skip` / `Delete` /
 /// `Replace`. Decodes + re-encodes the PNG once.
 fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutcome {
-    let (pos, size, png, _px_size, color) = match shape {
-        Shape::Raster { pos, size, png, px_size, color } => (*pos, *size, png, *px_size, *color),
+    let (pos, size, png, color, rotation, kind) = match shape {
+        Shape::Raster { pos, size, png, color, rotation, kind, .. } => {
+            (*pos, *size, png, *color, *rotation, *kind)
+        }
         _ => return RasterEraseOutcome::Skip,
+    };
+    // The pixel grid below is axis-aligned in the image's own frame. For
+    // a turned image, turn the lasso back by the same angle about the
+    // image centre instead, so the rest of this function can keep
+    // treating the raster as unrotated.
+    let unturned: Vec<[f32; 2]>;
+    let polygon: &[[f32; 2]] = if rotation != 0.0 {
+        let o = shape.obb();
+        unturned = polygon
+            .iter()
+            .map(|p| {
+                let q = o.to_local(*p);
+                [o.center[0] + q[0], o.center[1] + q[1]]
+            })
+            .collect();
+        &unturned
+    } else {
+        polygon
     };
     let decoded = match image::load_from_memory(png) {
         Ok(d) => d.to_rgba8(),
@@ -1079,9 +1524,11 @@ fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutco
     RasterEraseOutcome::Replace(Shape::Raster {
         pos,
         size,
-        png: new_png,
+        png: std::sync::Arc::new(new_png),
         px_size: [iw, ih],
         color,
+        rotation,
+        kind,
     })
 }
 
@@ -1183,5 +1630,226 @@ mod layer_xform_tests {
         c.scale_layer_about(0, -1.0, [10.0, 10.0]);
         assert!(c.undo_log.is_empty());
         assert!((dot(&c)[0] - 30.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod object_edit_tests {
+    use super::*;
+    use crate::canvas::shape::BorderStyle;
+    use crate::canvas::stroke::{PenSample, StrokeStyle};
+    use std::sync::Arc;
+
+    /// A short horizontal stroke starting at `(x, 0)`, tagged by its
+    /// red channel so tests can tell strokes apart after re-ordering.
+    fn stroke(tag: u8, x: f32) -> Stroke {
+        let mut s = Stroke::with_style([tag, 0, 0, 255], 4.0, StrokeStyle::Default);
+        for i in 0..=4 {
+            s.samples.push(PenSample { pos: [x + i as f32 * 10.0, 0.0], pressure: 1.0, tilt: [0.0, 0.0] });
+        }
+        s.build_cache();
+        s
+    }
+
+    fn raster(kind: RasterKind) -> Shape {
+        Shape::Raster {
+            pos: [0.0, 0.0], size: [200.0, 200.0], png: Arc::new(vec![1, 2, 3]), px_size: [1, 1],
+            color: [0; 4], rotation: 0.0, kind,
+        }
+    }
+
+    fn tags(c: &Canvas) -> Vec<u8> {
+        c.layers[0].strokes.iter().map(|s| s.color[0]).collect()
+    }
+
+    fn canvas(n: u8) -> Canvas {
+        let mut c = Canvas::default();
+        for t in 0..n {
+            c.layers[0].strokes.push(stroke(t, t as f32 * 100.0));
+        }
+        c
+    }
+
+    #[test]
+    fn delete_is_one_step_and_undo_puts_everything_back_in_place() {
+        let mut c = canvas(5);
+        c.delete_objects(0, &[1, 3], &[]);
+        assert_eq!(tags(&c), vec![0, 2, 4]);
+        assert_eq!(c.undo_log.len(), 1);
+        c.undo();
+        assert_eq!(tags(&c), vec![0, 1, 2, 3, 4]);
+        c.redo();
+        assert_eq!(tags(&c), vec![0, 2, 4]);
+        c.undo();
+        assert_eq!(tags(&c), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn insert_reports_where_things_landed_and_undoes_cleanly() {
+        let mut c = canvas(2);
+        let placed = c.insert_objects(0, vec![stroke(7, 0.0), stroke(8, 0.0)], vec![raster(RasterKind::Image)]);
+        assert_eq!(placed.strokes, vec![2, 3]);
+        assert_eq!(placed.shapes, vec![0]);
+        assert_eq!(tags(&c), vec![0, 1, 7, 8]);
+        c.undo();
+        assert_eq!(tags(&c), vec![0, 1]);
+        assert!(c.layers[0].shapes.is_empty());
+        c.redo();
+        assert_eq!(tags(&c), vec![0, 1, 7, 8]);
+        assert_eq!(c.layers[0].shapes.len(), 1);
+    }
+
+    #[test]
+    fn bring_to_front_and_send_to_back_keep_relative_order() {
+        let mut c = canvas(5);
+        let placed = c.reorder_objects(0, &[1, 3], &[], true);
+        assert_eq!(tags(&c), vec![0, 2, 4, 1, 3]);
+        assert_eq!(placed.strokes, vec![3, 4]);
+        c.undo();
+        assert_eq!(tags(&c), vec![0, 1, 2, 3, 4]);
+        c.redo();
+        assert_eq!(tags(&c), vec![0, 2, 4, 1, 3]);
+
+        let placed = c.reorder_objects(0, &[3, 4], &[], false);
+        assert_eq!(tags(&c), vec![1, 3, 0, 2, 4]);
+        assert_eq!(placed.strokes, vec![0, 1]);
+
+        // Already at the back: nothing to do, nothing recorded.
+        let before = c.undo_log.len();
+        c.reorder_objects(0, &[0, 1], &[], false);
+        assert_eq!(c.undo_log.len(), before);
+    }
+
+    #[test]
+    fn a_run_of_size_ticks_is_one_undo_step() {
+        let mut c = canvas(2);
+        c.restyle_objects(0, &[0], &[], None, Some(6.0), false);
+        c.restyle_objects(0, &[0], &[], None, Some(9.0), true);
+        c.restyle_objects(0, &[0], &[], None, Some(12.0), true);
+        assert_eq!(c.undo_log.len(), 1);
+        assert!((c.layers[0].strokes[0].base_width - 12.0).abs() < 1e-4);
+        // The cached widths follow, so the stroke repaints at the new size.
+        let w = c.layers[0].strokes[0].cache.as_ref().unwrap().widths[0];
+        assert!(w > 4.0 * 2.0, "cache width {w} did not grow");
+        c.undo();
+        assert!((c.layers[0].strokes[0].base_width - 4.0).abs() < 1e-4);
+        c.redo();
+        assert!((c.layers[0].strokes[0].base_width - 12.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn merging_never_folds_into_an_edit_of_different_objects() {
+        let mut c = canvas(2);
+        c.restyle_objects(0, &[0], &[], None, Some(6.0), false);
+        c.restyle_objects(0, &[1], &[], None, Some(9.0), true);
+        assert_eq!(c.undo_log.len(), 2);
+    }
+
+    #[test]
+    fn recolour_and_transform_undo_restore_a_rotated_shape_exactly() {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(Shape::Rect {
+            a: [0.0, 0.0], b: [40.0, 20.0], color: [1, 2, 3, 255], stroke_width: 2.0,
+            border: BorderStyle::Solid, rotation: 0.0,
+        });
+        c.transform_objects(0, &[], &[0], &Affine::rotate_about([20.0, 10.0], 0.5));
+        c.restyle_objects(0, &[], &[0], Some([9, 9, 9, 255]), None, false);
+        assert!(matches!(&c.layers[0].shapes[0], Shape::Rect { rotation, color, .. }
+            if (rotation - 0.5).abs() < 1e-5 && *color == [9, 9, 9, 255]));
+        c.undo();
+        c.undo();
+        assert!(matches!(&c.layers[0].shapes[0], Shape::Rect { a, b, rotation, color, .. }
+            if *a == [0.0, 0.0] && *b == [40.0, 20.0] && *rotation == 0.0 && *color == [1, 2, 3, 255]));
+    }
+
+    #[test]
+    fn identity_transform_writes_no_history() {
+        let mut c = canvas(1);
+        c.transform_objects(0, &[0], &[], &Affine::IDENTITY);
+        assert!(c.undo_log.is_empty());
+    }
+
+    #[test]
+    fn eraser_needs_to_touch_the_ink_and_never_takes_an_image() {
+        let mut c = Canvas::default();
+        // Diagonal stroke: its bounding box is 100×100, the ink a thin line.
+        let mut diagonal = Stroke::with_style([0, 0, 0, 255], 4.0, StrokeStyle::Default);
+        for i in 0..=10 {
+            let v = i as f32 * 10.0;
+            diagonal.samples.push(PenSample { pos: [v, v], pressure: 1.0, tilt: [0.0, 0.0] });
+        }
+        diagonal.build_cache();
+        c.layers[0].strokes.push(diagonal);
+        c.layers[0].shapes.push(raster(RasterKind::Image));
+
+        // Inside the stroke's box and on top of the image, but off the ink.
+        assert!(!c.erase_at([90.0, 10.0], 6.0));
+        assert_eq!(c.layers[0].strokes.len(), 1);
+        assert_eq!(c.layers[0].shapes.len(), 1);
+
+        // On the ink: the stroke goes, the image underneath stays.
+        assert!(c.erase_at([50.0, 50.0], 6.0));
+        assert!(c.layers[0].strokes.is_empty());
+        assert_eq!(c.layers[0].shapes.len(), 1);
+
+        // A fill sticker is still ink and still erasable.
+        c.layers[0].shapes.push(raster(RasterKind::Fill));
+        assert!(c.erase_at([50.0, 50.0], 6.0));
+        assert_eq!(c.layers[0].shapes.len(), 1);
+        assert!(matches!(&c.layers[0].shapes[0], Shape::Raster { kind: RasterKind::Image, .. }));
+    }
+
+    #[test]
+    fn the_lasso_eraser_takes_ink_and_leaves_pictures_whole() {
+        let mut c = canvas(1);
+        c.layers[0].shapes.push(raster(RasterKind::Image));
+        let around_everything = [[-50.0, -50.0], [300.0, -50.0], [300.0, 300.0], [-50.0, 300.0]];
+        assert!(c.erase_in_polygon(&around_everything));
+        assert!(c.layers[0].strokes.is_empty());
+        assert_eq!(c.layers[0].shapes.len(), 1, "the image survives");
+        assert!(matches!(&c.layers[0].shapes[0], Shape::Raster { png, .. } if **png == vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn promoting_a_plate_keeps_earlier_undo_entries_pointing_at_the_right_shapes() {
+        let mut c = Canvas::default();
+        c.layers[0].image = Some(LayerImage {
+            png: vec![9, 9],
+            size: [4, 2],
+            logical_size: [0.0, 0.0], // an older save: no logical size
+            canvas_origin: [10.0, 20.0],
+            capture_zoom: 1.0,
+        });
+        let line = |x: f32| Shape::Line {
+            a: [x, 0.0], b: [x, 50.0], color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid,
+        };
+        c.add_shape(line(1.0));
+        c.add_shape(line(2.0));
+        assert_eq!(c.promote_plate(0), Some(0));
+        // The image sits where the plate was drawn: origin, pixel size.
+        assert!(matches!(&c.layers[0].shapes[0], Shape::Raster { pos, size, kind: RasterKind::Image, .. }
+            if *pos == [10.0, 20.0] && *size == [4.0, 2.0]));
+        assert_eq!(c.layers[0].shapes.len(), 3);
+
+        // Undo steps through the promotion and removes the second line —
+        // not the image, and not the first line.
+        c.undo();
+        assert!(c.layers[0].image.is_some());
+        assert_eq!(c.layers[0].shapes.len(), 1);
+        assert!(matches!(&c.layers[0].shapes[0], Shape::Line { a, .. } if a[0] == 1.0));
+        // Redo brings the line back; the promotion had no visible edit
+        // after it to ride along with, so it waits for the next redo.
+        c.redo();
+        assert!(c.layers[0].image.is_some());
+        assert_eq!(c.layers[0].shapes.len(), 2);
+        c.redo();
+        assert!(c.layers[0].image.is_none());
+        assert_eq!(c.layers[0].shapes.len(), 3);
+        assert!(matches!(&c.layers[0].shapes[2], Shape::Line { a, .. } if a[0] == 2.0));
+        // And back again: every index still lines up.
+        c.undo();
+        c.undo();
+        assert!(c.layers[0].image.is_some());
+        assert!(c.layers[0].shapes.is_empty());
     }
 }

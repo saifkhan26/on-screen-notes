@@ -16,6 +16,14 @@ use std::path::PathBuf;
 /// The directory is created if it does not yet exist, so callers can pass the
 /// returned path straight to `std::fs::write` etc. without worrying.
 pub fn data_dir() -> Result<PathBuf> {
+    // `OSN_DATA_DIR` redirects everything (config + canvases) to another
+    // folder. Dev and test runs set it to a scratch copy so a build under
+    // development never reads or writes the user's real slides.
+    if let Some(dir) = std::env::var_os("OSN_DATA_DIR").filter(|d| !d.is_empty()) {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
     // ProjectDirs uses a "qualifier.organization.application" tuple to derive
     // a stable path. Pick a unique qualifier so we don't clash with another
     // app of the same name.

@@ -12,6 +12,7 @@
 pub mod arrow_tool;
 pub mod eraser_tool;
 pub mod pen_tool;
+pub mod select_tool;
 pub mod shape_tool;
 
 use crate::canvas::canvas::Canvas;
@@ -76,10 +77,15 @@ pub enum ToolKind {
     LassoErase,
     /// Lasso select. Same freeform-polygon collection as `LassoErase`,
     /// but on pen-up the on-screen pixels *inside* the polygon are
-    /// captured (like the freeze-frame feature) and inserted as a
-    /// bottom image layer. The capture itself runs in the app loop —
-    /// `end` only stashes the polygon in `pending_lasso_capture`.
+    /// captured and dropped onto the active layer as an image object,
+    /// selected and ready to move. The capture itself runs in the app
+    /// loop — `end` only stashes the polygon in `pending_lasso_capture`.
     LassoSelect,
+    /// Object select. Click an object on the active layer to select it
+    /// (Shift+click adds / removes, dragging empty space rubber-bands),
+    /// then move, resize or rotate the selection through its handles.
+    /// All state lives in `ActiveTool::select`.
+    Select,
 }
 
 impl ToolKind {
@@ -100,6 +106,7 @@ impl ToolKind {
             ToolKind::Spotlight     => "S",
             ToolKind::LassoErase    => "X",
             ToolKind::LassoSelect   => "Shift+X",
+            ToolKind::Select        => "V",
         }
     }
 }
@@ -189,6 +196,11 @@ pub struct ActiveTool {
     /// DPI, and the 2-frame chrome-hide that only the app has).
     /// Cleared once consumed.
     pub pending_lasso_capture: Option<Vec<[f32; 2]>>,
+    /// Select-tool state: which objects are selected and the move /
+    /// resize / rotate gesture in flight, if any. Kept even while
+    /// another tool is active only so the struct has one shape — the
+    /// app clears it every frame the Select tool is not the active one.
+    pub select: select_tool::SelectState,
 
     /// Snapshot of the user's current smoothing options. Copied onto
     /// each new stroke at pen-down so a mid-stroke UI change does not
@@ -217,13 +229,18 @@ impl ActiveTool {
             spotlight_size: 120.0,
             in_progress_lasso: None,
             pending_lasso_capture: None,
+            select: select_tool::SelectState::default(),
             smoothing: cfg.smoothing,
         }
     }
 
     /// Pen-down at `sample`. Begins a stroke or shape depending on tool.
-    pub fn begin(&mut self, sample: PenSample) {
+    /// Only the Select tool uses `canvas` here: to find out what the pen
+    /// landed on, and to switch the active layer when that is on
+    /// another one.
+    pub fn begin(&mut self, sample: PenSample, canvas: &mut Canvas) {
         match self.kind {
+            ToolKind::Select => self.select.begin(sample.pos, canvas),
             ToolKind::Pen | ToolKind::FreehandArrow => {
                 // Pen + freehand arrow honour the current stroke style
                 // (Default / Pencil / Marker / Airbrush) AND the
@@ -295,6 +312,7 @@ impl ActiveTool {
     /// For the eraser, deletes any stroke/shape we touch *immediately*.
     pub fn update(&mut self, sample: PenSample, canvas: &mut Canvas) {
         match self.kind {
+            ToolKind::Select => self.select.drag(sample.pos),
             ToolKind::Pen | ToolKind::FreehandArrow => {
                 if let Some(s) = self.in_progress_stroke.as_mut() {
                     s.push(sample);
@@ -351,6 +369,7 @@ impl ActiveTool {
     /// Pen-up. Commits the stroke or shape into `canvas`.
     pub fn end(&mut self, sample: PenSample, canvas: &mut Canvas) {
         match self.kind {
+            ToolKind::Select => self.select.end(sample.pos, canvas),
             ToolKind::Pen => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
                     s.push(sample);
@@ -426,6 +445,7 @@ impl ActiveTool {
                             content: prev.buffer,
                             font_size: prev.font_size,
                             color: prev.color,
+                            rotation: 0.0,
                         });
                     }
                 }
@@ -460,7 +480,7 @@ impl ActiveTool {
                 // Same close-the-polygon step as erase, but instead of
                 // mutating the canvas we hand the polygon to the app
                 // loop, which captures the screen pixels inside it and
-                // inserts them as a bottom image layer. Canvas is
+                // adds them to the active layer as an image. Canvas is
                 // untouched here.
                 let _ = canvas;
                 if let Some(mut poly) = self.in_progress_lasso.take() {
@@ -478,6 +498,7 @@ impl ActiveTool {
                         color: self.color,
                         stroke_width: self.size,
                         border: self.border_style,
+                        rotation: 0.0,
                     });
                 }
             }
@@ -489,6 +510,7 @@ impl ActiveTool {
                         color: self.color,
                         stroke_width: self.size,
                         border: self.border_style,
+                        rotation: 0.0,
                     });
                 }
             }
@@ -523,6 +545,7 @@ impl ActiveTool {
         self.in_progress_stroke = None;
         self.in_progress_shape  = None;
         self.in_progress_lasso  = None;
+        self.select.gesture     = None;
     }
 
     /// Build a synthetic preview `Shape` for the in-progress two-corner drag,
@@ -530,8 +553,8 @@ impl ActiveTool {
     pub fn preview_shape(&self) -> Option<Shape> {
         let (a, b) = self.in_progress_shape?;
         Some(match self.kind {
-            ToolKind::Rect    => Shape::Rect    { a, b, color: self.color, stroke_width: self.size, border: self.border_style },
-            ToolKind::Ellipse => Shape::Ellipse { a, b, color: self.color, stroke_width: self.size, border: self.border_style },
+            ToolKind::Rect    => Shape::Rect    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0 },
+            ToolKind::Ellipse => Shape::Ellipse { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0 },
             ToolKind::Line    => Shape::Line    { a, b, color: self.color, stroke_width: self.size, border: self.border_style },
             ToolKind::Arrow   => Shape::Arrow   { a, b, color: self.color, stroke_width: self.size, border: self.border_style },
             _ => return None,

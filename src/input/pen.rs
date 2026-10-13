@@ -118,6 +118,29 @@ impl PenInput {
     pub fn is_active(&self) -> bool {
         !matches!(self.backend, Backend::Disabled)
     }
+
+    /// True while the pen tip is touching the tablet.
+    pub fn is_down(&self) -> bool {
+        match &self.backend {
+            Backend::Disabled => false,
+            #[cfg(target_os = "windows")]
+            Backend::Wintab(w) => w.is_down(),
+        }
+    }
+
+    /// True if the pen pressed or visibly moved within the last
+    /// `window`. A tablet driver also moves the system cursor and
+    /// presses the left mouse button on the pen's behalf, so the mouse
+    /// path has to stand down while this is true or every pen stroke
+    /// would be drawn twice. With the pen out of range (or resting
+    /// still) this goes false and the mouse draws.
+    pub fn used_within(&self, window: std::time::Duration) -> bool {
+        match &self.backend {
+            Backend::Disabled => false,
+            #[cfg(target_os = "windows")]
+            Backend::Wintab(w) => w.used_within(window),
+        }
+    }
 }
 
 /// Translate a `PenEvent` into tool actions. Lives next to the event type
@@ -128,7 +151,7 @@ pub fn dispatch(
     canvas: &mut crate::canvas::canvas::Canvas,
 ) {
     match event {
-        PenEvent::Down(s) => tool.begin(s),
+        PenEvent::Down(s) => tool.begin(s, canvas),
         PenEvent::Move(s) => tool.update(s, canvas),
         PenEvent::Up(s)   => tool.end(s, canvas),
     }
@@ -178,6 +201,13 @@ mod windows_backend {
         is_down: bool,
         /// Most recent sample (used so `Up` always carries a position).
         last_sample: Option<PenSample>,
+        /// When the pen last pressed, or moved by more than sensor
+        /// jitter. A pen lying still on the tablet stays "in range" and
+        /// can keep emitting packets; those must not count as use, or
+        /// the mouse would be locked out for as long as it lies there.
+        last_used: Option<std::time::Instant>,
+        /// Where the pen was when it last counted as having moved.
+        rest_anchor: Option<[f32; 2]>,
     }
 
     // Wintab handles are not Send / Sync; we never move Wintab off the main
@@ -282,7 +312,15 @@ mod windows_backend {
                 pressure_max,
                 is_down: false,
                 last_sample: None,
+                last_used: None,
+                rest_anchor: None,
             })
+        }
+
+        pub fn is_down(&self) -> bool { self.is_down }
+
+        pub fn used_within(&self, window: std::time::Duration) -> bool {
+            self.last_used.is_some_and(|t| t.elapsed() <= window)
         }
 
         /// Drain any new packets and translate into `PenEvent`s.
@@ -331,6 +369,18 @@ mod windows_backend {
                     pressure,
                     tilt: [0.0, 0.0],
                 };
+                // Two pixels clears the jitter of a pen at rest. Measured
+                // from where the pen last counted as moved rather than
+                // from the previous packet, so a slow glide still adds up.
+                let moved = self.rest_anchor.map_or(true, |a| {
+                    (a[0] - pos[0]).abs() >= 2.0 || (a[1] - pos[1]).abs() >= 2.0
+                });
+                if moved {
+                    self.rest_anchor = Some(pos);
+                }
+                if pressure > 0.0 || moved {
+                    self.last_used = Some(std::time::Instant::now());
+                }
                 self.last_sample = Some(sample);
 
                 // Edge detection: we treat "pressure > 0" as the pen being

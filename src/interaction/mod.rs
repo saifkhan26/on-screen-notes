@@ -88,6 +88,7 @@ pub fn react_tool_shortcut(
     }}
     if let Some(b) = t.lasso          { if b.matches(key, mods) { tool.kind = ToolKind::LassoErase; return; }}
     if let Some(b) = t.lasso_select   { if b.matches(key, mods) { tool.kind = ToolKind::LassoSelect; return; }}
+    if let Some(b) = t.select         { if b.matches(key, mods) { tool.kind = ToolKind::Select;     return; }}
     if let Some(b) = t.eyedropper     { if b.matches(key, mods) { tool.eyedropper_pending = true;   return; }}
     if let Some(b) = t.rect           { if b.matches(key, mods) { tool.kind = ToolKind::Rect;       return; }}
     if let Some(b) = t.ellipse        { if b.matches(key, mods) { tool.kind = ToolKind::Ellipse;    return; }}
@@ -99,6 +100,9 @@ pub fn react_tool_shortcut(
     if key == egui::Key::Escape && !mods.ctrl && !mods.shift && !mods.alt {
         tool.eyedropper_pending = false;
         tool.in_progress_lasso  = None;
+        // First Esc drops an in-flight move / resize / rotate, the next
+        // one drops the selection.
+        tool.select.cancel();
     }
 }
 
@@ -204,6 +208,7 @@ pub fn route_text_input(
                     content: t.buffer,
                     font_size: t.font_size,
                     color: t.color,
+                    rotation: 0.0,
                 });
             }
         }

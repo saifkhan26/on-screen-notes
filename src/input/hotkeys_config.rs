@@ -223,6 +223,7 @@ pub struct ToolSection {
     #[serde(default = "d_spotlight")]      pub spotlight: String,
     #[serde(default = "d_lasso")]          pub lasso: String,
     #[serde(default = "d_lasso_select")]   pub lasso_select: String,
+    #[serde(default = "d_select")]         pub select: String,
     #[serde(default = "d_eyedropper")]     pub eyedropper: String,
     #[serde(default = "d_rect")]           pub rect: String,
     #[serde(default = "d_ellipse")]        pub ellipse: String,
@@ -237,6 +238,7 @@ impl Default for ToolSection {
             airbrush: d_airbrush(), fill: d_fill(), laser: d_laser(),
             text: d_text(), spotlight: d_spotlight(), lasso: d_lasso(),
             lasso_select: d_lasso_select(),
+            select: d_select(),
             eyedropper: d_eyedropper(), rect: d_rect(), ellipse: d_ellipse(),
             arrow: d_arrow(), freehand_arrow: d_freehand_arrow(),
         }
@@ -253,6 +255,7 @@ fn d_text()           -> String { "t".into() }
 fn d_spotlight()      -> String { "s".into() }
 fn d_lasso()          -> String { "x".into() }
 fn d_lasso_select()   -> String { "shift+x".into() }
+fn d_select()         -> String { "v".into() }
 fn d_eyedropper()     -> String { "i".into() }
 fn d_rect()           -> String { "r".into() }
 fn d_ellipse()        -> String { "o".into() }
@@ -308,6 +311,15 @@ pub struct CanvasSection {
     /// active layer's content. Helpful for "what's on this layer?"
     /// when many layers exist.
     #[serde(default = "d_preview_layer")] pub preview_layer: String,
+
+    // Select-tool actions. They only do anything while objects are
+    // selected, so `delete` and the arrow chords stay free otherwise.
+    #[serde(default = "d_delete_selection")] pub delete_selection: String,
+    #[serde(default = "d_duplicate")]        pub duplicate: String,
+    /// Paint the selection above everything else of its kind on the layer.
+    #[serde(default = "d_bring_front")]      pub bring_front: String,
+    /// Paint the selection below everything else of its kind on the layer.
+    #[serde(default = "d_send_back")]        pub send_back: String,
 }
 
 impl Default for CanvasSection {
@@ -329,6 +341,10 @@ impl Default for CanvasSection {
             opacity_dec: d_op_dec(),
             opacity_inc: d_op_inc(),
             preview_layer: d_preview_layer(),
+            delete_selection: d_delete_selection(),
+            duplicate: d_duplicate(),
+            bring_front: d_bring_front(),
+            send_back: d_send_back(),
         }
     }
 }
@@ -359,6 +375,10 @@ fn d_op_9()   -> String { "9".into() }
 fn d_op_dec() -> String { "-".into() }
 fn d_op_inc() -> String { "=".into() }
 fn d_preview_layer() -> String { "q".into() }
+fn d_delete_selection() -> String { "delete".into() }
+fn d_duplicate()   -> String { "ctrl+d".into() }
+fn d_bring_front() -> String { "ctrl+arrowup".into() }
+fn d_send_back()   -> String { "ctrl+arrowdown".into() }
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -384,6 +404,7 @@ pub struct ToolBindings {
     pub spotlight: Option<Binding>,
     pub lasso: Option<Binding>,
     pub lasso_select: Option<Binding>,
+    pub select: Option<Binding>,
     pub eyedropper: Option<Binding>,
     pub rect: Option<Binding>,
     pub ellipse: Option<Binding>,
@@ -411,6 +432,10 @@ pub struct CanvasBindings {
     pub opacity_dec: Option<Binding>,
     pub opacity_inc: Option<Binding>,
     pub preview_layer: Option<Binding>,
+    pub delete_selection: Option<Binding>,
+    pub duplicate: Option<Binding>,
+    pub bring_front: Option<Binding>,
+    pub send_back: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -445,6 +470,7 @@ impl HotkeysConfig {
                 spotlight:      p("tool.spotlight",      &self.tool.spotlight),
                 lasso:          p("tool.lasso",          &self.tool.lasso),
                 lasso_select:   p("tool.lasso_select",   &self.tool.lasso_select),
+                select:         p("tool.select",         &self.tool.select),
                 eyedropper:     p("tool.eyedropper",     &self.tool.eyedropper),
                 rect:           p("tool.rect",           &self.tool.rect),
                 ellipse:        p("tool.ellipse",        &self.tool.ellipse),
@@ -480,6 +506,10 @@ impl HotkeysConfig {
                 opacity_dec: p("canvas.opacity_dec", &self.canvas.opacity_dec),
                 opacity_inc: p("canvas.opacity_inc", &self.canvas.opacity_inc),
                 preview_layer: p("canvas.preview_layer", &self.canvas.preview_layer),
+                delete_selection: p("canvas.delete_selection", &self.canvas.delete_selection),
+                duplicate:   p("canvas.duplicate",   &self.canvas.duplicate),
+                bring_front: p("canvas.bring_front", &self.canvas.bring_front),
+                send_back:   p("canvas.send_back",   &self.canvas.send_back),
             },
         }
     }

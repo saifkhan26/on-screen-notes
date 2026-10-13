@@ -106,7 +106,9 @@ global-hotkey = "0.6"
 # serde + ron = serialise/deserialise our app state to a human-readable file
 # format on disk. RON is like JSON but more Rusty (and easier to debug by
 # opening the file in a text editor).
-serde = { version = "1", features = ["derive"] }
+# `rc` lets `Arc<…>` fields (the shared PNG bytes of a raster shape)
+# serialise as the value they point at, so the file format is unchanged.
+serde = { version = "1", features = ["derive", "rc"] }
 ron    = "0.8"
 
 # toml = hand-edited hotkeys file format. We pick TOML over YAML

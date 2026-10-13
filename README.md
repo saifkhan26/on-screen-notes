@@ -27,6 +27,10 @@ input.
 - **Laser pointer** — strokes fade ~1 s after pen-up
 - **Spotlight** — dims everything except a square around the cursor
 - **Lasso erase** — draw a closed loop, ink inside gets removed (with undo)
+- **Lasso capture** — draw a closed loop, the screen pixels inside become
+  an image on the active layer
+- **Select** — pick objects, then move / resize / rotate them with
+  handles; multi-select, duplicate, copy / paste, recolour, re-order
 - **Text labels** — click to place, type, Enter to commit
 - **Multiple canvases**, persistent on disk via RON
 - **Multiple layers per canvas** (independent visibility + opacity, and
@@ -111,8 +115,10 @@ the binary on first launch.
 | Text | `T` | Click anywhere, type, Enter commits |
 | Spotlight | `S` | Press again to exit |
 | Lasso erase | `X` | Draw closed loop |
+| Lasso capture | `Shift+X` | Draw closed loop → image object on the active layer |
+| Select | `V` | See [Selecting and transforming](#selecting-and-transforming) |
 | Eyedropper | `I` | One-shot — next click picks a pixel |
-| Eraser | `Ctrl` (hold) | Modifier — pen erases while held |
+| Eraser | `Ctrl` (hold) | Modifier — pen erases the ink it touches while held |
 | Rectangle | `R` | |
 | Ellipse | `O` | |
 | Straight arrow | `A` | |
@@ -124,6 +130,55 @@ the binary on first launch.
 Rect / Ellipse / Line / Arrow tools expose a contextual **dashed-border
 toggle** in the toolbar. When active, the shape commits with an
 animated marching-ants outline. Toggle is per-tool, not global.
+
+### Selecting and transforming
+
+The Select tool (`V`) picks through **every visible layer**: strokes,
+shapes, text, fills and images. Whatever is topmost under the pointer
+wins. A selection lives on one layer, so selecting something on another
+layer makes that layer the active one.
+
+| Do this | To |
+|---|---|
+| Click an object | Select it |
+| `Shift` + click | Add it to / remove it from the selection |
+| Drag from empty space | Box-select everything fully inside the box (on the active layer; if nothing there is inside, on the topmost layer that has something) |
+| Drag inside the frame | Move the selection |
+| Drag a corner handle | Resize, keeping proportions |
+| Drag a side handle | Stretch along one axis |
+| Drag the knob above the frame | Rotate (`Shift` snaps to 15°) |
+| `Delete` / `Backspace` | Delete the selection |
+| `Ctrl+D` | Duplicate |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste (works across slides and layers) |
+| `Ctrl+V` with an image on the clipboard | Paste it as an image object |
+| `Ctrl+↑` / `Ctrl+↓` | Bring to front / send to back |
+| Pick a palette colour, move the size slider | Recolour / change line width of the selection |
+| `Esc` | Cancel the drag in progress, then deselect |
+
+Every action is one undo step. Things worth knowing:
+
+- An image (lasso capture, pasted picture) is selected by a **click**.
+  Dragging from an unselected image draws the selection box instead, so
+  you can box-select ink drawn over a screenshot without dragging the
+  screenshot away. Clicks pass through the transparent parts of an
+  image to whatever is visible underneath. Neither eraser removes
+  images — delete them here.
+- Captures made by older versions, and frozen frames, are stored as a
+  layer's background rather than as objects. Clicking one turns it into
+  an ordinary image object in place — nothing moves — and from then on
+  it selects, moves, resizes and rotates like any other.
+- Side handles appear only where a one-axis stretch can be stored
+  exactly: a single shape, or a selection of strokes, lines, arrows and
+  unrotated boxes. Text, and groups containing rotated shapes, resize
+  from the corners.
+- Within a layer, ink always paints above shapes and images. Bring to
+  front / send to back re-orders strokes among strokes and shapes among
+  shapes; to put an image over ink, use a layer above.
+- While the Select tool is active, `Shift` + click selects rather than
+  picking a colour, and `Ctrl` does not erase. `I` still picks a colour.
+- Objects on different layers cannot be in one selection.
+- Pasting an image-only clipboard works on Windows; elsewhere the
+  clipboard must also carry text for the paste to be noticed.
 
 ---
 
@@ -216,7 +271,10 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Active layer opacity — step | `-` −10 %, `=` +10 % |
 | Layer preview popup (active layer) | `Q` (toggle) |
 | Toggle floating UI | `Tab` |
-| Cancel pending (eyedropper / lasso / text) | `Esc` |
+| Cancel pending (eyedropper / lasso / text / selection) | `Esc` |
+| Selection: delete / duplicate | `Delete` / `Ctrl+D` |
+| Selection: copy / cut / paste | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` |
+| Selection: bring to front / send to back | `Ctrl+↑` / `Ctrl+↓` |
 | Text mode: newline | `Shift+Enter` |
 | Text mode: commit | `Enter` |
 
@@ -263,6 +321,8 @@ laser      = "l"
 text       = "t"
 spotlight  = "s"
 lasso      = "x"
+lasso_select = "shift+x"
+select     = "v"
 eyedropper = "i"
 rect       = "r"
 ellipse    = "o"
@@ -298,7 +358,15 @@ opacity_9 = "9"
 opacity_dec = "-"
 opacity_inc = "="
 preview_layer = "q"
+
+# Select-tool actions (only act while objects are selected).
+delete_selection = "delete"
+duplicate   = "ctrl+d"
+bring_front = "ctrl+arrowup"
+send_back   = "ctrl+arrowdown"
 ```
+
+Copy / cut / paste are fixed to `Ctrl+C` / `Ctrl+X` / `Ctrl+V`.
 
 Modifier-key gestures stay hard-coded (they are not shortcuts):
 `Ctrl` (eraser), `Alt` (passthrough), `Space` (pan), `Shift+Space`
@@ -316,8 +384,19 @@ Modifier-key gestures stay hard-coded (they are not shortcuts):
 | Any tool | `Shift` + scroll | Active layer opacity |
 | Any tool | `Shift+Space` + scroll | Active layer zoom (about the cursor) |
 
-Right-click a palette swatch to recolour it. Mouse fallback works for
-every tool when no tablet driver is present.
+Right-click a palette swatch to recolour it.
+
+### Drawing with the mouse
+
+Every tool works with the mouse, with or without a tablet connected:
+left-drag draws, `Ctrl` + drag erases, `Shift` + click picks a colour,
+`Space` + drag pans. Mouse strokes have no pressure, so they are drawn
+at full width.
+
+With a tablet connected the pen and the mouse share the pointer. The
+mouse takes over about a quarter of a second after the pen stops
+pressing or moving — lift the pen out of range, or leave it lying
+still, and draw with the mouse.
 
 ---
 
@@ -386,7 +465,7 @@ src/
 │   ├── pen.rs        ─ Wintab queue → PenEvent
 │   └── picker.rs     ─ window-pick helpers
 ├── interaction/      ─ keyboard / mouse dispatch
-├── persistence/      ─ canvas + config load/save
+├── persistence/      ─ canvas + config load/save (`OSN_DATA_DIR` redirects it)
 ├── platform/         ─ OS-specific window tweaks
 ├── recording.rs      ─ frame capture, GIF / MP4 encode
 ├── screenshot/       ─ xcap composite + PNG write

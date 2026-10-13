@@ -205,8 +205,10 @@ pub fn flood_fill_active(
     FillResult::Filled(Shape::Raster {
         pos,
         size,
-        png: png_bytes,
+        png: std::sync::Arc::new(png_bytes),
         px_size: [bbox_w, bbox_h],
         color,
+        rotation: 0.0,
+        kind: crate::canvas::shape::RasterKind::Fill,
     })
 }

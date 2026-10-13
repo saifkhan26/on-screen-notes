@@ -7,7 +7,7 @@
 pub mod win32;
 
 #[cfg(target_os = "windows")]
-pub use win32::{client_rect, cursor_pos, lmb_down, reclaim_foreground, set_no_activate, set_window_capture_excluded, top_level_window_at, window_rect};
+pub use win32::{client_rect, cursor_pos, lmb_down, paste_chord_down, reclaim_foreground, set_no_activate, set_window_capture_excluded, top_level_window_at, window_rect};
 
 #[cfg(not(target_os = "windows"))]
 pub fn top_level_window_at(_x: i32, _y: i32) -> isize { 0 }
@@ -36,3 +36,6 @@ pub fn cursor_pos() -> Option<(i32, i32)> { None }
 
 #[cfg(not(target_os = "windows"))]
 pub fn lmb_down() -> bool { false }
+
+#[cfg(not(target_os = "windows"))]
+pub fn paste_chord_down() -> bool { false }

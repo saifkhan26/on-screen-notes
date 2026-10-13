@@ -20,7 +20,9 @@
 //! the same end effect because GPU stroke triangles are essentially free
 //! to redraw.
 
+use crate::canvas::affine::Affine;
 use crate::canvas::canvas::Canvas;
+use crate::canvas::hit::Selection;
 use crate::canvas::shape::{BorderStyle, Shape};
 use crate::canvas::stroke::{Stroke, StrokeStyle};
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -116,6 +118,11 @@ pub fn paint_canvas_egui(
     // bakes the same similarity into the layer's geometry. `None`
     // outside a gesture.
     layer_xform: Option<(usize, f32, [f32; 2])>,
+    // In-progress Select-tool gesture: `(layer index, selected objects,
+    // transform)`. The selected objects on that layer preview through
+    // the transform; like `layer_xform`, nothing is written back until
+    // the gesture ends and `Canvas::transform_objects` bakes it in.
+    sel_preview: Option<(usize, &Selection, Affine)>,
 ) {
     // Pre-compute the pan-zoom transform as a closure so we don't
     // recompute the same maths inside every loop.
@@ -183,16 +190,39 @@ pub fn paint_canvas_egui(
             let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, (op * 255.0) as u8);
             painter.image(*tex_id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
         }
+        // Objects the Select tool is dragging on this layer, and the
+        // transform to preview them under. They keep their place in the
+        // paint order — only where they land changes.
+        let dragged = sel_preview.filter(|(l, _, _)| *l == li);
         let shape_tex_for_layer = shape_textures.get(li);
         for (si, shape) in layer.shapes.iter().enumerate() {
             let tex = shape_tex_for_layer
                 .and_then(|v| v.get(si))
                 .copied()
                 .flatten();
-            paint_shape(painter, &to_screen, shape, zoom, op, tex);
+            match dragged {
+                Some((_, sel, m)) if sel.shapes.binary_search(&si).is_ok() => {
+                    // A shape's rotation and extents are stored fields,
+                    // not points that could be mapped on the way to the
+                    // screen, so preview a transformed copy. Cheap:
+                    // raster shapes share their PNG.
+                    let mut moved = shape.clone();
+                    moved.apply_affine(&m);
+                    paint_shape(painter, &to_screen, &moved, zoom, op, tex);
+                }
+                _ => paint_shape(painter, &to_screen, shape, zoom, op, tex),
+            }
         }
-        for stroke in &layer.strokes {
-            paint_stroke(painter, &to_screen, stroke, zoom, position_passes, op);
+        for (si, stroke) in layer.strokes.iter().enumerate() {
+            match dragged {
+                Some((_, sel, m)) if sel.strokes.binary_search(&si).is_ok() => {
+                    // A stroke is all points: map each one on its way
+                    // to the screen instead of copying the stroke.
+                    let moved = |p: [f32; 2]| to_screen(m.apply(p));
+                    paint_stroke(painter, &moved, stroke, zoom * m.linear_scale(), position_passes, op);
+                }
+                _ => paint_stroke(painter, &to_screen, stroke, zoom, position_passes, op),
+            }
         }
     }
     // Previews always paint on top of every layer regardless of which
@@ -252,7 +282,32 @@ fn paint_shape(
     raster_tex: Option<egui::TextureId>,
 ) {
     match shape {
-        Shape::Rect { a, b, color, stroke_width, border } => {
+        // A turned rectangle is no longer an `egui::Rect`, so it is
+        // drawn as an outline through its four turned corners instead.
+        // Unrotated rectangles fall through to the arm below and paint
+        // exactly as they always have.
+        Shape::Rect { color, stroke_width, border, rotation, .. } if *rotation != 0.0 => {
+            let o = shape.obb();
+            let stroke = egui::Stroke::new(*stroke_width * zoom, col(*color, layer_opacity));
+            match border {
+                BorderStyle::Solid => {
+                    // Same corner radius rule as the unrotated arm,
+                    // worked out in canvas units and traced as arcs.
+                    let min_side = o.half[0].min(o.half[1]) * 2.0;
+                    let corner = (*stroke_width * 2.5).max(0.0).min((min_side * 0.45).max(0.0));
+                    let pts: Vec<egui::Pos2> = rounded_box_outline(o.half, corner)
+                        .into_iter()
+                        .map(|q| to_screen(o.from_local(q)))
+                        .collect();
+                    painter.add(egui::Shape::closed_line(pts, stroke));
+                }
+                BorderStyle::DashedAnimated => {
+                    let c = o.corners().map(|p| to_screen(p));
+                    paint_dashed_polyline(painter, &[c[0], c[1], c[2], c[3], c[0]], stroke, zoom);
+                }
+            }
+        }
+        Shape::Rect { a, b, color, stroke_width, border, .. } => {
             let r = egui::Rect::from_two_pos(to_screen(*a), to_screen(*b));
             // Corner radius scales gently with stroke width, capped at
             // ~half the shorter side so a tiny rectangle stays a
@@ -279,18 +334,26 @@ fn paint_shape(
                 }
             }
         }
-        Shape::Ellipse { a, b, color, stroke_width, border } => {
+        Shape::Ellipse { a, b, color, stroke_width, border, rotation } => {
             // egui has no native ellipse stroke; approximate with a
             // 64-segment polyline.
             let cx = (a[0] + b[0]) * 0.5;
             let cy = (a[1] + b[1]) * 0.5;
             let rx = ((b[0] - a[0]) * 0.5).abs();
             let ry = ((b[1] - a[1]) * 0.5).abs();
+            // A turned ellipse is the same polyline with every point
+            // swung about the centre.
+            let (rs, rc) = rotation.sin_cos();
             const N: usize = 64;
             let pts: Vec<egui::Pos2> = (0..=N)
                 .map(|i| {
                     let t = (i as f32 / N as f32) * std::f32::consts::TAU;
-                    to_screen([cx + rx * t.cos(), cy + ry * t.sin()])
+                    let (x, y) = (rx * t.cos(), ry * t.sin());
+                    if *rotation == 0.0 {
+                        to_screen([cx + x, cy + y])
+                    } else {
+                        to_screen([cx + rc * x - rs * y, cy + rs * x + rc * y])
+                    }
                 })
                 .collect();
             let stroke = egui::Stroke::new(*stroke_width * zoom, col(*color, layer_opacity));
@@ -353,6 +416,28 @@ fn paint_shape(
             paint_round_line(painter, sb, to_screen(h1), w, c);
             paint_round_line(painter, sb, to_screen(h2), w, c);
         }
+        // `Painter::image` only takes an axis-aligned rect, so a turned
+        // image goes out as its own two-triangle textured quad.
+        Shape::Raster { rotation, .. } if *rotation != 0.0 => {
+            if let Some(tex_id) = raster_tex {
+                let tint = egui::Color32::from_rgba_unmultiplied(
+                    255, 255, 255,
+                    (layer_opacity * 255.0).clamp(0.0, 255.0) as u8,
+                );
+                let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                let mut mesh = egui::Mesh::with_texture(tex_id);
+                for (p, uv) in shape.obb().corners().into_iter().zip(uvs) {
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: to_screen(p),
+                        uv: egui::pos2(uv[0], uv[1]),
+                        color: tint,
+                    });
+                }
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                painter.add(egui::Shape::mesh(mesh));
+            }
+        }
         Shape::Raster { pos, size, .. } => {
             if let Some(tex_id) = raster_tex {
                 let p0 = to_screen(*pos);
@@ -370,7 +455,7 @@ fn paint_shape(
                 );
             }
         }
-        Shape::Text { pos, content, font_size, color } => {
+        Shape::Text { pos, content, font_size, color, rotation } => {
             let c = col(*color, layer_opacity);
             // The shape's `font_size` is in canvas-local logical px;
             // multiply by zoom so the on-screen height honours the
@@ -385,12 +470,53 @@ fn paint_shape(
             // line height; matches what most browsers default to.
             let line_h = size * 1.25;
             let top_left = to_screen(*pos);
-            for (i, line) in content.split('\n').enumerate() {
-                let lp = egui::pos2(top_left.x, top_left.y + i as f32 * line_h);
-                painter.text(lp, egui::Align2::LEFT_TOP, line, font_id.clone(), c);
+            if *rotation == 0.0 {
+                for (i, line) in content.split('\n').enumerate() {
+                    let lp = egui::pos2(top_left.x, top_left.y + i as f32 * line_h);
+                    painter.text(lp, egui::Align2::LEFT_TOP, line, font_id.clone(), c);
+                }
+            } else {
+                // Each line is its own galley turned about its top-left,
+                // stepped down the label's turned "down" direction so
+                // the lines stay stacked.
+                let (rs, rc) = rotation.sin_cos();
+                for (i, line) in content.split('\n').enumerate() {
+                    let d = i as f32 * line_h;
+                    let lp = egui::pos2(top_left.x - rs * d, top_left.y + rc * d);
+                    let galley = painter.layout_no_wrap(line.to_string(), font_id.clone(), c);
+                    painter.add(egui::epaint::TextShape::new(lp, galley, c).with_angle(*rotation));
+                }
             }
         }
     }
+}
+
+/// Outline of a rounded box centred on the origin, as points in the
+/// box's own frame, clockwise from the top edge. `corner` is the corner
+/// radius; zero gives the four plain corners.
+fn rounded_box_outline(half: [f32; 2], corner: f32) -> Vec<[f32; 2]> {
+    let [hw, hh] = half;
+    let r = corner.min(hw).min(hh).max(0.0);
+    if r < 0.01 {
+        return vec![[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+    }
+    // Arc centres with the angle each quarter-turn starts from:
+    // top-right, bottom-right, bottom-left, top-left.
+    let arcs = [
+        ([hw - r, -hh + r], -std::f32::consts::FRAC_PI_2),
+        ([hw - r, hh - r], 0.0),
+        ([-hw + r, hh - r], std::f32::consts::FRAC_PI_2),
+        ([-hw + r, -hh + r], std::f32::consts::PI),
+    ];
+    const STEPS: usize = 6;
+    let mut pts = Vec::with_capacity(arcs.len() * (STEPS + 1));
+    for (c, start) in arcs {
+        for k in 0..=STEPS {
+            let t = start + std::f32::consts::FRAC_PI_2 * (k as f32 / STEPS as f32);
+            pts.push([c[0] + r * t.cos(), c[1] + r * t.sin()]);
+        }
+    }
+    pts
 }
 
 /// Walk `pts` and emit dashed line segments using the global
@@ -1212,7 +1338,7 @@ pub fn render_layer_thumbnail(
     }
     let mut view = pixmap.as_mut();
     for shape in &layer.shapes {
-        draw_shape(&mut view, shape, t);
+        draw_shape(&mut view, shape, t, 1.0);
     }
     for stroke in &layer.strokes {
         draw_stroke(&mut view, stroke, t);
@@ -1317,14 +1443,14 @@ pub fn render_canvas(
             }
         }
         for shape in &layer.shapes {
-            draw_shape(pixmap, shape, t);
+            draw_shape(pixmap, shape, t, layer.opacity);
         }
         for stroke in &layer.strokes {
             draw_stroke(pixmap, stroke, t);
         }
     }
     if let Some(s) = preview_shape {
-        draw_shape(pixmap, s, t);
+        draw_shape(pixmap, s, t, 1.0);
     }
     if let Some(s) = preview_stroke {
         draw_stroke(pixmap, s, t);
@@ -1339,9 +1465,26 @@ fn rgba_paint(color: [u8; 4]) -> Paint<'static> {
     p
 }
 
-fn draw_shape(pixmap: &mut PixmapMut<'_>, shape: &Shape, t: Transform) {
+/// `t` with a turn of `rotation` radians about canvas point `(cx, cy)`
+/// applied first. Returns `t` untouched for an unrotated shape, so those
+/// rasterise exactly as they did before shapes could turn.
+fn turned(t: Transform, rotation: f32, cx: f32, cy: f32) -> Transform {
+    if rotation == 0.0 {
+        t
+    } else {
+        t.pre_concat(Transform::from_rotate_at(rotation.to_degrees(), cx, cy))
+    }
+}
+
+/// `image_opacity` is the opacity to draw picture rasters at — the
+/// layer's, so a plate image that has been turned into an object still
+/// fades with its layer in a screenshot the way the plate did. Nothing
+/// else reads it: drawn shapes and fill stickers rasterise at full
+/// strength here, as they always have.
+fn draw_shape(pixmap: &mut PixmapMut<'_>, shape: &Shape, t: Transform, image_opacity: f32) {
     match shape {
-        Shape::Rect { a, b, color, stroke_width, border } => {
+        Shape::Rect { a, b, color, stroke_width, border, rotation } => {
+            let t = turned(t, *rotation, (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5);
             let mut pb = PathBuilder::new();
             // Normalise corners so width/height are positive.
             let x0 = a[0].min(b[0]);
@@ -1368,11 +1511,12 @@ fn draw_shape(pixmap: &mut PixmapMut<'_>, shape: &Shape, t: Transform) {
                 pixmap.stroke_path(&path, &paint, &sk, t, None);
             }
         }
-        Shape::Ellipse { a, b, color, stroke_width, border } => {
+        Shape::Ellipse { a, b, color, stroke_width, border, rotation } => {
             let cx = (a[0] + b[0]) * 0.5;
             let cy = (a[1] + b[1]) * 0.5;
             let rx = ((b[0] - a[0]) * 0.5).abs().max(1.0);
             let ry = ((b[1] - a[1]) * 0.5).abs().max(1.0);
+            let t = turned(t, *rotation, cx, cy);
             // tiny_skia's PathBuilder has `push_oval` from a Rect.
             if let Some(rect) = tiny_skia::Rect::from_xywh(cx - rx, cy - ry, rx * 2.0, ry * 2.0) {
                 let mut pb = PathBuilder::new();
@@ -1451,7 +1595,12 @@ fn draw_shape(pixmap: &mut PixmapMut<'_>, shape: &Shape, t: Transform) {
             draw_line(pixmap, *b, [b[0] + h1x, b[1] + h1y], *color, *stroke_width, t);
             draw_line(pixmap, *b, [b[0] + h2x, b[1] + h2y], *color, *stroke_width, t);
         }
-        Shape::Raster { pos, size, png, .. } => {
+        Shape::Raster { pos, size, png, rotation, kind, .. } => {
+            let t = turned(t, *rotation, pos[0] + size[0] * 0.5, pos[1] + size[1] * 0.5);
+            let opacity = match kind {
+                crate::canvas::shape::RasterKind::Image => image_opacity.clamp(0.0, 1.0),
+                crate::canvas::shape::RasterKind::Fill => 1.0,
+            };
             // Decode and blit the PNG inline. Slow per call but the
             // screenshot path only fires once per save, not per frame.
             if let Ok(decoded) = image::load_from_memory(png) {
@@ -1477,7 +1626,7 @@ fn draw_shape(pixmap: &mut PixmapMut<'_>, shape: &Shape, t: Transform) {
                         .post_translate(pos[0], pos[1])
                         .post_concat(t);
                     let opts = tiny_skia::PixmapPaint {
-                        opacity: 1.0,
+                        opacity,
                         blend_mode: tiny_skia::BlendMode::SourceOver,
                         quality: tiny_skia::FilterQuality::Bilinear,
                     };
@@ -1485,7 +1634,8 @@ fn draw_shape(pixmap: &mut PixmapMut<'_>, shape: &Shape, t: Transform) {
                 }
             }
         }
-        Shape::Text { pos, content, font_size, color } => {
+        Shape::Text { pos, content, font_size, color, rotation } => {
+            let t = turned(t, *rotation, pos[0], pos[1]);
             // tiny-skia has no built-in font rasteriser, so the
             // screenshot pipeline can't show glyphs yet. We paint a
             // coloured underline at the top-left of each line and a
@@ -1633,5 +1783,45 @@ fn stamp_circle(
         if let Some(path) = pb.finish() {
             pixmap.fill_path(&path, paint, FillRule::Winding, t, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use crate::canvas::shape::RasterKind;
+    use std::sync::Arc;
+
+    /// The screenshot path turns shapes with tiny-skia; the overlay and
+    /// the hit-tests turn them with `Obb`. If the two disagreed on which
+    /// way is clockwise, a saved screenshot would show every rotated
+    /// object mirrored. A two-pixel image (red | blue) turned a quarter
+    /// turn must come out red above blue in both conventions.
+    #[test]
+    fn screenshot_path_turns_the_same_way_as_the_overlay() {
+        let mut src = image::RgbaImage::new(2, 1);
+        src.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        src.put_pixel(1, 0, image::Rgba([0, 0, 255, 255]));
+        let mut png = Vec::new();
+        src.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+
+        let shape = Shape::Raster {
+            pos: [30.0, 40.0], size: [40.0, 20.0], png: Arc::new(png), px_size: [2, 1],
+            color: [0; 4], rotation: std::f32::consts::FRAC_PI_2, kind: RasterKind::Image,
+        };
+        // Where `Obb` says the red (left) and blue (right) halves went.
+        let o = shape.obb();
+        let red_at = o.from_local([-10.0, 0.0]);
+        let blue_at = o.from_local([10.0, 0.0]);
+        assert!(red_at[1] < blue_at[1], "a clockwise quarter turn puts the left half on top");
+
+        let mut pixmap = tiny_skia::Pixmap::new(100, 100).unwrap();
+        draw_shape(&mut pixmap.as_mut(), &shape, Transform::identity(), 1.0);
+        let at = |p: [f32; 2]| pixmap.pixel(p[0] as u32, p[1] as u32).unwrap();
+        let (r, b) = (at(red_at), at(blue_at));
+        assert!(r.red() > 200 && r.blue() < 60, "expected red at {red_at:?}, got {r:?}");
+        assert!(b.blue() > 200 && b.red() < 60, "expected blue at {blue_at:?}, got {b:?}");
+        // Nothing left behind where the unrotated image used to reach.
+        assert_eq!(at([33.0, 50.0]).alpha(), 0);
     }
 }

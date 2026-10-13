@@ -601,6 +601,46 @@ impl Stroke {
         }
     }
 
+    /// Apply a full affine transform — the per-object counterpart of
+    /// `transform`, used when a selection is moved, rotated or
+    /// stretched. Widths scale by `Affine::linear_scale`, so a stroke
+    /// stretched along one axis thickens by the square root of the
+    /// stretch rather than not at all or by the whole factor.
+    ///
+    /// The cache is mapped in place for the same reason `transform`
+    /// maps it: the Select tool previews a gesture by painting the
+    /// cached polyline through this exact transform, so mapping the
+    /// cache makes the committed stroke identical to what the user saw.
+    pub fn apply_affine(&mut self, m: &crate::canvas::affine::Affine) {
+        let s = m.linear_scale();
+        for sample in &mut self.samples {
+            sample.pos = m.apply(sample.pos);
+        }
+        self.base_width *= s;
+        if let Some(c) = self.cache.as_mut() {
+            for p in &mut c.points {
+                *p = m.apply(*p);
+            }
+            for w in &mut c.widths {
+                *w *= s;
+            }
+        }
+    }
+
+    /// Change the stroke's thickness, keeping its path. The cached
+    /// per-point widths are all proportional to `base_width`, so they
+    /// rescale in place.
+    pub fn set_base_width(&mut self, width: f32) {
+        if self.base_width <= 0.0 || width <= 0.0 { return; }
+        let k = width / self.base_width;
+        self.base_width = width;
+        if let Some(c) = self.cache.as_mut() {
+            for w in &mut c.widths {
+                *w *= k;
+            }
+        }
+    }
+
     /// Krita NO_SMOOTHING: raw sample, only the tiny duplicate gate so
     /// idle digitiser ticks don't bloat the polyline.
     fn push_raw(&mut self, sample: PenSample) {

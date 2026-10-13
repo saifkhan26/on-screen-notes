@@ -52,7 +52,8 @@ pub fn show(
                     interacted |= tool_btn(ui, tool, ToolKind::Text,          "Text — T  (click to place, Enter to commit, Shift+Enter newline)");
                     interacted |= tool_btn(ui, tool, ToolKind::Spotlight,     "Spotlight — S  (dim everything except a square around the cursor; wheel resizes)");
                     interacted |= tool_btn(ui, tool, ToolKind::LassoErase,    "Lasso erase — X  (draw a closed loop; ink whose centroid lands inside is removed)");
-                    interacted |= tool_btn(ui, tool, ToolKind::LassoSelect,   "Lasso select — Shift+X  (draw a closed loop; the screen pixels inside are captured into a bottom layer)");
+                    interacted |= tool_btn(ui, tool, ToolKind::LassoSelect,   "Lasso capture — Shift+X  (draw a closed loop; the screen pixels inside become an image on the active layer)");
+                    interacted |= tool_btn(ui, tool, ToolKind::Select,        "Select — V  (click an object, Shift+click for more, drag empty space to box-select; handles move / resize / rotate; Delete removes)");
                     spacer(ui);
 
                     // Group 2: shape tools
@@ -198,6 +199,7 @@ fn paint_icon(ui: &mut egui::Ui, rect: egui::Rect, kind: ToolKind, color: Color3
         // Reuses the lasso glyph for now; a dedicated lasso-select icon
         // can be dropped into assets/icons/ later.
         ToolKind::LassoSelect   => egui::Image::new(egui::include_image!("../../assets/icons/lasso.svg")),
+        ToolKind::Select        => egui::Image::new(egui::include_image!("../../assets/icons/select.svg")),
     };
     img.tint(color)
         .fit_to_exact_size(rect.size())
@@ -405,6 +407,13 @@ fn help_btn(ui: &mut egui::Ui) -> bool {
                     row(ui, "Laser pointer",      "L");
                     row(ui, "Spotlight",          "S");
                     row(ui, "Lasso erase",        "X");
+                    row(ui, "Lasso capture",      "Shift + X  (screen → image on active layer)");
+                    row(ui, "Select",             "V  (Shift+click = add / remove, drag = box)");
+                    row(ui, "  move / resize / rotate", "drag inside / handles / top knob (Shift = 15°)");
+                    row(ui, "  delete / duplicate", "Delete / Ctrl+D");
+                    row(ui, "  copy / cut / paste", "Ctrl+C / Ctrl+X / Ctrl+V  (also pastes images)");
+                    row(ui, "  to front / to back", "Ctrl+↑ / Ctrl+↓");
+                    row(ui, "  recolour / resize line", "pick a colour / move the size slider");
                     row(ui, "Eyedropper (1 shot)","I");
                     row(ui, "Magnifier loupe",    "Hold Z  (wheel resizes zoom)");
                     row(ui, "Text",               "T  (Enter = commit, Shift+Enter = newline)");

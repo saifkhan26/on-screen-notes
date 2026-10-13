@@ -24,14 +24,18 @@ use std::collections::HashMap;
 pub struct OverlayCache {
     images: HashMap<(usize, usize), (usize, egui::TextureHandle)>,
     /// Per-shape texture cache for `Shape::Raster` fills. Keyed by
-    /// `(canvas, layer, shape_index)`; value carries the cached PNG
-    /// length as a fingerprint for invalidation.
-    shape_images: HashMap<(usize, usize, usize), (usize, egui::TextureHandle)>,
+    /// `(canvas, layer, shape_index)`; value carries `(PNG length,
+    /// address of the shared PNG buffer)` as a fingerprint. The address
+    /// is what catches a *different* image arriving at the same index —
+    /// deleting, re-ordering or pasting shapes shifts indices, and two
+    /// images can easily differ without differing in byte length.
+    shape_images: HashMap<(usize, usize, usize), ((usize, usize), egui::TextureHandle)>,
     /// Per-layer preview thumbnails — keyed by `(canvas, layer)`. The
-    /// `(usize, usize, usize)` fingerprint is `(strokes_len,
-    /// shapes_len, image_png_len)` and is cheap to recompute every
-    /// frame; mismatch triggers a re-render + re-upload.
-    layer_thumbs: HashMap<(usize, usize), ((usize, usize, usize), egui::TextureHandle)>,
+    /// fingerprint is `(strokes_len, shapes_len, image_png_len,
+    /// layer.rev)` and is cheap to recompute every frame; mismatch
+    /// triggers a re-render + re-upload. `rev` covers edits that move
+    /// or restyle objects without changing how many there are.
+    layer_thumbs: HashMap<(usize, usize), ((usize, usize, usize, u64), egui::TextureHandle)>,
 }
 
 impl OverlayCache {
@@ -53,6 +57,7 @@ impl OverlayCache {
             layer.strokes.len(),
             layer.shapes.len(),
             layer.image.as_ref().map(|i| i.png.len()).unwrap_or(0),
+            layer.rev,
         );
         let key = (canvas_idx, layer_idx);
         let cached_ok = match self.layer_thumbs.get(&key) {
@@ -131,11 +136,12 @@ impl OverlayCache {
         canvas_idx: usize,
         layer_idx: usize,
         shape_idx: usize,
-        png: &[u8],
+        png: &std::sync::Arc<Vec<u8>>,
     ) -> Option<egui::TextureId> {
         let key = (canvas_idx, layer_idx, shape_idx);
+        let fingerprint = (png.len(), std::sync::Arc::as_ptr(png) as usize);
         let needs_upload = match self.shape_images.get(&key) {
-            Some((cached_len, _)) => *cached_len != png.len(),
+            Some((cached, _)) => *cached != fingerprint,
             None => true,
         };
         if needs_upload {
@@ -158,7 +164,7 @@ impl OverlayCache {
                 color_image,
                 egui::TextureOptions::LINEAR,
             );
-            self.shape_images.insert(key, (png.len(), handle));
+            self.shape_images.insert(key, (fingerprint, handle));
         }
         self.shape_images.get(&key).map(|(_, h)| h.id())
     }
@@ -179,7 +185,21 @@ pub fn show(
     // dragged / zoomed layer previews at its new position and size
     // before the transform is committed.
     layer_xform: Option<(usize, f32, [f32; 2])>,
+    // Whether to draw the Select tool's frame and handles. False while
+    // a screenshot / capture / recording is grabbing the screen, so the
+    // handles never end up in the picture.
+    show_selection: bool,
 ) -> egui::Rect {
+    // Select-tool gesture in flight: the selected objects preview under
+    // its transform until pen-up commits it.
+    let sel_preview = if tool.kind == ToolKind::Select {
+        let canvas = manager.active();
+        tool.select
+            .preview_affine(canvas.zoom)
+            .map(|m| (canvas.active_layer, &tool.select.sel, m))
+    } else {
+        None
+    };
     // Pre-build per-layer image-texture IDs for the active canvas
     // before opening the panel so the borrow on `cache` is released
     // before the renderer runs. Scope the temporary so the `active`
@@ -276,6 +296,7 @@ pub fn show(
                 &shape_textures,
                 None,
                 layer_xform,
+                sel_preview,
             );
 
             // Live preview of the in-progress text edit. Painted via
@@ -416,6 +437,57 @@ pub fn show(
                 }
             }
 
+            // Select tool — frame, resize handles, rotate knob and the
+            // rubber-band box. Drawn in screen space at a fixed size so
+            // the handles stay the same size to grab at any zoom.
+            if matches!(tool.kind, ToolKind::Select) && show_selection {
+                let canvas = manager.active();
+                let zoom = canvas.zoom;
+                let ox = rect.min.x + canvas.pan[0];
+                let oy = rect.min.y + canvas.pan[1];
+                let to_screen = |p: [f32; 2]| egui::pos2(ox + p[0] * zoom, oy + p[1] * zoom);
+                let chrome = tool.select.chrome(canvas);
+                let painter = ui.painter();
+                // The overlay sits on arbitrary desktop content, so every
+                // line is a light stroke over a dark one: it reads on
+                // both bright and dark backgrounds.
+                let line = egui::Color32::from_rgb(86, 160, 255);
+                let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+
+                if let Some(m) = chrome.marquee {
+                    let r = egui::Rect::from_two_pos(to_screen([m[0], m[1]]), to_screen([m[2], m[3]]));
+                    painter.rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 28));
+                    painter.rect_stroke(r, egui::Rounding::ZERO, egui::Stroke::new(1.0, line));
+                }
+                if let Some(frame) = chrome.frame {
+                    let pts: Vec<egui::Pos2> = frame.iter().map(|p| to_screen(*p)).collect();
+                    painter.add(egui::Shape::closed_line(pts.clone(), egui::Stroke::new(3.0, under)));
+                    painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.4, line)));
+                    if let Some((top, knob)) = chrome.rotate_stem {
+                        let seg = [to_screen(top), to_screen(knob)];
+                        painter.line_segment(seg, egui::Stroke::new(3.0, under));
+                        painter.line_segment(seg, egui::Stroke::new(1.4, line));
+                    }
+                    for (p, handle) in &chrome.handles {
+                        let p = to_screen(*p);
+                        match handle {
+                            crate::tools::select_tool::Handle::Rotate => {
+                                painter.circle_filled(p, 6.5, under);
+                                painter.circle_filled(p, 5.0, egui::Color32::WHITE);
+                                painter.circle_stroke(p, 5.0, egui::Stroke::new(1.4, line));
+                            }
+                            crate::tools::select_tool::Handle::Scale { .. } => {
+                                let outer = egui::Rect::from_center_size(p, egui::vec2(11.0, 11.0));
+                                let inner = egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0));
+                                painter.rect_filled(outer, egui::Rounding::same(2.0), under);
+                                painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
+                                painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
+                            }
+                        }
+                    }
+                }
+            }
+
             // Magnifier loupe — captured desktop image painted into
             // a square around the cursor, with the canvas content
             // re-rendered on top at the matching magnification so
@@ -460,6 +532,7 @@ pub fn show(
                             &shape_textures,
                             Some(([pan_x_new, pan_y_new], new_zoom)),
                             layer_xform,
+                            sel_preview,
                         );
                     }
                     ctx.request_repaint();

@@ -182,6 +182,50 @@ pub struct OnScreenNotesApp {
     /// `true` if `ffmpeg -version` succeeded at app startup. Drives
     /// the MP4-vs-GIF branch in `toggle_record`.
     ffmpeg_available: bool,
+
+    /// Objects copied with Ctrl+C / Ctrl+X in the Select tool. The OS
+    /// clipboard only carries `CLIP_MARKER` to say "the newest copy is
+    /// this one"; the strokes and shapes themselves stay here.
+    obj_clipboard: (Vec<crate::canvas::stroke::Stroke>, Vec<crate::canvas::shape::Shape>),
+    /// How many times the current `obj_clipboard` has been pasted, so
+    /// each paste lands a step further from the original instead of
+    /// exactly on top of the last one.
+    paste_count: u32,
+    /// `(canvas index, undo-log length)` right after the last size
+    /// restyle of a selection. While both still match, the next size
+    /// tick is folded into that same undo entry — a slider drag is one
+    /// Ctrl+Z, not hundreds.
+    restyle_run: Option<(usize, usize)>,
+    /// Ctrl+V state on the previous frame, for edge detection — see
+    /// `platform::paste_chord_down`.
+    paste_chord_prev: bool,
+    /// True while a mouse drag that began on the canvas is being fed to
+    /// a tool. False for a press that landed on a widget, and after the
+    /// pen has taken a gesture over.
+    mouse_gesture: bool,
+}
+
+/// How long after the pen was last used the pointer still counts as
+/// the pen's. Covers the gap between the pen lifting and the driver
+/// releasing the mouse button it was holding down for it.
+const PEN_OWNS_POINTER: Duration = Duration::from_millis(250);
+
+/// Text put on the OS clipboard by an in-app copy. Seeing it come back
+/// in a paste means the newest thing the user copied is `obj_clipboard`.
+const CLIP_MARKER: &str = "on-screen-notes:selection";
+
+/// A Select-tool command picked out of this frame's key events, run
+/// after egui's input lock is released.
+#[derive(Clone, Copy)]
+enum SelAction {
+    Delete,
+    Duplicate,
+    ToFront,
+    ToBack,
+    Copy,
+    Cut,
+    PasteObjects,
+    PasteImage,
 }
 
 /// State held while a screenshot is in flight.
@@ -332,7 +376,17 @@ impl OnScreenNotesApp {
         }
 
         let config = crate::persistence::load_config();
-        let canvases = CanvasManager::load_or_default(&config);
+        let mut canvases = CanvasManager::load_or_default(&config);
+        // A slide that failed to load is the user's work in a state we
+        // could not read — say so on screen rather than only in the log.
+        let load_toast = {
+            let errs = canvases.take_load_errors();
+            match errs.len() {
+                0 => None,
+                1 => Some(errs[0].clone()),
+                n => Some(format!("{n} slides could not be read — originals kept beside them (*.unreadable-…)")),
+            }
+        };
         let tool = ActiveTool::from_config(&config);
 
         // Capture window/display handles into our holder; pen module needs them.
@@ -422,7 +476,7 @@ impl OnScreenNotesApp {
             osn_hwnd,
             recorder: crate::recording::Recorder::default(),
             ui_visible_before_record: true,
-            toast: None,
+            toast: load_toast.map(|m| (m, std::time::Instant::now())),
             pending_screenshot: None,
             pending_lasso: None,
             region_select: None,
@@ -433,6 +487,11 @@ impl OnScreenNotesApp {
             pin_prev_lmb: false,
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),
+            obj_clipboard: (Vec::new(), Vec::new()),
+            paste_count: 0,
+            restyle_run: None,
+            paste_chord_prev: false,
+            mouse_gesture: false,
         }
     }
 
@@ -771,8 +830,11 @@ impl OnScreenNotesApp {
         self.config.bg_opacity = 0.0;
     }
 
-    /// Capture the lasso region and insert it as a new bottom layer.
-    /// Toast on success / log on failure — never panics.
+    /// Capture the lasso region and drop it onto the **active layer** as
+    /// an image object, selected and ready to move / resize / rotate.
+    /// It paints under that layer's ink (a layer draws its shapes before
+    /// its strokes) and is an ordinary undo step. Toast on success / log
+    /// on failure — never panics.
     fn do_lasso_capture(
         &mut self,
         pixels_per_point: f32,
@@ -788,15 +850,185 @@ impl OnScreenNotesApp {
             polygon,
         ) {
             Ok(image) => {
-                let label = format!("Lasso region {}", crate::screenshot::chrono_like_timestamp());
-                self.canvases.active_mut().add_image_layer_bottom(image, label);
+                let shape = crate::canvas::shape::Shape::Raster {
+                    pos: image.canvas_origin,
+                    size: image.logical_size,
+                    png: std::sync::Arc::new(image.png),
+                    px_size: image.size,
+                    color: [0, 0, 0, 0],
+                    rotation: 0.0,
+                    kind: crate::canvas::shape::RasterKind::Image,
+                };
+                let c = self.canvases.active_mut();
+                c.add_shape(shape);
+                let placed = c.layers[c.active_layer].shapes.len() - 1;
+                self.select_only_shape(placed);
                 self.toast = Some((
-                    "Lasso region added as bottom layer".to_string(),
+                    "Captured onto the active layer — drag to move, handles to resize / rotate".to_string(),
                     std::time::Instant::now(),
                 ));
             }
             Err(e) => log::warn!("lasso capture failed: {e}"),
         }
+    }
+
+    /// Switch to the Select tool with exactly the shape at `index` on
+    /// the active layer selected.
+    fn select_only_shape(&mut self, index: usize) {
+        use crate::canvas::hit::ObjRef;
+        self.tool.kind = crate::tools::ToolKind::Select;
+        self.tool.select.gesture = None;
+        self.tool.select.sel.set_only(ObjRef::Shape(index));
+        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+    }
+
+    /// Clones of the selected objects on the active layer.
+    fn selected_objects(&self) -> (Vec<crate::canvas::stroke::Stroke>, Vec<crate::canvas::shape::Shape>) {
+        let c = self.canvases.active();
+        let Some(layer) = c.layers.get(c.active_layer) else { return (Vec::new(), Vec::new()) };
+        let sel = &self.tool.select.sel;
+        (
+            sel.strokes.iter().filter_map(|&i| layer.strokes.get(i).cloned()).collect(),
+            sel.shapes.iter().filter_map(|&i| layer.shapes.get(i).cloned()).collect(),
+        )
+    }
+
+    /// Add `strokes` / `shapes` to the active layer, shifted by `offset`
+    /// canvas pixels, as one undo step, and select them.
+    fn insert_and_select(
+        &mut self,
+        mut strokes: Vec<crate::canvas::stroke::Stroke>,
+        mut shapes: Vec<crate::canvas::shape::Shape>,
+        offset: [f32; 2],
+    ) {
+        if strokes.is_empty() && shapes.is_empty() { return; }
+        for s in &mut strokes { s.translate(offset); }
+        for s in &mut shapes { s.translate(offset); }
+        let c = self.canvases.active_mut();
+        let li = c.active_layer;
+        let placed = c.insert_objects(li, strokes, shapes);
+        self.tool.kind = crate::tools::ToolKind::Select;
+        self.tool.select.gesture = None;
+        self.tool.select.sel = placed;
+        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+    }
+
+    /// Run one Select-tool command against the current selection.
+    fn apply_sel_action(&mut self, action: SelAction, canvas_rect: egui::Rect, pixels_per_point: f32) {
+        // One nudge so a copy does not sit exactly on its original. Kept
+        // constant on screen, so it is divided by the zoom.
+        let step = 16.0 / self.canvases.active().zoom.max(1e-3);
+        let sel = self.tool.select.sel.clone();
+        let has_selection = self.tool.kind == crate::tools::ToolKind::Select && !sel.is_empty();
+        match action {
+            SelAction::Delete if has_selection => {
+                let c = self.canvases.active_mut();
+                let li = c.active_layer;
+                c.delete_objects(li, &sel.strokes, &sel.shapes);
+                self.tool.select.sel.clear();
+            }
+            SelAction::Duplicate if has_selection => {
+                let (strokes, shapes) = self.selected_objects();
+                self.insert_and_select(strokes, shapes, [step, step]);
+            }
+            SelAction::ToFront | SelAction::ToBack if has_selection => {
+                let to_front = matches!(action, SelAction::ToFront);
+                let c = self.canvases.active_mut();
+                let li = c.active_layer;
+                self.tool.select.sel = c.reorder_objects(li, &sel.strokes, &sel.shapes, to_front);
+            }
+            SelAction::Copy | SelAction::Cut if has_selection => {
+                self.obj_clipboard = self.selected_objects();
+                self.paste_count = 0;
+                // Mark the OS clipboard so a later paste knows this copy
+                // is newer than whatever another app put there before.
+                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(CLIP_MARKER)) {
+                    Ok(()) => {}
+                    Err(e) => log::warn!("could not mark the clipboard: {e}"),
+                }
+                if matches!(action, SelAction::Cut) {
+                    let c = self.canvases.active_mut();
+                    let li = c.active_layer;
+                    c.delete_objects(li, &sel.strokes, &sel.shapes);
+                    self.tool.select.sel.clear();
+                }
+            }
+            SelAction::PasteObjects => {
+                self.paste_count += 1;
+                let d = step * self.paste_count as f32;
+                let (strokes, shapes) = self.obj_clipboard.clone();
+                self.insert_and_select(strokes, shapes, [d, d]);
+            }
+            SelAction::PasteImage => self.paste_clipboard_image(canvas_rect, pixels_per_point),
+            // A selection command with nothing selected.
+            _ => {}
+        }
+        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+    }
+
+    /// Paste an image from the OS clipboard onto the active layer as an
+    /// image object, centred in the view at its natural on-screen size
+    /// (shrunk to fit if it is larger than the view). Silently does
+    /// nothing when the clipboard holds no image.
+    fn paste_clipboard_image(&mut self, canvas_rect: egui::Rect, pixels_per_point: f32) {
+        let img = match arboard::Clipboard::new().and_then(|mut cb| cb.get_image()) {
+            Ok(img) => img,
+            Err(_) => return,
+        };
+        let (w, h) = (img.width as u32, img.height as u32);
+        let Some(rgba) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else { return };
+        if w == 0 || h == 0 { return; }
+        let mut png: Vec<u8> = Vec::new();
+        if let Err(e) = rgba.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png) {
+            log::warn!("could not encode pasted image: {e}");
+            return;
+        }
+        let (pan, zoom) = {
+            let c = self.canvases.active();
+            (c.pan, c.zoom.max(1e-3))
+        };
+        // Natural size: one image pixel per physical screen pixel.
+        let ppp = pixels_per_point.max(0.01);
+        let mut size = [w as f32 / ppp / zoom, h as f32 / ppp / zoom];
+        let view = [canvas_rect.width() / zoom, canvas_rect.height() / zoom];
+        let fit = (view[0] * 0.9 / size[0]).min(view[1] * 0.9 / size[1]).min(1.0);
+        if fit > 0.0 {
+            size = [size[0] * fit, size[1] * fit];
+        }
+        let center = [
+            (canvas_rect.width() * 0.5 - pan[0]) / zoom,
+            (canvas_rect.height() * 0.5 - pan[1]) / zoom,
+        ];
+        let shape = crate::canvas::shape::Shape::Raster {
+            pos: [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
+            size,
+            png: std::sync::Arc::new(png),
+            px_size: [w, h],
+            color: [0, 0, 0, 0],
+            rotation: 0.0,
+            kind: crate::canvas::shape::RasterKind::Image,
+        };
+        self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
+        self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
+    }
+
+    /// Apply a toolbar colour / size change to the selected objects.
+    /// `prev_*` are the tool's values before the toolbar ran this frame.
+    fn restyle_selection(&mut self, prev_color: [u8; 4], prev_size: f32) {
+        if self.tool.kind != crate::tools::ToolKind::Select || self.tool.select.sel.is_empty() {
+            return;
+        }
+        let color = (self.tool.color != prev_color).then_some(self.tool.color);
+        let width = ((self.tool.size - prev_size).abs() > 1e-4).then_some(self.tool.size);
+        if color.is_none() && width.is_none() { return; }
+        let idx = self.canvases.active_index();
+        let sel = self.tool.select.sel.clone();
+        let c = self.canvases.active_mut();
+        let li = c.active_layer;
+        // Fold a run of size ticks into the entry the first one made.
+        let merge = color.is_none() && self.restyle_run == Some((idx, c.undo_log.len()));
+        c.restyle_objects(li, &sel.strokes, &sel.shapes, color, width, merge);
+        self.restyle_run = (width.is_some() && color.is_none()).then_some((idx, c.undo_log.len()));
     }
 
     /// Start or stop screen recording. Hides the floating UI on
@@ -1158,6 +1390,16 @@ impl eframe::App for OnScreenNotesApp {
             // rect (egui draws Windows on top of CentralPanel anyway).
             let prev_level = self.config.smoothing_level;
             let prev_pressure_curve = self.config.pressure_curve;
+            // Keep the Select tool's selection honest before anything
+            // this frame reads it: it is dropped the moment the tool,
+            // the slide, the layer or the layer's object count changes
+            // underneath it.
+            self.tool.select.sync(
+                self.tool.kind == crate::tools::ToolKind::Select,
+                self.canvases.active_index(),
+                self.canvases.active(),
+            );
+            let (prev_color, prev_size) = (self.tool.color, self.tool.size);
             let toolbar_clicked = if self.ui_visible {
                 ui::toolbar::show(
                     ctx,
@@ -1174,6 +1416,9 @@ impl eframe::App for OnScreenNotesApp {
             } else {
                 false
             };
+            // A colour or size picked in the toolbar while objects are
+            // selected restyles those objects.
+            self.restyle_selection(prev_color, prev_size);
             // If the user switched smoothing levels via the toolbar, push
             // the new value through the input filter, the tool's pass
             // budget, and rebuild every stroke cache so existing strokes
@@ -1203,6 +1448,12 @@ impl eframe::App for OnScreenNotesApp {
             // frame — the same one-frame lag the canvas pan has always
             // had.
             let layer_xform = self.layer_xform_for_render();
+            // Selection handles must stay out of anything that grabs the
+            // screen.
+            let show_selection = self.pending_screenshot.is_none()
+                && self.pending_freeze.is_none()
+                && self.pending_lasso.is_none()
+                && self.region_select.is_none();
             let canvas_rect = ui::overlay::show(
                 ctx,
                 &mut self.overlay_cache,
@@ -1212,6 +1463,7 @@ impl eframe::App for OnScreenNotesApp {
                 self.ui_visible,
                 self.loupe.as_ref(),
                 layer_xform,
+                show_selection,
             );
 
             // ---- Screenshot region selection --------------------------------
@@ -1352,6 +1604,19 @@ impl eframe::App for OnScreenNotesApp {
                     ctx.set_cursor_icon(egui::CursorIcon::None);
                 } else if tool_wants_crosshair && !on_ui {
                     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                } else if self.tool.kind == crate::tools::ToolKind::Select && !on_ui {
+                    // Say what a press here would do: grab a handle,
+                    // move the selection, or pick the object underneath.
+                    if let Some(p) = hover {
+                        let c = self.canvases.active();
+                        let local = [
+                            ((p.x - canvas_rect.min.x) - c.pan[0]) / c.zoom,
+                            ((p.y - canvas_rect.min.y) - c.pan[1]) / c.zoom,
+                        ];
+                        if let Some(icon) = select_cursor(&self.tool.select, local, c) {
+                            ctx.set_cursor_icon(icon);
+                        }
+                    }
                 }
             }
 
@@ -1369,6 +1634,16 @@ impl eframe::App for OnScreenNotesApp {
             // and stay blocked until the next Up so the gesture cannot
             // accidentally start a stroke half-way through tapping a
             // menu item.
+            // The tablet driver's synthetic mouse press can reach us a frame
+            // before the pen's own packet does. If the mouse path began a
+            // gesture for it, drop that now — the pen events below are the
+            // real thing, and the stroke must not be drawn twice.
+            if !pen_events.is_empty() && self.mouse_gesture {
+                self.tool.cancel();
+                self.eraser_override.cancel();
+                self.mouse_gesture = false;
+                self.pen_using_eraser = false;
+            }
             if !space_held && self.loupe.is_none() && self.region_select.is_none() {
                 // Mirror the current tool's size onto the eraser
                 // override so the temporary erase uses the same brush
@@ -1379,13 +1654,20 @@ impl eframe::App for OnScreenNotesApp {
 
                 let ctrl_held  = ctx.input(|i| i.modifiers.ctrl);
                 let shift_held = ctx.input(|i| i.modifiers.shift);
+                // In the Select tool Shift means "add to / remove from
+                // the selection" (and "snap rotation"), and Ctrl is left
+                // for the copy / duplicate chords — so neither the
+                // Shift colour-pick nor the Ctrl eraser applies there.
+                // The `I` eyedropper still works.
+                let select_active = self.tool.kind == crate::tools::ToolKind::Select;
+                self.tool.select.shift = shift_held;
 
                 // Shift-pick: while Shift is held over the canvas, give the
                 // user a crosshair so they know the next tap will sample a
                 // pixel instead of drawing ink. Toolbar / popups stay
                 // visible — `set_cursor_icon` does not affect drawing
                 // dispatch on its own, only the OS cursor glyph.
-                if shift_held && !self.pen_blocked {
+                if shift_held && !select_active && !self.pen_blocked {
                     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                 }
 
@@ -1437,7 +1719,7 @@ impl eframe::App for OnScreenNotesApp {
                             // sample the pixel at the pen tip on Down,
                             // set the pen colour, and lock the rest of
                             // the gesture out of dispatch.
-                            if shift_held || self.tool.eyedropper_pending {
+                            if (shift_held && !select_active) || self.tool.eyedropper_pending {
                                 self.pen_picking = true;
                                 let sx = client_origin[0] + s.pos[0] as i32;
                                 let sy = client_origin[1] + s.pos[1] as i32;
@@ -1454,7 +1736,7 @@ impl eframe::App for OnScreenNotesApp {
                             // this gesture: if Ctrl was held at Down,
                             // route every Move + Up to the eraser
                             // override regardless of Ctrl state later.
-                            self.pen_using_eraser = ctrl_held;
+                            self.pen_using_eraser = ctrl_held && !select_active;
                         }
                         PenEvent::Move(_) => {
                             if self.pen_blocked || self.pen_picking { continue; }
@@ -1489,22 +1771,40 @@ impl eframe::App for OnScreenNotesApp {
                 }
             }
 
-            // ---- Mouse fallback (only when tablet absent) ----------------
-            if !space_held && !self.pen.is_active() && !click_through_now && !toolbar_clicked
-                && self.region_select.is_none()
+            // ---- Mouse ----------------------------------------------------
+            // The mouse draws whenever the pen is not the one driving the
+            // pointer. A tablet driver moves the system cursor and presses
+            // the left button on the pen's behalf, so while the pen is
+            // down, or was used a moment ago, those synthetic mouse
+            // events must be ignored or every pen stroke would be drawn
+            // twice. With the pen out of range — or no tablet at all —
+            // the mouse has the canvas to itself.
+            let pen_owns_pointer = !pen_events.is_empty()
+                || self.pen.is_down()
+                || self.pen.used_within(PEN_OWNS_POINTER);
+            if !space_held && !pen_owns_pointer && !click_through_now
+                && self.region_select.is_none() && self.loupe.is_none()
             {
-                // Shift + click = colour pick. Resolve here so the
-                // sampling click does not also start a fallback stroke.
-                let (shift_held, primary_now) = ctx.input(|i| {
-                    (i.modifiers.shift, i.pointer.primary_down())
+                let (shift_held, ctrl_held, primary_now, cursor) = ctx.input(|i| {
+                    (
+                        i.modifiers.shift,
+                        i.modifiers.ctrl || i.modifiers.command,
+                        i.pointer.primary_down(),
+                        i.pointer.hover_pos().or(i.pointer.interact_pos()),
+                    )
                 });
-                let picking = shift_held || self.tool.eyedropper_pending;
+                // Same rule as the pen path: Shift belongs to the Select
+                // tool while it is active.
+                let select_active = self.tool.kind == crate::tools::ToolKind::Select;
+                self.tool.select.shift = shift_held;
+                // Shift + click = colour pick. Resolve here so the
+                // sampling click does not also start a stroke.
+                let picking = (shift_held && !select_active) || self.tool.eyedropper_pending;
                 if picking {
                     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                 }
-                let cursor_for_pick = ctx.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
                 if picking && primary_now && !self.mouse_was_down {
-                    if let Some(p) = cursor_for_pick {
+                    if let Some(p) = cursor {
                         let ppp = ctx.pixels_per_point();
                         let sx = client_origin[0] + (p.x * ppp) as i32;
                         let sy = client_origin[1] + (p.y * ppp) as i32;
@@ -1518,35 +1818,65 @@ impl eframe::App for OnScreenNotesApp {
                     // does not trigger a stroke or a second pick.
                     self.mouse_was_down = true;
                 }
-                if !primary_now {
+                if !primary_now && !self.mouse_gesture {
                     self.mouse_was_down = false;
                 }
                 if picking {
                     // Skip the rest of the mouse-drawing path entirely
                     // while picking; otherwise a release would synthesise
                     // a pen-up event over the freshly picked colour.
-                } else {
-                ctx.input(|i| {
-                    let pressed = i.pointer.primary_down();
-                    let cursor = i.pointer.hover_pos().or(i.pointer.interact_pos());
-                    if let Some(p) = cursor {
-                        let cursor_screen = [
-                            (p.x - canvas_rect.min.x).max(0.0),
-                            (p.y - canvas_rect.min.y).max(0.0),
-                        ];
-                        if let Some(ev) = interaction::mouse_to_pen_event(
-                            pressed,
-                            &mut self.mouse_was_down,
-                            cursor_screen,
-                            self.canvases.active(),
-                        ) {
-                            crate::input::pen::dispatch(
-                                ev, &mut self.tool, self.canvases.active_mut(),
-                            );
+                } else if let Some(p) = cursor {
+                    let cursor_screen = [
+                        (p.x - canvas_rect.min.x).max(0.0),
+                        (p.y - canvas_rect.min.y).max(0.0),
+                    ];
+                    if let Some(ev) = interaction::mouse_to_pen_event(
+                        primary_now,
+                        &mut self.mouse_was_down,
+                        cursor_screen,
+                        self.canvases.active(),
+                    ) {
+                        if matches!(ev, PenEvent::Down(_)) {
+                            // A press on the toolbar, the layer panel or a
+                            // popup is a click on that widget, not ink on
+                            // the canvas underneath it. Decided once at
+                            // press; the rest of the drag follows it.
+                            let on_ui = toolbar_clicked
+                                || ctx
+                                    .layer_id_at(p)
+                                    .map(|l| l.order > egui::Order::Background)
+                                    .unwrap_or(false);
+                            self.mouse_gesture = !on_ui;
+                            if self.mouse_gesture {
+                                // Same reasons as the pen path: keep
+                                // keyboard shortcuts flowing here, and
+                                // let Ctrl turn this drag into an erase.
+                                crate::platform::reclaim_foreground(self.osn_hwnd);
+                                self.pen_using_eraser = ctrl_held && !select_active;
+                            }
+                        }
+                        if self.mouse_gesture {
+                            let target_tool: &mut ActiveTool = if self.pen_using_eraser {
+                                &mut self.eraser_override
+                            } else {
+                                &mut self.tool
+                            };
+                            crate::input::pen::dispatch(ev, target_tool, self.canvases.active_mut());
+                            if matches!(ev, PenEvent::Up(_)) {
+                                self.mouse_gesture = false;
+                                self.pen_using_eraser = false;
+                            }
                         }
                     }
-                });
                 }
+            } else if !self.mouse_gesture {
+                // Someone else has the pointer. Follow the button so that
+                // when the mouse gets it back, drawing needs a fresh
+                // press rather than picking up one that was never its
+                // own (the pen's synthetic press, a pan drag…). A mouse
+                // drag that is merely paused — Space held mid-stroke —
+                // keeps its state so its release still ends the stroke.
+                self.mouse_was_down = ctx.input(|i| i.pointer.primary_down());
             }
 
             // ---- Deferred flood-fill --------------------------------------
@@ -1660,6 +1990,11 @@ impl eframe::App for OnScreenNotesApp {
             // not as a tool change or an undo.
             let text_consumed = interaction::route_text_input(ctx, &mut self.tool, &mut self.canvases);
 
+            // Select-tool commands found in this frame's events. They
+            // are only collected inside the input closure and run after
+            // it, because several of them need `&mut self` as a whole.
+            let mut sel_actions: Vec<SelAction> = Vec::new();
+
             ctx.input(|i| {
                 let mods = i.modifiers;
                 // Locals retained for the scroll handler below, which
@@ -1676,6 +2011,41 @@ impl eframe::App for OnScreenNotesApp {
                 }
                 let keys = &self.hotkeys_cfg;
                 for ev in &i.events {
+                    match ev {
+                        // egui-winit swallows the Ctrl+C / X / V key
+                        // presses and hands us these instead.
+                        egui::Event::Copy => sel_actions.push(SelAction::Copy),
+                        egui::Event::Cut => sel_actions.push(SelAction::Cut),
+                        egui::Event::Paste(text) if text == CLIP_MARKER => {
+                            sel_actions.push(SelAction::PasteObjects);
+                        }
+                        // Elsewhere there is no key-state fallback (see
+                        // `platform::paste_chord_down`), so a paste of
+                        // anything that is not our own marker is the
+                        // only cue to look for an image.
+                        #[cfg(not(target_os = "windows"))]
+                        egui::Event::Paste(_) => sel_actions.push(SelAction::PasteImage),
+                        egui::Event::Key { key, pressed: true, .. } => {
+                            let c = &keys.canvas;
+                            let hit = |b: Option<crate::input::hotkeys_config::Binding>| {
+                                b.is_some_and(|b| b.matches(*key, mods))
+                            };
+                            // Plain Backspace doubles as Delete: on a
+                            // tablet-side keyboard it is the nearer key.
+                            let bare_backspace = *key == egui::Key::Backspace
+                                && !(mods.ctrl || mods.command || mods.shift || mods.alt);
+                            if hit(c.delete_selection) || bare_backspace {
+                                sel_actions.push(SelAction::Delete);
+                            } else if hit(c.duplicate) {
+                                sel_actions.push(SelAction::Duplicate);
+                            } else if hit(c.bring_front) {
+                                sel_actions.push(SelAction::ToFront);
+                            } else if hit(c.send_back) {
+                                sel_actions.push(SelAction::ToBack);
+                            }
+                        }
+                        _ => {}
+                    }
                     if let egui::Event::Key { key, pressed: true, .. } = ev {
                         // Tool switch shortcuts.
                         interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
@@ -1690,10 +2060,18 @@ impl eframe::App for OnScreenNotesApp {
                         }
                         // Undo / redo / clear / delete-canvas.
                         if let Some(b) = keys.canvas.undo {
-                            if b.matches(*key, mods) { self.canvases.active_mut().undo(); }
+                            if b.matches(*key, mods) {
+                                self.canvases.active_mut().undo();
+                                // The entry a size-slider run was being
+                                // folded into may be gone now.
+                                self.restyle_run = None;
+                            }
                         }
                         if let Some(b) = keys.canvas.redo {
-                            if b.matches(*key, mods) { self.canvases.active_mut().redo(); }
+                            if b.matches(*key, mods) {
+                                self.canvases.active_mut().redo();
+                                self.restyle_run = None;
+                            }
                         }
                         if let Some(b) = keys.canvas.clear_layer {
                             if b.matches(*key, mods) { self.canvases.active_mut().clear(); }
@@ -1813,6 +2191,23 @@ impl eframe::App for OnScreenNotesApp {
                     }
                 }
             });
+
+            // ---- Select-tool commands -----------------------------------
+            // Ctrl+V with only an image on the clipboard produces no egui
+            // event at all, so watch the physical chord for that case.
+            // When the clipboard holds our own marker text this fires
+            // alongside `PasteObjects` and finds no image — harmless.
+            let chord = crate::platform::paste_chord_down() && ctx.input(|i| i.focused);
+            if chord && !self.paste_chord_prev && !text_consumed {
+                sel_actions.push(SelAction::PasteImage);
+            }
+            self.paste_chord_prev = chord;
+            if !sel_actions.is_empty() {
+                let ppp = ctx.pixels_per_point();
+                for action in sel_actions {
+                    self.apply_sel_action(action, canvas_rect, ppp);
+                }
+            }
 
             // ---- Status badge + layer panel ------------------------------
             // Both hide when the master UI toggle is off.
@@ -2047,3 +2442,41 @@ fn transform_pen_event(
     }
 }
 
+
+/// Cursor for the Select tool with the pointer at canvas point `p`: it
+/// previews what a press there would do (or shows what the gesture in
+/// flight is doing). `None` leaves the default arrow.
+fn select_cursor(
+    state: &crate::tools::select_tool::SelectState,
+    p: [f32; 2],
+    canvas: &crate::canvas::canvas::Canvas,
+) -> Option<egui::CursorIcon> {
+    use crate::tools::select_tool::{Gesture, Handle, Hover};
+    use egui::CursorIcon as C;
+    // Nearest of the four resize cursors to the direction the handle
+    // actually pulls in, which follows the frame when it is turned.
+    let resize = |x: i8, y: i8| {
+        let deg = state.handle_direction(x, y, canvas).to_degrees().rem_euclid(180.0);
+        if !(22.5..157.5).contains(&deg) {
+            C::ResizeHorizontal
+        } else if deg < 67.5 {
+            C::ResizeNwSe
+        } else if deg < 112.5 {
+            C::ResizeVertical
+        } else {
+            C::ResizeNeSw
+        }
+    };
+    match state.gesture {
+        Some(Gesture::Move { .. }) | Some(Gesture::Rotate { .. }) => Some(C::Grabbing),
+        Some(Gesture::Resize { x, y, .. }) => Some(resize(x, y)),
+        Some(Gesture::Marquee { .. }) => Some(C::Crosshair),
+        None => match state.hover(p, canvas) {
+            Hover::Handle(Handle::Rotate) => Some(C::Grab),
+            Hover::Handle(Handle::Scale { x, y }) => Some(resize(x, y)),
+            Hover::Selection => Some(C::Move),
+            Hover::Object => Some(C::PointingHand),
+            Hover::Nothing => None,
+        },
+    }
+}
