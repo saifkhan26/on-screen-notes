@@ -57,6 +57,11 @@ pub struct OnScreenNotesApp {
     /// and apply it to `canvas.pan`, then move the anchor forward.
     pan_drag_anchor: Option<egui::Pos2>,
 
+    /// Anchor for middle-button drag pan, same meaning as
+    /// `pan_drag_anchor`. Kept separate because the Space path clears
+    /// that one every frame Space is up.
+    middle_pan_anchor: Option<egui::Pos2>,
+
     /// Active **Shift**+Space layer gesture — a drag pans the layer, the
     /// wheel zooms it, and both accumulate into one similarity
     /// transform. `None` means the current Space drag pans the whole
@@ -465,6 +470,7 @@ impl OnScreenNotesApp {
             last_save_at: Instant::now(),
             first_frame: true,
             pan_drag_anchor: None,
+            middle_pan_anchor: None,
             layer_xform: None,
             pen_filter: crate::input::filter::PenFilter::for_level(level),
             pen_blocked: false,
@@ -1877,6 +1883,47 @@ impl eframe::App for OnScreenNotesApp {
                 // drag that is merely paused — Space held mid-stroke —
                 // keeps its state so its release still ends the stroke.
                 self.mouse_was_down = ctx.input(|i| i.pointer.primary_down());
+            }
+
+            // ---- Middle-button pan ----------------------------------------
+            // Middle drag pans the viewport without touching the keyboard.
+            // Drawing only reads the primary button, so the two never
+            // compete. Runs after the tool cursors above so the grab hand
+            // wins. Space owns the pan while held; a press on the toolbar
+            // or a popup is not a pan.
+            let (middle_down, middle_pressed, cursor) = ctx.input(|i| {
+                (
+                    i.pointer.middle_down(),
+                    i.pointer.button_pressed(egui::PointerButton::Middle),
+                    i.pointer
+                        .hover_pos()
+                        .or(i.pointer.interact_pos())
+                        .or(i.pointer.latest_pos()),
+                )
+            });
+            if !middle_down || space_held || click_through_now
+                || self.loupe.is_some() || self.region_select.is_some()
+            {
+                self.middle_pan_anchor = None;
+            } else if let Some(p) = cursor {
+                match self.middle_pan_anchor {
+                    Some(anchor) => self.apply_pan_delta(p.x - anchor.x, p.y - anchor.y),
+                    None if middle_pressed => {
+                        let on_ui = ctx
+                            .layer_id_at(p)
+                            .map(|l| l.order > egui::Order::Background)
+                            .unwrap_or(false);
+                        if !on_ui {
+                            self.begin_pan_gesture(false);
+                            self.middle_pan_anchor = Some(p);
+                        }
+                    }
+                    None => {}
+                }
+                if self.middle_pan_anchor.is_some() {
+                    self.middle_pan_anchor = Some(p);
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
             }
 
             // ---- Deferred flood-fill --------------------------------------

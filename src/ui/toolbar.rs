@@ -433,6 +433,7 @@ fn help_btn(ui: &mut egui::Ui) -> bool {
                     row(ui, "Temporary eraser",   "Hold Ctrl + draw");
                     row(ui, "Pick colour",        "Hold Shift + tap");
                     row(ui, "Pan canvas",         "Hold Space + drag");
+                    row(ui, "Pan canvas (mouse)", "Middle-click + drag");
                     row(ui, "Pan active layer",   "Hold Shift + Space + drag");
                     row(ui, "Pen size (pen tool)","Scroll");
                     row(ui, "Zoom (other tools)", "Scroll");
