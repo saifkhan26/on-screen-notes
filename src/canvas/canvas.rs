@@ -670,6 +670,51 @@ impl Canvas {
     /// edits via a slider or hotkey).
     pub fn mark_dirty(&mut self) { self.dirty = true; }
 
+    /// Add to `out` the name of every video / GIF file this canvas uses:
+    /// on its layers, and in its undo and redo history, since an undo can
+    /// bring back an object that was deleted.
+    pub fn media_files(&self, out: &mut std::collections::HashSet<String>) {
+        let mut add = |s: &Shape| {
+            if let Some(m) = s.media() {
+                out.insert(m.file.clone());
+            }
+        };
+        for layer in &self.layers {
+            layer.shapes.iter().for_each(&mut add);
+        }
+        self.legacy_shapes.iter().for_each(&mut add);
+        for entry in self.undo_log.iter().chain(&self.redo_log) {
+            // No catch-all arm: a new entry kind that holds shapes must
+            // be added here, or its videos could be deleted while an undo
+            // still needs them.
+            match entry {
+                UndoEntry::ShapeErased(_, _, s) => add(s),
+                UndoEntry::Cleared(_, _, shapes) => shapes.iter().for_each(&mut add),
+                UndoEntry::ShapeReplaced(_, _, old, new) => {
+                    add(old);
+                    add(new);
+                }
+                UndoEntry::ObjectsReplaced(_, _, shapes) => {
+                    for (_, before, after) in shapes {
+                        add(before);
+                        add(after);
+                    }
+                }
+                UndoEntry::ObjectsRemoved(_, _, shapes) | UndoEntry::ObjectsInserted(_, _, shapes) => {
+                    shapes.iter().for_each(|(_, s)| add(s));
+                }
+                UndoEntry::StrokeAdded(_)
+                | UndoEntry::ShapeAdded(_)
+                | UndoEntry::StrokeErased(..)
+                | UndoEntry::StrokePartiallyErased(..)
+                | UndoEntry::LayerMoved(..)
+                | UndoEntry::LayerScaled(..)
+                | UndoEntry::ObjectsReordered(..)
+                | UndoEntry::PlatePromoted(..) => {}
+            }
+        }
+    }
+
     /// Erase every stroke / shape on the **active** layer whose ink the
     /// eraser disc at `point` (canvas-local) actually touches. Returns
     /// true if anything was erased. Strokes / shapes on other layers
@@ -1254,6 +1299,7 @@ fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
         color: [0, 0, 0, 0],
         rotation: 0.0,
         kind: RasterKind::Image,
+        media: None,
     });
     layer.rev += 1;
     Some(img.capture_zoom)
@@ -1267,7 +1313,7 @@ fn demote_plate(layers: &mut [Layer], li: usize, capture_zoom: f32) -> bool {
     let Some(layer) = layers.get_mut(li) else { return false };
     let promoted = matches!(
         layer.shapes.first(),
-        Some(Shape::Raster { kind: RasterKind::Image, rotation, .. }) if *rotation == 0.0
+        Some(Shape::Raster { kind: RasterKind::Image, rotation, media: None, .. }) if *rotation == 0.0
     );
     if layer.image.is_some() || !promoted { return false; }
     let Shape::Raster { pos, size, png, px_size, .. } = layer.shapes.remove(0) else { return false };
@@ -1529,6 +1575,7 @@ fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutco
         color,
         rotation,
         kind,
+        media: None,
     })
 }
 
@@ -1654,7 +1701,7 @@ mod object_edit_tests {
     fn raster(kind: RasterKind) -> Shape {
         Shape::Raster {
             pos: [0.0, 0.0], size: [200.0, 200.0], png: Arc::new(vec![1, 2, 3]), px_size: [1, 1],
-            color: [0; 4], rotation: 0.0, kind,
+            color: [0; 4], rotation: 0.0, kind, media: None,
         }
     }
 

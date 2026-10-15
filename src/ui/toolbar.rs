@@ -26,6 +26,8 @@ pub fn show(
     pressure_curve: &mut f32,
     pinned_hwnd: &mut Option<isize>,
     pin_picking: &mut bool,
+    // Set when the "Insert video / GIF" button is clicked.
+    insert_media: &mut bool,
 ) -> bool {
     let mut interacted = false;
 
@@ -85,7 +87,8 @@ pub fn show(
                     interacted |= size_widget(ui, tool);
                     spacer(ui);
 
-                    // Group 5: utilities (pin + settings + help)
+                    // Group 5: utilities (insert media + pin + settings + help)
+                    interacted |= insert_media_btn(ui, insert_media);
                     interacted |= pin_btn(ui, pinned_hwnd, pin_picking);
                     interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve);
                     interacted |= help_btn(ui);
@@ -171,6 +174,24 @@ fn tool_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, kind: ToolKind, tooltip: &
     let response = response.on_hover_text(tooltip);
     if response.clicked() {
         tool.kind = kind;
+        return true;
+    }
+    response.hovered() || response.is_pointer_button_down_on()
+}
+
+/// "Insert picture / video / GIF" — opens the Open dialog (the app runs it).
+fn insert_media_btn(ui: &mut egui::Ui, clicked: &mut bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
+    let bg = if response.hovered() { Color32::from_white_alpha(22) } else { Color32::TRANSPARENT };
+    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+    let icon_rect = rect.shrink(rect.width() * 0.22);
+    egui::Image::new(egui::include_image!("../../assets/icons/film.svg"))
+        .tint(theme::TEXT_PRIMARY)
+        .fit_to_exact_size(icon_rect.size())
+        .paint_at(ui, icon_rect);
+    let response = response.on_hover_text("Insert picture / video / GIF  (or drop a file onto the canvas)");
+    if response.clicked() {
+        *clicked = true;
         return true;
     }
     response.hovered() || response.is_pointer_button_down_on()
@@ -417,6 +438,9 @@ fn help_btn(ui: &mut egui::Ui) -> bool {
                     row(ui, "Eyedropper (1 shot)","I");
                     row(ui, "Magnifier loupe",    "Hold Z  (wheel resizes zoom)");
                     row(ui, "Text",               "T  (Enter = commit, Shift+Enter = newline)");
+                    row(ui, "Insert picture / video / GIF", "film button, or drop a file on the canvas");
+                    row(ui, "  play / pause",     "K  (hover or select it; bar appears below)");
+                    row(ui, "  prev / next frame", ", / .");
                     row(ui, "Rectangle",          "R");
                     row(ui, "Ellipse",            "O");
                     row(ui, "Straight arrow",     "A");

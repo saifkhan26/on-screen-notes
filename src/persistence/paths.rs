@@ -46,6 +46,14 @@ pub fn canvases_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Directory under `data_dir()` holding the copies of inserted videos
+/// and GIFs. Slides refer to these files by name (`MediaRef::file`).
+pub fn media_dir() -> Result<PathBuf> {
+    let dir = data_dir()?.join("media");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Default screenshot output directory (Pictures/on-screen-notes/).
 pub fn default_screenshot_dir() -> Result<PathBuf> {
     let user = directories::UserDirs::new()

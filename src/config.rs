@@ -139,6 +139,12 @@ pub struct AppConfig {
     /// keeps older config files loading without the field.
     #[serde(default)]
     pub smoothing: SmoothingOptions,
+
+    /// Where to find FFmpeg (the `ffmpeg` exe or its folder), set by
+    /// "Locate ffmpeg…". `None` searches the usual places; see
+    /// `media::ffmpeg`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_path: Option<std::path::PathBuf>,
 }
 
 fn default_pressure_curve() -> f32 { 1.0 }
@@ -181,6 +187,7 @@ impl Default for AppConfig {
             pressure_curve: 1.0,
             recording_format: RecordingFormat::default(),
             smoothing: SmoothingOptions::default(),
+            ffmpeg_path: None,
         }
     }
 }

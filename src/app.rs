@@ -208,6 +208,19 @@ pub struct OnScreenNotesApp {
     /// a tool. False for a press that landed on a widget, and after the
     /// pen has taken a gesture over.
     mouse_gesture: bool,
+
+    /// Players for the videos and GIFs on the active slide.
+    media: crate::media::MediaHub,
+    /// Their playback bars, and the FFmpeg setup window.
+    media_ui: ui::media_controls::MediaUi,
+    /// Files being copied in and read as videos / GIFs.
+    media_imports: Vec<crate::media::import::ImportJob>,
+    /// Videos picked or dropped before FFmpeg was set up, with where
+    /// they were dropped. Imported once it is; dropped if the setup
+    /// window is closed without it.
+    media_waiting: Vec<(std::path::PathBuf, Option<egui::Pos2>)>,
+    /// Open dialog started by the toolbar's "Insert video / GIF".
+    media_dialog: Option<std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>>,
 }
 
 /// How long after the pen was last used the pointer still counts as
@@ -456,6 +469,8 @@ impl OnScreenNotesApp {
             }
         };
 
+        crate::media::ffmpeg::set_configured(config.ffmpeg_path.clone());
+
         Self {
             config,
             hotkeys_cfg,
@@ -498,6 +513,11 @@ impl OnScreenNotesApp {
             restyle_run: None,
             paste_chord_prev: false,
             mouse_gesture: false,
+            media: crate::media::MediaHub::new(),
+            media_ui: ui::media_controls::MediaUi::new(),
+            media_imports: Vec::new(),
+            media_waiting: Vec::new(),
+            media_dialog: None,
         }
     }
 
@@ -515,9 +535,15 @@ impl OnScreenNotesApp {
                 rect,
                 ps.bg_color,
                 ps.bg_opacity_before,
+                &self.media.current_frames(),
             )
         } else {
-            crate::screenshot::capture_and_save(self.canvases.active(), &self.config, ps.pixels_per_point)
+            crate::screenshot::capture_and_save(
+                self.canvases.active(),
+                &self.config,
+                ps.pixels_per_point,
+                &self.media.current_frames(),
+            )
         };
         match res {
             Ok(r) => {
@@ -864,6 +890,7 @@ impl OnScreenNotesApp {
                     color: [0, 0, 0, 0],
                     rotation: 0.0,
                     kind: crate::canvas::shape::RasterKind::Image,
+                    media: None,
                 };
                 let c = self.canvases.active_mut();
                 c.add_shape(shape);
@@ -909,7 +936,13 @@ impl OnScreenNotesApp {
     ) {
         if strokes.is_empty() && shapes.is_empty() { return; }
         for s in &mut strokes { s.translate(offset); }
-        for s in &mut shapes { s.translate(offset); }
+        for s in &mut shapes {
+            s.translate(offset);
+            // A copy of a video or GIF plays on its own.
+            if let crate::canvas::shape::Shape::Raster { media: Some(m), .. } = s {
+                m.id = crate::canvas::shape::fresh_media_id();
+            }
+        }
         let c = self.canvases.active_mut();
         let li = c.active_layer;
         let placed = c.insert_objects(li, strokes, shapes);
@@ -1013,9 +1046,166 @@ impl OnScreenNotesApp {
             color: [0, 0, 0, 0],
             rotation: 0.0,
             kind: crate::canvas::shape::RasterKind::Image,
+            media: None,
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
+    }
+
+    /// Start bringing in a picture, video or GIF. A video waits for
+    /// FFmpeg to be set up first.
+    fn start_media_import(&mut self, path: std::path::PathBuf, at: Option<egui::Pos2>) {
+        use crate::canvas::shape::MediaKind;
+        if crate::media::import::media_kind(&path) == Some(MediaKind::Video) && crate::media::ffmpeg::tools().is_none() {
+            self.media_waiting.push((path, at));
+            self.media_ui.ffmpeg_window = true;
+            return;
+        }
+        let job = crate::media::import::ImportJob::start(path, at);
+        self.toast = Some((format!("Inserting {}…", job.file_name()), Instant::now()));
+        self.media_imports.push(job);
+    }
+
+    /// Where a file was dropped, in screen points. egui's pointer is not
+    /// updated during an OS drag, so ask the OS where the cursor is.
+    fn drop_point(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
+        let ppp = ctx.pixels_per_point().max(0.01);
+        if let (Some((cx, cy)), Some((left, top, _, _))) =
+            (crate::platform::cursor_pos(), crate::platform::client_rect(self.osn_hwnd))
+        {
+            return Some(egui::pos2((cx - left) as f32 / ppp, (cy - top) as f32 / ppp));
+        }
+        ctx.input(|i| i.pointer.hover_pos())
+    }
+
+    /// Collect files from the Open dialog and from drag-and-drop, and
+    /// turn finished imports into objects on the active layer.
+    fn poll_media_inputs(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) {
+        use std::sync::mpsc::TryRecvError;
+        if let Some(rx) = &self.media_dialog {
+            match rx.try_recv() {
+                Ok(paths) => {
+                    self.media_dialog = None;
+                    for p in paths { self.start_media_import(p, None); }
+                }
+                Err(TryRecvError::Disconnected) => self.media_dialog = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        let (dropped, hovering) = ctx.input(|i| (i.raw.dropped_files.clone(), !i.raw.hovered_files.is_empty()));
+        if !dropped.is_empty() {
+            let at = self.drop_point(ctx);
+            for (n, file) in dropped.into_iter().enumerate() {
+                let Some(path) = file.path else { continue };
+                if !crate::media::import::is_supported(&path) {
+                    self.toast = Some(("Only pictures, videos and GIFs can be dropped here".into(), Instant::now()));
+                    continue;
+                }
+                // Several files at once fan out instead of stacking.
+                let at = at.map(|p| p + egui::vec2(24.0, 24.0) * n as f32);
+                self.start_media_import(path, at);
+            }
+        }
+        if hovering {
+            egui::Area::new(egui::Id::new("osn_drop_hint"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    ui::theme::card_frame().inner_margin(egui::Margin::symmetric(16.0, 10.0)).show(ui, |ui| {
+                        ui.label("Drop to insert picture / video / GIF");
+                    });
+                });
+        }
+
+        let mut finished = Vec::new();
+        self.media_imports.retain(|job| match job.take() {
+            Some(r) => {
+                finished.push((job.path.clone(), job.at, job.file_name(), r));
+                false
+            }
+            None => true,
+        });
+        for (path, at, name, result) in finished {
+            use crate::media::import::ImportError;
+            match result {
+                Ok(imported) => {
+                    self.insert_media(imported, at, canvas_rect, ctx.pixels_per_point());
+                    self.toast = Some((format!("Inserted {name}"), Instant::now()));
+                }
+                Err(ImportError::NeedsFfmpeg) => {
+                    self.media_waiting.push((path, at));
+                    self.media_ui.ffmpeg_window = true;
+                }
+                Err(ImportError::Failed(e)) => {
+                    log::warn!("import of {name} failed: {e}");
+                    self.toast = Some((format!("Couldn't insert {name}: {e}"), Instant::now()));
+                }
+            }
+        }
+    }
+
+    /// Place an imported picture / video / GIF on the active layer at its
+    /// natural on-screen size (shrunk to fit the view), centred on `at` or
+    /// on the view, and select it (a video's playback bar then shows).
+    fn insert_media(
+        &mut self,
+        imported: crate::media::import::Imported,
+        at: Option<egui::Pos2>,
+        canvas_rect: egui::Rect,
+        pixels_per_point: f32,
+    ) {
+        let (pan, zoom) = {
+            let c = self.canvases.active();
+            (c.pan, c.zoom.max(1e-3))
+        };
+        let ppp = pixels_per_point.max(0.01);
+        let [w, h] = imported.size;
+        let mut size = [w.max(1) as f32 / ppp / zoom, h.max(1) as f32 / ppp / zoom];
+        let view = [canvas_rect.width() / zoom, canvas_rect.height() / zoom];
+        let fit = (view[0] * 0.9 / size[0]).min(view[1] * 0.9 / size[1]).min(1.0);
+        if fit > 0.0 {
+            size = [size[0] * fit, size[1] * fit];
+        }
+        let screen = at.unwrap_or(canvas_rect.center()) - canvas_rect.min;
+        let center = [(screen.x - pan[0]) / zoom, (screen.y - pan[1]) / zoom];
+        let shape = crate::canvas::shape::Shape::Raster {
+            pos: [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
+            size,
+            png: std::sync::Arc::new(imported.png),
+            px_size: imported.png_size,
+            color: [0, 0, 0, 0],
+            rotation: 0.0,
+            kind: crate::canvas::shape::RasterKind::Image,
+            media: imported.media.map(Box::new),
+        };
+        self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
+    }
+
+    /// Carry out what the playback bars and the FFmpeg window asked for.
+    fn apply_media_out(&mut self, out: ui::media_controls::MediaUiOut) {
+        for (id, cmd) in out.commands {
+            self.media.command(id, cmd);
+        }
+        if out.clicked {
+            crate::platform::reclaim_foreground(self.osn_hwnd);
+        }
+        if let Some(p) = out.located {
+            self.config.ffmpeg_path = Some(p);
+        }
+        if out.ffmpeg_ready {
+            self.ffmpeg_available = true;
+            self.media.ffmpeg_changed();
+            for (path, at) in std::mem::take(&mut self.media_waiting) {
+                self.start_media_import(path, at);
+            }
+        } else if !self.media_ui.ffmpeg_window {
+            // Set-up window closed without FFmpeg: give up on those.
+            self.media_waiting.clear();
+        }
+        if let Some(t) = out.toast {
+            self.toast = Some((t, Instant::now()));
+        }
     }
 
     /// Apply a toolbar colour / size change to the selected objects.
@@ -1406,6 +1596,7 @@ impl eframe::App for OnScreenNotesApp {
                 self.canvases.active(),
             );
             let (prev_color, prev_size) = (self.tool.color, self.tool.size);
+            let mut insert_media = false;
             let toolbar_clicked = if self.ui_visible {
                 ui::toolbar::show(
                     ctx,
@@ -1418,10 +1609,22 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.config.pressure_curve,
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
+                    &mut insert_media,
                 )
             } else {
                 false
             };
+            if insert_media && self.media_dialog.is_none() {
+                let mut exts = vec!["gif"];
+                exts.extend_from_slice(crate::media::import::VIDEO_EXTS);
+                exts.extend_from_slice(crate::media::import::IMAGE_EXTS);
+                self.media_dialog = Some(ui::media_controls::pick_files(
+                    self.osn_hwnd,
+                    "Insert picture, video or GIF",
+                    &[("Pictures, videos and GIFs", &exts)],
+                    true,
+                ));
+            }
             // A colour or size picked in the toolbar while objects are
             // selected restyles those objects.
             self.restyle_selection(prev_color, prev_size);
@@ -1454,6 +1657,9 @@ impl eframe::App for OnScreenNotesApp {
             // frame — the same one-frame lag the canvas pan has always
             // had.
             let layer_xform = self.layer_xform_for_render();
+            // Advance video / GIF playback and upload new frames before
+            // the canvas paints them.
+            self.media.sync(ctx, self.canvases.active(), ctx.pixels_per_point());
             // Selection handles must stay out of anything that grabs the
             // screen.
             let show_selection = self.pending_screenshot.is_none()
@@ -1470,7 +1676,30 @@ impl eframe::App for OnScreenNotesApp {
                 self.loupe.as_ref(),
                 layer_xform,
                 show_selection,
+                &self.media,
             );
+
+            // ---- Videos & GIFs ------------------------------------------
+            // New files from the dialog / drag-and-drop, finished imports,
+            // then the playback bars. Drawn before the pen dispatch below
+            // so a tap on a bar counts as UI, never as ink.
+            self.poll_media_inputs(ctx, canvas_rect);
+            let media_objs = ui::media_controls::media_on_screen(self.canvases.active(), canvas_rect);
+            let media_selected = if self.tool.kind == crate::tools::ToolKind::Select {
+                ui::media_controls::selected_media(self.canvases.active(), &self.tool.select.sel)
+            } else {
+                None
+            };
+            let show_media_bars = self.ui_visible
+                && show_selection
+                && !click_through_now
+                && !self.recorder.is_recording()
+                && self.tool.in_progress_stroke.is_none()
+                && self.tool.select.gesture.is_none();
+            let mut media_out =
+                self.media_ui.show(ctx, &self.media, &media_objs, media_selected, canvas_rect, show_media_bars);
+            self.media_ui.ffmpeg_window(ctx, self.osn_hwnd, &mut media_out);
+            self.apply_media_out(media_out);
 
             // ---- Screenshot region selection --------------------------------
             // Draws the dimmed rubber-band over the canvas and, on release,
@@ -2041,6 +2270,10 @@ impl eframe::App for OnScreenNotesApp {
             // are only collected inside the input closure and run after
             // it, because several of them need `&mut self` as a whole.
             let mut sel_actions: Vec<SelAction> = Vec::new();
+            // Play / step keys, applied after the input closure. Not while
+            // a text field has the keyboard.
+            let mut media_keys: Vec<crate::media::Cmd> = Vec::new();
+            let media_keys_live = !ctx.wants_keyboard_input();
 
             ctx.input(|i| {
                 let mods = i.modifiers;
@@ -2089,6 +2322,15 @@ impl eframe::App for OnScreenNotesApp {
                                 sel_actions.push(SelAction::ToFront);
                             } else if hit(c.send_back) {
                                 sel_actions.push(SelAction::ToBack);
+                            }
+                            if media_keys_live {
+                                if hit(c.media_play_pause) {
+                                    media_keys.push(crate::media::Cmd::TogglePlay);
+                                } else if hit(c.media_prev_frame) {
+                                    media_keys.push(crate::media::Cmd::Step(-1));
+                                } else if hit(c.media_next_frame) {
+                                    media_keys.push(crate::media::Cmd::Step(1));
+                                }
                             }
                         }
                         _ => {}
@@ -2253,6 +2495,14 @@ impl eframe::App for OnScreenNotesApp {
                 let ppp = ctx.pixels_per_point();
                 for action in sel_actions {
                     self.apply_sel_action(action, canvas_rect, ppp);
+                }
+            }
+            if !media_keys.is_empty() {
+                let pointer = ctx.input(|i| i.pointer.hover_pos());
+                if let Some(id) = ui::media_controls::hotkey_target(&media_objs, media_selected, pointer) {
+                    for cmd in media_keys {
+                        self.media.command(id, cmd);
+                    }
                 }
             }
 
@@ -2425,7 +2675,16 @@ impl eframe::App for OnScreenNotesApp {
         // annotation tool, and the UI stays smooth even with 9+
         // PNG-bearing canvases.
         if self.last_save_at.elapsed() > Duration::from_millis(5000) {
-            self.canvases.save_all();
+            // Media the in-app clipboard holds must survive a slide
+            // delete; while an import runs, media cleanup waits.
+            let clipboard_media: std::collections::HashSet<String> = self
+                .obj_clipboard
+                .1
+                .iter()
+                .filter_map(|s| s.media().map(|m| m.file.clone()))
+                .collect();
+            let media_in_use = self.media_imports.is_empty().then_some(&clipboard_media);
+            self.canvases.save_all(media_in_use);
             if let Err(e) = crate::persistence::save_config(&self.config) {
                 log::warn!("config save failed: {e}");
             }

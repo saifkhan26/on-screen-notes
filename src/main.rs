@@ -20,6 +20,7 @@ mod error;
 mod flood_fill;
 mod input;
 mod interaction;
+mod media;
 mod persistence;
 mod platform;
 mod recording;
@@ -82,7 +83,9 @@ fn main() -> Result<()> {
             // looking "frozen" to the user. The tiny floating button is
             // still always-on-top so the user can summon the overlay.
             // Minimum size keeps the toolbar usable.
-            .with_min_inner_size([320.0, 240.0]),
+            .with_min_inner_size([320.0, 240.0])
+            // Videos and GIFs can be dropped onto the canvas from Explorer.
+            .with_drag_and_drop(true),
         // We rely on the OS compositor for transparency; tell eframe to
         // not paint a background colour itself.
         ..Default::default()

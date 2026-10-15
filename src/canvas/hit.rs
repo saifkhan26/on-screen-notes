@@ -280,9 +280,11 @@ pub fn raster_solid_at(png: &[u8], u: f32, v: f32, may_decode: bool) -> bool {
 }
 
 /// For a raster shape already known to contain `p` in its box: is the
-/// image actually visible there? Always true for every other shape.
+/// image actually visible there? Always true for every other shape, and
+/// for videos and GIFs, whose `png` is only the first frame — a GIF
+/// that starts transparent would otherwise be unclickable there.
 fn shape_solid_at(shape: &Shape, p: [f32; 2], may_decode: bool) -> bool {
-    let Shape::Raster { png, .. } = shape else { return true };
+    let Shape::Raster { png, media: None, .. } = shape else { return true };
     let o = shape.obb();
     let q = o.to_local(p);
     let (hw, hh) = (o.half[0].max(1e-3), o.half[1].max(1e-3));
@@ -409,7 +411,7 @@ mod tests {
     fn image(pos: [f32; 2], size: [f32; 2], png: Vec<u8>) -> Shape {
         Shape::Raster {
             pos, size, png: Arc::new(png), px_size: [1, 1], color: [0; 4],
-            rotation: 0.0, kind: crate::canvas::shape::RasterKind::Image,
+            rotation: 0.0, kind: crate::canvas::shape::RasterKind::Image, media: None,
         }
     }
 

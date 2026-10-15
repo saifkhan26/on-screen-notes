@@ -42,6 +42,61 @@ pub enum RasterKind {
 fn is_zero(v: &f32) -> bool { *v == 0.0 }
 fn is_fill(k: &RasterKind) -> bool { *k == RasterKind::Fill }
 
+/// What a media picture plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaKind {
+    /// Animated GIF, decoded in-process.
+    Gif,
+    /// Video file, decoded by an `ffmpeg` child process.
+    Video,
+}
+
+/// Stream facts measured at import, so the control bar can show the
+/// length and frame count before a player has started.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MediaMeta {
+    /// Frame rate as `num / den`. `[0, 1]` for GIFs, whose frames each
+    /// carry their own delay.
+    pub frame_rate: [u32; 2],
+    /// Number of frames (an estimate for videos that do not record it).
+    pub frames: u32,
+    /// Length in seconds.
+    pub duration: f64,
+    /// Display size in pixels, after any rotation the file asks for.
+    pub size: [u32; 2],
+}
+
+/// Hands out `MediaRef::id`s. Ids are runtime-only, so a counter that
+/// restarts with the app is all they need.
+static NEXT_MEDIA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A new, never-used `MediaRef::id`.
+pub fn fresh_media_id() -> u64 {
+    NEXT_MEDIA_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The video or animated GIF behind a media picture. The file itself is
+/// a copy kept in the app's `media/` folder; the slide stores only its
+/// name, so slide files stay small.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaRef {
+    /// File name inside `persistence::paths::media_dir()`, named after a
+    /// hash of the contents (`"<16 hex digits>.<ext>"`).
+    pub file: String,
+    pub kind: MediaKind,
+    /// Name of the file the user inserted, for messages.
+    #[serde(default)]
+    pub source_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<MediaMeta>,
+    /// Key of this object's player while the app runs. Not saved: every
+    /// load mints fresh ids. Clones (undo snapshots, the transform
+    /// preview) keep it, so they show the same playback; a duplicate
+    /// gets a new one in `insert_and_select` and plays on its own.
+    #[serde(skip, default = "fresh_media_id")]
+    pub id: u64,
+}
+
 /// Oriented bounding box: a rectangle of half-extents `half` centred on
 /// `center` and turned by `angle` radians (clockwise on screen).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -217,6 +272,13 @@ pub enum Shape {
         /// every raster saved before this field existed is.
         #[serde(default, skip_serializing_if = "is_fill")]
         kind: RasterKind,
+        /// Set when the picture plays a video or animated GIF. `png` is
+        /// then a small poster frame: thumbnails, flood fill and
+        /// screenshots without a live frame draw it, and app builds
+        /// from before this field existed load the slide and show it
+        /// as a still image. `kind` is always `Image`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media: Option<Box<MediaRef>>,
     },
 }
 
@@ -231,6 +293,14 @@ impl Shape {
             Shape::Arrow   { color, .. } => *color,
             Shape::Text    { color, .. } => *color,
             Shape::Raster  { color, .. } => *color,
+        }
+    }
+
+    /// The media this shape plays, if it is a video or GIF picture.
+    pub fn media(&self) -> Option<&MediaRef> {
+        match self {
+            Shape::Raster { media: Some(m), .. } => Some(m),
+            _ => None,
         }
     }
 
@@ -442,20 +512,72 @@ mod tests {
         assert!(!text.contains("rotation"), "{text}");
         let raster = Shape::Raster {
             pos: [0.0, 0.0], size: [1.0, 1.0], png: Arc::new(vec![7]), px_size: [1, 1],
-            color: [0; 4], rotation: 0.0, kind: RasterKind::Fill,
+            color: [0; 4], rotation: 0.0, kind: RasterKind::Fill, media: None,
         };
         let text = ron::to_string(&raster).unwrap();
-        assert!(!text.contains("rotation") && !text.contains("kind"), "{text}");
+        assert!(!text.contains("rotation") && !text.contains("kind") && !text.contains("media"), "{text}");
     }
 
     #[test]
     fn rotation_and_kind_round_trip() {
         let raster = Shape::Raster {
             pos: [3.0, 4.0], size: [10.0, 6.0], png: Arc::new(vec![7, 8]), px_size: [2, 1],
-            color: [0; 4], rotation: 0.5, kind: RasterKind::Image,
+            color: [0; 4], rotation: 0.5, kind: RasterKind::Image, media: None,
         };
         let back: Shape = ron::from_str(&ron::to_string(&raster).unwrap()).unwrap();
         assert!(matches!(back, Shape::Raster { rotation, kind: RasterKind::Image, .. } if (rotation - 0.5).abs() < 1e-6));
+    }
+
+    fn media_raster() -> Shape {
+        Shape::Raster {
+            pos: [3.0, 4.0], size: [10.0, 6.0], png: Arc::new(vec![7, 8]), px_size: [2, 1],
+            color: [0; 4], rotation: 0.0, kind: RasterKind::Image,
+            media: Some(Box::new(MediaRef {
+                file: "0123456789abcdef.mp4".into(),
+                kind: MediaKind::Video,
+                source_name: "clip.mp4".into(),
+                meta: Some(MediaMeta { frame_rate: [30000, 1001], frames: 300, duration: 10.01, size: [1920, 1080] }),
+                id: fresh_media_id(),
+            })),
+        }
+    }
+
+    #[test]
+    fn media_round_trips_without_its_runtime_id() {
+        let shape = media_raster();
+        let text = ron::to_string(&shape).unwrap();
+        assert!(!text.contains("id:"), "{text}");
+        let back: Shape = ron::from_str(&text).unwrap();
+        let (a, b) = (shape.media().unwrap(), back.media().unwrap());
+        assert_eq!((&a.file, a.kind, &a.source_name, a.meta), (&b.file, b.kind, &b.source_name, b.meta));
+        // A load mints a fresh id rather than reusing a saved one.
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn builds_without_media_load_slides_that_have_it() {
+        // The `Raster` variant as it was before `media` existed. ron
+        // skips fields a type does not know, so an older build opens a
+        // slide with a video on it and shows the poster frame.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        enum OldShape {
+            Raster {
+                pos: [f32; 2],
+                size: [f32; 2],
+                png: Vec<u8>,
+                px_size: [u32; 2],
+                color: [u8; 4],
+                #[serde(default)]
+                rotation: f32,
+                #[serde(default)]
+                kind: RasterKind,
+            },
+        }
+        let text = ron::to_string(&media_raster()).unwrap();
+        let old: OldShape = ron::from_str(&text).unwrap();
+        let OldShape::Raster { png, kind, .. } = old;
+        assert_eq!((png, kind), (vec![7, 8], RasterKind::Image));
     }
 
     #[test]

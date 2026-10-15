@@ -39,7 +39,7 @@ use crate::error::{Context, Result};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -118,35 +118,11 @@ pub struct Recorder {
     started_at: Option<Instant>,
 }
 
-/// `CREATE_NO_WINDOW` Win32 flag — suppresses the brief console
-/// pop-up Windows shows when a GUI app spawns a console child
-/// process. No-op on non-Windows.
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// Apply `CREATE_NO_WINDOW` on Windows so child-process spawns from
-/// the GUI binary do not flash a console window.
-fn hide_console(cmd: &mut Command) -> &mut Command {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd
-}
-
-/// One-shot detection of an `ffmpeg` binary on PATH. Cached at app
-/// startup so toggling recording doesn't pay the spawn cost. Returns
-/// `true` when `ffmpeg -version` exits 0.
+/// Whether an `ffmpeg` binary can be found (see `media::ffmpeg` for
+/// where it looks). Cached after the first call, so toggling recording
+/// doesn't pay the spawn cost.
 pub fn detect_ffmpeg() -> bool {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    hide_console(&mut cmd)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::media::ffmpeg::tools().is_some()
 }
 
 /// Active encoder for a recording session. Worker uses the same
@@ -168,7 +144,8 @@ impl Mp4Pipe {
     fn spawn(path: &Path, w: u16, h: u16, fps: u32) -> Result<Self> {
         let size_arg = format!("{w}x{h}");
         let fps_arg = fps.to_string();
-        let mut cmd = Command::new("ffmpeg");
+        let tools = crate::media::ffmpeg::tools().context("ffmpeg not found")?;
+        let mut cmd = tools.ffmpeg_cmd();
         cmd.args([
                 "-y",
                 "-f", "rawvideo",
@@ -185,7 +162,7 @@ impl Mp4Pipe {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = hide_console(&mut cmd)
+        let mut child = cmd
             .spawn()
             .context("spawning ffmpeg")?;
         let stdin = child.stdin.take().context("ffmpeg stdin missing")?;

@@ -54,7 +54,7 @@ pub fn flood_fill_active(
     };
     {
         let mut view = pixmap.as_mut();
-        render::render_canvas(&mut view, canvas, None, None, ppp);
+        render::render_canvas(&mut view, canvas, None, None, ppp, None);
     }
 
     // Convert click (canvas-local) → pixmap pixel coords.
@@ -210,5 +210,6 @@ pub fn flood_fill_active(
         color,
         rotation: 0.0,
         kind: crate::canvas::shape::RasterKind::Fill,
+        media: None,
     })
 }

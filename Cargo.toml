@@ -48,7 +48,10 @@ eframe = { version = "0.29", default-features = false, features = [
 
 # egui = the immediate-mode GUI library underneath eframe. We pull it directly
 # so we can use its types (Pos2, Color32, Painter, …) in our own modules.
-egui = "0.29"
+# `bytemuck` lets a decoded video frame's RGBA bytes become `Color32`
+# pixels without a per-pixel copy.
+egui = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 
 # egui_extras = optional widgets and image loaders. We enable `svg` so we can
 # bundle Lucide-style SVG icons via `include_image!` and tint them per state.
@@ -88,6 +91,10 @@ windows     = { version = "0.56", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     # ClientToScreen for freeze-frame client-area resolution.
     "Win32_Graphics_Gdi",
+    # Job object that kills the ffmpeg video decoders when the app
+    # exits, even by crash (`panic = "abort"` skips every `Drop`).
+    "Win32_System_JobObjects",
+    "Win32_Security",
 ] }
 
 # tiny-skia = a small, pure-Rust 2D rasteriser. We use it to draw our
@@ -133,8 +140,13 @@ env_logger  = "0.11"
 directories = "5"
 
 # image = read/write image files. We use it to save the composited
-# screenshot as a PNG.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# screenshot as a PNG, to decode animated GIFs placed on the canvas (its
+# GIF decoder composites each frame onto the previous ones), and to read
+# pictures dropped onto the canvas.
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg", "webp", "bmp"] }
+
+# rfd = native "Open file" dialog for inserting a video or GIF.
+rfd = "0.14"
 
 # lyon = sweep-line 2-D path tessellator. We use it for the Fill tool.
 #
@@ -185,6 +197,17 @@ panic         = "abort"  # On panic, abort instead of unwinding the stack.
                          # Smaller binary; we use Result<T,E> everywhere
                          # so we don't rely on panic-unwind cleanup.
 incremental   = false    # Disable incremental compilation for release.
+
+# The GIF and PNG decoders run per pixel on every frame of an animated
+# GIF; size-optimised code makes a large GIF load several times slower.
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.gif]
+opt-level = 3
+[profile.release.package.weezl]
+opt-level = 3
+[profile.release.package.png]
+opt-level = 3
 
 # Dev profile keeps incremental compilation and debug info (faster edit-test
 # loop, slightly bigger binary — fine, we only ship release builds).

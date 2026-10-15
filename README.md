@@ -32,6 +32,10 @@ input.
 - **Select** — pick objects, then move / resize / rotate them with
   handles; multi-select, duplicate, copy / paste, recolour, re-order
 - **Text labels** — click to place, type, Enter to commit
+- **Videos, GIFs & pictures** — drop a video, animated GIF or picture
+  onto the canvas (or use the film button); videos and GIFs play /
+  pause, scrub, and step frame by frame forward and back. See
+  [Videos & GIFs](#videos--gifs)
 - **Multiple canvases**, persistent on disk via RON
 - **Multiple layers per canvas** (independent visibility + opacity, and
   each layer can be panned / zoomed on its own with `Shift+Space`)
@@ -124,6 +128,7 @@ the binary on first launch.
 | Straight arrow | `A` | |
 | Freehand arrow | `Shift+A` | |
 | Straight line | toolbar only | |
+| Insert picture / video / GIF | toolbar film button, or drag & drop | See [Videos & GIFs](#videos--gifs) |
 
 ### Dashed border
 
@@ -277,6 +282,8 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Selection: bring to front / send to back | `Ctrl+↑` / `Ctrl+↓` |
 | Text mode: newline | `Shift+Enter` |
 | Text mode: commit | `Enter` |
+| Video / GIF: play / pause | `K` |
+| Video / GIF: previous / next frame | `,` / `.` (hold to repeat) |
 
 ---
 
@@ -298,7 +305,8 @@ Resolution order (first hit wins):
 Strings are case-insensitive. Modifiers: `ctrl` (also `cmd` /
 `command` on macOS), `shift`, `alt` (also `option`). Special keys:
 `arrowleft|right|up|down`, `backspace`, `delete`, `enter`, `escape`,
-`tab`, `space`, `f1`..`f12`. Letters and digits as-is (`a`, `0`).
+`tab`, `space`, `comma`, `period`, `f1`..`f12`. Letters and digits as-is
+(`a`, `0`).
 
 A bad binding (typo, unknown token) is silently disabled — only that
 one shortcut goes dead, the rest still work. Look at `RUST_LOG=warn`
@@ -364,6 +372,12 @@ delete_selection = "delete"
 duplicate   = "ctrl+d"
 bring_front = "ctrl+arrowup"
 send_back   = "ctrl+arrowdown"
+
+# Video / GIF playback: the selected one, else the one under the
+# pointer, else the only one on the slide.
+media_play_pause = "k"
+media_prev_frame = "comma"
+media_next_frame = "period"
 ```
 
 Copy / cut / paste are fixed to `Ctrl+C` / `Ctrl+X` / `Ctrl+V`.
@@ -415,6 +429,77 @@ still, and draw with the mouse.
 
 ---
 
+## Videos & GIFs
+
+Drop a video or animated GIF from Explorer onto the canvas, or click the
+**film** button in the toolbar and pick one or more files. The object
+lands where it was dropped (or mid-view), sized to its natural size or
+shrunk to fit, and selected. From there it is an ordinary picture:
+move / resize / rotate it with the Select tool, draw over it, undo,
+duplicate (each copy plays on its own), put it on any layer.
+
+**Pictures** (PNG, JPEG, WebP, BMP) drop in the same way and become a
+still image, like a pasted one: turned upright if a phone stored it
+sideways, scaled down to 3840 px on the long side, and saved inside the
+slide (not in the `media` folder). A single-frame GIF does the same.
+
+- **Formats** — GIF always; MP4, M4V, MOV, MKV, WebM, AVI, WMV through
+  FFmpeg. Video plays **muted**.
+- **On a slide** — GIFs start playing and loop, like on the web. Videos
+  wait on their first frame until you press play, and stop on the last
+  frame (turn on loop in the bar to repeat).
+- **Playback bar** — appears just below the object while the pointer is
+  over it (with any tool) and while it is selected:
+  previous frame · play / pause · next frame · seek bar · time and
+  frame number · loop. Tapping the bar never draws ink. The bar is
+  never in screenshots or recordings.
+- **Keys** — `K` play / pause, `,` / `.` previous / next frame (see
+  [In-overlay shortcuts](#in-overlay-shortcuts)).
+- **Screenshots** include the frame each video / GIF is showing.
+
+### Where the files go
+
+Inserted files are **copied** into a `media` folder next to the
+slides (`%APPDATA%\OnScreenNotes\on-screen-notes\data\media\` on
+Windows), named after a hash of their content, so moving or deleting
+the original does not break the slide and inserting the same file twice
+stores it once. Slides keep only the file name plus a small poster
+frame.
+
+Deleting a slide (`Ctrl+Shift+Backspace`) also deletes the copies of its
+videos and GIFs — once the slides have been saved without it, and only
+copies nothing else still uses: no other slide, no undo history on
+another slide, nothing in the in-app clipboard (those wait until the
+app closes). Deleting a single object leaves its file in place, since
+Ctrl+Z can bring it back. The file you originally dropped or picked is
+never touched.
+
+### FFmpeg
+
+Videos are decoded by an `ffmpeg` child process (nothing is linked, so
+the app builds and runs without it — GIFs need no FFmpeg at all). The
+app looks for `ffmpeg` + `ffprobe`, in order:
+
+1. `ffmpeg_path` in `config.ron` (the exe or its folder — set by
+   **Locate ffmpeg…**),
+2. next to `on-screen-notes.exe` (portable setup),
+3. WinGet's install folders (so a fresh install is found without a
+   restart),
+4. `PATH`.
+
+If it is missing, inserting a video opens a **Video needs FFmpeg**
+window: **Install FFmpeg** runs
+`winget install Gyan.FFmpeg.Essentials` in a console window (answer its
+prompts there) and picks FFmpeg up when it finishes; **Locate ffmpeg…**
+points the app at an existing copy. On macOS / Linux install it with
+`brew install ffmpeg` / your package manager.
+
+Decoding is capped at 1920 px on the long side and at about the size the
+video is shown at. Decoders stop a few seconds after a video is paused
+and always exit with the app.
+
+---
+
 ## Recording
 
 `Ctrl+Shift+R` starts a screen capture of the area under the overlay;
@@ -423,8 +508,9 @@ press again to stop. `Ctrl+Shift+P` pauses / resumes mid-record.
 Output format toggle in settings:
 
 - **GIF** — pure-Rust encoder, ~80 KB dependency, always available.
-- **MP4 if available** — uses `ffmpeg` from PATH; falls back to GIF
-  when ffmpeg is missing. Smaller files, better quality.
+- **MP4 if available** — uses `ffmpeg` (found the same way as for
+  [videos](#ffmpeg)); falls back to GIF when ffmpeg is missing. Smaller
+  files, better quality.
 
 Recorded GIF bytes are pushed to the clipboard too — paste straight
 into Slack / Discord.
@@ -465,12 +551,14 @@ src/
 │   ├── pen.rs        ─ Wintab queue → PenEvent
 │   └── picker.rs     ─ window-pick helpers
 ├── interaction/      ─ keyboard / mouse dispatch
+├── media/            ─ video / GIF playback, import, ffmpeg discovery
 ├── persistence/      ─ canvas + config load/save (`OSN_DATA_DIR` redirects it)
 ├── platform/         ─ OS-specific window tweaks
 ├── recording.rs      ─ frame capture, GIF / MP4 encode
 ├── screenshot/       ─ xcap composite + PNG write
 ├── tools/            ─ ActiveTool dispatch, per-tool helpers
-└── ui/               ─ toolbar, overlay, loupe, status, layer panel
+└── ui/               ─ toolbar, overlay, loupe, status, layer panel,
+                        media playback bar
 ```
 
 Every module starts with a `//!` doc comment explaining its role —

@@ -112,6 +112,8 @@ fn key_from_name(name: &str) -> Option<egui::Key> {
         // Symbols
         "-" | "minus" => K::Minus,
         "=" | "equals" | "equal" => K::Equals,
+        "," | "comma" => K::Comma,
+        "." | "period" | "dot" => K::Period,
         // Editing
         "backspace" => K::Backspace,
         "delete" | "del" => K::Delete,
@@ -320,6 +322,12 @@ pub struct CanvasSection {
     #[serde(default = "d_bring_front")]      pub bring_front: String,
     /// Paint the selection below everything else of its kind on the layer.
     #[serde(default = "d_send_back")]        pub send_back: String,
+
+    // Video / GIF playback. They act on the selected video or GIF, else
+    // the one under the pointer, else the only one on the slide.
+    #[serde(default = "d_media_play_pause")] pub media_play_pause: String,
+    #[serde(default = "d_media_prev_frame")] pub media_prev_frame: String,
+    #[serde(default = "d_media_next_frame")] pub media_next_frame: String,
 }
 
 impl Default for CanvasSection {
@@ -345,6 +353,9 @@ impl Default for CanvasSection {
             duplicate: d_duplicate(),
             bring_front: d_bring_front(),
             send_back: d_send_back(),
+            media_play_pause: d_media_play_pause(),
+            media_prev_frame: d_media_prev_frame(),
+            media_next_frame: d_media_next_frame(),
         }
     }
 }
@@ -379,6 +390,9 @@ fn d_delete_selection() -> String { "delete".into() }
 fn d_duplicate()   -> String { "ctrl+d".into() }
 fn d_bring_front() -> String { "ctrl+arrowup".into() }
 fn d_send_back()   -> String { "ctrl+arrowdown".into() }
+fn d_media_play_pause() -> String { "k".into() }
+fn d_media_prev_frame() -> String { "comma".into() }
+fn d_media_next_frame() -> String { "period".into() }
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -436,6 +450,9 @@ pub struct CanvasBindings {
     pub duplicate: Option<Binding>,
     pub bring_front: Option<Binding>,
     pub send_back: Option<Binding>,
+    pub media_play_pause: Option<Binding>,
+    pub media_prev_frame: Option<Binding>,
+    pub media_next_frame: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -510,6 +527,9 @@ impl HotkeysConfig {
                 duplicate:   p("canvas.duplicate",   &self.canvas.duplicate),
                 bring_front: p("canvas.bring_front", &self.canvas.bring_front),
                 send_back:   p("canvas.send_back",   &self.canvas.send_back),
+                media_play_pause: p("canvas.media_play_pause", &self.canvas.media_play_pause),
+                media_prev_frame: p("canvas.media_prev_frame", &self.canvas.media_prev_frame),
+                media_next_frame: p("canvas.media_next_frame", &self.canvas.media_next_frame),
             },
         }
     }
@@ -585,5 +605,26 @@ impl HotkeysConfig {
                       # enter, escape, tab, space, f1..f12.\n\n";
         let full = format!("{header}{toml_str}");
         std::fs::write(&p, full)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_keys_parse() {
+        let c = HotkeysConfig::default().parsed().canvas;
+        assert_eq!(c.media_play_pause.map(|b| b.key), Some(egui::Key::K));
+        assert_eq!(c.media_prev_frame.map(|b| b.key), Some(egui::Key::Comma));
+        assert_eq!(c.media_next_frame.map(|b| b.key), Some(egui::Key::Period));
+        assert_eq!(parse(",").map(|b| b.key), Some(egui::Key::Comma));
+        assert_eq!(parse("shift+.").map(|b| (b.key, b.shift)), Some((egui::Key::Period, true)));
+    }
+
+    #[test]
+    fn files_without_media_keys_get_the_defaults() {
+        let cfg: HotkeysConfig = toml::from_str("[canvas]\nundo = \"ctrl+z\"\n").unwrap();
+        assert_eq!(cfg.canvas.media_play_pause, "k");
     }
 }

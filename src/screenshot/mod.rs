@@ -268,7 +268,15 @@ pub fn capture_lasso_layer(
 /// physical pixels while the canvas coords are in egui logical pixels;
 /// passing the ratio here lets the rasteriser line up with what the
 /// user sees on screen.
-pub fn capture_and_save(canvas: &Canvas, cfg: &AppConfig, pixels_per_point: f32) -> Result<ShotResult> {
+///
+/// `media_frames` holds the frame each video / GIF is showing, so the
+/// picture has what is on screen rather than the poster frame.
+pub fn capture_and_save(
+    canvas: &Canvas,
+    cfg: &AppConfig,
+    pixels_per_point: f32,
+    media_frames: &render::MediaFrames,
+) -> Result<ShotResult> {
     // 1) Pick the primary monitor. xcap returns a Vec; element 0 is usually
     //    the primary, but we also look for the one flagged as primary.
     let monitors = xcap::Monitor::all().context("listing monitors")?;
@@ -293,7 +301,7 @@ pub fn capture_and_save(canvas: &Canvas, cfg: &AppConfig, pixels_per_point: f32)
         // For screenshot we always render at the canvas's current pan/zoom,
         // multiplied by the DPI scale so a 150 % display lays strokes at
         // the physical pixel positions the user sees on the live overlay.
-        render::render_canvas(&mut view, canvas, None, None, pixels_per_point);
+        render::render_canvas(&mut view, canvas, None, None, pixels_per_point, Some(media_frames));
     }
 
     // 4) Convert tiny-skia's premultiplied RGBA into the `image` crate's
@@ -335,6 +343,7 @@ pub fn capture_region_and_save(
     rect_points: [f32; 4],
     bg_color: [u8; 3],
     bg_opacity: f32,
+    media_frames: &render::MediaFrames,
 ) -> Result<ShotResult> {
     let monitors = xcap::Monitor::all().context("listing monitors")?;
     let monitor = monitors
@@ -374,7 +383,7 @@ pub fn capture_region_and_save(
         .ok_or_else(|| crate::error::anyhow!("could not allocate pixmap"))?;
     {
         let mut view = pixmap.as_mut();
-        render::render_canvas(&mut view, canvas, None, None, ppp);
+        render::render_canvas(&mut view, canvas, None, None, ppp, Some(media_frames));
     }
     let raw = pixmap.data().to_vec();
     let mut fg = RgbaImage::from_raw(w, h, raw)

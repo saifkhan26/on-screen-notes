@@ -19,6 +19,7 @@ pub mod stroke;
 
 use crate::canvas::canvas::Canvas;
 use crate::config::AppConfig;
+use std::collections::HashSet;
 
 /// Top-level holder for all canvases.
 pub struct CanvasManager {
@@ -36,6 +37,13 @@ pub struct CanvasManager {
     /// trigger that cleanup — a short in-memory list on its own proves
     /// nothing about which files are safe to delete.
     prune_orphans: bool,
+    /// Video / GIF files that deleted slides used. Each is deleted from
+    /// the media folder once no slide, undo history or clipboard uses it.
+    media_to_check: HashSet<String>,
+    /// Set by `delete_active`: the next save rewrites the slide files
+    /// without the deleted slide, and only after that may its media go —
+    /// a crash in between must not leave a slide whose videos are gone.
+    media_cleanup_due: bool,
 }
 
 /// Stand-in for a slot whose file is missing or unreadable. It keeps
@@ -96,7 +104,15 @@ impl CanvasManager {
                 canvases.push(Canvas::default());
             }
         }
-        Self { canvases, active: 0, load_errors, protected, prune_orphans: false }
+        Self {
+            canvases,
+            active: 0,
+            load_errors,
+            protected,
+            prune_orphans: false,
+            media_to_check: HashSet::new(),
+            media_cleanup_due: false,
+        }
     }
 
     /// Slides that failed to load at startup, one message each. Returns
@@ -181,6 +197,10 @@ impl CanvasManager {
             log::warn!("delete canvas ignored: an unreadable slide file is being kept in place");
             return;
         }
+        // Its videos and GIFs become candidates for deletion; the next
+        // save decides which are really unused.
+        self.canvases[self.active].media_files(&mut self.media_to_check);
+        self.media_cleanup_due = true;
         if self.canvases.len() == 1 {
             self.canvases[0] = Canvas::default();
             self.active = 0;
@@ -214,8 +234,14 @@ impl CanvasManager {
     /// pace.
     ///
     /// After an explicit canvas delete, also removes the now-stale files
-    /// past `canvases.len()` so the deleted slot doesn't linger.
-    pub fn save_all(&mut self) {
+    /// past `canvases.len()` so the deleted slot doesn't linger, then the
+    /// deleted slide's videos and GIFs that nothing else uses.
+    ///
+    /// `media_in_use` holds media files referenced outside the slides
+    /// (the in-app clipboard); `None` means an import is still running,
+    /// whose file name is not known yet, so no media is deleted now —
+    /// what is left waits for `save_all_blocking` at exit.
+    pub fn save_all(&mut self, media_in_use: Option<&HashSet<String>>) {
         // Collect dirty canvases as (index, clone). We need to clone
         // because the worker thread owns them while serialising — the
         // UI thread keeps drawing meanwhile. A clone of a PNG-bearing
@@ -237,6 +263,10 @@ impl CanvasManager {
             return;
         }
         let prune = std::mem::take(&mut self.prune_orphans);
+        let media = match media_in_use {
+            Some(keep) if std::mem::take(&mut self.media_cleanup_due) => self.unused_media(keep),
+            _ => Vec::new(),
+        };
         std::thread::spawn(move || {
             for (i, c) in dirty {
                 if let Err(e) = crate::persistence::save_canvas(i, &c) {
@@ -246,7 +276,25 @@ impl CanvasManager {
             if prune {
                 remove_stale_canvas_files(count);
             }
+            delete_media_files(&media);
         });
+    }
+
+    /// Take out of `media_to_check` the files nothing uses — no slide, no
+    /// undo history, nothing in `keep` — and return them for deletion.
+    /// Files a slide uses are dropped from the list (they are not
+    /// orphans); files only `keep` uses stay for a later check.
+    fn unused_media(&mut self, keep: &HashSet<String>) -> Vec<String> {
+        let mut used = HashSet::new();
+        for c in &self.canvases {
+            c.media_files(&mut used);
+        }
+        self.media_to_check.retain(|f| !used.contains(f));
+        let unused: Vec<String> = self.media_to_check.iter().filter(|f| !keep.contains(*f)).cloned().collect();
+        for f in &unused {
+            self.media_to_check.remove(f);
+        }
+        unused
     }
 
     /// Synchronous variant used at app shutdown — blocks until every
@@ -264,6 +312,40 @@ impl CanvasManager {
         if std::mem::take(&mut self.prune_orphans) {
             remove_stale_canvas_files(self.canvases.len());
         }
+        // The clipboard and any unfinished import end with the app, so
+        // only the slides still count.
+        if !self.media_to_check.is_empty() {
+            self.media_cleanup_due = false;
+            let unused = self.unused_media(&HashSet::new());
+            delete_media_files(&unused);
+        }
+    }
+}
+
+/// Delete these files from the media folder. Only the app's own copies
+/// live there — the file the user originally dropped or picked is never
+/// touched. A failure (say, the file is still open somewhere) is logged
+/// and the file left in place.
+fn delete_media_files(names: &[String]) {
+    if names.is_empty() { return; }
+    let Ok(dir) = crate::persistence::paths::media_dir() else { return };
+    delete_media_files_in(&dir, names);
+}
+
+fn delete_media_files_in(dir: &std::path::Path, names: &[String]) {
+    for name in names {
+        // Names come from slide files; refuse anything that is not a
+        // plain file name, so a damaged slide cannot point outside.
+        if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+            log::warn!("not deleting media {name:?}: not a plain file name");
+            continue;
+        }
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::info!("deleted unused media {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("could not delete unused media {}: {e}", path.display()),
+        }
     }
 }
 
@@ -278,6 +360,94 @@ fn remove_stale_canvas_files(count: usize) {
                 let _ = std::fs::remove_file(&p);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod media_cleanup_tests {
+    use super::*;
+    use crate::canvas::canvas::UndoEntry;
+    use crate::canvas::shape::{fresh_media_id, MediaKind, MediaRef, RasterKind, Shape};
+    use std::sync::Arc;
+
+    fn video(file: &str) -> Shape {
+        Shape::Raster {
+            pos: [0.0, 0.0], size: [10.0, 10.0], png: Arc::new(vec![1]), px_size: [1, 1],
+            color: [0; 4], rotation: 0.0, kind: RasterKind::Image,
+            media: Some(Box::new(MediaRef {
+                file: file.into(), kind: MediaKind::Video, source_name: String::new(), meta: None, id: fresh_media_id(),
+            })),
+        }
+    }
+
+    fn manager(canvases: Vec<Canvas>) -> CanvasManager {
+        CanvasManager {
+            canvases,
+            active: 0,
+            load_errors: Vec::new(),
+            protected: Vec::new(),
+            prune_orphans: false,
+            media_to_check: HashSet::new(),
+            media_cleanup_due: false,
+        }
+    }
+
+    fn names(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn media_files_include_the_undo_history() {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(video("a.mp4"));
+        c.undo_log.push(UndoEntry::ObjectsRemoved(0, Vec::new(), vec![(0, video("b.mp4"))]));
+        c.redo_log.push(UndoEntry::ShapeErased(0, 0, video("c.gif")));
+        let mut out = HashSet::new();
+        c.media_files(&mut out);
+        assert_eq!(out, names(&["a.mp4", "b.mp4", "c.gif"]));
+    }
+
+    #[test]
+    fn deleting_a_slide_frees_only_media_nothing_else_uses() {
+        let mut gone = Canvas::default();
+        gone.layers[0].shapes.extend([video("only-here.mp4"), video("shared.mp4"), video("copied.gif")]);
+        gone.undo_log.push(UndoEntry::ShapeErased(0, 0, video("in-undo.mp4")));
+        let mut other = Canvas::default();
+        other.layers[0].shapes.push(video("shared.mp4"));
+        let mut m = manager(vec![gone, other]);
+
+        m.delete_active();
+        assert!(m.media_cleanup_due);
+        let mut unused = m.unused_media(&names(&["copied.gif"]));
+        unused.sort();
+        assert_eq!(unused, vec!["in-undo.mp4".to_string(), "only-here.mp4".to_string()]);
+        // Still on the clipboard: checked again later. In use on another
+        // slide: no longer a candidate.
+        assert_eq!(m.media_to_check, names(&["copied.gif"]));
+        // At exit the clipboard is gone.
+        assert_eq!(m.unused_media(&HashSet::new()), vec!["copied.gif".to_string()]);
+    }
+
+    #[test]
+    fn clearing_the_last_slide_frees_its_media_too() {
+        let mut only = Canvas::default();
+        only.layers[0].shapes.push(video("v.mp4"));
+        let mut m = manager(vec![only]);
+        m.delete_active();
+        assert_eq!(m.unused_media(&HashSet::new()), vec!["v.mp4".to_string()]);
+    }
+
+    #[test]
+    fn deletion_stays_inside_the_media_folder() {
+        let root = std::env::temp_dir().join(format!("osn-media-gc-{}", std::process::id()));
+        let media = root.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("x.mp4"), b"x").unwrap();
+        std::fs::write(root.join("outside.txt"), b"keep").unwrap();
+        delete_media_files_in(&media, &["x.mp4".into(), "../outside.txt".into(), "missing.gif".into()]);
+        assert!(!media.join("x.mp4").exists());
+        assert!(root.join("outside.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

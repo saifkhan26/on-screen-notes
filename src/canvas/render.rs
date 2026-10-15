@@ -1338,7 +1338,7 @@ pub fn render_layer_thumbnail(
     }
     let mut view = pixmap.as_mut();
     for shape in &layer.shapes {
-        draw_shape(&mut view, shape, t, 1.0);
+        draw_shape(&mut view, shape, t, 1.0, None);
     }
     for stroke in &layer.strokes {
         draw_stroke(&mut view, stroke, t);
@@ -1374,6 +1374,7 @@ pub fn render_canvas(
     preview_shape: Option<&Shape>,
     preview_stroke: Option<&Stroke>,
     pixels_per_point: f32,
+    media_frames: Option<&MediaFrames>,
 ) {
     // Clear to fully transparent — we composite onto the screen, and any
     // unpainted pixel must let the pixels behind show through.
@@ -1443,14 +1444,14 @@ pub fn render_canvas(
             }
         }
         for shape in &layer.shapes {
-            draw_shape(pixmap, shape, t, layer.opacity);
+            draw_shape(pixmap, shape, t, layer.opacity, media_frames);
         }
         for stroke in &layer.strokes {
             draw_stroke(pixmap, stroke, t);
         }
     }
     if let Some(s) = preview_shape {
-        draw_shape(pixmap, s, t, 1.0);
+        draw_shape(pixmap, s, t, 1.0, None);
     }
     if let Some(s) = preview_stroke {
         draw_stroke(pixmap, s, t);
@@ -1476,12 +1477,54 @@ fn turned(t: Transform, rotation: f32, cx: f32, cy: f32) -> Transform {
     }
 }
 
+/// Current frames of the videos and GIFs on screen, by `MediaRef::id`.
+pub type MediaFrames = std::collections::HashMap<u64, std::sync::Arc<egui::ColorImage>>;
+
+/// A PNG as a premultiplied tiny-skia pixmap.
+fn png_pixmap(png: &[u8]) -> Option<tiny_skia::Pixmap> {
+    let rgba = image::load_from_memory(png).ok()?.to_rgba8();
+    let mut src = tiny_skia::Pixmap::new(rgba.width(), rgba.height())?;
+    for (px, dst) in rgba.pixels().zip(src.pixels_mut()) {
+        let [r, g, b, a] = px.0;
+        let af = a as f32 / 255.0;
+        *dst = tiny_skia::PremultipliedColorU8::from_rgba(
+            (r as f32 * af) as u8,
+            (g as f32 * af) as u8,
+            (b as f32 * af) as u8,
+            a,
+        )
+        .unwrap_or_else(|| {
+            tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap()
+        });
+    }
+    Some(src)
+}
+
+/// An egui image (already premultiplied) as a tiny-skia pixmap.
+fn color_image_pixmap(img: &egui::ColorImage) -> Option<tiny_skia::Pixmap> {
+    let mut src = tiny_skia::Pixmap::new(img.size[0] as u32, img.size[1] as u32)?;
+    for (px, dst) in img.pixels.iter().zip(src.pixels_mut()) {
+        let [r, g, b, a] = px.to_array();
+        // `from_rgba` rejects a colour channel above alpha.
+        *dst = tiny_skia::PremultipliedColorU8::from_rgba(r.min(a), g.min(a), b.min(a), a)
+            .unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap());
+    }
+    Some(src)
+}
+
 /// `image_opacity` is the opacity to draw picture rasters at — the
 /// layer's, so a plate image that has been turned into an object still
 /// fades with its layer in a screenshot the way the plate did. Nothing
 /// else reads it: drawn shapes and fill stickers rasterise at full
 /// strength here, as they always have.
-fn draw_shape(pixmap: &mut PixmapMut<'_>, shape: &Shape, t: Transform, image_opacity: f32) {
+/// `media_frames` supplies the live frame for videos and GIFs.
+fn draw_shape(
+    pixmap: &mut PixmapMut<'_>,
+    shape: &Shape,
+    t: Transform,
+    image_opacity: f32,
+    media_frames: Option<&MediaFrames>,
+) {
     match shape {
         Shape::Rect { a, b, color, stroke_width, border, rotation } => {
             let t = turned(t, *rotation, (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5);
@@ -1595,43 +1638,34 @@ fn draw_shape(pixmap: &mut PixmapMut<'_>, shape: &Shape, t: Transform, image_opa
             draw_line(pixmap, *b, [b[0] + h1x, b[1] + h1y], *color, *stroke_width, t);
             draw_line(pixmap, *b, [b[0] + h2x, b[1] + h2y], *color, *stroke_width, t);
         }
-        Shape::Raster { pos, size, png, rotation, kind, .. } => {
+        Shape::Raster { pos, size, png, rotation, kind, media, .. } => {
             let t = turned(t, *rotation, pos[0] + size[0] * 0.5, pos[1] + size[1] * 0.5);
             let opacity = match kind {
                 crate::canvas::shape::RasterKind::Image => image_opacity.clamp(0.0, 1.0),
                 crate::canvas::shape::RasterKind::Fill => 1.0,
             };
-            // Decode and blit the PNG inline. Slow per call but the
-            // screenshot path only fires once per save, not per frame.
-            if let Ok(decoded) = image::load_from_memory(png) {
-                let rgba = decoded.to_rgba8();
-                let (iw, ih) = (rgba.width(), rgba.height());
-                if let Some(mut src) = tiny_skia::Pixmap::new(iw, ih) {
-                    for (px, dst) in rgba.pixels().zip(src.pixels_mut()) {
-                        let [r, g, b, a] = px.0;
-                        let af = a as f32 / 255.0;
-                        *dst = tiny_skia::PremultipliedColorU8::from_rgba(
-                            (r as f32 * af) as u8,
-                            (g as f32 * af) as u8,
-                            (b as f32 * af) as u8,
-                            a,
-                        )
-                        .unwrap_or_else(|| {
-                            tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap()
-                        });
-                    }
-                    let sx = size[0] / iw as f32;
-                    let sy = size[1] / ih as f32;
-                    let draw_t = Transform::from_scale(sx, sy)
-                        .post_translate(pos[0], pos[1])
-                        .post_concat(t);
-                    let opts = tiny_skia::PixmapPaint {
-                        opacity,
-                        blend_mode: tiny_skia::BlendMode::SourceOver,
-                        quality: tiny_skia::FilterQuality::Bilinear,
-                    };
-                    pixmap.draw_pixmap(0, 0, src.as_ref(), &opts, draw_t, None);
-                }
+            // A video or GIF draws the frame it is showing when there is
+            // one; otherwise (and for every still picture) the PNG is
+            // decoded inline. Slow per call but the screenshot path only
+            // fires once per save, not per frame.
+            let live = media.as_ref().and_then(|m| media_frames?.get(&m.id));
+            let src = match live {
+                Some(frame) => color_image_pixmap(frame),
+                None => png_pixmap(png),
+            };
+            if let Some(src) = src {
+                let (iw, ih) = (src.width(), src.height());
+                let sx = size[0] / iw as f32;
+                let sy = size[1] / ih as f32;
+                let draw_t = Transform::from_scale(sx, sy)
+                    .post_translate(pos[0], pos[1])
+                    .post_concat(t);
+                let opts = tiny_skia::PixmapPaint {
+                    opacity,
+                    blend_mode: tiny_skia::BlendMode::SourceOver,
+                    quality: tiny_skia::FilterQuality::Bilinear,
+                };
+                pixmap.draw_pixmap(0, 0, src.as_ref(), &opts, draw_t, None);
             }
         }
         Shape::Text { pos, content, font_size, color, rotation } => {
@@ -1807,7 +1841,7 @@ mod rotation_tests {
 
         let shape = Shape::Raster {
             pos: [30.0, 40.0], size: [40.0, 20.0], png: Arc::new(png), px_size: [2, 1],
-            color: [0; 4], rotation: std::f32::consts::FRAC_PI_2, kind: RasterKind::Image,
+            color: [0; 4], rotation: std::f32::consts::FRAC_PI_2, kind: RasterKind::Image, media: None,
         };
         // Where `Obb` says the red (left) and blue (right) halves went.
         let o = shape.obb();
@@ -1816,7 +1850,7 @@ mod rotation_tests {
         assert!(red_at[1] < blue_at[1], "a clockwise quarter turn puts the left half on top");
 
         let mut pixmap = tiny_skia::Pixmap::new(100, 100).unwrap();
-        draw_shape(&mut pixmap.as_mut(), &shape, Transform::identity(), 1.0);
+        draw_shape(&mut pixmap.as_mut(), &shape, Transform::identity(), 1.0, None);
         let at = |p: [f32; 2]| pixmap.pixel(p[0] as u32, p[1] as u32).unwrap();
         let (r, b) = (at(red_at), at(blue_at));
         assert!(r.red() > 200 && r.blue() < 60, "expected red at {red_at:?}, got {r:?}");

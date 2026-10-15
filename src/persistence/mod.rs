@@ -266,7 +266,7 @@ mod tests {
         files.sort();
         let render = |c: &Canvas| {
             let mut pixmap = tiny_skia::Pixmap::new(960, 540).unwrap();
-            crate::canvas::render::render_canvas(&mut pixmap.as_mut(), c, None, None, 1.0);
+            crate::canvas::render::render_canvas(&mut pixmap.as_mut(), c, None, None, 1.0, None);
             pixmap.data().to_vec()
         };
         let (mut strokes, mut unpickable, mut plates, mut plate_unpickable) = (0, 0, 0, 0);

@@ -5,6 +5,7 @@
 
 pub mod layer_panel;
 pub mod loupe;
+pub mod media_controls;
 pub mod overlay;
 pub mod status;
 pub mod theme;

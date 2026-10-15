@@ -189,6 +189,9 @@ pub fn show(
     // a screenshot / capture / recording is grabbing the screen, so the
     // handles never end up in the picture.
     show_selection: bool,
+    // Live frames for videos and GIFs; their poster frame stands in
+    // until a player has one.
+    media: &crate::media::MediaHub,
 ) -> egui::Rect {
     // Select-tool gesture in flight: the selected objects preview under
     // its transform until pen-up commits it.
@@ -231,9 +234,10 @@ pub fn show(
                     .iter()
                     .enumerate()
                     .map(|(si, shape)| match shape {
-                        crate::canvas::shape::Shape::Raster { png, .. } => {
-                            cache.ensure_shape_texture(ctx, canvas_idx, li, si, png)
-                        }
+                        crate::canvas::shape::Shape::Raster { png, media: m, .. } => m
+                            .as_ref()
+                            .and_then(|m| media.texture(m.id))
+                            .or_else(|| cache.ensure_shape_texture(ctx, canvas_idx, li, si, png)),
                         _ => None,
                     })
                     .collect()
