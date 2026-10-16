@@ -12,6 +12,7 @@
 pub mod affine;
 pub mod canvas;
 pub mod hit;
+pub mod ink_gpu;
 pub mod render;
 pub mod shape;
 pub mod smoothing;

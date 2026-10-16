@@ -399,6 +399,12 @@ impl OnScreenNotesApp {
             cc.egui_ctx.set_fonts(fonts);
         }
 
+        // Committed ink is drawn from GPU memory when the device allows
+        // it; see `canvas::ink_gpu`.
+        if let Some(rs) = cc.wgpu_render_state.as_ref() {
+            crate::canvas::ink_gpu::init(rs);
+        }
+
         let config = crate::persistence::load_config();
         let mut canvases = CanvasManager::load_or_default(&config);
         // A slide that failed to load is the user's work in a state we
