@@ -221,3 +221,28 @@ pub fn client_rect(hwnd_raw: isize) -> Option<(i32, i32, i32, i32)> {
     if !ok { return None; }
     Some((origin.x, origin.y, origin.x + r.right, origin.y + r.bottom))
 }
+
+/// Refresh rate in Hz of the monitor showing `hwnd_raw`, or `None` when
+/// Windows does not say (it reports 0 or 1 for "hardware default").
+pub fn refresh_rate_hz(hwnd_raw: isize) -> Option<u32> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW, ENUM_CURRENT_SETTINGS,
+        MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    };
+    // SAFETY: both calls only write into the structs we pass, each with
+    // its size filled in, and keep no pointer to them.
+    unsafe {
+        let monitor = MonitorFromWindow(HWND(hwnd_raw), MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(monitor, &mut info.monitorInfo as *mut MONITORINFO).as_bool() {
+            return None;
+        }
+        let mut mode = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+        if !EnumDisplaySettingsW(PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode).as_bool() {
+            return None;
+        }
+        (mode.dmDisplayFrequency > 1).then_some(mode.dmDisplayFrequency)
+    }
+}

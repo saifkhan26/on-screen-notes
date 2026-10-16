@@ -22,7 +22,7 @@
 //! canvas-space position fixed across the zoom change so the world
 //! appears to scale "around" the cursor.
 
-use crate::canvas::canvas::Canvas;
+use crate::canvas::CanvasManager;
 use crate::tools::{ActiveTool, ToolKind};
 
 /// Canvas zoom range: 0.1 % to 100 000 %, wide enough not to be in the
@@ -43,7 +43,7 @@ pub fn handle_scroll(
     ctrl_held: bool,
     shift_held: bool,
     tool: &mut ActiveTool,
-    canvas: &mut Canvas,
+    canvases: &mut CanvasManager,
     bg_opacity: &mut f32,
 ) {
     // Stepped controls (opacity / pen size / spotlight size) read
@@ -67,6 +67,8 @@ pub fn handle_scroll(
     // notch granularity as the background-opacity branch.
     if shift_held {
         if notches == 0 { return; }
+        // A real edit, so this one goes through `active_mut` and is saved.
+        let canvas = canvases.active_mut();
         if let Some(layer) = canvas.layers.get_mut(canvas.active_layer) {
             const STEP: f32 = 0.01;
             layer.opacity = (layer.opacity + n_f * STEP).clamp(0.0, 1.0);
@@ -84,55 +86,73 @@ pub fn handle_scroll(
         const SIZE_MAX: f32 = 80.0;
         tool.size = (tool.size + n_f).clamp(SIZE_MIN, SIZE_MAX);
     } else {
-        // Live zoom around the cursor. Uses the raw wheel delta
-        // sum so smooth-scroll wheels and trackpad pinches drive
-        // continuous, per-frame zoom — there is no "land on the
-        // next notch" pause between updates.
-        if raw_delta_y.abs() < 0.001 { return; }
-        // 1.10× per raw unit gives a snappy but smooth feel: a
-        // single notch (delta ≈ ±1) ≈ ±10 % zoom; sub-notch
-        // events from trackpads / hi-res wheels apply
-        // proportionally.
-        let factor: f32 = 1.10_f32.powf(raw_delta_y);
-        let z_old = canvas.zoom;
-        let z_new = (z_old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        // Relative, so a step still registers at tiny zoom levels.
-        if (z_new / z_old - 1.0).abs() < 1e-4 { return; }
-        let cx = (cursor_screen[0] - canvas.pan[0]) / z_old;
-        let cy = (cursor_screen[1] - canvas.pan[1]) / z_old;
-        canvas.zoom = z_new;
-        canvas.pan[0] = cursor_screen[0] - cx * z_new;
-        canvas.pan[1] = cursor_screen[1] - cy * z_new;
+        // View only: the slide is not flagged for the autosave.
+        let (pan, zoom) = canvases.active_view_mut();
+        zoom_about_cursor(pan, zoom, raw_delta_y, cursor_screen);
     }
+}
+
+/// Live zoom around the cursor. Uses the raw wheel delta sum so
+/// smooth-scroll wheels and trackpad pinches drive continuous,
+/// per-frame zoom — there is no "land on the next notch" pause between
+/// updates.
+fn zoom_about_cursor(pan: &mut [f32; 2], zoom: &mut f32, raw_delta_y: f32, cursor_screen: [f32; 2]) {
+    if raw_delta_y.abs() < 0.001 { return; }
+    // 1.10× per raw unit gives a snappy but smooth feel: a single notch
+    // (delta ≈ ±1) ≈ ±10 % zoom; sub-notch events from trackpads /
+    // hi-res wheels apply proportionally.
+    let factor: f32 = 1.10_f32.powf(raw_delta_y);
+    let z_old = *zoom;
+    let z_new = (z_old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+    // Relative, so a step still registers at tiny zoom levels.
+    if (z_new / z_old - 1.0).abs() < 1e-4 { return; }
+    let cx = (cursor_screen[0] - pan[0]) / z_old;
+    let cy = (cursor_screen[1] - pan[1]) / z_old;
+    *zoom = z_new;
+    pan[0] = cursor_screen[0] - cx * z_new;
+    pan[1] = cursor_screen[1] - cy * z_new;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canvas::canvas::Canvas;
 
-    fn wheel(steps: i32, delta: f32, tool: &mut ActiveTool, canvas: &mut Canvas) {
-        let mut bg = 0.5;
+    fn wheel(steps: i32, delta: f32, canvas: &mut Canvas) {
         for _ in 0..steps {
-            handle_scroll(0, delta, [100.0, 100.0], false, false, tool, canvas, &mut bg);
+            zoom_about_cursor(&mut canvas.pan, &mut canvas.zoom, delta, [100.0, 100.0]);
         }
     }
 
     #[test]
-    fn zoom_reaches_far_past_the_old_limits_and_stops_at_the_new_ones() {
+    fn wheel_zoom_is_not_an_edit_but_layer_opacity_is() {
         let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
         tool.kind = ToolKind::Select;
         let mut canvas = Canvas::default();
-        wheel(60, 1.0, &mut tool, &mut canvas);
+        canvas.dirty = false;
+        let mut m = CanvasManager::for_tests(vec![canvas]);
+        let mut bg = 0.5;
+        handle_scroll(1, 1.0, [100.0, 100.0], false, false, &mut tool, &mut m, &mut bg);
+        assert!(m.active().zoom > 1.0);
+        assert!(!m.active().dirty, "zooming must not trigger a slide save");
+        handle_scroll(1, 1.0, [100.0, 100.0], false, true, &mut tool, &mut m, &mut bg);
+        assert!(m.active().dirty, "a layer-opacity change must be saved");
+    }
+
+    #[test]
+    fn zoom_reaches_far_past_the_old_limits_and_stops_at_the_new_ones() {
+        let mut canvas = Canvas::default();
+        wheel(60, 1.0, &mut canvas);
         assert!(canvas.zoom > 100.0, "well past the old 16x: {}", canvas.zoom);
-        wheel(200, 1.0, &mut tool, &mut canvas);
+        wheel(200, 1.0, &mut canvas);
         assert_eq!(canvas.zoom, MAX_ZOOM);
         // Out again, through the tiny levels where an absolute "too
         // small a step" test used to stall.
-        wheel(400, -1.0, &mut tool, &mut canvas);
+        wheel(400, -1.0, &mut canvas);
         assert_eq!(canvas.zoom, MIN_ZOOM);
         // The point under the cursor stays put.
         let under = [(100.0 - canvas.pan[0]) / canvas.zoom, (100.0 - canvas.pan[1]) / canvas.zoom];
-        wheel(5, 1.0, &mut tool, &mut canvas);
+        wheel(5, 1.0, &mut canvas);
         let after = [(100.0 - canvas.pan[0]) / canvas.zoom, (100.0 - canvas.pan[1]) / canvas.zoom];
         assert!((under[0] - after[0]).abs() < 1e-2 * under[0].abs().max(1.0), "{under:?} vs {after:?}");
     }

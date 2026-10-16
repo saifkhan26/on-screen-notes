@@ -170,6 +170,37 @@ pub(crate) fn parse_canvas(s: &str, position_passes: usize) -> std::result::Resu
     Ok(c)
 }
 
+/// One slide's pan and zoom, as kept in `views.ron`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SlideView {
+    pub pan: [f32; 2],
+    pub zoom: f32,
+}
+
+/// Write every slide's view, in slide order, to `canvases/views.ron`.
+///
+/// Panning and zooming are not edits, so they no longer mark a slide
+/// for the autosave — rewriting a big slide just to record where the
+/// user looked cost seconds of CPU per save. The views go here instead:
+/// a few bytes per slide, written only when one changes. Each
+/// `canvas_N.ron` still carries the view it was last saved with, so the
+/// files read fine without this one.
+pub fn save_views(views: &[SlideView]) -> Result<()> {
+    let path = paths::canvases_dir()?.join("views.ron");
+    atomic_write(&path, ron::ser::to_string(views)?.as_bytes())
+}
+
+/// The views `save_views` wrote, or none if the file is missing or
+/// unreadable (each slide then keeps the view stored in its own file).
+pub fn load_views() -> Vec<SlideView> {
+    let Ok(path) = paths::canvases_dir().map(|d| d.join("views.ron")) else { return Vec::new() };
+    let Ok(s) = std::fs::read_to_string(&path) else { return Vec::new() };
+    ron::from_str(&s).unwrap_or_else(|e| {
+        log::warn!("views.ron could not be read ({e}); keeping each slide's saved view");
+        Vec::new()
+    })
+}
+
 /// Atomic write helper: we write to `<path>.tmp` and rename onto `path`.
 ///
 /// Why: `std::fs::write` is not atomic — if the program crashes mid-write

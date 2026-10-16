@@ -128,6 +128,16 @@ impl PenInput {
         }
     }
 
+    /// True if any packet arrived within the last `window` — the pen is
+    /// in range, even if it is holding still. Wider than `used_within`.
+    pub fn seen_within(&self, window: std::time::Duration) -> bool {
+        match &self.backend {
+            Backend::Disabled => false,
+            #[cfg(target_os = "windows")]
+            Backend::Wintab(w) => w.seen_within(window),
+        }
+    }
+
     /// True if the pen pressed or visibly moved within the last
     /// `window`. A tablet driver also moves the system cursor and
     /// presses the left mouse button on the pen's behalf, so the mouse
@@ -208,6 +218,8 @@ mod windows_backend {
         last_used: Option<std::time::Instant>,
         /// Where the pen was when it last counted as having moved.
         rest_anchor: Option<[f32; 2]>,
+        /// When the last packet of any kind arrived.
+        last_packet: Option<std::time::Instant>,
     }
 
     // Wintab handles are not Send / Sync; we never move Wintab off the main
@@ -314,6 +326,7 @@ mod windows_backend {
                 last_sample: None,
                 last_used: None,
                 rest_anchor: None,
+                last_packet: None,
             })
         }
 
@@ -321,6 +334,10 @@ mod windows_backend {
 
         pub fn used_within(&self, window: std::time::Duration) -> bool {
             self.last_used.is_some_and(|t| t.elapsed() <= window)
+        }
+
+        pub fn seen_within(&self, window: std::time::Duration) -> bool {
+            self.last_packet.is_some_and(|t| t.elapsed() <= window)
         }
 
         /// Drain any new packets and translate into `PenEvent`s.
@@ -357,6 +374,9 @@ mod windows_backend {
                 )
             };
             let removed = removed as usize;
+            if removed > 0 {
+                self.last_packet = Some(std::time::Instant::now());
+            }
 
             for p in &packets[..removed] {
                 let pos = [
