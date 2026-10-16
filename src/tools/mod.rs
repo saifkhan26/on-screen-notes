@@ -246,8 +246,17 @@ impl ActiveTool {
                 // (Default / Pencil / Marker / Airbrush) AND the
                 // current smoothing options so the user's choice locks
                 // in at pen-down.
+                // The pen and pencil draw at the size as it looks on
+                // screen (`StrokeStyle::sizes_on_screen`); once drawn the
+                // width is fixed, so the line scales with the view like
+                // everything else.
+                let width = if self.kind == ToolKind::Pen && self.style.sizes_on_screen() {
+                    self.size / canvas.zoom.max(1e-3)
+                } else {
+                    self.size
+                };
                 let mut s = Stroke::with_style_and_smoothing(
-                    self.color, self.size, self.style, self.smoothing,
+                    self.color, width, self.style, self.smoothing,
                 );
                 s.push(sample);
                 self.in_progress_stroke = Some(s);
@@ -559,5 +568,29 @@ impl ActiveTool {
             ToolKind::Arrow   => Shape::Arrow   { a, b, color: self.color, stroke_width: self.size, border: self.border_style },
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn width_drawn(kind: ToolKind, style: StrokeStyle, zoom: f32) -> f32 {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = kind;
+        tool.style = style;
+        tool.size = 8.0;
+        let mut canvas = Canvas { zoom, ..Canvas::default() };
+        tool.begin(PenSample::from_pos([10.0, 10.0]), &mut canvas);
+        tool.in_progress_stroke.expect("a stroke started").base_width
+    }
+
+    #[test]
+    fn pen_and_pencil_draw_the_size_seen_on_screen() {
+        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Default, 1.0), 8.0);
+        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Default, 4.0), 2.0, "zoomed in, finer on the canvas");
+        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Pencil, 0.5), 16.0, "zoomed out, wider on the canvas");
+        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Marker, 4.0), 8.0, "the marker keeps canvas units");
+        assert_eq!(width_drawn(ToolKind::FreehandArrow, StrokeStyle::Default, 4.0), 8.0);
     }
 }

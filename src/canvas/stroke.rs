@@ -64,6 +64,16 @@ impl Default for StrokeStyle {
     fn default() -> Self { StrokeStyle::Default }
 }
 
+impl StrokeStyle {
+    /// Pen and pencil lines take the toolbar size as it looks on screen:
+    /// drawn zoomed in 4×, a line is a quarter as wide on the canvas, so
+    /// it comes out the size picked, fine enough for detail. Marker and
+    /// airbrush keep the size in canvas units.
+    pub fn sizes_on_screen(self) -> bool {
+        matches!(self, StrokeStyle::Default | StrokeStyle::Pencil)
+    }
+}
+
 fn default_stroke_style() -> StrokeStyle { StrokeStyle::Default }
 
 /// One pen-down-to-pen-up stroke, with all its visual properties.

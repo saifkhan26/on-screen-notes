@@ -936,9 +936,14 @@ impl Canvas {
         width: Option<f32>,
         merge_into_last: bool,
     ) {
+        let zoom = self.zoom.max(1e-3);
         let edit_stroke = |s: &mut Stroke| {
             if let Some(c) = color { s.color = c; }
-            if let Some(w) = width { s.set_base_width(w); }
+            // Pen and pencil lines take the size as it looks on screen,
+            // as when they are drawn.
+            if let Some(w) = width {
+                s.set_base_width(if s.style.sizes_on_screen() { w / zoom } else { w });
+            }
         };
         let edit_shape = |s: &mut Shape| s.restyle(color, width);
 
@@ -1786,6 +1791,16 @@ mod object_edit_tests {
         assert!((c.layers[0].strokes[0].base_width - 4.0).abs() < 1e-4);
         c.redo();
         assert!((c.layers[0].strokes[0].base_width - 12.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn restyling_while_zoomed_sizes_pen_lines_on_screen() {
+        let mut c = canvas(2);
+        c.layers[0].strokes[1].style = StrokeStyle::Marker;
+        c.zoom = 2.0;
+        c.restyle_objects(0, &[0, 1], &[], None, Some(6.0), false);
+        assert!((c.layers[0].strokes[0].base_width - 3.0).abs() < 1e-4, "a pen line looks 6 px wide at 2×");
+        assert!((c.layers[0].strokes[1].base_width - 6.0).abs() < 1e-4, "a marker keeps canvas units");
     }
 
     #[test]

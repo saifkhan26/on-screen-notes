@@ -133,6 +133,13 @@ the binary on first launch.
 | Insert picture / video / GIF | toolbar film button, or drag & drop | See [Videos & GIFs](#videos--gifs) |
 | Open a PureRef board | toolbar film button, or drag & drop a `.pur` | Opens as a new slide; see [PureRef boards](#pureref-boards) |
 
+The pen and pencil draw at the chosen size as it looks on screen,
+whatever the zoom: zoomed in 4×, a new line is a quarter as wide on the
+canvas, so detail work gets fine lines. A line keeps its width once
+drawn and scales with the view like everything else; the size slider
+re-widths selected pen and pencil lines the same way. Marker, airbrush,
+eraser and shapes keep their size in canvas units.
+
 ### Dashed border
 
 Rect / Ellipse / Line / Arrow tools expose a contextual **dashed-border
