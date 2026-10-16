@@ -80,10 +80,15 @@ pub struct GifScan {
 /// Count frames and add up delays. Skips LZW decoding, so it is fast
 /// even for large GIFs.
 pub fn scan(path: &Path) -> Result<GifScan> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    scan_reader(BufReader::new(file))
+}
+
+/// `scan` for a GIF already in memory or behind any reader.
+pub fn scan_reader<R: std::io::Read>(reader: R) -> Result<GifScan> {
     let mut opts = gif::DecodeOptions::new();
     opts.skip_frame_decoding(true);
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut dec = opts.read_info(BufReader::new(file)).context("reading GIF header")?;
+    let mut dec = opts.read_info(reader).context("reading GIF header")?;
     let size = [u32::from(dec.width()), u32::from(dec.height())];
     let (mut frames, mut duration) = (0u32, 0.0);
     while let Some(frame) = dec.read_next_frame().context("reading GIF frame")? {

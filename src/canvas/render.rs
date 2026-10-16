@@ -1368,6 +1368,10 @@ pub fn render_layer_thumbnail(
 /// 125/150/200 % DPI the two diverge, so without this scale strokes
 /// land in the wrong region of the saved PNG. Pass `1.0` from any
 /// caller that operates entirely in logical space.
+///
+/// `media_frames` is passed by screenshots only: it supplies the frame
+/// each video / GIF is showing, and also makes stored pictures draw from
+/// their full-size files rather than their previews.
 pub fn render_canvas(
     pixmap: &mut PixmapMut<'_>,
     canvas: &Canvas,
@@ -1482,7 +1486,10 @@ pub type MediaFrames = std::collections::HashMap<u64, std::sync::Arc<egui::Color
 
 /// A PNG as a premultiplied tiny-skia pixmap.
 fn png_pixmap(png: &[u8]) -> Option<tiny_skia::Pixmap> {
-    let rgba = image::load_from_memory(png).ok()?.to_rgba8();
+    rgba_pixmap(&image::load_from_memory(png).ok()?.to_rgba8())
+}
+
+fn rgba_pixmap(rgba: &image::RgbaImage) -> Option<tiny_skia::Pixmap> {
     let mut src = tiny_skia::Pixmap::new(rgba.width(), rgba.height())?;
     for (px, dst) in rgba.pixels().zip(src.pixels_mut()) {
         let [r, g, b, a] = px.0;
@@ -1638,7 +1645,7 @@ fn draw_shape(
             draw_line(pixmap, *b, [b[0] + h1x, b[1] + h1y], *color, *stroke_width, t);
             draw_line(pixmap, *b, [b[0] + h2x, b[1] + h2y], *color, *stroke_width, t);
         }
-        Shape::Raster { pos, size, png, rotation, kind, media, .. } => {
+        Shape::Raster { pos, size, png, rotation, kind, media, picture, .. } => {
             let t = turned(t, *rotation, pos[0] + size[0] * 0.5, pos[1] + size[1] * 0.5);
             let opacity = match kind {
                 crate::canvas::shape::RasterKind::Image => image_opacity.clamp(0.0, 1.0),
@@ -1647,11 +1654,20 @@ fn draw_shape(
             // A video or GIF draws the frame it is showing when there is
             // one; otherwise (and for every still picture) the PNG is
             // decoded inline. Slow per call but the screenshot path only
-            // fires once per save, not per frame.
+            // fires once per save, not per frame. A screenshot (the only
+            // caller passing `media_frames`) draws a stored picture from
+            // its full-size file; thumbnails and flood fill make do with
+            // its preview.
             let live = media.as_ref().and_then(|m| media_frames?.get(&m.id));
-            let src = match live {
-                Some(frame) => color_image_pixmap(frame),
-                None => png_pixmap(png),
+            let full = picture.as_ref().filter(|_| media_frames.is_some()).and_then(|p| {
+                let path = crate::persistence::paths::media_dir().ok()?.join(&p.file);
+                let img = image::open(path).ok()?.to_rgba8();
+                rgba_pixmap(&p.view(&img, u32::MAX))
+            });
+            let src = match (live, full) {
+                (Some(frame), _) => color_image_pixmap(frame),
+                (None, Some(full)) => Some(full),
+                (None, None) => png_pixmap(png),
             };
             if let Some(src) = src {
                 let (iw, ih) = (src.width(), src.height());
@@ -1842,6 +1858,7 @@ mod rotation_tests {
         let shape = Shape::Raster {
             pos: [30.0, 40.0], size: [40.0, 20.0], png: Arc::new(png), px_size: [2, 1],
             color: [0; 4], rotation: std::f32::consts::FRAC_PI_2, kind: RasterKind::Image, media: None,
+            picture: None,
         };
         // Where `Obb` says the red (left) and blue (right) halves went.
         let o = shape.obb();

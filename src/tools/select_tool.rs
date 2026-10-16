@@ -596,6 +596,7 @@ mod tests {
         Shape::Raster {
             pos, size, png: Arc::new(Vec::new()), px_size: [1, 1], color: [0; 4],
             rotation: 0.0, kind: RasterKind::Image, media: None,
+            picture: None,
         }
     }
 

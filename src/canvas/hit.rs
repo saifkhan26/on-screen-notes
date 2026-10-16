@@ -412,6 +412,7 @@ mod tests {
         Shape::Raster {
             pos, size, png: Arc::new(png), px_size: [1, 1], color: [0; 4],
             rotation: 0.0, kind: crate::canvas::shape::RasterKind::Image, media: None,
+            picture: None,
         }
     }
 

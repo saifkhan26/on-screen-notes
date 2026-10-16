@@ -27,7 +27,7 @@ const POSTER_SIDE: u32 = 480;
 /// Pictures are scaled down to at most this many pixels on their long
 /// side. They are stored in the slide file, and a full-size camera photo
 /// would add tens of megabytes to it; 4K still looks sharp full-screen.
-const IMAGE_SIDE: u32 = 3840;
+pub(super) const IMAGE_SIDE: u32 = 3840;
 
 /// What a file would be imported as, from its extension.
 pub fn media_kind(path: &Path) -> Option<MediaKind> {
@@ -180,20 +180,20 @@ fn import_image(path: &Path) -> Result<Imported> {
 }
 
 /// `size` scaled down (never up) so its long side is at most `side`.
-fn fit_side(size: [u32; 2], side: u32) -> [u32; 2] {
+pub(super) fn fit_side(size: [u32; 2], side: u32) -> [u32; 2] {
     let long = size[0].max(size[1]).max(1);
     if long <= side { return [size[0].max(1), size[1].max(1)]; }
     let s = side as f64 / long as f64;
     [((size[0] as f64 * s).round() as u32).max(1), ((size[1] as f64 * s).round() as u32).max(1)]
 }
 
-fn shrink(img: image::RgbaImage, side: u32) -> image::RgbaImage {
+pub(super) fn shrink(img: image::RgbaImage, side: u32) -> image::RgbaImage {
     let [w, h] = fit_side([img.width(), img.height()], side);
     if [w, h] == [img.width(), img.height()] { return img; }
     image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle)
 }
 
-fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>> {
+pub(super) fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>> {
     let mut png = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).context("encoding poster")?;
     Ok(png)
@@ -214,6 +214,36 @@ fn hashed_name(hash: u64, src: &Path) -> String {
 fn copy_hashed(src: &Path) -> Result<String> {
     let dir = crate::persistence::paths::media_dir()?;
     copy_hashed_into(src, &dir)
+}
+
+/// Store `bytes` in `dir` under a name hashed from them, as
+/// `copy_hashed_into` does for a file. Returns the name and whether this
+/// call created the file (`false`: the same content was already there,
+/// so something else may be using it).
+pub(super) fn store_bytes_into(dir: &Path, bytes: &[u8], ext: &str) -> Result<(String, bool)> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut hash = FNV_OFFSET;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    let name = format!("{hash:016x}.{}", ext.to_ascii_lowercase());
+    let dest = dir.join(&name);
+    if dest.is_file() {
+        return Ok((name, false));
+    }
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".store-{}-{n}.tmp", std::process::id()));
+    let written = (|| -> Result<()> {
+        let mut out = File::create(&tmp).context("creating a media file")?;
+        out.write_all(bytes).context("writing a media file")?;
+        out.sync_all().context("writing a media file")
+    })();
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &dest).map_err(|e| anyhow!("storing a media file: {e}"))) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok((name, true))
 }
 
 fn copy_hashed_into(src: &Path, dir: &Path) -> Result<String> {

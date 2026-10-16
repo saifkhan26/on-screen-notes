@@ -91,11 +91,25 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    // PureRef boards named on the command line ("Open with" in
+    // Explorer) open as new slides once the app is up.
+    let boards: Vec<std::path::PathBuf> = std::env::args_os()
+        .skip(1)
+        .map(std::path::PathBuf::from)
+        .filter(|p| crate::media::pureref::is_pureref(p))
+        .collect();
+
     // `run_native` returns `Result<(), eframe::Error>`; map into anyhow.
     eframe::run_native(
         "on-screen-notes",
         native_options,
-        Box::new(|cc| Ok(Box::new(OnScreenNotesApp::new(cc)))),
+        Box::new(|cc| {
+            let mut app = OnScreenNotesApp::new(cc);
+            for board in boards {
+                app.start_pureref_open(board);
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| crate::error::anyhow!("eframe failed: {e}"))?;
 

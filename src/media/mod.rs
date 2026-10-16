@@ -9,6 +9,7 @@
 pub mod ffmpeg;
 pub mod gif_player;
 pub mod import;
+pub mod pureref;
 pub mod video_player;
 
 use crate::canvas::canvas::Canvas;

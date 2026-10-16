@@ -36,6 +36,8 @@ input.
   onto the canvas (or use the film button); videos and GIFs play /
   pause, scrub, and step frame by frame forward and back. See
   [Videos & GIFs](#videos--gifs)
+- **PureRef boards** — drop a `.pur` file (PureRef 1.x or 2.x) to open it
+  as a new slide. See [PureRef boards](#pureref-boards)
 - **Multiple canvases**, persistent on disk via RON
 - **Multiple layers per canvas** (independent visibility + opacity, and
   each layer can be panned / zoomed on its own with `Shift+Space`)
@@ -129,6 +131,7 @@ the binary on first launch.
 | Freehand arrow | `Shift+A` | |
 | Straight line | toolbar only | |
 | Insert picture / video / GIF | toolbar film button, or drag & drop | See [Videos & GIFs](#videos--gifs) |
+| Open a PureRef board | toolbar film button, or drag & drop a `.pur` | Opens as a new slide; see [PureRef boards](#pureref-boards) |
 
 ### Dashed border
 
@@ -422,10 +425,13 @@ still, and draw with the mouse.
 - Each canvas holds a stack of **layers** (strokes + shapes + optional
   raster background). `↑` / `↓` walk the active layer. Per-layer
   visibility + opacity edit lives in the layer panel.
-- Both canvases and layers persist as RON files under the platform's
-  config dir (`%APPDATA%\on-screen-notes\` on Windows,
-  `~/.config/on-screen-notes/` on Linux,
-  `~/Library/Application Support/on-screen-notes/` on macOS).
+- Both canvases and layers persist as RON files (`canvases\canvas_N.ron`,
+  one per slide, plus `config.ron` and the `media` folder) under the
+  platform's data dir: `%APPDATA%\OnScreenNotes\on-screen-notes\data\` on
+  Windows, `~/.local/share/on-screen-notes/` on Linux,
+  `~/Library/Application Support/dev.OnScreenNotes.on-screen-notes/` on
+  macOS. Setting the `OSN_DATA_DIR` environment variable points the app
+  at another folder instead.
 
 ---
 
@@ -473,6 +479,52 @@ another slide, nothing in the in-app clipboard (those wait until the
 app closes). Deleting a single object leaves its file in place, since
 Ctrl+Z can bring it back. The file you originally dropped or picked is
 never touched.
+
+### PureRef boards
+
+Drop a PureRef `.pur` file onto the canvas, pick one with the **film**
+button, or open it with the app from Explorer ("Open with", or
+`on-screen-notes.exe board.pur`), and it opens as a **new slide** at the
+end, which the app switches to. Boards saved by PureRef 1.10 / 1.11 and
+by PureRef 2 (including 2's "save as legacy") both work.
+
+- **Progress:** while a board opens, a card at the bottom shows what it
+  is doing (reading the board, then picture N of M) with a progress bar
+  and a **Cancel** button. Big boards take a while: a 1.8 GB board with
+  1,500 pictures takes about half a minute. Several boards can open at
+  once.
+- **Pictures** keep their place, size, rotation, crop and mirroring. The
+  whole board is shown at its natural size and shrunk to fit the view if
+  it is bigger. Each picture becomes an ordinary picture object on the
+  slide.
+- **Animated GIFs play**, like a dropped GIF, unless the board crops or
+  mirrors them: those come in as a still of the first frame.
+- **Notes** become text labels with their colour and rotation, wrapped
+  to the note's width when it has a fixed one. Their background box and
+  rich-text styling are dropped.
+- **Not brought over:** pictures that are only linked from disk rather
+  than stored in the board, formats the app cannot decode (such as PSD,
+  TIFF or EXR in PureRef 2 boards), and drawings. The toast says how
+  many items were skipped.
+
+**How it is stored.** A board's pictures are copied into the app's
+`media` folder (next to `canvases`), mostly as the original files,
+named after a hash of their content so the same picture is stored once.
+The slide itself keeps only their names, where they go, and a small
+preview of each, so even a board with hundreds of pictures makes a slide
+file of a few MB, and startup and autosave stay fast. On screen each
+picture is loaded in the background at about the size it is shown, so a
+big board opens quickly and zooming in sharpens what you look at.
+Screenshots use the full pictures.
+
+Opening is one-way: the board file is only read, never changed, and
+the slide keeps no link to it or to the pictures' original files.
+Deleting the slide never touches the `.pur` file or any picture on disk;
+the app's own copies in `media` are deleted once the slides are saved
+without it and nothing else uses them (another slide, undo history, the
+in-app clipboard), as with videos and GIFs. A huge PureRef 2 board is
+read through a temporary copy of its database in the system temp folder,
+deleted when the board is open.
 
 ### FFmpeg
 

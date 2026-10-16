@@ -173,6 +173,16 @@ impl CanvasManager {
         self.active += 1;
     }
 
+    /// Append a ready-made canvas (an opened PureRef board) as the last
+    /// slide and move into it. Returns its index. The canvas keeps its
+    /// own `dirty` flag; a `Canvas::default()`-built one is dirty, so the
+    /// next autosave writes it.
+    pub fn push_canvas(&mut self, canvas: Canvas) -> usize {
+        self.canvases.push(canvas);
+        self.active = self.canvases.len() - 1;
+        self.active
+    }
+
     /// Move to the previous canvas. Wraps to the last when at the first
     /// (going-backwards is symmetrical: the user explicitly asked to leave
     /// the first sheet, so wrap them to the most recent one).
@@ -377,6 +387,7 @@ mod media_cleanup_tests {
             media: Some(Box::new(MediaRef {
                 file: file.into(), kind: MediaKind::Video, source_name: String::new(), meta: None, id: fresh_media_id(),
             })),
+            picture: None,
         }
     }
 

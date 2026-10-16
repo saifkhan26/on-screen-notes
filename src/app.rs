@@ -221,6 +221,8 @@ pub struct OnScreenNotesApp {
     media_waiting: Vec<(std::path::PathBuf, Option<egui::Pos2>)>,
     /// Open dialog started by the toolbar's "Insert video / GIF".
     media_dialog: Option<std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>>,
+    /// PureRef boards being read, each becoming a new slide.
+    pureref_jobs: Vec<crate::media::pureref::OpenJob>,
 }
 
 /// How long after the pen was last used the pointer still counts as
@@ -518,6 +520,7 @@ impl OnScreenNotesApp {
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
             media_dialog: None,
+            pureref_jobs: Vec::new(),
         }
     }
 
@@ -891,6 +894,7 @@ impl OnScreenNotesApp {
                     rotation: 0.0,
                     kind: crate::canvas::shape::RasterKind::Image,
                     media: None,
+                    picture: None,
                 };
                 let c = self.canvases.active_mut();
                 c.add_shape(shape);
@@ -1047,6 +1051,7 @@ impl OnScreenNotesApp {
             rotation: 0.0,
             kind: crate::canvas::shape::RasterKind::Image,
             media: None,
+            picture: None,
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
@@ -1086,7 +1091,13 @@ impl OnScreenNotesApp {
             match rx.try_recv() {
                 Ok(paths) => {
                     self.media_dialog = None;
-                    for p in paths { self.start_media_import(p, None); }
+                    for p in paths {
+                        if crate::media::pureref::is_pureref(&p) {
+                            self.start_pureref_open(p);
+                        } else {
+                            self.start_media_import(p, None);
+                        }
+                    }
                 }
                 Err(TryRecvError::Disconnected) => self.media_dialog = None,
                 Err(TryRecvError::Empty) => {}
@@ -1098,8 +1109,12 @@ impl OnScreenNotesApp {
             let at = self.drop_point(ctx);
             for (n, file) in dropped.into_iter().enumerate() {
                 let Some(path) = file.path else { continue };
+                if crate::media::pureref::is_pureref(&path) {
+                    self.start_pureref_open(path);
+                    continue;
+                }
                 if !crate::media::import::is_supported(&path) {
-                    self.toast = Some(("Only pictures, videos and GIFs can be dropped here".into(), Instant::now()));
+                    self.toast = Some(("Only pictures, videos, GIFs and PureRef boards can be dropped here".into(), Instant::now()));
                     continue;
                 }
                 // Several files at once fan out instead of stacking.
@@ -1113,7 +1128,7 @@ impl OnScreenNotesApp {
                 .interactable(false)
                 .show(ctx, |ui| {
                     ui::theme::card_frame().inner_margin(egui::Margin::symmetric(16.0, 10.0)).show(ui, |ui| {
-                        ui.label("Drop to insert picture / video / GIF");
+                        ui.label("Drop to insert picture / video / GIF, or open a PureRef board");
                     });
                 });
         }
@@ -1142,6 +1157,100 @@ impl OnScreenNotesApp {
                     self.toast = Some((format!("Couldn't insert {name}: {e}"), Instant::now()));
                 }
             }
+        }
+
+        self.show_pureref_progress(ctx);
+        let mut boards = Vec::new();
+        self.pureref_jobs.retain(|job| match job.take() {
+            Some(r) => {
+                boards.push((job.path.clone(), job.file_name(), r));
+                false
+            }
+            None => true,
+        });
+        for (path, name, result) in boards {
+            match result {
+                Ok(board) => {
+                    let (pictures, notes) = board.counts();
+                    let skipped = board.skipped;
+                    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    let canvas = crate::media::pureref::into_canvas(
+                        board,
+                        [canvas_rect.width(), canvas_rect.height()],
+                        ctx.pixels_per_point(),
+                        &stem,
+                    );
+                    let idx = self.canvases.push_canvas(canvas);
+                    let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+                    let mut msg = format!(
+                        "Opened {name} as slide {} — {}, {}",
+                        idx + 1,
+                        count(pictures, "picture", "pictures"),
+                        count(notes, "note", "notes"),
+                    );
+                    if skipped > 0 {
+                        msg.push_str(&format!(", {skipped} skipped"));
+                    }
+                    self.toast = Some((msg, Instant::now()));
+                }
+                Err(e) if e == "cancelled" => {
+                    self.toast = Some((format!("Stopped opening {name}"), Instant::now()));
+                }
+                Err(e) => {
+                    log::warn!("opening {name} failed: {e}");
+                    self.toast = Some((format!("Couldn't open {name}: {e}"), Instant::now()));
+                }
+            }
+        }
+    }
+
+    /// Start reading a PureRef board; it becomes a new slide once read.
+    /// The board file is only read, never written.
+    pub(crate) fn start_pureref_open(&mut self, path: std::path::PathBuf) {
+        self.pureref_jobs.push(crate::media::pureref::OpenJob::start(path));
+    }
+
+    /// A card at the bottom of the screen for each board being opened:
+    /// what it is doing, a progress bar, and a button to stop it.
+    fn show_pureref_progress(&mut self, ctx: &egui::Context) {
+        use crate::media::pureref::Stage;
+        if self.pureref_jobs.is_empty() {
+            return;
+        }
+        let mut cancel = Vec::new();
+        egui::Area::new(egui::Id::new("osn_pureref_progress"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
+            .show(ctx, |ui| {
+                ui::theme::card_frame().inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+                    for (i, job) in self.pureref_jobs.iter().enumerate() {
+                        let (stage, done, total) = job.progress();
+                        let fraction = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                        let name = job.file_name();
+                        let text = match stage {
+                            Stage::Reading if total > 0 => {
+                                format!("Reading {name} — {} of {} MB", done >> 20, total >> 20)
+                            }
+                            Stage::Reading => format!("Reading {name}…"),
+                            Stage::Pictures => format!("Opening {name} — picture {} of {total}", done.min(total)),
+                        };
+                        if i > 0 {
+                            ui.add_space(6.0);
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(text);
+                            if job.cancelling() {
+                                ui.label("Stopping…");
+                            } else if ui.button("Cancel").clicked() {
+                                cancel.push(i);
+                            }
+                        });
+                        ui.add(egui::ProgressBar::new(fraction).desired_width(360.0).show_percentage());
+                    }
+                });
+            });
+        for i in cancel {
+            self.pureref_jobs[i].cancel();
+            crate::platform::reclaim_foreground(self.osn_hwnd);
         }
     }
 
@@ -1178,6 +1287,7 @@ impl OnScreenNotesApp {
             rotation: 0.0,
             kind: crate::canvas::shape::RasterKind::Image,
             media: imported.media.map(Box::new),
+            picture: None,
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
     }
@@ -1618,10 +1728,11 @@ impl eframe::App for OnScreenNotesApp {
                 let mut exts = vec!["gif"];
                 exts.extend_from_slice(crate::media::import::VIDEO_EXTS);
                 exts.extend_from_slice(crate::media::import::IMAGE_EXTS);
+                exts.push("pur");
                 self.media_dialog = Some(ui::media_controls::pick_files(
                     self.osn_hwnd,
-                    "Insert picture, video or GIF",
-                    &[("Pictures, videos and GIFs", &exts)],
+                    "Insert picture, video, GIF or PureRef board",
+                    &[("Pictures, videos, GIFs and PureRef boards", &exts), ("PureRef boards", &["pur"])],
                     true,
                 ));
             }
@@ -2676,14 +2787,16 @@ impl eframe::App for OnScreenNotesApp {
         // PNG-bearing canvases.
         if self.last_save_at.elapsed() > Duration::from_millis(5000) {
             // Media the in-app clipboard holds must survive a slide
-            // delete; while an import runs, media cleanup waits.
+            // delete; while an import or a board is being opened (its
+            // pictures may be files a deleted slide also used), media
+            // cleanup waits.
             let clipboard_media: std::collections::HashSet<String> = self
                 .obj_clipboard
                 .1
                 .iter()
-                .filter_map(|s| s.media().map(|m| m.file.clone()))
+                .filter_map(|s| s.media_file().map(str::to_string))
                 .collect();
-            let media_in_use = self.media_imports.is_empty().then_some(&clipboard_media);
+            let media_in_use = (self.media_imports.is_empty() && self.pureref_jobs.is_empty()).then_some(&clipboard_media);
             self.canvases.save_all(media_in_use);
             if let Err(e) = crate::persistence::save_config(&self.config) {
                 log::warn!("config save failed: {e}");

@@ -211,5 +211,6 @@ pub fn flood_fill_active(
         rotation: 0.0,
         kind: crate::canvas::shape::RasterKind::Fill,
         media: None,
+        picture: None,
     })
 }

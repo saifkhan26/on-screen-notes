@@ -41,6 +41,7 @@ pub enum RasterKind {
 
 fn is_zero(v: &f32) -> bool { *v == 0.0 }
 fn is_fill(k: &RasterKind) -> bool { *k == RasterKind::Fill }
+fn is_false(v: &bool) -> bool { !*v }
 
 /// What a media picture plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +96,61 @@ pub struct MediaRef {
     /// gets a new one in `insert_and_select` and plays on its own.
     #[serde(skip, default = "fresh_media_id")]
     pub id: u64,
+}
+
+/// A picture whose full-size pixels live in a file in the app's
+/// `media/` folder instead of in the slide. Pictures from PureRef boards
+/// are stored this way: a board can hold hundreds, and inline they
+/// would make the slide file huge. `Raster::png` is then a small
+/// preview (PNG, or JPEG when opaque: every reader sniffs the format) —
+/// what thumbnails draw, what shows while the file loads, and all that
+/// app builds from before this field existed can show.
+///
+/// The file is often the picture's original, shared by every crop of
+/// it: `crop` and `mirror` say what part of it this shape shows, and are
+/// applied when it is loaded rather than baked into a copy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PictureRef {
+    /// File name inside `persistence::paths::media_dir()`, named after a
+    /// hash of the contents (`"<16 hex digits>.<ext>"`).
+    pub file: String,
+    /// Pixel size of what the shape shows: the crop's, or the file's.
+    pub size: [u32; 2],
+    /// `[x, y, width, height]` in the file's pixels; `None` = all of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<[u32; 4]>,
+    /// Shown flipped left to right (after cropping).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mirror: bool,
+}
+
+impl PictureRef {
+    /// What the shape shows of the file's decoded pixels, scaled so its
+    /// long side is at most `max_side` (never up).
+    pub fn view(&self, img: &image::RgbaImage, max_side: u32) -> image::RgbaImage {
+        use image::GenericImageView;
+        let (iw, ih) = img.dimensions();
+        if iw == 0 || ih == 0 {
+            return img.clone();
+        }
+        let [x, y, w, h] = self.crop.unwrap_or([0, 0, iw, ih]);
+        // A crop the file is too small for (it was replaced) is clamped.
+        let (x, y) = (x.min(iw.saturating_sub(1)), y.min(ih.saturating_sub(1)));
+        let (w, h) = (w.clamp(1, iw - x), h.clamp(1, ih - y));
+        let part = img.view(x, y, w, h);
+        let long = w.max(h);
+        let mut out = if long > max_side {
+            let s = f64::from(max_side) / f64::from(long);
+            let (tw, th) = (((f64::from(w) * s).round() as u32).max(1), ((f64::from(h) * s).round() as u32).max(1));
+            image::imageops::thumbnail(&*part, tw, th)
+        } else {
+            part.to_image()
+        };
+        if self.mirror {
+            image::imageops::flip_horizontal_in_place(&mut out);
+        }
+        out
+    }
 }
 
 /// Oriented bounding box: a rectangle of half-extents `half` centred on
@@ -279,6 +335,11 @@ pub enum Shape {
         /// as a still image. `kind` is always `Image`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         media: Option<Box<MediaRef>>,
+        /// Set when the full-size picture is a file in the media folder;
+        /// `png` is then a small preview. Never set together with
+        /// `media`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picture: Option<Box<PictureRef>>,
     },
 }
 
@@ -300,6 +361,17 @@ impl Shape {
     pub fn media(&self) -> Option<&MediaRef> {
         match self {
             Shape::Raster { media: Some(m), .. } => Some(m),
+            _ => None,
+        }
+    }
+
+    /// The media-folder file this shape needs, if any: a video or GIF,
+    /// or the full-size pixels of a stored picture. Slide-delete cleanup
+    /// keeps every file some shape still names.
+    pub fn media_file(&self) -> Option<&str> {
+        match self {
+            Shape::Raster { media: Some(m), .. } => Some(&m.file),
+            Shape::Raster { picture: Some(p), .. } => Some(&p.file),
             _ => None,
         }
     }
@@ -513,6 +585,7 @@ mod tests {
         let raster = Shape::Raster {
             pos: [0.0, 0.0], size: [1.0, 1.0], png: Arc::new(vec![7]), px_size: [1, 1],
             color: [0; 4], rotation: 0.0, kind: RasterKind::Fill, media: None,
+            picture: None,
         };
         let text = ron::to_string(&raster).unwrap();
         assert!(!text.contains("rotation") && !text.contains("kind") && !text.contains("media"), "{text}");
@@ -523,6 +596,7 @@ mod tests {
         let raster = Shape::Raster {
             pos: [3.0, 4.0], size: [10.0, 6.0], png: Arc::new(vec![7, 8]), px_size: [2, 1],
             color: [0; 4], rotation: 0.5, kind: RasterKind::Image, media: None,
+            picture: None,
         };
         let back: Shape = ron::from_str(&ron::to_string(&raster).unwrap()).unwrap();
         assert!(matches!(back, Shape::Raster { rotation, kind: RasterKind::Image, .. } if (rotation - 0.5).abs() < 1e-6));
@@ -539,6 +613,7 @@ mod tests {
                 meta: Some(MediaMeta { frame_rate: [30000, 1001], frames: 300, duration: 10.01, size: [1920, 1080] }),
                 id: fresh_media_id(),
             })),
+            picture: None,
         }
     }
 
@@ -578,6 +653,52 @@ mod tests {
         let old: OldShape = ron::from_str(&text).unwrap();
         let OldShape::Raster { png, kind, .. } = old;
         assert_eq!((png, kind), (vec![7, 8], RasterKind::Image));
+    }
+
+    fn stored_picture(crop: Option<[u32; 4]>, mirror: bool) -> Shape {
+        Shape::Raster {
+            pos: [3.0, 4.0], size: [10.0, 6.0], png: Arc::new(vec![7, 8]), px_size: [2, 1],
+            color: [0; 4], rotation: 0.0, kind: RasterKind::Image, media: None,
+            picture: Some(Box::new(PictureRef { file: "0123456789abcdef.jpg".into(), size: [400, 300], crop, mirror })),
+        }
+    }
+
+    #[test]
+    fn stored_pictures_round_trip_and_leave_other_rasters_alone() {
+        let plain = ron::to_string(&media_raster()).unwrap();
+        assert!(!plain.contains("picture"), "{plain}");
+        let whole = ron::to_string(&stored_picture(None, false)).unwrap();
+        assert!(!whole.contains("crop") && !whole.contains("mirror"), "{whole}");
+        let shape = stored_picture(Some([1, 2, 3, 4]), true);
+        let back: Shape = ron::from_str(&ron::to_string(&shape).unwrap()).unwrap();
+        assert_eq!(back.media_file(), Some("0123456789abcdef.jpg"), "slide-delete cleanup sees the file");
+        assert!(back.media().is_none(), "nothing to play");
+        let Shape::Raster { picture: Some(p), .. } = back else { panic!("picture lost") };
+        assert_eq!((p.size, p.crop, p.mirror), ([400, 300], Some([1, 2, 3, 4]), true));
+        // A build from before `picture` existed opens it and shows the
+        // preview (the same old variant the media test uses).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        enum OldShape {
+            Raster { pos: [f32; 2], size: [f32; 2], png: Vec<u8>, px_size: [u32; 2], color: [u8; 4] },
+        }
+        let OldShape::Raster { png, .. } = ron::from_str(&ron::to_string(&shape).unwrap()).unwrap();
+        assert_eq!(png, vec![7, 8]);
+    }
+
+    #[test]
+    fn a_picture_view_crops_mirrors_and_shrinks() {
+        let img = image::RgbaImage::from_fn(8, 4, |x, y| image::Rgba([x as u8, y as u8, 0, 255]));
+        let p = PictureRef { file: String::new(), size: [4, 2], crop: Some([2, 1, 4, 2]), mirror: true };
+        let v = p.view(&img, u32::MAX);
+        assert_eq!(v.dimensions(), (4, 2));
+        // Columns 2..6 of rows 1..3, right to left.
+        assert_eq!((v.get_pixel(0, 0).0[0], v.get_pixel(3, 0).0[0], v.get_pixel(0, 1).0[1]), (5, 2, 2));
+        let whole = PictureRef { crop: None, mirror: false, ..p.clone() };
+        assert_eq!(whole.view(&img, 4).dimensions(), (4, 2), "shrunk to the long side asked for");
+        // A crop past the file's edge (the file changed) is clamped.
+        let past = PictureRef { crop: Some([6, 3, 10, 10]), ..p };
+        assert_eq!(past.view(&img, u32::MAX).dimensions(), (2, 1));
     }
 
     #[test]

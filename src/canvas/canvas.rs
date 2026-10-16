@@ -670,13 +670,14 @@ impl Canvas {
     /// edits via a slider or hotkey).
     pub fn mark_dirty(&mut self) { self.dirty = true; }
 
-    /// Add to `out` the name of every video / GIF file this canvas uses:
-    /// on its layers, and in its undo and redo history, since an undo can
-    /// bring back an object that was deleted.
+    /// Add to `out` the name of every media-folder file this canvas uses
+    /// (videos, GIFs, stored pictures): on its layers, and in its undo
+    /// and redo history, since an undo can bring back an object that was
+    /// deleted.
     pub fn media_files(&self, out: &mut std::collections::HashSet<String>) {
         let mut add = |s: &Shape| {
-            if let Some(m) = s.media() {
-                out.insert(m.file.clone());
+            if let Some(f) = s.media_file() {
+                out.insert(f.to_string());
             }
         };
         for layer in &self.layers {
@@ -1300,6 +1301,7 @@ fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
         rotation: 0.0,
         kind: RasterKind::Image,
         media: None,
+        picture: None,
     });
     layer.rev += 1;
     Some(img.capture_zoom)
@@ -1313,7 +1315,7 @@ fn demote_plate(layers: &mut [Layer], li: usize, capture_zoom: f32) -> bool {
     let Some(layer) = layers.get_mut(li) else { return false };
     let promoted = matches!(
         layer.shapes.first(),
-        Some(Shape::Raster { kind: RasterKind::Image, rotation, media: None, .. }) if *rotation == 0.0
+        Some(Shape::Raster { kind: RasterKind::Image, rotation, media: None, picture: None, .. }) if *rotation == 0.0
     );
     if layer.image.is_some() || !promoted { return false; }
     let Shape::Raster { pos, size, png, px_size, .. } = layer.shapes.remove(0) else { return false };
@@ -1576,6 +1578,7 @@ fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutco
         rotation,
         kind,
         media: None,
+        picture: None,
     })
 }
 
@@ -1702,6 +1705,7 @@ mod object_edit_tests {
         Shape::Raster {
             pos: [0.0, 0.0], size: [200.0, 200.0], png: Arc::new(vec![1, 2, 3]), px_size: [1, 1],
             color: [0; 4], rotation: 0.0, kind, media: None,
+            picture: None,
         }
     }
 

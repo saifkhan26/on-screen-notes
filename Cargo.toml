@@ -148,6 +148,14 @@ image = { version = "0.25", default-features = false, features = ["png", "gif", 
 # rfd = native "Open file" dialog for inserting a video or GIF.
 rfd = "0.14"
 
+# rusqlite = SQLite bindings, used only to read PureRef 2.x boards: a
+# `.pur` file from PureRef 2 is a SQLite database with a small header in
+# front. `bundled` compiles SQLite from source (no system library to go
+# missing); `serialize` opens the database from memory, read-only, so the
+# board file on disk is never opened as a database or written to. The
+# statement cache (a default feature) is not needed for a one-off read.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "serialize"] }
+
 # lyon = sweep-line 2-D path tessellator. We use it for the Fill tool.
 #
 # Why lyon instead of a simpler ear-clipping triangulator (earcutr)?

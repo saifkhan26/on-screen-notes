@@ -36,6 +36,11 @@ pub struct OverlayCache {
     /// triggers a re-render + re-upload. `rev` covers edits that move
     /// or restyle objects without changing how many there are.
     layer_thumbs: HashMap<(usize, usize), ((usize, usize, usize, u64), egui::TextureHandle)>,
+    /// Full-size pixels of stored pictures, loaded at the size shown.
+    pictures: crate::ui::picture_cache::PictureCache,
+    /// Where the canvas was drawn last frame, to tell which pictures are
+    /// on screen before this frame's layout runs.
+    last_canvas_rect: Option<egui::Rect>,
 }
 
 impl OverlayCache {
@@ -222,8 +227,23 @@ pub fn show(
             })
             .collect()
     };
+    cache.pictures.begin_frame(ctx);
     let shape_textures: Vec<Vec<Option<egui::TextureId>>> = {
         let active = manager.active();
+        // On-screen footprint of a shape, for stored pictures: how big
+        // to load it, and whether to load it at all.
+        let view = cache.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect());
+        let ppp = ctx.pixels_per_point();
+        let (pan, zoom) = (active.pan, active.zoom);
+        let footprint = |shape: &crate::canvas::shape::Shape| {
+            let obb = shape.obb();
+            let mut r = egui::Rect::NOTHING;
+            for p in obb.corners() {
+                r.extend_with(egui::pos2(view.min.x + pan[0] + p[0] * zoom, view.min.y + pan[1] + p[1] * zoom));
+            }
+            let long = obb.half[0].max(obb.half[1]) * 2.0 * zoom * ppp;
+            (long, r.intersects(view.expand(view.width().max(view.height()) * 0.25)))
+        };
         active
             .layers
             .iter()
@@ -234,10 +254,14 @@ pub fn show(
                     .iter()
                     .enumerate()
                     .map(|(si, shape)| match shape {
-                        crate::canvas::shape::Shape::Raster { png, media: m, .. } => m
-                            .as_ref()
-                            .and_then(|m| media.texture(m.id))
-                            .or_else(|| cache.ensure_shape_texture(ctx, canvas_idx, li, si, png)),
+                        crate::canvas::shape::Shape::Raster { png, media: m, picture, .. } => match (m, picture) {
+                            (Some(m), _) => media.texture(m.id).or_else(|| cache.ensure_shape_texture(ctx, canvas_idx, li, si, png)),
+                            (None, Some(p)) => {
+                                let (long, on_screen) = footprint(shape);
+                                cache.pictures.texture(ctx, p, png, long, on_screen && layer.visible)
+                            }
+                            (None, None) => cache.ensure_shape_texture(ctx, canvas_idx, li, si, png),
+                        },
                         _ => None,
                     })
                     .collect()
@@ -252,6 +276,7 @@ pub fn show(
             let avail = ui.available_size();
             let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
             canvas_rect = rect;
+            cache.last_canvas_rect = Some(rect);
 
             // Empty-canvas hint — appears only when the canvas has no
             // strokes / no shapes. Disappears the moment the user starts
