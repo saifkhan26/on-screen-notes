@@ -226,6 +226,8 @@ pub struct OnScreenNotesApp {
     media_dialog: Option<std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>>,
     /// PureRef boards being read, each becoming a new slide.
     pureref_jobs: Vec<crate::media::pureref::OpenJob>,
+    /// When the last frame started, for `hold_to_refresh_rate`.
+    last_frame_at: Option<Instant>,
     /// The picture the last in-app copy put on the OS clipboard, so a
     /// paste that finds it there pastes the objects instead. Set by the
     /// thread that builds it.
@@ -551,6 +553,7 @@ impl OnScreenNotesApp {
             media_waiting: Vec::new(),
             media_dialog: None,
             pureref_jobs: Vec::new(),
+            last_frame_at: None,
             clip_image: Default::default(),
         }
     }
@@ -729,36 +732,37 @@ impl OnScreenNotesApp {
         ctx.request_repaint();
     }
 
-    /// Whether the next frame should come at once rather than at the
-    /// idle pace: the pen is drawing, a button is held, or a gesture,
-    /// capture or recording is under way — whatever needs the lowest
-    /// latency.
-    fn needs_live_frames(&self, ctx: &egui::Context) -> bool {
+    /// Whether frames should come as fast as they can be drawn, above the
+    /// display's refresh rate: only while ink is going down (pen-to-pixel
+    /// latency is what this app is for) and while a capture or recording
+    /// counts frames.
+    fn needs_live_frames(&self) -> bool {
         self.pen.is_down()
-            || self.mouse_gesture
-            || ctx.input(|i| i.pointer.any_down())
             || self.tool.in_progress_stroke.is_some()
+            || self.pending_screenshot.is_some()
+            || self.pending_freeze.is_some()
+            || self.pending_lasso.is_some()
+            || self.recorder.is_recording()
+    }
+
+    /// Whether frames should come every display refresh: a button is
+    /// held or a gesture is under way (a drag, a pan, a selection), the
+    /// pen is in range, something on screen changes by itself, or work
+    /// in flight shows progress.
+    fn needs_steady_frames(&self, ctx: &egui::Context) -> bool {
+        let canvas = self.canvases.active();
+        self.mouse_gesture
+            || ctx.input(|i| i.pointer.any_down())
             || self.tool.select.gesture.is_some()
             || self.layer_xform.is_some()
             || self.pan_drag_anchor.is_some()
             || self.middle_pan_anchor.is_some()
             || self.region_select.is_some()
-            || self.pending_screenshot.is_some()
-            || self.pending_freeze.is_some()
-            || self.pending_lasso.is_some()
-            || self.recorder.is_recording()
             || self.loupe.is_some()
             // Polls the mouse button itself while the overlay is
             // click-through, so it gets no input events.
             || self.pin_picking
-    }
-
-    /// Whether frames should come every display refresh: the pen is in
-    /// range, something on screen changes by itself, or work in flight
-    /// shows progress.
-    fn needs_steady_frames(&self) -> bool {
-        let canvas = self.canvases.active();
-        self.pen.seen_within(PEN_NEARBY)
+            || self.pen.seen_within(PEN_NEARBY)
             || !self.tool.laser_strokes.is_empty()
             || !self.pureref_jobs.is_empty()
             || !self.media_imports.is_empty()
@@ -767,18 +771,38 @@ impl OnScreenNotesApp {
             || canvas.layers.iter().any(|l| l.visible && l.shapes.iter().any(crate::canvas::shape::Shape::animates))
     }
 
-    /// How long until the next frame is due; `None` means at once. Live
-    /// work (drawing, gestures) gets every frame it can; a pen in range
-    /// and things that move get one per display refresh; a playing GIF
-    /// or video gets its own frame times, never above the refresh rate;
+    /// Hold every frame that is not drawing ink to the display's refresh
+    /// rate. Each input event (each mouse move of a drag) makes egui draw
+    /// a frame on top of the ones paced here, and with Mailbox
+    /// presentation nothing waits for the screen: panning drew 800+ full
+    /// frames a second for a 99 Hz display and kept the GPU near 80 %. A
+    /// frame that starts with a button or pen press is never held, and
+    /// once ink is going down frames are not held either, so drawing
+    /// latency is unchanged.
+    fn hold_to_refresh_rate(&mut self, ctx: &egui::Context) {
+        let pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { pressed: true, .. })));
+        if !pressed && !self.needs_live_frames() {
+            if let Some(since) = self.last_frame_at.map(|t| t.elapsed()) {
+                if since < self.idle_frame {
+                    std::thread::sleep(self.idle_frame - since);
+                }
+            }
+        }
+        self.last_frame_at = Some(Instant::now());
+    }
+
+    /// How long until the next frame is due; `None` means at once. Ink
+    /// going down gets every frame it can; gestures, a pen in range and
+    /// things that move get one per display refresh; a playing GIF or
+    /// video gets its own frame times, never above the refresh rate;
     /// otherwise a slow idle tick.
     fn next_frame_in(&self, ctx: &egui::Context) -> Option<Duration> {
-        if self.needs_live_frames(ctx) {
+        if self.needs_live_frames() {
             return None;
         }
         let refresh = self.idle_frame;
         let mut wait = IDLE_TICK;
-        if self.needs_steady_frames() {
+        if self.needs_steady_frames(ctx) {
             wait = wait.min(refresh);
         }
         if let Some(media) = self.media.next_frame_in() {
@@ -1525,6 +1549,7 @@ impl eframe::App for OnScreenNotesApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.hold_to_refresh_rate(ctx);
         // Frame timing for `OSN_PERF_LOG`; does nothing when it is unset.
         let _perf = crate::perf::frame(|| {
             let c = self.canvases.active();
