@@ -22,10 +22,17 @@ use crate::canvas::canvas::Canvas;
 use crate::config::AppConfig;
 use crate::persistence::SlideView;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 /// Top-level holder for all canvases.
 pub struct CanvasManager {
-    canvases: Vec<Canvas>,
+    /// One entry per slide. `None` is a slide whose file the background
+    /// loader is still reading: nothing of it is in memory, so nothing
+    /// can draw on it, and no save can write over its file. `active`
+    /// always points at a `Some`.
+    canvases: Vec<Option<Canvas>>,
     active: usize,
     /// One human-readable line per slide that could not be read at
     /// startup. Drained by the app into a toast.
@@ -46,9 +53,14 @@ pub struct CanvasManager {
     /// without the deleted slide, and only after that may its media go —
     /// a crash in between must not leave a slide whose videos are gone.
     media_cleanup_due: bool,
-    /// Every slide's view as `views.ron` last received it, to tell when
-    /// the file needs writing again.
-    saved_views: Vec<SlideView>,
+    /// Slides still being read after startup; `None` once all are in.
+    loading: Option<BackgroundLoad>,
+    /// Per slide, its view as `views.ron` last received it (`None`: not
+    /// known yet), to tell when the file needs writing again.
+    saved_views: Vec<Option<SlideView>>,
+    /// The views `views.ron` held at startup, given to each slide as it
+    /// is read.
+    file_views: Vec<SlideView>,
 }
 
 /// Stand-in for a slot whose file is missing or unreadable. It keeps
@@ -61,98 +73,314 @@ fn placeholder_canvas() -> Canvas {
     c
 }
 
+/// What reading one slot produced, with an unreadable file already
+/// copied aside — done before the slot reaches the manager, so no save
+/// can get to the file first.
+struct SlotLoad {
+    /// The slide, or a blank placeholder when the file is missing or
+    /// could not be read.
+    canvas: Canvas,
+    /// One line for the user when the file could not be read.
+    error: Option<String>,
+    /// The file could not be read *and* could not be copied aside: the
+    /// slot must never be written.
+    protected: bool,
+}
+
+/// Read slot `idx` from disk. A missing file becomes a placeholder; an
+/// unreadable one is copied aside and becomes a placeholder.
+fn load_slot(idx: usize, passes: usize) -> SlotLoad {
+    use crate::persistence::LoadOutcome;
+    match crate::persistence::load_canvas(idx, passes) {
+        LoadOutcome::Loaded(canvas) => SlotLoad { canvas, error: None, protected: false },
+        LoadOutcome::Missing => {
+            log::warn!("canvas_{idx}.ron is missing; leaving a blank slide in its place");
+            SlotLoad { canvas: placeholder_canvas(), error: None, protected: false }
+        }
+        LoadOutcome::Unreadable(e) => {
+            log::warn!("canvas_{idx}.ron could not be read: {e}");
+            let (error, protected) = match crate::persistence::preserve_unreadable(idx) {
+                Ok(kept) => (
+                    format!(
+                        "Slide {} could not be read — original kept as {}",
+                        idx + 1,
+                        kept.file_name().and_then(|n| n.to_str()).unwrap_or("a copy"),
+                    ),
+                    false,
+                ),
+                Err(copy_err) => {
+                    log::warn!("could not copy canvas_{idx}.ron aside: {copy_err}");
+                    (format!("Slide {} could not be read — its file is left untouched", idx + 1), true)
+                }
+            };
+            SlotLoad { canvas: placeholder_canvas(), error: Some(error), protected }
+        }
+    }
+}
+
+/// The slides read on background threads after startup, so the window
+/// opens as soon as the first one is in.
+struct BackgroundLoad {
+    /// Per slot: someone — a loader thread, or the UI thread when the
+    /// user goes to a slide before its turn — has started reading it.
+    /// Whoever flips it first reads the file; nobody else touches it.
+    claims: Arc<Vec<AtomicBool>>,
+    results: mpsc::Receiver<(usize, SlotLoad)>,
+    /// Smoothing passes for slides read from now on.
+    passes: usize,
+    /// Stroke caches were rebuilt (smoothing or pressure curve changed)
+    /// after the threads started; slides they deliver are rebuilt too.
+    caches_stale: bool,
+    started: Instant,
+}
+
+/// How many threads read slides in the background: half the cores, at
+/// most four, so the UI keeps its share.
+fn background_workers() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4))
+}
+
+/// Slots `1..=max` in the order the loader threads take them: the
+/// slides the arrow keys reach from slide 1 (the next one, and the last
+/// one `prev` wraps to) first, then the rest in order.
+fn load_order(max: usize) -> Vec<usize> {
+    let mut order = vec![1];
+    if max > 1 {
+        order.push(max);
+    }
+    order.extend(2..max);
+    order
+}
+
 impl CanvasManager {
     /// Build a manager from disk, falling back to `cfg.initial_canvas_count`
     /// blank canvases for first-time launches.
-    pub fn load_or_default(cfg: &AppConfig) -> Self {
-        use crate::persistence::LoadOutcome;
-        let passes = cfg.smoothing_level.position_passes();
-        let mut canvases = Vec::new();
-        let mut load_errors = Vec::new();
-        let mut protected = Vec::new();
-        // Walk every slot up to the highest file on disk. A gap or an
-        // unreadable file becomes a blank placeholder instead of ending
-        // the walk, so one bad slide can never hide the ones after it.
-        if let Some(max) = crate::persistence::max_canvas_index() {
-            for idx in 0..=max {
-                match crate::persistence::load_canvas(idx, passes) {
-                    LoadOutcome::Loaded(c) => canvases.push(c),
-                    LoadOutcome::Missing => {
-                        log::warn!("canvas_{idx}.ron is missing; leaving a blank slide in its place");
-                        canvases.push(placeholder_canvas());
-                    }
-                    LoadOutcome::Unreadable(e) => {
-                        log::warn!("canvas_{idx}.ron could not be read: {e}");
-                        match crate::persistence::preserve_unreadable(idx) {
-                            Ok(kept) => load_errors.push(format!(
-                                "Slide {} could not be read — original kept as {}",
-                                idx + 1,
-                                kept.file_name().and_then(|n| n.to_str()).unwrap_or("a copy"),
-                            )),
-                            Err(copy_err) => {
-                                log::warn!("could not copy canvas_{idx}.ron aside: {copy_err}");
-                                protected.push(idx);
-                                load_errors.push(format!(
-                                    "Slide {} could not be read — its file is left untouched",
-                                    idx + 1,
-                                ));
-                            }
-                        }
-                        canvases.push(placeholder_canvas());
-                    }
-                }
-            }
-        }
-        // First-time boot: spin up some empty canvases.
-        if canvases.is_empty() {
-            for _ in 0..cfg.initial_canvas_count.max(1) {
-                canvases.push(Canvas::default());
-            }
-        }
-        apply_views(&mut canvases, &crate::persistence::load_views());
-        let saved_views = views_of(&canvases);
-        Self {
-            canvases,
-            active: 0,
-            load_errors,
-            protected,
-            prune_orphans: false,
-            media_to_check: HashSet::new(),
-            media_cleanup_due: false,
-            saved_views,
-        }
+    ///
+    /// Only the first slide is read before this returns; the others are
+    /// read on background threads (`poll_loads` takes them in), and a
+    /// slide the user goes to before then is read on the spot.
+    pub fn start_loading(cfg: &AppConfig) -> Self {
+        Self::start_loading_with(cfg, background_workers())
     }
 
-    /// A manager over `canvases` that has touched no file.
+    /// Read every slide before returning.
     #[cfg(test)]
-    pub(crate) fn for_tests(canvases: Vec<Canvas>) -> Self {
-        let saved_views = views_of(&canvases);
-        Self {
-            canvases,
+    pub fn load_or_default(cfg: &AppConfig) -> Self {
+        let mut m = Self::start_loading(cfg);
+        m.finish_loading();
+        m
+    }
+
+    /// `start_loading` with `workers` loader threads. With none, slides
+    /// are only read when visited or by `finish_loading`.
+    fn start_loading_with(cfg: &AppConfig, workers: usize) -> Self {
+        let passes = cfg.smoothing_level.position_passes();
+        let mut m = Self {
+            canvases: Vec::new(),
             active: 0,
             load_errors: Vec::new(),
             protected: Vec::new(),
             prune_orphans: false,
             media_to_check: HashSet::new(),
             media_cleanup_due: false,
+            loading: None,
+            saved_views: Vec::new(),
+            file_views: crate::persistence::load_views(),
+        };
+        // Every slot up to the highest file on disk gets an entry. A gap
+        // or an unreadable file becomes a blank placeholder instead of
+        // ending the list, so one bad slide can never hide the ones after
+        // it.
+        if let Some(max) = crate::persistence::max_canvas_index() {
+            let started = Instant::now();
+            m.canvases.resize_with(max + 1, || None);
+            m.install(0, load_slot(0, passes));
+            log::info!("slide 1 read in {:.0} ms; {max} more loading in the background", started.elapsed().as_secs_f64() * 1000.0);
+            if max > 0 {
+                let claims: Arc<Vec<AtomicBool>> = Arc::new((0..=max).map(|i| AtomicBool::new(i == 0)).collect());
+                let order = Arc::new(load_order(max));
+                let (tx, results) = mpsc::channel();
+                for _ in 0..workers {
+                    let (claims, order, tx) = (claims.clone(), order.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name("slide-loader".into()).spawn(move || {
+                        for &idx in order.iter() {
+                            if claims[idx].swap(true, Ordering::AcqRel) {
+                                continue; // another thread, or the UI, has it
+                            }
+                            if tx.send((idx, load_slot(idx, passes))).is_err() {
+                                return; // the manager is gone
+                            }
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        // The slides still load, on the UI thread, when visited.
+                        log::warn!("could not start a slide loader thread: {e}");
+                    }
+                }
+                m.loading = Some(BackgroundLoad { claims, results, passes, caches_stale: false, started });
+            }
+        }
+        // First-time boot: spin up some empty canvases.
+        if m.canvases.is_empty() {
+            for _ in 0..cfg.initial_canvas_count.max(1) {
+                m.canvases.push(Some(Canvas::default()));
+            }
+            m.saved_views = m.canvases.iter().map(|c| c.as_ref().map(view_of)).collect();
+        }
+        m
+    }
+
+    /// A manager over `canvases`, all loaded, that has touched no file.
+    #[cfg(test)]
+    pub(crate) fn for_tests(canvases: Vec<Canvas>) -> Self {
+        let saved_views = canvases.iter().map(|c| Some(view_of(c))).collect();
+        Self {
+            canvases: canvases.into_iter().map(Some).collect(),
+            active: 0,
+            load_errors: Vec::new(),
+            protected: Vec::new(),
+            prune_orphans: false,
+            media_to_check: HashSet::new(),
+            media_cleanup_due: false,
+            loading: None,
             saved_views,
+            file_views: Vec::new(),
         }
     }
 
     /// Every slide's view, if any changed since `views.ron` was last
-    /// written; they then count as written.
+    /// written; they then count as written. Nothing while slides are
+    /// still being read: an unread slide has no view to write yet, and a
+    /// made-up one would replace its real one.
     fn take_changed_views(&mut self) -> Option<Vec<SlideView>> {
-        let views = views_of(&self.canvases);
-        if views == self.saved_views {
+        if self.loading.is_some() {
             return None;
         }
-        self.saved_views = views.clone();
+        let views: Vec<SlideView> = self.canvases.iter().flatten().map(view_of).collect();
+        let same = views.len() == self.saved_views.len() && views.iter().zip(&self.saved_views).all(|(v, s)| s.as_ref() == Some(v));
+        if same {
+            return None;
+        }
+        self.saved_views = views.iter().copied().map(Some).collect();
         Some(views)
     }
 
+    /// Put a read slot in place and note what went wrong with it.
+    fn install(&mut self, idx: usize, load: SlotLoad) {
+        if let Some(e) = load.error {
+            self.load_errors.push(e);
+        }
+        if load.protected {
+            self.protected.push(idx);
+        }
+        // The view in `views.ron` is newer than the one in the slide's
+        // own file, which is only rewritten when the slide is edited.
+        let mut canvas = load.canvas;
+        if let Some(v) = self.file_views.get(idx) {
+            apply_view(&mut canvas, v);
+        }
+        if self.saved_views.len() <= idx {
+            self.saved_views.resize(idx + 1, None);
+        }
+        self.saved_views[idx] = Some(view_of(&canvas));
+        self.canvases[idx] = Some(canvas);
+    }
+
+    /// `install` for a slot a loader thread read, which may predate a
+    /// smoothing or pressure change.
+    fn install_from_thread(&mut self, idx: usize, mut load: SlotLoad) {
+        if let Some(bg) = self.loading.as_ref().filter(|bg| bg.caches_stale) {
+            for layer in &mut load.canvas.layers {
+                for stroke in &mut layer.strokes {
+                    stroke.cache = None;
+                    stroke.build_cache_with(bg.passes);
+                }
+            }
+        }
+        self.install(idx, load);
+    }
+
+    /// Every loader thread has stopped. A slot one of them claimed but
+    /// never delivered (the thread panicked while reading it) is treated
+    /// like an unreadable file that could not be copied aside: a
+    /// placeholder that is never written, so the file stays as it is.
+    fn loaders_gone(&mut self) {
+        let Some(bg) = self.loading.as_ref() else { return };
+        let lost: Vec<usize> = (0..bg.claims.len())
+            .filter(|&i| self.canvases[i].is_none() && bg.claims[i].load(Ordering::Acquire))
+            .collect();
+        for idx in lost {
+            log::warn!("reading canvas_{idx}.ron failed; its file is left untouched");
+            self.install(idx, SlotLoad {
+                canvas: placeholder_canvas(),
+                error: Some(format!("Slide {} could not be read — its file is left untouched", idx + 1)),
+                protected: true,
+            });
+        }
+    }
+
+    /// Drop the loader once every slot is in.
+    fn check_loading_done(&mut self) {
+        if let Some(bg) = self.loading.as_ref() {
+            if self.canvases.iter().all(Option::is_some) {
+                log::info!("all {} slides read in {:.0} ms", bg.claims.len(), bg.started.elapsed().as_secs_f64() * 1000.0);
+                crate::perf::line(format!("background load: all {} slides in {:.1} ms", bg.claims.len(), crate::perf::ms(bg.started.elapsed())));
+                self.loading = None;
+            }
+        }
+    }
+
+    /// Take in the slides the loader threads have finished. Never
+    /// blocks; call once a frame.
+    pub fn poll_loads(&mut self) {
+        while let Some(bg) = self.loading.as_ref() {
+            match bg.results.try_recv() {
+                Ok((idx, load)) => self.install_from_thread(idx, load),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.loaders_gone();
+                    break;
+                }
+            }
+        }
+        self.check_loading_done();
+    }
+
+    /// Make sure slot `idx` is in memory: read it now if no loader
+    /// thread has started on it, or wait for the thread that has.
+    fn ensure_loaded(&mut self, idx: usize) {
+        if self.canvases[idx].is_some() {
+            return;
+        }
+        let bg = self.loading.as_ref().expect("an unread slide while no loader is running");
+        if !bg.claims[idx].swap(true, Ordering::AcqRel) {
+            let load = load_slot(idx, bg.passes);
+            self.install(idx, load);
+        }
+        while self.canvases[idx].is_none() {
+            let Some(bg) = self.loading.as_ref() else { break };
+            match bg.results.recv() {
+                Ok((i, load)) => self.install_from_thread(i, load),
+                Err(mpsc::RecvError) => self.loaders_gone(),
+            }
+        }
+        self.check_loading_done();
+    }
+
+    /// Wait until every slide is in memory.
+    pub fn finish_loading(&mut self) {
+        for idx in 0..self.canvases.len() {
+            self.ensure_loaded(idx);
+        }
+    }
+
     /// Slides that failed to load at startup, one message each. Returns
-    /// them once; later calls get an empty list.
+    /// them all at once when every slide has been read; later calls get
+    /// an empty list.
     pub fn take_load_errors(&mut self) -> Vec<String> {
+        if self.loading.is_some() {
+            return Vec::new();
+        }
         std::mem::take(&mut self.load_errors)
     }
 
@@ -166,7 +394,7 @@ impl CanvasManager {
     /// and changes nothing costs one redundant write, whereas a missed
     /// mark would silently lose the user's work.
     pub fn active_mut(&mut self) -> &mut Canvas {
-        let c = &mut self.canvases[self.active];
+        let c = self.canvases[self.active].as_mut().expect("the active slide is always loaded");
         c.dirty = true;
         c
     }
@@ -178,13 +406,13 @@ impl CanvasManager {
     /// per save. The autosave writes views to their own small file
     /// instead (`persistence::save_views`).
     pub fn active_view_mut(&mut self) -> (&mut [f32; 2], &mut f32) {
-        let c = &mut self.canvases[self.active];
+        let c = self.canvases[self.active].as_mut().expect("the active slide is always loaded");
         (&mut c.pan, &mut c.zoom)
     }
 
     /// Read-only access to the active canvas (used by renderer + screenshot).
     pub fn active(&self) -> &Canvas {
-        &self.canvases[self.active]
+        self.canvases[self.active].as_ref().expect("the active slide is always loaded")
     }
 
     /// Index of the active canvas (for status bar display).
@@ -197,13 +425,18 @@ impl CanvasManager {
     /// budget. Called when the user switches smoothing level so the
     /// existing strokes get rerendered with the new look.
     pub fn rebuild_all_caches(&mut self, position_passes: usize) {
-        for canvas in &mut self.canvases {
+        for canvas in self.canvases.iter_mut().flatten() {
             for layer in &mut canvas.layers {
                 for stroke in &mut layer.strokes {
                     stroke.cache = None;
                     stroke.build_cache_with(position_passes);
                 }
             }
+        }
+        // Slides still being read get the same treatment when they land.
+        if let Some(bg) = self.loading.as_mut() {
+            bg.passes = position_passes;
+            bg.caches_stale = true;
         }
     }
 
@@ -214,9 +447,10 @@ impl CanvasManager {
     pub fn next(&mut self) {
         if self.active + 1 >= self.canvases.len() {
             // At the end → grow a new blank canvas.
-            self.canvases.push(Canvas::default());
+            self.canvases.push(Some(Canvas::default()));
         }
         self.active += 1;
+        self.ensure_loaded(self.active);
     }
 
     /// Append a ready-made canvas (an opened PureRef board) as the last
@@ -224,7 +458,7 @@ impl CanvasManager {
     /// own `dirty` flag; a `Canvas::default()`-built one is dirty, so the
     /// next autosave writes it.
     pub fn push_canvas(&mut self, canvas: Canvas) -> usize {
-        self.canvases.push(canvas);
+        self.canvases.push(Some(canvas));
         self.active = self.canvases.len() - 1;
         self.active
     }
@@ -238,6 +472,7 @@ impl CanvasManager {
         } else {
             self.active -= 1;
         }
+        self.ensure_loaded(self.active);
     }
 
     /// Delete the active canvas.
@@ -246,6 +481,11 @@ impl CanvasManager {
     /// * Otherwise we remove it and shift the active index back by one
     ///   (or stay at 0 if we just removed canvas 0).
     pub fn delete_active(&mut self) {
+        // Every later slide gets rewritten one file slot down, so each
+        // must be in memory first — a slide still being read has nothing
+        // to rewrite, and its file would be pruned or overwritten. This
+        // also settles which slots end up protected.
+        self.finish_loading();
         // Deleting shifts every later slide down a file slot. With a
         // protected slot in play that shift would point the "never write
         // this index" guard at the wrong file, so refuse instead.
@@ -255,10 +495,12 @@ impl CanvasManager {
         }
         // Its videos and GIFs become candidates for deletion; the next
         // save decides which are really unused.
-        self.canvases[self.active].media_files(&mut self.media_to_check);
+        if let Some(c) = &self.canvases[self.active] {
+            c.media_files(&mut self.media_to_check);
+        }
         self.media_cleanup_due = true;
         if self.canvases.len() == 1 {
-            self.canvases[0] = Canvas::default();
+            self.canvases[0] = Some(Canvas::default());
             self.active = 0;
             return;
         }
@@ -270,7 +512,7 @@ impl CanvasManager {
         // Removing a canvas shifts every later one down a file slot, so
         // their existing files now hold the wrong content — everything
         // has to be rewritten, not just the deleted index.
-        for c in &mut self.canvases {
+        for c in self.canvases.iter_mut().flatten() {
             c.dirty = true;
         }
         // Best-effort: also remove the on-disk file for the removed slot,
@@ -311,9 +553,11 @@ impl CanvasManager {
         // canvas is cheap relative to RON serialisation because it is
         // just an `Arc`-less deep copy of bytes; serialisation
         // formats those bytes into ASCII which is 5-10× larger.
+        // A slide still being read is `None` here and never written.
         let copy_started = std::time::Instant::now();
         let mut dirty: Vec<(usize, Canvas)> = Vec::new();
-        for (i, c) in self.canvases.iter_mut().enumerate() {
+        for (i, slot) in self.canvases.iter_mut().enumerate() {
+            let Some(c) = slot else { continue };
             if c.dirty && !self.protected.contains(&i) {
                 dirty.push((i, c.clone()));
                 c.dirty = false;
@@ -358,8 +602,13 @@ impl CanvasManager {
     /// Files a slide uses are dropped from the list (they are not
     /// orphans); files only `keep` uses stay for a later check.
     fn unused_media(&mut self, keep: &HashSet<String>) -> Vec<String> {
+        // A slide still being read may use any of them; check later.
+        // (Deleting a slide reads them all first, so this is a guard.)
+        if self.canvases.iter().any(Option::is_none) {
+            return Vec::new();
+        }
         let mut used = HashSet::new();
-        for c in &self.canvases {
+        for c in self.canvases.iter().flatten() {
             c.media_files(&mut used);
         }
         self.media_to_check.retain(|f| !used.contains(f));
@@ -379,7 +628,8 @@ impl CanvasManager {
                 log::warn!("failed to save slide views: {e}");
             }
         }
-        for (i, c) in self.canvases.iter_mut().enumerate() {
+        for (i, slot) in self.canvases.iter_mut().enumerate() {
+            let Some(c) = slot else { continue };
             if !c.dirty || self.protected.contains(&i) { continue; }
             if let Err(e) = crate::persistence::save_canvas(i, c) {
                 log::warn!("failed to save canvas {i}: {e}");
@@ -400,21 +650,25 @@ impl CanvasManager {
     }
 }
 
-fn views_of(canvases: &[Canvas]) -> Vec<SlideView> {
-    canvases.iter().map(|c| SlideView { pan: c.pan, zoom: c.zoom }).collect()
+fn view_of(c: &Canvas) -> SlideView {
+    SlideView { pan: c.pan, zoom: c.zoom }
 }
 
-/// Give each slide the view `views.ron` has for it. Anything that is not
-/// a usable view (a damaged or hand-edited file) is skipped, leaving the
-/// view stored in the slide's own file.
-fn apply_views(canvases: &mut [Canvas], views: &[SlideView]) {
+/// Give a slide a view from `views.ron`, unless it is not a usable one
+/// (a damaged or hand-edited file); the view stored in the slide's own
+/// file then stays.
+fn apply_view(c: &mut Canvas, v: &SlideView) {
     use crate::interaction::zoom_pan::{MAX_ZOOM, MIN_ZOOM};
+    if v.pan.iter().all(|p| p.is_finite()) && (MIN_ZOOM..=MAX_ZOOM).contains(&v.zoom) {
+        c.pan = v.pan;
+        c.zoom = v.zoom;
+    }
+}
+
+#[cfg(test)]
+fn apply_views(canvases: &mut [Canvas], views: &[SlideView]) {
     for (c, v) in canvases.iter_mut().zip(views) {
-        let usable = v.pan.iter().all(|p| p.is_finite()) && (MIN_ZOOM..=MAX_ZOOM).contains(&v.zoom);
-        if usable {
-            c.pan = v.pan;
-            c.zoom = v.zoom;
-        }
+        apply_view(c, v);
     }
 }
 
@@ -632,7 +886,59 @@ mod loader_tests {
         let m = CanvasManager::load_or_default(&AppConfig::default());
         assert_eq!(m.active().zoom, 4.0);
 
+        slides_still_loading_are_never_written(&dir);
+
         std::env::remove_var("OSN_DATA_DIR");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A slide the background loader has not read yet is never written,
+    /// is read when the user goes to it, and is read before a delete
+    /// shifts the slides down a slot. Runs inside the test above, which
+    /// owns `OSN_DATA_DIR`.
+    fn slides_still_loading_are_never_written(dir: &std::path::Path) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            std::fs::remove_file(e.unwrap().path()).unwrap();
+        }
+        let slide = |x: f32| {
+            let mut c = Canvas::default();
+            c.pan = [x, 0.0];
+            crate::persistence::serialize_canvas(&c).unwrap()
+        };
+        std::fs::write(dir.join("canvas_0.ron"), slide(10.0)).unwrap();
+        std::fs::write(dir.join("canvas_1.ron"), slide(11.0)).unwrap();
+        // canvas_2.ron deliberately absent.
+        std::fs::write(dir.join("canvas_3.ron"), slide(13.0)).unwrap();
+        let file = |i: usize| std::fs::read_to_string(dir.join(format!("canvas_{i}.ron"))).unwrap();
+        let pan = |i: usize| crate::persistence::parse_canvas(&file(i), 3).unwrap().pan;
+        let (one, three) = (file(1), file(3));
+
+        // No loader threads, so slides 2-4 stay unread until visited.
+        let mut m = CanvasManager::start_loading_with(&AppConfig::default(), 0);
+        assert_eq!(m.count(), 4);
+        assert_eq!(m.active().pan, [10.0, 0.0]);
+        m.active_mut().pan = [20.0, 0.0];
+        m.save_all_blocking();
+        assert_eq!(pan(0), [20.0, 0.0]);
+        assert_eq!(file(1), one, "an unread slide is not written");
+        assert_eq!(file(3), three, "an unread slide is not written");
+        assert!(!dir.join("canvas_2.ron").exists());
+
+        // Back from the first slide wraps to the last, which is read then.
+        let mut wrap = CanvasManager::start_loading_with(&AppConfig::default(), 0);
+        wrap.prev();
+        assert_eq!((wrap.active_index(), wrap.active().pan), (3, [13.0, 0.0]));
+
+        // Delete slide 2: slides 3 and 4 are read first, then all shift.
+        m.next();
+        assert_eq!(m.active().pan, [11.0, 0.0]);
+        m.delete_active();
+        assert_eq!(m.count(), 3);
+        m.save_all_blocking();
+        assert_eq!(pan(0), [20.0, 0.0]);
+        assert_eq!(pan(1), Canvas::default().pan, "the gap is now slot 1");
+        assert_eq!(pan(2), [13.0, 0.0], "the last slide moved down, not lost");
+        assert!(!dir.join("canvas_3.ron").exists());
+        assert!(m.take_load_errors().is_empty());
     }
 }
