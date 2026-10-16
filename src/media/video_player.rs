@@ -356,6 +356,9 @@ pub struct VideoPlayer {
     error: Option<String>,
     /// Position (seconds) to open at, applied once the probe is in.
     pending_resume: Option<f64>,
+    /// Start playing once the probe is in (it was playing when it left
+    /// the screen).
+    pending_play: bool,
     /// When the view first stopped suiting the decoded size; see
     /// `follow_view`.
     resize_since: Option<Instant>,
@@ -364,7 +367,9 @@ pub struct VideoPlayer {
 impl VideoPlayer {
     /// Start probing `path`. Videos open paused; `resume` is a position
     /// in seconds to open at.
-    pub fn new(path: PathBuf, tools: Option<Tools>, resume: Option<f64>) -> Self {
+    /// A video starts paused on the frame at `resume` seconds (the first
+    /// without one), unless `playing`, which starts it once it can.
+    pub fn new(path: PathBuf, tools: Option<Tools>, resume: Option<f64>, playing: bool) -> Self {
         let mut error = None;
         let probe = match (&tools, path.is_file()) {
             (_, false) => {
@@ -397,6 +402,7 @@ impl VideoPlayer {
             on_screen: None,
             error,
             pending_resume: resume,
+            pending_play: playing,
             resize_since: None,
         }
     }
@@ -430,6 +436,9 @@ impl VideoPlayer {
                 self.probe = Probe::Ready(info);
                 if let Some(t) = self.pending_resume.take() {
                     self.want = (t * fps).round() as u64;
+                }
+                if std::mem::take(&mut self.pending_play) {
+                    self.clock = Some(Clock { t0: Instant::now(), start: self.want });
                 }
             }
             Ok(Err(e)) => {
@@ -637,6 +646,11 @@ impl VideoPlayer {
 
     pub fn position(&self) -> f64 {
         self.info().map_or(0.0, |i| self.current() as f64 / i.fps())
+    }
+
+    /// Playing, or about to once the probe is in.
+    pub fn is_playing(&self) -> bool {
+        self.clock.is_some() || self.pending_play
     }
 
     pub fn command(&mut self, cmd: Cmd, now: Instant) {

@@ -76,6 +76,13 @@ impl Player {
             Player::Video(p) => p.position(),
         }
     }
+
+    fn is_playing(&self) -> bool {
+        match self {
+            Player::Gif(p) => p.is_playing(),
+            Player::Video(p) => p.is_playing(),
+        }
+    }
 }
 
 struct Entry {
@@ -113,9 +120,10 @@ const GIF_KEEP: Duration = Duration::from_secs(90);
 #[derive(Default)]
 pub struct MediaHub {
     entries: HashMap<u64, Entry>,
-    /// Positions of objects that left the screen (slide switch, hidden
-    /// layer, undo), keyed by `MediaRef::id`, to pick up where they were.
-    resume: HashMap<u64, f64>,
+    /// Position, and whether it was playing, of each object that left
+    /// the screen (slide switch, hidden layer, undo), keyed by
+    /// `MediaRef::id`, to pick up where it was.
+    resume: HashMap<u64, (f64, bool)>,
     /// Decoded GIFs by file name, shared by every object showing the
     /// same file, with the time each was last used.
     gifs: HashMap<String, (Arc<GifData>, Instant)>,
@@ -144,7 +152,14 @@ impl MediaHub {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(v) => {
                         let path = dir.as_ref().map(|d| d.join(&m.file)).unwrap_or_default();
-                        let resume = self.resume.remove(&m.id);
+                        // Nothing autoplays: a player starts paused unless
+                        // the user had this object playing when it left the
+                        // screen. Ids are minted per run, so after a restart
+                        // every GIF and video waits for the user again.
+                        let (resume, playing) = match self.resume.remove(&m.id) {
+                            Some((pos, playing)) => (Some(pos), playing),
+                            None => (None, false),
+                        };
                         let player = match m.kind {
                             MediaKind::Gif => {
                                 let data = match self.gifs.get(&m.file) {
@@ -155,9 +170,9 @@ impl MediaHub {
                                         d
                                     }
                                 };
-                                Player::Gif(GifPlayer::new(data, resume))
+                                Player::Gif(GifPlayer::new(data, resume, playing))
                             }
-                            MediaKind::Video => Player::Video(Box::new(VideoPlayer::new(path, ffmpeg::tools(), resume))),
+                            MediaKind::Video => Player::Video(Box::new(VideoPlayer::new(path, ffmpeg::tools(), resume, playing))),
                         };
                         v.insert(Entry { player, meta: m.meta, texture: None, uploaded: None, seen: tick })
                     }
@@ -177,7 +192,7 @@ impl MediaHub {
         let resume = &mut self.resume;
         self.entries.retain(|id, e| {
             if e.seen == tick { return true; }
-            resume.insert(*id, e.player.position());
+            resume.insert(*id, (e.player.position(), e.player.is_playing()));
             false
         });
         if resume.len() > 512 { resume.clear(); }

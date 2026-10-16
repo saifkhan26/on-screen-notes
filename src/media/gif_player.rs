@@ -164,16 +164,17 @@ pub struct GifPlayer {
 }
 
 impl GifPlayer {
-    /// GIFs autoplay and loop, like they do on the web. `resume` is a
-    /// position in seconds to start from.
-    pub fn new(data: Arc<GifData>, resume: Option<f64>) -> Self {
+    /// A GIF starts paused, on the frame at `resume` seconds (the first
+    /// without one), unless `playing`: the user starts it, nothing
+    /// autoplays. It loops once playing.
+    pub fn new(data: Arc<GifData>, resume: Option<f64>, playing: bool) -> Self {
         let mut p = Self {
             data,
             frames: Vec::new(),
             starts: Vec::new(),
             index: 0,
             into_frame: 0.0,
-            playing: true,
+            playing,
             looping: true,
             last_tick: None,
         };
@@ -254,6 +255,10 @@ impl GifPlayer {
         self.starts.get(self.index).copied().unwrap_or(0.0) + self.into_frame
     }
 
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
     pub fn command(&mut self, cmd: Cmd) {
         let n = self.frames.len();
         match cmd {
@@ -328,7 +333,7 @@ mod tests {
             error: Mutex::new(None),
             stop: AtomicBool::new(false),
         });
-        GifPlayer::new(data, None)
+        GifPlayer::new(data, None, true)
     }
 
     #[test]
@@ -346,6 +351,21 @@ mod tests {
         assert_eq!(p.index, 0);
         p.command(Cmd::Seek { secs: 0.25, preview: false });
         assert_eq!(p.index, 1);
+    }
+
+    #[test]
+    fn gifs_start_paused_unless_told_to_play() {
+        let data = player(&[0.1, 0.1]).data;
+        let mut p = GifPlayer::new(Arc::clone(&data), None, false);
+        let t0 = Instant::now();
+        p.tick(t0);
+        p.tick(t0 + std::time::Duration::from_millis(250));
+        assert_eq!((p.index, p.is_playing(), p.next_change_in()), (0, false, None), "no autoplay");
+        p.command(Cmd::TogglePlay);
+        assert!(p.is_playing());
+        // Brought back on screen mid-way and playing, it carries on.
+        let back = GifPlayer::new(data, Some(0.15), true);
+        assert_eq!((back.index, back.is_playing()), (1, true));
     }
 
     #[test]

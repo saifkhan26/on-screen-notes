@@ -461,9 +461,12 @@ slide (not in the `media` folder). A single-frame GIF does the same.
 
 - **Formats** — GIF always; MP4, M4V, MOV, MKV, WebM, AVI, WMV through
   FFmpeg. Video plays **muted**.
-- **On a slide** — GIFs start playing and loop, like on the web. Videos
-  wait on their first frame until you press play, and stop on the last
-  frame (turn on loop in the bar to repeat).
+- **On a slide** — nothing plays by itself. GIFs and videos wait on
+  their first frame until you press play (the bar's play button, or
+  `K`), every time the app starts. A GIF then loops; a video stops on
+  its last frame (turn on loop in the bar to repeat). One you started
+  keeps playing, from where it was, when you flip away from its slide
+  and back.
 - **Playback bar** — appears just below the object while the pointer is
   over it (with any tool) and while it is selected:
   previous frame · play / pause · next frame · seek bar · time and
@@ -507,8 +510,9 @@ by PureRef 2 (including 2's "save as legacy") both work.
   whole board is shown at its natural size and shrunk to fit the view if
   it is bigger. Each picture becomes an ordinary picture object on the
   slide.
-- **Animated GIFs play**, like a dropped GIF, unless the board crops or
-  mirrors them: those come in as a still of the first frame.
+- **Animated GIFs** come in as GIFs you can play, like a dropped one
+  (paused until you start them), unless the board crops or mirrors
+  them: those come in as a still of the first frame.
 - **Notes** become text labels with their colour and rotation, wrapped
   to the note's width when it has a fixed one. Their background box and
   rich-text styling are dropped.
