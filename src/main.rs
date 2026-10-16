@@ -22,6 +22,7 @@ mod flood_fill;
 mod input;
 mod interaction;
 mod media;
+mod perf;
 mod persistence;
 mod platform;
 mod recording;

@@ -400,7 +400,9 @@ impl OnScreenNotesApp {
         }
 
         let config = crate::persistence::load_config();
+        let load_started = Instant::now();
         let mut canvases = CanvasManager::load_or_default(&config);
+        crate::perf::line(format!("startup load: {} slides in {:.1} ms", canvases.count(), crate::perf::ms(load_started.elapsed())));
         // A slide that failed to load is the user's work in a state we
         // could not read — say so on screen rather than only in the log.
         let load_toast = {
@@ -1441,6 +1443,17 @@ impl eframe::App for OnScreenNotesApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Frame timing for `OSN_PERF_LOG`; does nothing when it is unset.
+        let _perf = crate::perf::frame(|| {
+            let c = self.canvases.active();
+            let (strokes, shapes) = c.layers.iter().fold((0, 0), |(a, b), l| (a + l.strokes.len(), b + l.shapes.len()));
+            format!(
+                "slide {}/{} strokes {strokes} shapes {shapes} zoom {:.3}",
+                self.canvases.active_index() + 1,
+                self.canvases.count(),
+                c.zoom,
+            )
+        });
         // ---- First-frame init -------------------------------------------
         // On startup, explicitly tell the OS: "we want input by default".
         // This synchronises our `modifiers.alt_held = false` model with

@@ -258,6 +258,7 @@ impl CanvasManager {
         // canvas is cheap relative to RON serialisation because it is
         // just an `Arc`-less deep copy of bytes; serialisation
         // formats those bytes into ASCII which is 5-10× larger.
+        let copy_started = std::time::Instant::now();
         let mut dirty: Vec<(usize, Canvas)> = Vec::new();
         for (i, c) in self.canvases.iter_mut().enumerate() {
             if c.dirty && !self.protected.contains(&i) {
@@ -277,10 +278,19 @@ impl CanvasManager {
             Some(keep) if std::mem::take(&mut self.media_cleanup_due) => self.unused_media(keep),
             _ => Vec::new(),
         };
+        crate::perf::line(format!("autosave: copied {} slide(s) on the UI thread in {:.1} ms", dirty.len(), crate::perf::ms(copy_started.elapsed())));
         std::thread::spawn(move || {
             for (i, c) in dirty {
+                let t = std::time::Instant::now();
                 if let Err(e) = crate::persistence::save_canvas(i, &c) {
                     log::warn!("failed to save canvas {i}: {e}");
+                }
+                if crate::perf::enabled() {
+                    let size = crate::persistence::paths::canvases_dir()
+                        .ok()
+                        .and_then(|d| std::fs::metadata(d.join(format!("canvas_{i}.ron"))).ok())
+                        .map_or(0, |m| m.len());
+                    crate::perf::line(format!("autosave: slide {} written in {:.1} ms, {:.1} MB", i + 1, crate::perf::ms(t.elapsed()), size as f64 / 1e6));
                 }
             }
             if prune {
