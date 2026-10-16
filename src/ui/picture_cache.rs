@@ -18,14 +18,17 @@ use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Smallest copy asked for, so a tiny on-screen picture does not reload
 /// every time it grows by a few pixels.
 const MIN_SIDE: u32 = 128;
-/// Frames a picture may go undrawn before its full-size texture goes.
-const DROP_AFTER: u64 = 180;
-/// Frames before its preview and bookkeeping go too.
-const FORGET_AFTER: u64 = 3600;
+/// How long a picture may go undrawn before its full-size texture goes.
+/// Time, not frames: the frame rate swings from ~90 to several hundred,
+/// and flipping between two slides should not reload their pictures.
+const DROP_AFTER: Duration = Duration::from_secs(3);
+/// How long before its preview and bookkeeping go too.
+const FORGET_AFTER: Duration = Duration::from_secs(60);
 /// Texture memory above which oversized copies are replaced by smaller.
 const BUDGET_BYTES: usize = 768 << 20;
 /// Most pixel bytes uploaded per frame, to keep frames even.
@@ -40,7 +43,9 @@ struct Entry {
     pending: u32,
     /// Long side the picture is shown at now.
     want: u32,
+    /// Frame it was last drawn in, and when.
     seen: u64,
+    seen_at: Instant,
     /// The file could not be read; the preview stays.
     broken: bool,
 }
@@ -71,6 +76,9 @@ pub struct PictureCache {
     queue: Arc<Queue>,
     done_tx: Sender<Loaded>,
     done_rx: Receiver<Loaded>,
+    /// Finished copies not uploaded yet (the per-frame upload budget ran
+    /// out): one per picture, the biggest.
+    ready: HashMap<PictureRef, (u32, ColorImage)>,
     workers_started: bool,
     tick: u64,
 }
@@ -78,7 +86,7 @@ pub struct PictureCache {
 impl Default for PictureCache {
     fn default() -> Self {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        Self { entries: HashMap::new(), queue: Arc::default(), done_tx, done_rx, workers_started: false, tick: 0 }
+        Self { entries: HashMap::new(), queue: Arc::default(), done_tx, done_rx, ready: HashMap::new(), workers_started: false, tick: 0 }
     }
 }
 
@@ -90,25 +98,32 @@ fn side_for(shown: f32, full: u32) -> u32 {
 }
 
 impl PictureCache {
-    /// Once per frame, before any `texture` call: upload what the
-    /// workers finished, and let go of what has not been drawn lately.
+    /// Once per frame, before any `texture` call: let go of what has not
+    /// been drawn lately, then upload what the workers finished.
+    ///
+    /// Nothing made here may be freed in the same frame. egui-wgpu writes
+    /// a new texture's pixels through the GPU queue and destroys freed
+    /// textures before it submits the frame, so a texture made and freed
+    /// in one frame fails the submit, which aborts the app. Flipping
+    /// between two slides of pictures did exactly that: a copy finished
+    /// for a picture that had just gone idle was made, then freed by the
+    /// eviction below. So eviction runs first, each picture gets at most
+    /// one new copy a frame, and only while it is still being drawn.
     pub fn begin_frame(&mut self, ctx: &egui::Context) {
         self.tick += 1;
         let tick = self.tick;
-        let mut budget = UPLOAD_PER_FRAME;
-        while budget > 0 {
-            let Ok(done) = self.done_rx.try_recv() else { break };
+        let now = Instant::now();
+
+        // Take in finished work, keeping the biggest copy per picture.
+        while let Ok(done) = self.done_rx.try_recv() {
             let Some(e) = self.entries.get_mut(&done.picture) else { continue };
             if e.pending <= done.side {
                 e.pending = 0;
             }
             match done.image {
                 Some(img) => {
-                    budget = budget.saturating_sub(img.pixels.len() * 4);
-                    // A late, smaller copy never replaces a bigger one.
-                    if e.tex.as_ref().map_or(true, |(s, _)| *s < done.side) {
-                        let handle = ctx.load_texture(format!("osn_picture_{}", done.picture.file), img, TextureOptions::LINEAR);
-                        e.tex = Some((done.side, handle));
+                    if self.ready.get(&done.picture).map_or(true, |(side, _)| *side < done.side) {
+                        self.ready.insert(done.picture, (done.side, img));
                     }
                 }
                 None => e.broken = true,
@@ -117,7 +132,7 @@ impl PictureCache {
 
         // Undrawn for a while: free the GPU copy; for longer: forget it.
         self.entries.retain(|_, e| {
-            let idle = tick.saturating_sub(e.seen);
+            let idle = now.saturating_duration_since(e.seen_at);
             if idle > DROP_AFTER {
                 e.tex = None;
                 e.pending = 0;
@@ -135,6 +150,28 @@ impl PictureCache {
                 }
             }
         }
+
+        // Upload, within the per-frame budget. A copy for a picture not
+        // drawn last frame is let go; it is asked for again if the
+        // picture comes back.
+        let mut budget = UPLOAD_PER_FRAME;
+        for (picture, (side, img)) in std::mem::take(&mut self.ready) {
+            let Some(e) = self.entries.get_mut(&picture) else { continue };
+            if tick.saturating_sub(e.seen) > 2 {
+                continue;
+            }
+            if budget == 0 {
+                self.ready.insert(picture, (side, img));
+                continue;
+            }
+            // A late, smaller copy never replaces a bigger one.
+            if e.tex.as_ref().map_or(true, |(s, _)| *s < side) {
+                budget = budget.saturating_sub(img.pixels.len() * 4);
+                let handle = ctx.load_texture(format!("osn_picture_{}", picture.file), img, TextureOptions::LINEAR);
+                e.tex = Some((side, handle));
+            }
+        }
+
         // Requests for pictures no longer on screen are dropped unstarted;
         // they are asked for again if the picture comes back.
         let mut dropped = Vec::new();
@@ -168,9 +205,11 @@ impl PictureCache {
             pending: 0,
             want: 0,
             seen: tick,
+            seen_at: Instant::now(),
             broken: false,
         });
         e.seen = tick;
+        e.seen_at = Instant::now();
         let full = picture.size[0].max(picture.size[1]);
         let want = side_for(shown, full);
         e.want = want;
@@ -260,6 +299,58 @@ fn load(picture: &PictureRef, side: u32) -> Option<ColorImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(ctx: &egui::Context, run: impl FnMut(&egui::Context)) -> egui::TexturesDelta {
+        let mut d = ctx.run(egui::RawInput::default(), run).textures_delta;
+        // The font atlas is egui's own.
+        d.set.retain(|(id, _)| *id != TextureId::default());
+        d
+    }
+
+    fn copy(side: usize) -> Option<ColorImage> {
+        Some(ColorImage::new([side, side], egui::Color32::RED))
+    }
+
+    /// egui-wgpu fails the frame (and the app aborts) when a texture is
+    /// made and freed in the same frame; flipping between two slides of
+    /// pictures used to do that.
+    #[test]
+    fn no_texture_is_made_and_freed_in_one_frame() {
+        let ctx = egui::Context::default();
+        let mut cache = PictureCache::default();
+        let p = PictureRef { file: "x.png".into(), size: [4000, 3000], crop: None, mirror: false };
+        let mut preview = Vec::new();
+        image::RgbaImage::new(4, 3).write_to(&mut std::io::Cursor::new(&mut preview), image::ImageFormat::Png).unwrap();
+        // `visible: false` keeps the loader threads out of it; the copies
+        // below stand in for what they would deliver.
+        let made_and_freed = |d: &egui::TexturesDelta| d.free.iter().any(|f| d.set.iter().any(|(s, _)| s == f));
+
+        let d = frame(&ctx, |ctx| {
+            cache.begin_frame(ctx);
+            cache.texture(ctx, &p, &preview, 200.0, false);
+        });
+        assert_eq!((d.set.len(), d.free.len()), (1, 0), "the preview");
+
+        // Two copies of the picture finish in the same frame.
+        cache.done_tx.send(Loaded { picture: p.clone(), side: 128, image: copy(128) }).unwrap();
+        cache.done_tx.send(Loaded { picture: p.clone(), side: 256, image: copy(256) }).unwrap();
+        let d = frame(&ctx, |ctx| {
+            cache.begin_frame(ctx);
+            cache.texture(ctx, &p, &preview, 200.0, false);
+        });
+        assert_eq!((d.set.len(), d.free.len()), (1, 0), "one copy, the bigger");
+        assert_eq!(cache.entries[&p].tex.as_ref().map(|(s, _)| *s), Some(256));
+
+        // It goes off screen past `DROP_AFTER` while a bigger copy
+        // finishes: the old copy goes, the new one is not made.
+        let e = cache.entries.get_mut(&p).unwrap();
+        e.seen_at -= DROP_AFTER * 2;
+        e.seen = cache.tick.saturating_sub(10);
+        cache.done_tx.send(Loaded { picture: p.clone(), side: 512, image: copy(512) }).unwrap();
+        let d = frame(&ctx, |ctx| cache.begin_frame(ctx));
+        assert!(!made_and_freed(&d));
+        assert_eq!((d.set.len(), d.free.len()), (0, 1));
+    }
 
     #[test]
     fn sizes_step_in_powers_of_two_within_the_picture() {
