@@ -46,6 +46,11 @@ pub struct OverlayCache {
 impl OverlayCache {
     pub fn new() -> Self { Self::default() }
 
+    /// Stored pictures are still loading at their on-screen size.
+    pub fn pictures_busy(&self) -> bool {
+        self.pictures.busy()
+    }
+
     /// Ensure a thumbnail texture exists for the given layer. Returns
     /// `None` for empty layers (no strokes / shapes / image) so the
     /// hover popup can render a placeholder instead. Fingerprint =

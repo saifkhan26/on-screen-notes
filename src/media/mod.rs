@@ -214,10 +214,25 @@ impl MediaHub {
         })
     }
 
-    /// True while a GIF or video on screen is playing or waiting for a
-    /// frame, so the app keeps drawing frames for it.
-    pub fn is_animating(&self) -> bool {
-        self.entries.keys().any(|id| self.status(*id).is_some_and(|s| s.playing || s.loading))
+    /// How soon a GIF or video on screen shows its next frame, while one
+    /// is playing or waiting for a frame. The app repaints by this rather
+    /// than flat out: a GIF changes a few dozen times a second at most,
+    /// and drawing a thousand frames a second for it kept the GPU busy.
+    pub fn next_frame_in(&self) -> Option<Duration> {
+        let mut soonest: Option<f64> = None;
+        for (id, e) in &self.entries {
+            let next = match &e.player {
+                Player::Gif(p) => p.next_change_in(),
+                Player::Video(_) => self.status(*id).filter(|s| s.playing || s.loading).map(|s| {
+                    let [num, den] = e.meta.map_or([30, 1], |m| m.frame_rate);
+                    if s.loading || num == 0 { 0.05 } else { f64::from(den.max(1)) / f64::from(num) }
+                }),
+            };
+            if let Some(n) = next {
+                soonest = Some(soonest.map_or(n, |s| s.min(n)));
+            }
+        }
+        soonest.map(|s| Duration::from_secs_f64(s.clamp(0.0, 1.0)))
     }
 
     pub fn command(&mut self, id: u64, cmd: Cmd) {

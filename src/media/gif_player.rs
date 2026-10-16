@@ -230,6 +230,19 @@ impl GifPlayer {
         self.frames.get(self.index).map(|f| &f.image)
     }
 
+    /// Seconds until the frame shown changes, while playing: the app
+    /// paces its repaints by this instead of drawing flat out.
+    pub fn next_change_in(&self) -> Option<f64> {
+        if !self.playing {
+            return None;
+        }
+        if self.frames.len() < 2 {
+            // Still decoding: look again shortly for more frames.
+            return (!self.done()).then_some(0.05);
+        }
+        Some((self.frames[self.index].delay - self.into_frame).max(0.0))
+    }
+
     fn seek(&mut self, secs: f64) {
         if self.frames.is_empty() { return; }
         let secs = secs.max(0.0);
@@ -333,5 +346,19 @@ mod tests {
         assert_eq!(p.index, 0);
         p.command(Cmd::Seek { secs: 0.25, preview: false });
         assert_eq!(p.index, 1);
+    }
+
+    #[test]
+    fn says_when_the_next_frame_is_due() {
+        let mut p = player(&[0.1, 0.2, 0.1]);
+        let t0 = Instant::now();
+        p.tick(t0);
+        p.tick(t0 + std::time::Duration::from_millis(150));
+        // Frame 1 (0.2 s) has shown for 0.05 s.
+        let left = p.next_change_in().unwrap();
+        assert!((left - 0.15).abs() < 1e-6, "{left}");
+        p.command(Cmd::TogglePlay);
+        assert_eq!(p.next_change_in(), None, "a paused GIF needs no frames");
+        assert_eq!(player(&[0.1]).next_change_in(), None, "nor does a single frame");
     }
 }

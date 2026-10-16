@@ -365,6 +365,18 @@ impl Shape {
         }
     }
 
+    /// Whether the shape moves by itself on screen — a marching-ants
+    /// border — so the view has to keep repainting while it shows.
+    pub fn animates(&self) -> bool {
+        matches!(
+            self,
+            Shape::Rect { border: BorderStyle::DashedAnimated, .. }
+                | Shape::Ellipse { border: BorderStyle::DashedAnimated, .. }
+                | Shape::Line { border: BorderStyle::DashedAnimated, .. }
+                | Shape::Arrow { border: BorderStyle::DashedAnimated, .. }
+        )
+    }
+
     /// The media-folder file this shape needs, if any: a video or GIF,
     /// or the full-size pixels of a stored picture. Slide-delete cleanup
     /// keeps every file some shape still names.

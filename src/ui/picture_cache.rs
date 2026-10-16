@@ -226,6 +226,12 @@ impl PictureCache {
         id
     }
 
+    /// Pictures are still being loaded or uploaded, so frames should keep
+    /// coming for them to sharpen.
+    pub fn busy(&self) -> bool {
+        !self.ready.is_empty() || self.entries.values().any(|e| e.pending > 0)
+    }
+
     fn ask(&mut self, picture: &PictureRef, side: u32) {
         if !self.workers_started {
             self.workers_started = true;

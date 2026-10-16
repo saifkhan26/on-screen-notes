@@ -367,6 +367,11 @@ impl CanvasManager {
         self.check_loading_done();
     }
 
+    /// Slides are still being read in the background.
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
     /// Wait until every slide is in memory.
     pub fn finish_loading(&mut self) {
         for idx in 0..self.canvases.len() {

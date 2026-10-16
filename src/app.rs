@@ -242,6 +242,14 @@ const PEN_OWNS_POINTER: Duration = Duration::from_millis(250);
 /// packets as it moves; this bridges the pauses of a hand held still.
 const PEN_NEARBY: Duration = Duration::from_secs(1);
 
+/// Frame interval when nothing on screen moves by itself. Frames keep
+/// coming this often because Wintab packets and global hotkeys are
+/// polled per frame; anything the user does with the mouse, keyboard or
+/// pen (whose driver moves the cursor as the pen comes into range) wakes
+/// egui at once anyway. Every frame redraws the whole window, so at the
+/// display's refresh rate an idle overlay kept the GPU a quarter busy.
+const IDLE_TICK: Duration = Duration::from_millis(100);
+
 /// The monitor's refresh period, or 60 Hz when Windows does not say.
 fn refresh_period(hwnd: isize) -> Duration {
     let hz = crate::platform::refresh_rate_hz(hwnd).unwrap_or(60).clamp(30, 500);
@@ -722,12 +730,11 @@ impl OnScreenNotesApp {
     }
 
     /// Whether the next frame should come at once rather than at the
-    /// idle pace: the pen is in range or drawing, a button is held, a
-    /// gesture, capture or recording is under way, or something on
-    /// screen moves by itself.
+    /// idle pace: the pen is drawing, a button is held, or a gesture,
+    /// capture or recording is under way — whatever needs the lowest
+    /// latency.
     fn needs_live_frames(&self, ctx: &egui::Context) -> bool {
         self.pen.is_down()
-            || self.pen.seen_within(PEN_NEARBY)
             || self.mouse_gesture
             || ctx.input(|i| i.pointer.any_down())
             || self.tool.in_progress_stroke.is_some()
@@ -741,8 +748,43 @@ impl OnScreenNotesApp {
             || self.pending_lasso.is_some()
             || self.recorder.is_recording()
             || self.loupe.is_some()
+            // Polls the mouse button itself while the overlay is
+            // click-through, so it gets no input events.
+            || self.pin_picking
+    }
+
+    /// Whether frames should come every display refresh: the pen is in
+    /// range, something on screen changes by itself, or work in flight
+    /// shows progress.
+    fn needs_steady_frames(&self) -> bool {
+        let canvas = self.canvases.active();
+        self.pen.seen_within(PEN_NEARBY)
             || !self.tool.laser_strokes.is_empty()
-            || self.media.is_animating()
+            || !self.pureref_jobs.is_empty()
+            || !self.media_imports.is_empty()
+            || self.canvases.is_loading()
+            || self.overlay_cache.pictures_busy()
+            || canvas.layers.iter().any(|l| l.visible && l.shapes.iter().any(crate::canvas::shape::Shape::animates))
+    }
+
+    /// How long until the next frame is due; `None` means at once. Live
+    /// work (drawing, gestures) gets every frame it can; a pen in range
+    /// and things that move get one per display refresh; a playing GIF
+    /// or video gets its own frame times, never above the refresh rate;
+    /// otherwise a slow idle tick.
+    fn next_frame_in(&self, ctx: &egui::Context) -> Option<Duration> {
+        if self.needs_live_frames(ctx) {
+            return None;
+        }
+        let refresh = self.idle_frame;
+        let mut wait = IDLE_TICK;
+        if self.needs_steady_frames() {
+            wait = wait.min(refresh);
+        }
+        if let Some(media) = self.media.next_frame_in() {
+            wait = wait.min(media.max(refresh));
+        }
+        Some(wait)
     }
 
     // -- Space-drag gestures ---------------------------------------------
@@ -2939,20 +2981,25 @@ impl eframe::App for OnScreenNotesApp {
         //     once. `request_repaint()` with no delay is what minimises
         //     pen-to-pixel latency — with Mailbox present mode each
         //     refresh shows the newest frame.
-        //   * Otherwise one frame per display refresh. With no frame cap
-        //     an idle overlay drew 1000+ fps and kept a core busy. The
-        //     slower pace still drains Wintab well before a pen coming
-        //     into range touches down (its driver moves the mouse too,
-        //     which wakes egui at once), runs toasts and other timers,
-        //     and input events still repaint immediately.
-        if self.needs_live_frames(ctx) {
-            ctx.request_repaint();
-        } else {
-            // egui takes `predicted_dt` (1/60 s unless set) off every
-            // delay to aim for the frame *before* the deadline, which
-            // turns a one-refresh delay into no delay at all. Add it back.
-            let predicted = Duration::try_from_secs_f32(ctx.input(|i| i.predicted_dt)).unwrap_or_default();
-            ctx.request_repaint_after(self.idle_frame + predicted);
+        //   * Otherwise as `next_frame_in` paces them: per refresh while
+        //     the pen is in range or something moves, at a GIF's or
+        //     video's own frame times, else a slow idle tick. Uncapped,
+        //     an idle overlay drew 1000+ fps; at the refresh rate it
+        //     still kept the GPU a quarter busy redrawing an unchanged
+        //     window. The slow pace still drains Wintab well before a pen
+        //     coming into range touches down (its driver moves the mouse
+        //     too, which wakes egui at once), runs toasts and other
+        //     timers, and input events still repaint immediately.
+        match self.next_frame_in(ctx) {
+            None => ctx.request_repaint(),
+            Some(wait) => {
+                // egui takes `predicted_dt` (1/60 s unless set) off every
+                // delay to aim for the frame *before* the deadline, which
+                // turns a one-refresh delay into no delay at all. Add it
+                // back.
+                let predicted = Duration::try_from_secs_f32(ctx.input(|i| i.predicted_dt)).unwrap_or_default();
+                ctx.request_repaint_after(wait + predicted);
+            }
         }
     }
 
