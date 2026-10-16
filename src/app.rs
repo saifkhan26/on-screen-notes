@@ -400,17 +400,12 @@ impl OnScreenNotesApp {
         }
 
         let config = crate::persistence::load_config();
-        let mut canvases = CanvasManager::load_or_default(&config);
-        // A slide that failed to load is the user's work in a state we
-        // could not read — say so on screen rather than only in the log.
-        let load_toast = {
-            let errs = canvases.take_load_errors();
-            match errs.len() {
-                0 => None,
-                1 => Some(errs[0].clone()),
-                n => Some(format!("{n} slides could not be read — originals kept beside them (*.unreadable-…)")),
-            }
-        };
+        // Before any slide is read: stroke caches built while loading
+        // read the curve from this global.
+        crate::canvas::stroke::set_pressure_curve(config.pressure_curve);
+        // Reads the first slide now; the rest follow on background
+        // threads so the window does not wait for them.
+        let canvases = CanvasManager::start_loading(&config);
         let tool = ActiveTool::from_config(&config);
 
         // Capture window/display handles into our holder; pen module needs them.
@@ -448,10 +443,6 @@ impl OnScreenNotesApp {
 
         // Capture level before `config` is moved into the struct below.
         let level = config.smoothing_level;
-        // Push the persisted pressure-curve value into the global
-        // atomic so stroke caches built before the first render pick
-        // it up.
-        crate::canvas::stroke::set_pressure_curve(config.pressure_curve);
         let mut eraser_override = ActiveTool::from_config(&config);
         eraser_override.kind = crate::tools::ToolKind::Eraser;
 
@@ -503,7 +494,7 @@ impl OnScreenNotesApp {
             osn_hwnd,
             recorder: crate::recording::Recorder::default(),
             ui_visible_before_record: true,
-            toast: load_toast.map(|m| (m, std::time::Instant::now())),
+            toast: None,
             pending_screenshot: None,
             pending_lasso: None,
             region_select: None,
@@ -1456,6 +1447,21 @@ impl eframe::App for OnScreenNotesApp {
             crate::platform::set_no_activate(self.osn_hwnd);
             self.first_frame = false;
             log::info!("on-screen-notes started: overlay visible, input enabled");
+        }
+
+        // ---- Slides still loading ---------------------------------------
+        // Take in what the background loader finished. A slide that failed
+        // to load is the user's work in a state we could not read — say
+        // so on screen rather than only in the log (reported once every
+        // slide is in).
+        self.canvases.poll_loads();
+        let errs = self.canvases.take_load_errors();
+        if !errs.is_empty() {
+            let msg = match errs.len() {
+                1 => errs[0].clone(),
+                n => format!("{n} slides could not be read — originals kept beside them (*.unreadable-…)"),
+            };
+            self.toast = Some((msg, std::time::Instant::now()));
         }
 
         // ---- Always-on subsystems ----------------------------------------
