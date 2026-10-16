@@ -25,6 +25,14 @@
 use crate::canvas::canvas::Canvas;
 use crate::tools::{ActiveTool, ToolKind};
 
+/// Canvas zoom range: 0.1 % to 100 000 %, wide enough not to be in the
+/// way (a big PureRef board fits at a fraction of a percent). Zoom is
+/// still bounded: at 0 the maths divides by zero, and far past these
+/// the f32 canvas coordinates run out of precision and ink jitters.
+/// Other code already treats 0.001 as the smallest zoom.
+pub const MIN_ZOOM: f32 = 0.001;
+pub const MAX_ZOOM: f32 = 1000.0;
+
 /// Apply `notches` wheel steps (signed integer — positive = wheel up).
 /// Step sizes are tuned for gradual, fine-grained control: one notch
 /// nudges the value just enough to feel responsive without overshooting.
@@ -87,12 +95,45 @@ pub fn handle_scroll(
         // proportionally.
         let factor: f32 = 1.10_f32.powf(raw_delta_y);
         let z_old = canvas.zoom;
-        let z_new = (z_old * factor).clamp(0.1, 16.0);
-        if (z_new - z_old).abs() < 1e-4 { return; }
+        let z_new = (z_old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        // Relative, so a step still registers at tiny zoom levels.
+        if (z_new / z_old - 1.0).abs() < 1e-4 { return; }
         let cx = (cursor_screen[0] - canvas.pan[0]) / z_old;
         let cy = (cursor_screen[1] - canvas.pan[1]) / z_old;
         canvas.zoom = z_new;
         canvas.pan[0] = cursor_screen[0] - cx * z_new;
         canvas.pan[1] = cursor_screen[1] - cy * z_new;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wheel(steps: i32, delta: f32, tool: &mut ActiveTool, canvas: &mut Canvas) {
+        let mut bg = 0.5;
+        for _ in 0..steps {
+            handle_scroll(0, delta, [100.0, 100.0], false, false, tool, canvas, &mut bg);
+        }
+    }
+
+    #[test]
+    fn zoom_reaches_far_past_the_old_limits_and_stops_at_the_new_ones() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = ToolKind::Select;
+        let mut canvas = Canvas::default();
+        wheel(60, 1.0, &mut tool, &mut canvas);
+        assert!(canvas.zoom > 100.0, "well past the old 16x: {}", canvas.zoom);
+        wheel(200, 1.0, &mut tool, &mut canvas);
+        assert_eq!(canvas.zoom, MAX_ZOOM);
+        // Out again, through the tiny levels where an absolute "too
+        // small a step" test used to stall.
+        wheel(400, -1.0, &mut tool, &mut canvas);
+        assert_eq!(canvas.zoom, MIN_ZOOM);
+        // The point under the cursor stays put.
+        let under = [(100.0 - canvas.pan[0]) / canvas.zoom, (100.0 - canvas.pan[1]) / canvas.zoom];
+        wheel(5, 1.0, &mut tool, &mut canvas);
+        let after = [(100.0 - canvas.pan[0]) / canvas.zoom, (100.0 - canvas.pan[1]) / canvas.zoom];
+        assert!((under[0] - after[0]).abs() < 1e-2 * under[0].abs().max(1.0), "{under:?} vs {after:?}");
     }
 }

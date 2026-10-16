@@ -465,30 +465,60 @@ fn paint_shape(
             // at startup; egui silently falls back to Proportional
             // when the family is unknown, so this is safe regardless
             // of whether a font file is bundled.
-            let font_id = egui::FontId::new(size, egui::FontFamily::Name("handwritten".into()));
+            let family = egui::FontFamily::Name("handwritten".into());
             // 1.25 × font_size is the standard "comfortable reading"
             // line height; matches what most browsers default to.
             let line_h = size * 1.25;
             let top_left = to_screen(*pos);
-            if *rotation == 0.0 {
-                for (i, line) in content.split('\n').enumerate() {
-                    let lp = egui::pos2(top_left.x, top_left.y + i as f32 * line_h);
-                    painter.text(lp, egui::Align2::LEFT_TOP, line, font_id.clone(), c);
-                }
-            } else {
-                // Each line is its own galley turned about its top-left,
-                // stepped down the label's turned "down" direction so
-                // the lines stay stacked.
-                let (rs, rc) = rotation.sin_cos();
-                for (i, line) in content.split('\n').enumerate() {
-                    let d = i as f32 * line_h;
-                    let lp = egui::pos2(top_left.x - rs * d, top_left.y + rc * d);
-                    let galley = painter.layout_no_wrap(line.to_string(), font_id.clone(), c);
-                    painter.add(egui::epaint::TextShape::new(lp, galley, c).with_angle(*rotation));
-                }
+            // Each line is its own galley turned about its top-left,
+            // stepped down the label's turned "down" direction so the
+            // lines stay stacked.
+            let (rs, rc) = rotation.sin_cos();
+            for (i, line) in content.split('\n').enumerate() {
+                let d = i as f32 * line_h;
+                let lp = egui::pos2(top_left.x - rs * d, top_left.y + rc * d);
+                paint_text_line(painter, lp, line, size, &family, c, *rotation);
             }
         }
     }
+}
+
+/// Largest text, in physical pixels, that glyphs are rasterised at.
+/// egui draws each glyph into its font atlas at the size it is shown and
+/// panics on one wider than the atlas (about 8k pixels), which zooming
+/// far into a label would reach; bigger text is laid out at this size
+/// and its mesh stretched, so it is a little soft but the right size.
+const MAX_GLYPH_PX: f32 = 512.0;
+
+/// One line of a text label, `size` logical px tall, its top-left at
+/// `lp`, turned by `angle` about that corner.
+fn paint_text_line(
+    painter: &egui::Painter,
+    lp: egui::Pos2,
+    line: &str,
+    size: f32,
+    family: &egui::FontFamily,
+    color: egui::Color32,
+    angle: f32,
+) {
+    let ctx = painter.ctx();
+    let ppp = ctx.pixels_per_point();
+    let drawn = size.min(MAX_GLYPH_PX / ppp);
+    let galley = painter.layout_no_wrap(line.to_string(), egui::FontId::new(drawn, family.clone()), color);
+    let shape = egui::epaint::TextShape::new(lp, galley, color).with_angle(angle);
+    if drawn >= size {
+        painter.add(shape);
+        return;
+    }
+    let (tex_size, discs) = ctx.fonts(|f| (f.font_image_size(), f.texture_atlas().lock().prepared_discs()));
+    let options = ctx.tessellation_options(|o| *o);
+    let mut mesh = egui::Mesh::default();
+    egui::epaint::Tessellator::new(ppp, options, tex_size, discs).tessellate_text(&shape, &mut mesh);
+    let k = size / drawn;
+    for v in &mut mesh.vertices {
+        v.pos = lp + (v.pos - lp) * k;
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Outline of a rounded box centred on the origin, as points in the
