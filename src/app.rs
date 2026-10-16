@@ -2919,7 +2919,11 @@ impl eframe::App for OnScreenNotesApp {
         if self.needs_live_frames(ctx) {
             ctx.request_repaint();
         } else {
-            ctx.request_repaint_after(self.idle_frame);
+            // egui takes `predicted_dt` (1/60 s unless set) off every
+            // delay to aim for the frame *before* the deadline, which
+            // turns a one-refresh delay into no delay at all. Add it back.
+            let predicted = Duration::try_from_secs_f32(ctx.input(|i| i.predicted_dt)).unwrap_or_default();
+            ctx.request_repaint_after(self.idle_frame + predicted);
         }
     }
 
