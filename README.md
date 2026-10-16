@@ -157,7 +157,7 @@ layer makes that layer the active one.
 | Drag the knob above the frame | Rotate (`Shift` snaps to 15°) |
 | `Delete` / `Backspace` | Delete the selection |
 | `Ctrl+D` | Duplicate |
-| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste (works across slides and layers) |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste (works across slides and layers; on Windows the copy also pastes as a picture in other apps) |
 | `Ctrl+V` with an image on the clipboard | Paste it as an image object |
 | `Ctrl+↑` / `Ctrl+↓` | Bring to front / send to back |
 | Pick a palette colour, move the size slider | Recolour / change line width of the selection |
@@ -187,6 +187,16 @@ Every action is one undo step. Things worth knowing:
 - Objects on different layers cannot be in one selection.
 - Pasting an image-only clipboard works on Windows; elsewhere the
   clipboard must also carry text for the paste to be noticed.
+- **Copying into other apps (Windows).** `Ctrl+C` / `Ctrl+X` also put
+  the selection on the clipboard as a picture, so it pastes into Krita,
+  Photoshop, a browser or a chat. A single picture goes over at its full
+  size, as its original pixels (a PureRef picture with its crop and
+  mirror, a video or GIF as the frame it shows). Anything else goes
+  over as drawn, at its on-screen sharpness, cropped to the selection,
+  on a transparent background; text labels are left out of it for now.
+  Pasting back into this app still pastes the objects themselves, not
+  a flattened picture of them. A big picture takes a moment to reach
+  the clipboard.
 
 ---
 

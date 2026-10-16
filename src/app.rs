@@ -223,6 +223,10 @@ pub struct OnScreenNotesApp {
     media_dialog: Option<std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>>,
     /// PureRef boards being read, each becoming a new slide.
     pureref_jobs: Vec<crate::media::pureref::OpenJob>,
+    /// The picture the last in-app copy put on the OS clipboard, so a
+    /// paste that finds it there pastes the objects instead. Set by the
+    /// thread that builds it.
+    clip_image: std::sync::Arc<std::sync::Mutex<Option<crate::clipboard::Fingerprint>>>,
 }
 
 /// How long after the pen was last used the pointer still counts as
@@ -521,6 +525,7 @@ impl OnScreenNotesApp {
             media_waiting: Vec::new(),
             media_dialog: None,
             pureref_jobs: Vec::new(),
+            clip_image: Default::default(),
         }
     }
 
@@ -989,6 +994,8 @@ impl OnScreenNotesApp {
                     Ok(()) => {}
                     Err(e) => log::warn!("could not mark the clipboard: {e}"),
                 }
+                #[cfg(target_os = "windows")]
+                self.copy_image_to_clipboard(pixels_per_point);
                 if matches!(action, SelAction::Cut) {
                     let c = self.canvases.active_mut();
                     let li = c.active_layer;
@@ -996,28 +1003,78 @@ impl OnScreenNotesApp {
                     self.tool.select.sel.clear();
                 }
             }
-            SelAction::PasteObjects => {
-                self.paste_count += 1;
-                let d = step * self.paste_count as f32;
-                let (strokes, shapes) = self.obj_clipboard.clone();
-                self.insert_and_select(strokes, shapes, [d, d]);
-            }
-            SelAction::PasteImage => self.paste_clipboard_image(canvas_rect, pixels_per_point),
+            SelAction::PasteObjects => self.paste_objects(step),
+            SelAction::PasteImage => self.paste_clipboard_image(canvas_rect, pixels_per_point, step),
             // A selection command with nothing selected.
             _ => {}
         }
         self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
+    /// Paste the in-app clipboard's objects, each paste a step further
+    /// along so repeated pastes fan out.
+    fn paste_objects(&mut self, step: f32) {
+        self.paste_count += 1;
+        let d = step * self.paste_count as f32;
+        let (strokes, shapes) = self.obj_clipboard.clone();
+        self.insert_and_select(strokes, shapes, [d, d]);
+    }
+
+    /// Put the objects just copied on the OS clipboard as a picture too,
+    /// for pasting into other apps (see `crate::clipboard`). Built on a
+    /// thread: decoding and encoding a big picture takes a moment, and
+    /// until it lands the clipboard holds the text marker. Windows only:
+    /// elsewhere pasting an image raises no event the app can catch
+    /// (`platform::paste_chord_down`), and in-app paste needs the marker.
+    #[cfg(target_os = "windows")]
+    fn copy_image_to_clipboard(&self, pixels_per_point: f32) {
+        let (strokes, shapes) = self.obj_clipboard.clone();
+        let zoom = self.canvases.active().zoom;
+        let frames = self.media.current_frames();
+        let media_dir = crate::persistence::paths::media_dir().ok();
+        let mark = std::sync::Arc::clone(&self.clip_image);
+        *mark.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let spawned = std::thread::Builder::new().name("osn-copy-image".into()).spawn(move || {
+            let Some(img) = crate::clipboard::image_of(strokes, shapes, zoom, pixels_per_point, &frames, media_dir.as_deref()) else {
+                return;
+            };
+            let (w, h) = (img.width() as usize, img.height() as usize);
+            let bytes = img.into_raw();
+            let Ok(mut cb) = arboard::Clipboard::new() else { return };
+            // Whatever the user copied elsewhere in the meantime wins.
+            if cb.get_text().ok().as_deref() != Some(CLIP_MARKER) {
+                return;
+            }
+            // Marked first, so a paste right after the image lands
+            // already knows it.
+            let fp = crate::clipboard::fingerprint(w, h, &bytes);
+            *mark.lock().unwrap_or_else(|e| e.into_inner()) = Some(fp);
+            let image = arboard::ImageData { width: w, height: h, bytes: std::borrow::Cow::Owned(bytes) };
+            if let Err(e) = cb.set_image(image) {
+                log::warn!("could not put the copy on the clipboard as a picture: {e}");
+                *mark.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        });
+        if let Err(e) = spawned {
+            log::warn!("could not start copying a picture: {e}");
+        }
+    }
+
     /// Paste an image from the OS clipboard onto the active layer as an
     /// image object, centred in the view at its natural on-screen size
     /// (shrunk to fit if it is larger than the view). Silently does
-    /// nothing when the clipboard holds no image.
-    fn paste_clipboard_image(&mut self, canvas_rect: egui::Rect, pixels_per_point: f32) {
+    /// nothing when the clipboard holds no image. The picture of an
+    /// in-app copy pastes as the objects it was made from instead.
+    fn paste_clipboard_image(&mut self, canvas_rect: egui::Rect, pixels_per_point: f32, step: f32) {
         let img = match arboard::Clipboard::new().and_then(|mut cb| cb.get_image()) {
             Ok(img) => img,
             Err(_) => return,
         };
+        let own = *self.clip_image.lock().unwrap_or_else(|e| e.into_inner());
+        if own.is_some() && own == Some(crate::clipboard::fingerprint(img.width, img.height, &img.bytes)) {
+            self.paste_objects(step);
+            return;
+        }
         let (w, h) = (img.width as u32, img.height as u32);
         let Some(rgba) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else { return };
         if w == 0 || h == 0 { return; }
