@@ -20,6 +20,7 @@ pub mod stroke;
 
 use crate::canvas::canvas::Canvas;
 use crate::config::AppConfig;
+use crate::persistence::SlideView;
 use std::collections::HashSet;
 
 /// Top-level holder for all canvases.
@@ -45,6 +46,9 @@ pub struct CanvasManager {
     /// without the deleted slide, and only after that may its media go —
     /// a crash in between must not leave a slide whose videos are gone.
     media_cleanup_due: bool,
+    /// Every slide's view as `views.ron` last received it, to tell when
+    /// the file needs writing again.
+    saved_views: Vec<SlideView>,
 }
 
 /// Stand-in for a slot whose file is missing or unreadable. It keeps
@@ -105,6 +109,8 @@ impl CanvasManager {
                 canvases.push(Canvas::default());
             }
         }
+        apply_views(&mut canvases, &crate::persistence::load_views());
+        let saved_views = views_of(&canvases);
         Self {
             canvases,
             active: 0,
@@ -113,7 +119,35 @@ impl CanvasManager {
             prune_orphans: false,
             media_to_check: HashSet::new(),
             media_cleanup_due: false,
+            saved_views,
         }
+    }
+
+    /// A manager over `canvases` that has touched no file.
+    #[cfg(test)]
+    pub(crate) fn for_tests(canvases: Vec<Canvas>) -> Self {
+        let saved_views = views_of(&canvases);
+        Self {
+            canvases,
+            active: 0,
+            load_errors: Vec::new(),
+            protected: Vec::new(),
+            prune_orphans: false,
+            media_to_check: HashSet::new(),
+            media_cleanup_due: false,
+            saved_views,
+        }
+    }
+
+    /// Every slide's view, if any changed since `views.ron` was last
+    /// written; they then count as written.
+    fn take_changed_views(&mut self) -> Option<Vec<SlideView>> {
+        let views = views_of(&self.canvases);
+        if views == self.saved_views {
+            return None;
+        }
+        self.saved_views = views.clone();
+        Some(views)
     }
 
     /// Slides that failed to load at startup, one message each. Returns
@@ -135,6 +169,17 @@ impl CanvasManager {
         let c = &mut self.canvases[self.active];
         c.dirty = true;
         c
+    }
+
+    /// The active canvas's pan and zoom, for moving the view. Unlike
+    /// `active_mut` this does not flag the canvas for the autosave:
+    /// looking around is not an edit, and rewriting a big slide every
+    /// few seconds while the user pans and zooms cost seconds of CPU
+    /// per save. The autosave writes views to their own small file
+    /// instead (`persistence::save_views`).
+    pub fn active_view_mut(&mut self) -> (&mut [f32; 2], &mut f32) {
+        let c = &mut self.canvases[self.active];
+        (&mut c.pan, &mut c.zoom)
     }
 
     /// Read-only access to the active canvas (used by renderer + screenshot).
@@ -253,6 +298,13 @@ impl CanvasManager {
     /// whose file name is not known yet, so no media is deleted now —
     /// what is left waits for `save_all_blocking` at exit.
     pub fn save_all(&mut self, media_in_use: Option<&HashSet<String>>) {
+        if let Some(views) = self.take_changed_views() {
+            std::thread::spawn(move || {
+                if let Err(e) = crate::persistence::save_views(&views) {
+                    log::warn!("failed to save slide views: {e}");
+                }
+            });
+        }
         // Collect dirty canvases as (index, clone). We need to clone
         // because the worker thread owns them while serialising — the
         // UI thread keeps drawing meanwhile. A clone of a PNG-bearing
@@ -322,6 +374,11 @@ impl CanvasManager {
     /// dirty canvas hits disk so a forced kill after `on_exit` can't
     /// drop edits.
     pub fn save_all_blocking(&mut self) {
+        if let Some(views) = self.take_changed_views() {
+            if let Err(e) = crate::persistence::save_views(&views) {
+                log::warn!("failed to save slide views: {e}");
+            }
+        }
         for (i, c) in self.canvases.iter_mut().enumerate() {
             if !c.dirty || self.protected.contains(&i) { continue; }
             if let Err(e) = crate::persistence::save_canvas(i, c) {
@@ -339,6 +396,24 @@ impl CanvasManager {
             self.media_cleanup_due = false;
             let unused = self.unused_media(&HashSet::new());
             delete_media_files(&unused);
+        }
+    }
+}
+
+fn views_of(canvases: &[Canvas]) -> Vec<SlideView> {
+    canvases.iter().map(|c| SlideView { pan: c.pan, zoom: c.zoom }).collect()
+}
+
+/// Give each slide the view `views.ron` has for it. Anything that is not
+/// a usable view (a damaged or hand-edited file) is skipped, leaving the
+/// view stored in the slide's own file.
+fn apply_views(canvases: &mut [Canvas], views: &[SlideView]) {
+    use crate::interaction::zoom_pan::{MAX_ZOOM, MIN_ZOOM};
+    for (c, v) in canvases.iter_mut().zip(views) {
+        let usable = v.pan.iter().all(|p| p.is_finite()) && (MIN_ZOOM..=MAX_ZOOM).contains(&v.zoom);
+        if usable {
+            c.pan = v.pan;
+            c.zoom = v.zoom;
         }
     }
 }
@@ -403,15 +478,7 @@ mod media_cleanup_tests {
     }
 
     fn manager(canvases: Vec<Canvas>) -> CanvasManager {
-        CanvasManager {
-            canvases,
-            active: 0,
-            load_errors: Vec::new(),
-            protected: Vec::new(),
-            prune_orphans: false,
-            media_to_check: HashSet::new(),
-            media_cleanup_due: false,
-        }
+        CanvasManager::for_tests(canvases)
     }
 
     fn names(v: &[&str]) -> HashSet<String> {
@@ -474,6 +541,50 @@ mod media_cleanup_tests {
 }
 
 #[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn clean() -> Canvas {
+        let mut c = Canvas::default();
+        c.dirty = false;
+        c
+    }
+
+    #[test]
+    fn moving_the_view_saves_the_views_but_not_the_slide() {
+        let mut m = CanvasManager::for_tests(vec![clean(), clean()]);
+        assert_eq!(m.take_changed_views(), None);
+        let (pan, zoom) = m.active_view_mut();
+        pan[0] += 10.0;
+        *zoom = 2.0;
+        assert!(!m.active().dirty, "a view change is not an edit");
+        let fresh = SlideView { pan: [0.0, 0.0], zoom: 1.0 };
+        assert_eq!(m.take_changed_views(), Some(vec![SlideView { pan: [10.0, 0.0], zoom: 2.0 }, fresh]));
+        assert_eq!(m.take_changed_views(), None, "written once, then quiet until the next change");
+        // A real edit still flags the slide.
+        m.active_mut();
+        assert!(m.active().dirty);
+    }
+
+    #[test]
+    fn stored_views_apply_unless_unusable() {
+        let mut canvases = vec![clean(), clean(), clean()];
+        canvases[2].zoom = 3.0;
+        let views = [
+            SlideView { pan: [5.0, -7.0], zoom: 0.25 },
+            SlideView { pan: [f32::NAN, 0.0], zoom: 2.0 },
+            SlideView { pan: [1.0, 1.0], zoom: 0.0 },
+            SlideView { pan: [9.0, 9.0], zoom: 9.0 }, // no such slide
+        ];
+        apply_views(&mut canvases, &views);
+        assert_eq!((canvases[0].pan, canvases[0].zoom), ([5.0, -7.0], 0.25));
+        assert_eq!((canvases[1].pan, canvases[1].zoom), ([0.0, 0.0], 1.0));
+        assert_eq!((canvases[2].pan, canvases[2].zoom), ([0.0, 0.0], 3.0));
+        assert!(canvases.iter().all(|c| !c.dirty));
+    }
+}
+
+#[cfg(test)]
 mod loader_tests {
     use super::*;
 
@@ -510,6 +621,16 @@ mod loader_tests {
         assert_eq!(std::fs::read_to_string(dir.join("canvas_1.ron")).unwrap(), "this is not a canvas");
         assert!(!dir.join("canvas_2.ron").exists());
         assert!(dir.join("canvas_3.ron").exists());
+        assert!(!dir.join("views.ron").exists(), "no view moved, nothing to write");
+
+        // Looking around a slide writes only the views, which the next
+        // start picks up.
+        let slide_0 = std::fs::read_to_string(dir.join("canvas_0.ron")).unwrap();
+        *m.active_view_mut().1 = 4.0;
+        m.save_all_blocking();
+        assert_eq!(std::fs::read_to_string(dir.join("canvas_0.ron")).unwrap(), slide_0);
+        let m = CanvasManager::load_or_default(&AppConfig::default());
+        assert_eq!(m.active().zoom, 4.0);
 
         std::env::remove_var("OSN_DATA_DIR");
         let _ = std::fs::remove_dir_all(&root);

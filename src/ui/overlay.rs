@@ -432,8 +432,8 @@ pub fn show(
                 }
                 let p = ui.painter_at(rect);
                 p.add(egui::Shape::mesh(mesh));
-                // Repaint each frame so the spotlight tracks live.
-                ctx.request_repaint();
+                // No repaint request needed to track the pointer: every
+                // pointer move is an input event, which repaints at once.
             }
 
             // Lasso-erase preview — dashed grey loop tracking the

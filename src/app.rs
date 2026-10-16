@@ -46,6 +46,9 @@ pub struct OnScreenNotesApp {
 
     /// Debounce timer for "save canvases to disk".
     last_save_at: Instant,
+    /// Gap between frames while nothing is happening: one refresh of
+    /// the monitor the overlay is on. See the end of `update`.
+    idle_frame: Duration,
 
     /// Set to false after the very first `update` runs. Used to push
     /// initial-state viewport commands (e.g. clear click-through).
@@ -233,6 +236,17 @@ pub struct OnScreenNotesApp {
 /// the pen's. Covers the gap between the pen lifting and the driver
 /// releasing the mouse button it was holding down for it.
 const PEN_OWNS_POINTER: Duration = Duration::from_millis(250);
+
+/// How long after its last Wintab packet the pen still counts as in
+/// range, keeping frames coming at full speed. A hovering pen sends
+/// packets as it moves; this bridges the pauses of a hand held still.
+const PEN_NEARBY: Duration = Duration::from_secs(1);
+
+/// The monitor's refresh period, or 60 Hz when Windows does not say.
+fn refresh_period(hwnd: isize) -> Duration {
+    let hz = crate::platform::refresh_rate_hz(hwnd).unwrap_or(60).clamp(30, 500);
+    Duration::from_secs_f64(1.0 / f64::from(hz))
+}
 
 /// Text put on the OS clipboard by an in-app copy. Seeing it come back
 /// in a paste means the newest thing the user copied is `obj_clipboard`.
@@ -497,6 +511,7 @@ impl OnScreenNotesApp {
             overlay_visible: true,
             mouse_was_down: false,
             last_save_at: Instant::now(),
+            idle_frame: Duration::from_secs_f64(1.0 / 60.0),
             first_frame: true,
             pan_drag_anchor: None,
             middle_pan_anchor: None,
@@ -711,6 +726,30 @@ impl OnScreenNotesApp {
         ctx.request_repaint();
     }
 
+    /// Whether the next frame should come at once rather than at the
+    /// idle pace: the pen is in range or drawing, a button is held, a
+    /// gesture, capture or recording is under way, or something on
+    /// screen moves by itself.
+    fn needs_live_frames(&self, ctx: &egui::Context) -> bool {
+        self.pen.is_down()
+            || self.pen.seen_within(PEN_NEARBY)
+            || self.mouse_gesture
+            || ctx.input(|i| i.pointer.any_down())
+            || self.tool.in_progress_stroke.is_some()
+            || self.tool.select.gesture.is_some()
+            || self.layer_xform.is_some()
+            || self.pan_drag_anchor.is_some()
+            || self.middle_pan_anchor.is_some()
+            || self.region_select.is_some()
+            || self.pending_screenshot.is_some()
+            || self.pending_freeze.is_some()
+            || self.pending_lasso.is_some()
+            || self.recorder.is_recording()
+            || self.loupe.is_some()
+            || !self.tool.laser_strokes.is_empty()
+            || self.media.is_animating()
+    }
+
     // -- Space-drag gestures ---------------------------------------------
 
     /// Begin a Space-drag. `layer_mode` is whether Shift was down at the
@@ -755,9 +794,9 @@ impl OnScreenNotesApp {
             // *after* the zoom scale.
             x.pan([dx / zoom, dy / zoom]);
         } else {
-            let c = self.canvases.active_mut();
-            c.pan[0] += dx;
-            c.pan[1] += dy;
+            let (pan, _) = self.canvases.active_view_mut();
+            pan[0] += dx;
+            pan[1] += dy;
         }
     }
 
@@ -1473,6 +1512,7 @@ impl eframe::App for OnScreenNotesApp {
             // gives the "click-through but OSN stays focused"
             // behaviour. No-op on non-Windows targets.
             crate::platform::set_no_activate(self.osn_hwnd);
+            self.idle_frame = refresh_period(self.osn_hwnd);
             self.first_frame = false;
             log::info!("on-screen-notes started: overlay visible, input enabled");
         }
@@ -2434,9 +2474,9 @@ impl eframe::App for OnScreenNotesApp {
             if let Some(b) = self.hotkeys_cfg.canvas.reset_view {
                 let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
                 if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
-                    let c = self.canvases.active_mut();
-                    c.zoom = 1.0;
-                    c.pan  = [0.0, 0.0];
+                    let (pan, zoom) = self.canvases.active_view_mut();
+                    *zoom = 1.0;
+                    *pan  = [0.0, 0.0];
                 }
             }
             if let Some(b) = self.hotkeys_cfg.canvas.freeze_frame {
@@ -2661,7 +2701,7 @@ impl eframe::App for OnScreenNotesApp {
                             ctrl,
                             shift,
                             &mut self.tool,
-                            self.canvases.active_mut(),
+                            &mut self.canvases,
                             &mut self.config.bg_opacity,
                         );
                     }
@@ -2877,18 +2917,33 @@ impl eframe::App for OnScreenNotesApp {
             if let Err(e) = crate::persistence::save_config(&self.config) {
                 log::warn!("config save failed: {e}");
             }
+            // The overlay may have moved to another monitor.
+            self.idle_frame = refresh_period(self.osn_hwnd);
             self.last_save_at = Instant::now();
         }
 
-        // Always request the next frame. Reasoning:
-        //   * Pen events come from a polled Wintab queue; we must call
-        //     `pen.poll()` every frame or packets pile up and feel laggy.
-        //   * Global hotkey events are also polled each frame.
-        //   * `request_repaint()` (no delay) is what minimises pen-to-pixel
-        //     latency — eframe will paint as fast as the display allows.
-        // Cost: continuous repaint when idle. Acceptable: this is a
-        // foreground drawing tool, not a background daemon.
-        ctx.request_repaint();
+        // Always request the next frame: pen events come from a polled
+        // Wintab queue and global hotkeys are polled too, so frames have
+        // to keep coming even when nothing on screen changes.
+        //   * While the pen is in range or anything is in motion, at
+        //     once. `request_repaint()` with no delay is what minimises
+        //     pen-to-pixel latency — with Mailbox present mode each
+        //     refresh shows the newest frame.
+        //   * Otherwise one frame per display refresh. With no frame cap
+        //     an idle overlay drew 1000+ fps and kept a core busy. The
+        //     slower pace still drains Wintab well before a pen coming
+        //     into range touches down (its driver moves the mouse too,
+        //     which wakes egui at once), runs toasts and other timers,
+        //     and input events still repaint immediately.
+        if self.needs_live_frames(ctx) {
+            ctx.request_repaint();
+        } else {
+            // egui takes `predicted_dt` (1/60 s unless set) off every
+            // delay to aim for the frame *before* the deadline, which
+            // turns a one-refresh delay into no delay at all. Add it back.
+            let predicted = Duration::try_from_secs_f32(ctx.input(|i| i.predicted_dt)).unwrap_or_default();
+            ctx.request_repaint_after(self.idle_frame + predicted);
+        }
     }
 
     /// Save state on graceful exit so nothing is lost.

@@ -214,6 +214,12 @@ impl MediaHub {
         })
     }
 
+    /// True while a GIF or video on screen is playing or waiting for a
+    /// frame, so the app keeps drawing frames for it.
+    pub fn is_animating(&self) -> bool {
+        self.entries.keys().any(|id| self.status(*id).is_some_and(|s| s.playing || s.loading))
+    }
+
     pub fn command(&mut self, id: u64, cmd: Cmd) {
         let Some(e) = self.entries.get_mut(&id) else { return };
         match &mut e.player {
