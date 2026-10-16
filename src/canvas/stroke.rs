@@ -424,6 +424,18 @@ pub struct StrokeCache {
     /// Per-point full width in canvas-local pixels. The renderer multiplies
     /// by the canvas's current zoom on each paint.
     pub widths: Vec<f32>,
+    /// Changes whenever `points` or `widths` change, and differs between
+    /// caches built separately, so the GPU ink cache can tell an edited
+    /// stroke from one it already holds. Copies of a cache share it,
+    /// which is right: their geometry is the same.
+    pub rev: u64,
+}
+
+/// Next value for `StrokeCache::rev`.
+fn next_cache_rev() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Stroke {
@@ -571,6 +583,7 @@ impl Stroke {
                 p[0] += d[0];
                 p[1] += d[1];
             }
+            c.rev = next_cache_rev();
         }
     }
 
@@ -598,6 +611,7 @@ impl Stroke {
             for w in &mut c.widths {
                 *w *= a;
             }
+            c.rev = next_cache_rev();
         }
     }
 
@@ -624,6 +638,7 @@ impl Stroke {
             for w in &mut c.widths {
                 *w *= s;
             }
+            c.rev = next_cache_rev();
         }
     }
 
@@ -638,6 +653,7 @@ impl Stroke {
             for w in &mut c.widths {
                 *w *= k;
             }
+            c.rev = next_cache_rev();
         }
     }
 
@@ -826,7 +842,7 @@ pub fn build_spine(samples: &[PenSample], base_width: f32, position_passes: usiz
 
     let n = samples.len();
     if n == 0 {
-        return StrokeCache { points: Vec::new(), widths: Vec::new() };
+        return StrokeCache { points: Vec::new(), widths: Vec::new(), rev: next_cache_rev() };
     }
     // Width at a node: base_width scaled by (curved) pressure, floored so a
     // near-zero-pressure sample still paints a hairline rather than nothing.
@@ -834,7 +850,7 @@ pub fn build_spine(samples: &[PenSample], base_width: f32, position_passes: usiz
     if n == 1 {
         let s = samples[0];
         let w = (base_width * apply_curve(s.pressure, curve).max(0.1)).max(0.8);
-        return StrokeCache { points: vec![s.pos], widths: vec![w] };
+        return StrokeCache { points: vec![s.pos], widths: vec![w], rev: next_cache_rev() };
     }
 
     // Pre-smooth raw control positions in sample-space (matches the old
@@ -930,7 +946,7 @@ pub fn build_spine(samples: &[PenSample], base_width: f32, position_passes: usiz
     // deliberate corners across the few decimated nodes).
     smooth_widths_causal(&mut widths);
 
-    StrokeCache { points, widths }
+    StrokeCache { points, widths, rev: next_cache_rev() }
 }
 
 #[cfg(test)]

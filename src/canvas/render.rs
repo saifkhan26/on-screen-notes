@@ -4,7 +4,13 @@
 //!    pushes the geometry as GPU triangles through `wgpu`. There is **no
 //!    CPU rasterisation and no per-frame texture upload**, which is what
 //!    keeps the live drawing surface low-latency. This is the path the
-//!    overlay uses every frame.
+//!    overlay uses every frame. Committed strokes skip egui when they
+//!    can: `canvas::ink_gpu` keeps them in GPU memory and draws them
+//!    with the same look, so a frame's cost no longer grows with the
+//!    stroke count. Everything else (the live stroke, laser trails,
+//!    shapes) is built here each frame, and ink that falls back to this
+//!    path is culled to the view, simplified when zoomed out and capped
+//!    by `MAX_INK_VERTICES`.
 //!
 //! 2. **`render_canvas`** — rasterises the canvas into a `tiny_skia::Pixmap`.
 //!    Used only by the screenshot pipeline (we need RGBA pixels to write a
@@ -23,6 +29,7 @@
 use crate::canvas::affine::Affine;
 use crate::canvas::canvas::Canvas;
 use crate::canvas::hit::Selection;
+use crate::canvas::ink_gpu;
 use crate::canvas::shape::{BorderStyle, Shape};
 use crate::canvas::stroke::{Stroke, StrokeStyle};
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -133,6 +140,13 @@ pub fn paint_canvas_egui(
     let pan_x = origin.x + view_pan[0];
     let pan_y = origin.y + view_pan[1];
     let to_screen = |p: [f32; 2]| egui::pos2(pan_x + p[0] * zoom, pan_y + p[1] * zoom);
+    // Strokes wholly outside this rect are not built at all. The margin
+    // covers the ribbon's feather and the minimum on-screen radius.
+    let view = painter.clip_rect().expand(4.0);
+    // Vertices committed ink may still add this frame; see
+    // `MAX_INK_VERTICES`.
+    let mut ink_budget = MAX_INK_VERTICES;
+    let mut over_budget = 0usize;
 
     // Paint each layer in stack order: index 0 paints first (bottom),
     // last layer paints last (top). Within a layer, shapes first then
@@ -164,6 +178,7 @@ pub fn paint_canvas_egui(
         // previewed layer needs its gesture scale folded in here too —
         // otherwise a layer shrinking under the wheel would keep
         // full-thickness ink until the gesture committed.
+        let view_zoom = zoom;
         let zoom = zoom * lscale;
         // Raster image (frozen frame) goes UNDER the layer's strokes
         // and shapes — it is the "background plate" the user is
@@ -213,17 +228,70 @@ pub fn paint_canvas_egui(
                 _ => paint_shape(painter, &to_screen, shape, zoom, op, tex),
             }
         }
-        for (si, stroke) in layer.strokes.iter().enumerate() {
-            match dragged {
-                Some((_, sel, m)) if sel.strokes.binary_search(&si).is_ok() => {
-                    // A stroke is all points: map each one on its way
-                    // to the screen instead of copying the stroke.
-                    let moved = |p: [f32; 2]| to_screen(m.apply(p));
-                    paint_stroke(painter, &moved, stroke, zoom * m.linear_scale(), position_passes, op);
+        let is_dragged = |si: usize| dragged.is_some_and(|(_, sel, _)| sel.strokes.binary_search(&si).is_ok());
+        // One stroke through egui, skipped when off screen or past the
+        // vertex budget.
+        let mut paint_egui = |si: usize, stroke: &Stroke| match dragged {
+            Some((_, sel, m)) if sel.strokes.binary_search(&si).is_ok() => {
+                // A stroke is all points: map each one on its way
+                // to the screen instead of copying the stroke.
+                let moved = |p: [f32; 2]| to_screen(m.apply(p));
+                let z = zoom * m.linear_scale();
+                let cost = stroke_vertex_cost(stroke, z);
+                if cost > ink_budget { over_budget += 1; return; }
+                ink_budget -= cost;
+                paint_stroke(painter, &moved, stroke, z, position_passes, op);
+            }
+            _ => {
+                if !stroke_on_screen(stroke, &to_screen, view) { return; }
+                let cost = stroke_vertex_cost(stroke, zoom);
+                if cost > ink_budget { over_budget += 1; return; }
+                ink_budget -= cost;
+                paint_stroke(painter, &to_screen, stroke, zoom, position_passes, op);
+            }
+        };
+        if ink_gpu::enabled() {
+            // Committed strokes come from the GPU ink cache in runs;
+            // whatever it cannot draw goes through egui in between, so
+            // the paint order stays the same.
+            let xf = ink_gpu::Xform { pan: [pan_x, pan_y], zoom: view_zoom, scale: lscale, off };
+            let mut run = ink_gpu::Run::new(xf);
+            for plan in ink_gpu::plan_layer(painter.ctx(), &layer.strokes, op) {
+                let range = plan.first..plan.first + plan.len;
+                let visible = plan.bbox.is_some_and(|[x0, y0, x1, y1]| {
+                    view.intersects(egui::Rect::from_two_pos(to_screen([x0, y0]), to_screen([x1, y1])))
+                });
+                let any_dragged = dragged.is_some_and(|(_, sel, _)| {
+                    let i = sel.strokes.partition_point(|&s| s < range.start);
+                    sel.strokes.get(i).is_some_and(|&s| s < range.end)
+                });
+                if plan.on_gpu && plan.all && !any_dragged {
+                    if visible {
+                        run.push(plan.key, plan.starts[0], plan.starts[plan.len]);
+                    }
+                    continue;
                 }
-                _ => paint_stroke(painter, &to_screen, stroke, zoom, position_passes, op),
+                for (j, stroke) in layer.strokes[range].iter().enumerate() {
+                    let si = plan.first + j;
+                    if plan.on_gpu && ink_gpu::drawable(stroke) && !is_dragged(si) {
+                        if visible {
+                            run.push(plan.key, plan.starts[j], plan.starts[j + 1]);
+                        }
+                        continue;
+                    }
+                    run.flush(painter);
+                    paint_egui(si, stroke);
+                }
+            }
+            run.flush(painter);
+        } else {
+            for (si, stroke) in layer.strokes.iter().enumerate() {
+                paint_egui(si, stroke);
             }
         }
+    }
+    if over_budget > 0 {
+        log::debug!("ink over its vertex budget: {over_budget} stroke(s) not drawn this frame");
     }
     // Previews always paint on top of every layer regardless of which
     // is active — the user expects to see their in-progress mark even
@@ -255,6 +323,120 @@ pub fn paint_canvas_egui(
             paint_stroke(painter, &to_screen, stroke, zoom, position_passes, alpha);
         }
     }
+}
+
+/// Most vertices committed ink may add in one frame. egui puts a frame's
+/// vertices and indices into one GPU buffer each, and wgpu treats a
+/// buffer over its 256 MB limit as fatal, which aborts the app. Four
+/// million vertices is about 80 MB, and the ribbon's 4.5 indices per
+/// vertex about 72 MB, leaving room for everything else on screen.
+/// Strokes past the budget are skipped for that frame.
+const MAX_INK_VERTICES: usize = 4_000_000;
+
+/// Zoomed out, ribbon nodes closer than this on screen are merged.
+const LOD_MIN_GAP_PX: f32 = 0.5;
+
+/// Whether any of `stroke` can land inside `view` (screen space).
+/// `to_screen` is a pan plus a positive uniform scale, so the bounding
+/// box's corners map to the screen box's corners.
+fn stroke_on_screen(
+    stroke: &Stroke,
+    to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
+    view: egui::Rect,
+) -> bool {
+    let Some([x0, y0, x1, y1]) = stroke.bounds() else { return false };
+    view.intersects(egui::Rect::from_two_pos(to_screen([x0, y0]), to_screen([x1, y1])))
+}
+
+/// Most vertices egui emits for one filled disc of radius `r` points:
+/// small discs are often a 4-vertex quad from the font atlas, otherwise
+/// a feathered polygon (`Path::add_circle`) with two vertices per point.
+fn disc_vertex_cost(r: f32) -> usize {
+    if r <= 2.0 { 18 } else if r <= 5.0 { 34 } else if r < 18.0 { 66 } else if r < 50.0 { 130 } else { 258 }
+}
+
+/// Upper estimate of the vertices `paint_stroke` emits for `stroke` at
+/// `zoom`, including the zoomed-out level of detail it applies.
+fn stroke_vertex_cost(stroke: &Stroke, zoom: f32) -> usize {
+    let Some(cache) = &stroke.cache else {
+        return stroke.samples.len().saturating_mul(32);
+    };
+    let n = cache.points.len();
+    let max_w = cache.widths.iter().copied().fold(stroke.base_width, f32::max);
+    let disc = disc_vertex_cost(max_w * 0.5 * zoom * 1.1);
+    if n <= 1 {
+        return disc;
+    }
+    let mut arc = 0.0_f32;
+    let mut stamps = 1.0_f32;
+    let k = match stroke.style {
+        StrokeStyle::Pencil => 0.20,
+        StrokeStyle::Airbrush => 0.10,
+        _ => 0.0,
+    };
+    for i in 0..n - 1 {
+        let (a, b) = (cache.points[i], cache.points[i + 1]);
+        let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        arc += len;
+        if k > 0.0 {
+            stamps += len / (0.5 * (cache.widths[i] + cache.widths[i + 1]) * k).max(0.5);
+        }
+    }
+    let fill = if stroke.filled { n * 3 } else { 0 };
+    match stroke.style {
+        StrokeStyle::Pencil | StrokeStyle::Airbrush => {
+            (stamps.ceil() as usize + 1).saturating_mul(disc) + fill
+        }
+        StrokeStyle::Default | StrokeStyle::Marker => {
+            let nodes = if zoom < 1.0 {
+                n.min((arc * zoom / LOD_MIN_GAP_PX).ceil() as usize + 2)
+            } else {
+                n
+            };
+            let fans = if FAN_CORNERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                nodes * disc
+            } else {
+                0
+            };
+            nodes * 4 + 2 * disc + fans + fill
+        }
+    }
+}
+
+/// Drop nodes closer than `min_gap` (canvas units) to the last node
+/// kept. The first and last nodes always stay, so the stroke still
+/// starts and ends where it did.
+fn decimate(points: &[[f32; 2]], widths: &[f32], min_gap: f32) -> (Vec<[f32; 2]>, Vec<f32>) {
+    let n = points.len();
+    if n <= 2 {
+        return (points.to_vec(), widths.to_vec());
+    }
+    let gap2 = min_gap * min_gap;
+    let mut pts = Vec::with_capacity(n);
+    let mut ws = Vec::with_capacity(n);
+    pts.push(points[0]);
+    ws.push(widths[0]);
+    for i in 1..n - 1 {
+        let l = pts[pts.len() - 1];
+        let p = points[i];
+        if (p[0] - l[0]).powi(2) + (p[1] - l[1]).powi(2) >= gap2 {
+            pts.push(p);
+            ws.push(widths[i]);
+        }
+    }
+    // Keep the end node; if the last interior node kept sits right on
+    // top of it, the end replaces it.
+    if pts.len() > 1 {
+        let l = pts[pts.len() - 1];
+        let e = points[n - 1];
+        if (e[0] - l[0]).powi(2) + (e[1] - l[1]).powi(2) < gap2 {
+            pts.pop();
+            ws.pop();
+        }
+    }
+    pts.push(points[n - 1]);
+    ws.push(widths[n - 1]);
+    (pts, ws)
 }
 
 /// Number of seconds a laser-pointer stroke takes to fade from full
@@ -664,16 +846,8 @@ fn paint_dash_pill(
     }
 }
 
-/// Paint a single stroke. Two paths:
-///
-/// 1. **Committed strokes** carry a pre-built `cache` (set by
-///    `Stroke::build_cache` in `Canvas::add_stroke`). We just walk the
-///    cached polyline and emit `line_segment`s — no Catmull-Rom math,
-///    no allocation. This is the fast path that runs every frame.
-///
-/// 2. **Live in-progress strokes** lack a cache (their geometry changes
-///    every pen sample). We do the Catmull-Rom subdivision inline.
-///    The live stroke is one stroke at most, so this stays cheap.
+/// Paint a single stroke through `painter` at `zoom`. What it draws is
+/// `emit_stroke`; `PainterSink` turns that into egui shapes.
 fn paint_stroke(
     painter: &egui::Painter,
     to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
@@ -682,75 +856,246 @@ fn paint_stroke(
     position_passes: usize,
     layer_opacity: f32,
 ) {
-    if stroke.samples.is_empty() {
-        return;
-    }
-    let color = col(stroke.color, layer_opacity);
+    let mut sink = PainterSink { painter, to_screen, zoom };
+    emit_stroke(&mut sink, stroke, zoom, position_passes, layer_opacity);
+}
 
+/// Width of the soft edge on each side of a ribbon, in screen points.
+pub(crate) const RIBBON_FEATHER: f32 = 1.0;
+
+/// What ink is drawn from: discs, variable-width ribbons and filled
+/// polygons, all in canvas coordinates. `PainterSink` turns them into
+/// egui shapes at the current zoom. The GPU ink cache
+/// (`canvas::ink_gpu`) stores them once and applies the same zoom rules
+/// in its shader, so both share this one description of every style.
+pub(crate) trait InkSink {
+    /// A filled disc of canvas radius `rc` at `c`; `rule` says how its
+    /// on-screen radius follows from `rc` and the zoom.
+    fn disc(&mut self, c: [f32; 2], rc: f32, rule: DiscRule, color: egui::Color32);
+    /// A ribbon through `points`, `ribbon_half(widths, style, i)` canvas
+    /// units either side of `points[i]` along `ribbon_normal(points, i)`,
+    /// with a `RIBBON_FEATHER` soft edge. `points` has at least two
+    /// entries.
+    fn ribbon(&mut self, points: &[[f32; 2]], widths: &[f32], style: StrokeStyle, color: egui::Color32);
+    /// The polygon through `points`, closed back to the start, filled.
+    fn fill(&mut self, points: &[[f32; 2]], color: egui::Color32);
+}
+
+/// How a disc's on-screen radius follows from its canvas radius `rc` at
+/// a zoom. It is data rather than code so the GPU ink shader can apply
+/// the same rule; `ink_gpu`'s `disc_radius` mirrors `DiscRule::radius`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DiscRule {
+    /// Ribbon end caps and fan corners: shrunk by half the feather so
+    /// the disc's own soft edge lands inside the ribbon, and never under
+    /// 0.4 px.
+    Cap = 0,
+    /// Stamps and lone polyline points: left out under 0.4 px.
+    Stamp = 1,
+    /// A one-sample dot: always drawn.
+    Plain = 2,
+}
+
+impl DiscRule {
+    /// On-screen radius at `zoom`, or `None` when the disc is not drawn.
+    pub(crate) fn radius(self, rc: f32, zoom: f32) -> Option<f32> {
+        let r = rc * zoom;
+        match self {
+            DiscRule::Cap => Some((r - RIBBON_FEATHER * 0.5).max(0.4)),
+            DiscRule::Stamp => (r >= 0.4).then_some(r),
+            DiscRule::Plain => Some(r),
+        }
+    }
+}
+
+/// Unit normal of the ribbon at `points[i]`: the tangent (from the
+/// neighbouring points) turned 90° counter-clockwise.
+pub(crate) fn ribbon_normal(points: &[[f32; 2]], i: usize) -> [f32; 2] {
+    let n = points.len();
+    let dir = if i == 0 {
+        [points[1][0] - points[0][0], points[1][1] - points[0][1]]
+    } else if i == n - 1 {
+        [points[n - 1][0] - points[n - 2][0], points[n - 1][1] - points[n - 2][1]]
+    } else {
+        [points[i + 1][0] - points[i - 1][0], points[i + 1][1] - points[i - 1][1]]
+    };
+    let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt().max(1.0e-6);
+    [-dir[1] / len, dir[0] / len]
+}
+
+/// Canvas half-width of the ribbon at `points[i]`.
+pub(crate) fn ribbon_half(widths: &[f32], style: StrokeStyle, i: usize) -> f32 {
+    // Pencil style: jitter each polyline point's half-width with a
+    // deterministic hash so the ribbon edge gains a graphite-like
+    // graininess instead of reading as a perfect ribbon.
+    let jitter = match style {
+        StrokeStyle::Default | StrokeStyle::Marker => 1.0,
+        StrokeStyle::Pencil  => 0.78 + 0.32 * hash01(i as u32),
+        // Airbrush never reaches the ribbon path — stamp walk
+        // bailed out above. Keep a sane default for completeness.
+        StrokeStyle::Airbrush => 1.0,
+    };
+    widths[i] * 0.5 * jitter
+}
+
+/// Draws ink straight away through an egui `Painter`.
+struct PainterSink<'a, F> {
+    painter: &'a egui::Painter,
+    to_screen: &'a F,
+    zoom: f32,
+}
+
+impl<F: Fn([f32; 2]) -> egui::Pos2> InkSink for PainterSink<'_, F> {
+    fn disc(&mut self, c: [f32; 2], rc: f32, rule: DiscRule, color: egui::Color32) {
+        if let Some(r) = rule.radius(rc, self.zoom) {
+            self.painter.circle_filled((self.to_screen)(c), r, color);
+        }
+    }
+
+    // Emit one mesh with a built-in feather band along the left and
+    // right edges. For each polyline point we generate 4 vertices,
+    // outer→inner→inner→outer, where the *outer* vertices carry
+    // alpha=0. Linear vertex-colour interpolation gives a soft 1 px
+    // fringe along both edges → proper anti-aliasing for raw meshes
+    // (egui only auto-feathers `Shape::line` / `circle_filled`, not
+    // user-built meshes).
+    fn ribbon(&mut self, points: &[[f32; 2]], widths: &[f32], style: StrokeStyle, color: egui::Color32) {
+        let n = points.len();
+        let trans = egui::Color32::from_rgba_premultiplied(0, 0, 0, 0);
+        let mut mesh = egui::Mesh::default();
+        mesh.vertices.reserve(n * 4);
+        mesh.indices.reserve((n - 1) * 18);
+
+        for i in 0..n {
+            let [nx, ny] = ribbon_normal(points, i);
+            let half = (ribbon_half(widths, style, i) * self.zoom).max(0.4);
+            let p = (self.to_screen)(points[i]);
+            // Four vertices per point: outer_left, inner_left,
+            // inner_right, outer_right.
+            let outer_l = egui::pos2(p.x + nx * (half + RIBBON_FEATHER), p.y + ny * (half + RIBBON_FEATHER));
+            let inner_l = egui::pos2(p.x + nx * half,                    p.y + ny * half);
+            let inner_r = egui::pos2(p.x - nx * half,                    p.y - ny * half);
+            let outer_r = egui::pos2(p.x - nx * (half + RIBBON_FEATHER), p.y - ny * (half + RIBBON_FEATHER));
+            mesh.colored_vertex(outer_l, trans);
+            mesh.colored_vertex(inner_l, color);
+            mesh.colored_vertex(inner_r, color);
+            mesh.colored_vertex(outer_r, trans);
+        }
+        for i in 0..(n - 1) {
+            let base = (i * 4)       as u32;
+            let next = ((i + 1) * 4) as u32;
+            // Left feather strip (outer_l ↔ inner_l).
+            mesh.add_triangle(base + 0, base + 1, next + 0);
+            mesh.add_triangle(base + 1, next + 1, next + 0);
+            // Interior (inner_l ↔ inner_r).
+            mesh.add_triangle(base + 1, base + 2, next + 1);
+            mesh.add_triangle(base + 2, next + 2, next + 1);
+            // Right feather strip (inner_r ↔ outer_r).
+            mesh.add_triangle(base + 2, base + 3, next + 2);
+            mesh.add_triangle(base + 3, next + 3, next + 2);
+        }
+        self.painter.add(egui::Shape::mesh(mesh));
+    }
+
+    fn fill(&mut self, points: &[[f32; 2]], color: egui::Color32) {
+        paint_fill_from_polyline(self.painter, self.to_screen, points, color);
+    }
+}
+
+/// The colour a stroke's ribbon or stamps are drawn in.
+fn stroke_paint_color(stroke: &Stroke, layer_opacity: f32) -> egui::Color32 {
     // Pencil look: drop the colour alpha to ~55 % so the stroke reads as
     // translucent graphite. Width jitter (added inside the mesh build)
     // contributes the grainy edge.
-    let paint_color = match stroke.style {
-        StrokeStyle::Default => color,
+    match stroke.style {
+        StrokeStyle::Default => col(stroke.color, layer_opacity),
         StrokeStyle::Pencil  => pencil_color(stroke.color, layer_opacity),
         StrokeStyle::Marker  => marker_color(stroke.color, layer_opacity),
         StrokeStyle::Airbrush => airbrush_color(stroke.color, layer_opacity),
-    };
+    }
+}
+
+/// Everything one stroke draws, in paint order. Two cases:
+///
+/// 1. **Committed strokes** carry a pre-built `cache` (set by
+///    `Stroke::build_cache` in `Canvas::add_stroke`), so no Catmull-Rom
+///    work happens here.
+///
+/// 2. **Live in-progress strokes** lack a cache (their geometry changes
+///    every pen sample), so the spine is rebuilt each frame through the
+///    same `build_spine` the cache uses: the live preview matches the
+///    committed stroke exactly (WYSIWYG on pen-up). It is one stroke at
+///    most, so this stays cheap.
+///
+/// `zoom` only picks the level of detail: below 1, a committed ribbon
+/// drops nodes closer than `LOD_MIN_GAP_PX` on screen. The GPU ink
+/// cache passes 1, keeping every node.
+pub(crate) fn emit_stroke(
+    sink: &mut impl InkSink,
+    stroke: &Stroke,
+    zoom: f32,
+    position_passes: usize,
+    layer_opacity: f32,
+) {
+    if stroke.samples.is_empty() {
+        return;
+    }
+    let paint_color = stroke_paint_color(stroke, layer_opacity);
 
     if stroke.samples.len() == 1 {
         let s = stroke.samples[0];
         let pressure = if matches!(stroke.style, StrokeStyle::Marker) { 1.0 } else { s.pressure.max(0.1) };
-        let r = (stroke.base_width * 0.5 * pressure).max(0.4) * zoom;
-        painter.circle_filled(to_screen(s.pos), r, paint_color);
+        sink.disc(s.pos, (stroke.base_width * 0.5 * pressure).max(0.4), DiscRule::Plain, paint_color);
         return;
     }
 
-    if let Some(cache) = &stroke.cache {
-        // Fill goes UNDER the outline so the user-drawn line still
-        // reads as the boundary on top of the colour blob.
-        if stroke.filled {
-            paint_fill_from_polyline(
-                painter, to_screen, &cache.points,
-                fill_color(stroke.color, layer_opacity),
-            );
+    let live;
+    let cache = match &stroke.cache {
+        Some(cache) => cache,
+        None => {
+            let position_passes = stroke.smoothing.cache_passes(position_passes);
+            live = crate::canvas::stroke::build_spine(&stroke.samples, stroke.base_width, position_passes);
+            &live
         }
-        // Marker = constant-width ribbon (no pressure modulation).
-        // Airbrush = soft-disc stamp walk (handled inside the
-        // grouped polyline helper via the style discriminant).
-        let const_widths: Vec<f32>;
-        let widths_for_paint: &[f32] = if matches!(stroke.style, StrokeStyle::Marker) {
-            const_widths = vec![stroke.base_width; cache.widths.len()];
-            &const_widths
-        } else {
-            &cache.widths
-        };
-        paint_polyline_grouped(
-            painter, to_screen, &cache.points, widths_for_paint,
-            paint_color, zoom, stroke.style,
-        );
-        return;
+    };
+    // Fill goes UNDER the outline so the user-drawn line still reads as
+    // the boundary on top of the colour blob. For the live Fill-tool
+    // stroke it grows every frame as the user drags; lyon's sweep-line
+    // tessellator handles self-intersection, so the preview never
+    // flashes holes when the polyline briefly crosses itself.
+    if stroke.filled {
+        sink.fill(&cache.points, fill_color(stroke.color, layer_opacity));
     }
-
-    // Slow path: live stroke (no cache yet) — recompute Catmull-Rom inline.
-    paint_stroke_live(painter, to_screen, stroke, zoom, position_passes, layer_opacity);
+    // Marker = constant-width ribbon (no pressure modulation).
+    // Airbrush = soft-disc stamp walk (handled inside the polyline
+    // helper via the style discriminant).
+    let const_widths: Vec<f32>;
+    let widths_for_paint: &[f32] = if matches!(stroke.style, StrokeStyle::Marker) {
+        const_widths = vec![stroke.base_width; cache.widths.len()];
+        &const_widths
+    } else {
+        &cache.widths
+    };
+    // Zoomed out, many cached nodes land within half a pixel of each
+    // other on screen; the ribbon styles drop those. At zoom 1 and
+    // above nothing changes. Pencil and airbrush stamp by canvas arc
+    // length, so their nodes are left alone.
+    let lod: (Vec<[f32; 2]>, Vec<f32>);
+    let (pts, ws): (&[[f32; 2]], &[f32]) = if zoom < 1.0
+        && stroke.cache.is_some()
+        && matches!(stroke.style, StrokeStyle::Default | StrokeStyle::Marker)
+    {
+        lod = decimate(&cache.points, widths_for_paint, LOD_MIN_GAP_PX / zoom);
+        (&lod.0, &lod.1)
+    } else {
+        (&cache.points, widths_for_paint)
+    };
+    emit_polyline(sink, pts, ws, paint_color, stroke.style);
 }
 
-/// Paint a polyline whose width varies along its length as smoothly-joined
-/// **groups** of constant-width line segments. This is the trick that
-/// gives us anti-aliased, smoothly-joined strokes while keeping the
-/// pressure-driven width variation:
-///
-///   * `egui::Shape::line(points, Stroke)` is rendered as one *single* mesh
-///     with proper miter joins and feathered (anti-aliased) edges.
-///   * Pure single-Stroke means the *whole* polyline shares one width.
-///     Pressure variation needs different widths.
-///
-/// We split the cached polyline into runs where consecutive widths are
-/// within 25 % of the running average, emit each run as its own
-/// `Shape::line`, and overlap the boundary point so adjacent runs tuck
-/// into each other without visible gaps.
-/// Paint a variable-width centerline as a **single triangle-strip
-/// ribbon mesh** plus round caps at each endpoint.
+/// A variable-width centerline as a **single triangle-strip ribbon
+/// mesh** plus round caps at each endpoint (or, for pencil and
+/// airbrush, a walk of disc stamps).
 ///
 /// Why a custom mesh instead of `egui::Shape::line` + disc stamps:
 ///
@@ -763,22 +1108,17 @@ fn paint_stroke(
 ///
 /// One mesh = one feathered outline. The interior is a flat triangle
 /// fill with no internal seams, so no fringe stacking is possible.
-fn paint_polyline_grouped(
-    painter: &egui::Painter,
-    to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
+fn emit_polyline(
+    sink: &mut impl InkSink,
     points: &[[f32; 2]],
     widths: &[f32],
     color: egui::Color32,
-    zoom: f32,
     style: StrokeStyle,
 ) {
     let n = points.len();
     if n == 0 { return; }
     if n == 1 {
-        let r = widths[0] * 0.5 * zoom;
-        if r >= 0.4 {
-            painter.circle_filled(to_screen(points[0]), r, color);
-        }
+        sink.disc(points[0], widths[0] * 0.5, DiscRule::Stamp, color);
         return;
     }
 
@@ -797,23 +1137,13 @@ fn paint_polyline_grouped(
     // from the per-stamp width jitter is what gives the graphite
     // texture.
     if let StrokeStyle::Pencil = style {
-        paint_pencil_stamps(painter, to_screen, points, widths, color, zoom);
+        emit_pencil_stamps(sink, points, widths, color);
         return;
     }
     if let StrokeStyle::Airbrush = style {
-        paint_airbrush_stamps(painter, to_screen, points, widths, color, zoom);
+        emit_airbrush_stamps(sink, points, widths, color);
         return;
     }
-
-    // Emit one mesh with a built-in feather band along the left and
-    // right edges. For each polyline point we generate 4 vertices,
-    // outer→inner→inner→outer, where the *outer* vertices carry
-    // alpha=0. Linear vertex-colour interpolation gives a soft 1 px
-    // fringe along both edges → proper anti-aliasing for raw meshes
-    // (egui only auto-feathers `Shape::line` / `circle_filled`, not
-    // user-built meshes).
-    const FEATHER: f32 = 1.0;
-    let trans = egui::Color32::from_rgba_premultiplied(0, 0, 0, 0);
 
     // ---- Round caps painted BEFORE the ribbon mesh -------------
     // Painting discs first then the ribbon on top ensures the ribbon's
@@ -822,10 +1152,10 @@ fn paint_polyline_grouped(
     // interior; only its backward hemisphere remains visible — which
     // is exactly the round-cap silhouette we want.
     //
-    // We also shrink each disc by `FEATHER` so its halo lands INSIDE
-    // the ribbon's solid interior instead of stacking with the
-    // ribbon's outer feather strip. Without that shrink, the user
-    // sees a darker bead at every endpoint because the two AA
+    // `DiscRule::Cap` also shrinks each disc by half the feather so its
+    // halo lands INSIDE the ribbon's solid interior instead of stacking
+    // with the ribbon's outer feather strip. Without that shrink, the
+    // user sees a darker bead at every endpoint because the two AA
     // gradients overlay in the same perpendicular pixel band.
     let (j0, jn) = match style {
         StrokeStyle::Default | StrokeStyle::Marker => (1.0_f32, 1.0_f32),
@@ -835,68 +1165,10 @@ fn paint_polyline_grouped(
         ),
         StrokeStyle::Airbrush => (1.0_f32, 1.0_f32),
     };
-    let r0 = (widths[0]     * 0.5 * j0 * zoom - FEATHER * 0.5).max(0.4);
-    let rn = (widths[n - 1] * 0.5 * jn * zoom - FEATHER * 0.5).max(0.4);
-    if r0 >= 0.4 {
-        painter.circle_filled(to_screen(points[0]), r0, color);
-    }
-    if rn >= 0.4 {
-        painter.circle_filled(to_screen(points[n - 1]), rn, color);
-    }
+    sink.disc(points[0], widths[0] * 0.5 * j0, DiscRule::Cap, color);
+    sink.disc(points[n - 1], widths[n - 1] * 0.5 * jn, DiscRule::Cap, color);
 
-    let mut mesh = egui::Mesh::default();
-    mesh.vertices.reserve(n * 4);
-    mesh.indices.reserve((n - 1) * 18);
-
-    for i in 0..n {
-        let dir = if i == 0 {
-            [points[1][0] - points[0][0], points[1][1] - points[0][1]]
-        } else if i == n - 1 {
-            [points[n - 1][0] - points[n - 2][0], points[n - 1][1] - points[n - 2][1]]
-        } else {
-            [points[i + 1][0] - points[i - 1][0], points[i + 1][1] - points[i - 1][1]]
-        };
-        let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt().max(1.0e-6);
-        // Unit normal: rotate the tangent 90° CCW.
-        let nx = -dir[1] / len;
-        let ny =  dir[0] / len;
-        // Pencil style: jitter each polyline point's half-width with a
-        // deterministic hash so the ribbon edge gains a graphite-like
-        // graininess instead of reading as a perfect ribbon.
-        let jitter = match style {
-            StrokeStyle::Default | StrokeStyle::Marker => 1.0,
-            StrokeStyle::Pencil  => 0.78 + 0.32 * hash01(i as u32),
-            // Airbrush never reaches the ribbon path — stamp walk
-            // bailed out above. Keep a sane default for completeness.
-            StrokeStyle::Airbrush => 1.0,
-        };
-        let half = (widths[i] * 0.5 * jitter * zoom).max(0.4);
-        let p = to_screen(points[i]);
-        // Four vertices per point: outer_left, inner_left,
-        // inner_right, outer_right.
-        let outer_l = egui::pos2(p.x + nx * (half + FEATHER), p.y + ny * (half + FEATHER));
-        let inner_l = egui::pos2(p.x + nx * half,             p.y + ny * half);
-        let inner_r = egui::pos2(p.x - nx * half,             p.y - ny * half);
-        let outer_r = egui::pos2(p.x - nx * (half + FEATHER), p.y - ny * (half + FEATHER));
-        mesh.colored_vertex(outer_l, trans);
-        mesh.colored_vertex(inner_l, color);
-        mesh.colored_vertex(inner_r, color);
-        mesh.colored_vertex(outer_r, trans);
-    }
-    for i in 0..(n - 1) {
-        let base = (i * 4)       as u32;
-        let next = ((i + 1) * 4) as u32;
-        // Left feather strip (outer_l ↔ inner_l).
-        mesh.add_triangle(base + 0, base + 1, next + 0);
-        mesh.add_triangle(base + 1, next + 1, next + 0);
-        // Interior (inner_l ↔ inner_r).
-        mesh.add_triangle(base + 1, base + 2, next + 1);
-        mesh.add_triangle(base + 2, next + 2, next + 1);
-        // Right feather strip (inner_r ↔ outer_r).
-        mesh.add_triangle(base + 2, base + 3, next + 2);
-        mesh.add_triangle(base + 3, next + 3, next + 2);
-    }
-    painter.add(egui::Shape::mesh(mesh));
+    sink.ribbon(points, widths, style, color);
 
     // Fan-corner discs — Krita's `paintFan` analogue. At each
     // interior polyline vertex whose tangent rotates by more than
@@ -907,9 +1179,9 @@ fn paint_polyline_grouped(
     // angular triangle fans and visually identical to Krita's
     // own implementation. Only fires when the caller opted in.
     //
-    // Same `FEATHER` shrink as the endpoint caps: keeps the disc's
-    // AA halo inside the ribbon body so the user doesn't see a bead
-    // at every painted corner.
+    // Same `DiscRule::Cap` shrink as the endpoint caps: keeps the
+    // disc's AA halo inside the ribbon body so the user doesn't see a
+    // bead at every painted corner.
     if FAN_CORNERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         let step = f32::from_bits(
             FAN_CORNERS_STEP_BITS.load(std::sync::atomic::Ordering::Relaxed),
@@ -925,67 +1197,19 @@ fn paint_polyline_grouped(
             let cos_t = (d1[0] * d2[0] + d1[1] * d2[1]) / (l1 * l2);
             let theta = cos_t.clamp(-1.0, 1.0).acos();
             if theta > step {
-                let r = (widths[i] * 0.5 * zoom - FEATHER * 0.5).max(0.4);
-                painter.circle_filled(to_screen(points[i]), r, color);
+                sink.disc(points[i], widths[i] * 0.5, DiscRule::Cap, color);
             }
         }
     }
 }
 
-/// Variant used for the live in-progress stroke (no cache, recomputed each
-/// frame). We build a temporary points/widths Vec via Catmull-Rom and feed
-/// it to `paint_polyline_grouped` — same anti-aliased look as committed
-/// strokes, no cache.
-fn paint_stroke_live(
-    painter: &egui::Painter,
-    to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
-    stroke: &Stroke,
-    zoom: f32,
-    position_passes: usize,
-    layer_opacity: f32,
-) {
-    let color = col(stroke.color, layer_opacity);
-
-    // Same geometry as the committed cache: the shared ribbon-spine builder
-    // (centripetal Catmull-Rom + adaptive arc-length / turn-angle
-    // decimation). Rebuilding it fresh each frame is cheap for a single
-    // in-progress stroke and guarantees the live preview matches the
-    // committed stroke exactly (WYSIWYG on pen-up).
-    let position_passes = stroke.smoothing.cache_passes(position_passes);
-    let cache =
-        crate::canvas::stroke::build_spine(&stroke.samples, stroke.base_width, position_passes);
-    let points = cache.points;
-    let widths = cache.widths;
-
-    let paint_color = match stroke.style {
-        StrokeStyle::Default => color,
-        StrokeStyle::Pencil  => pencil_color(stroke.color, layer_opacity),
-        StrokeStyle::Marker  => marker_color(stroke.color, layer_opacity),
-        StrokeStyle::Airbrush => airbrush_color(stroke.color, layer_opacity),
-    };
-    // Fill underlay for the live (in-progress) Fill-tool stroke. Grows
-    // every frame as the user drags. lyon's sweep-line tessellator
-    // handles self-intersection cleanly so the live preview never
-    // flashes holes when the user's polyline briefly crosses itself.
-    if stroke.filled {
-        paint_fill_from_polyline(
-            painter, to_screen, &points,
-            fill_color(stroke.color, layer_opacity),
-        );
-    }
-    // Marker live preview also uses constant-width ribbon — pressure
-    // does not modulate width for highlighter-style strokes.
-    let const_widths: Vec<f32>;
-    let widths_for_paint: &[f32] = if matches!(stroke.style, StrokeStyle::Marker) {
-        const_widths = vec![stroke.base_width; widths.len()];
-        &const_widths
-    } else {
-        &widths
-    };
-    paint_polyline_grouped(
-        painter, to_screen, &points, widths_for_paint,
-        paint_color, zoom, stroke.style,
-    );
+/// The fan-corner setting as `(enabled, step in radians)`, for the GPU
+/// ink cache to key its stored strokes on.
+pub(crate) fn fan_corners() -> (bool, f32) {
+    (
+        FAN_CORNERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+        f32::from_bits(FAN_CORNERS_STEP_BITS.load(std::sync::atomic::Ordering::Relaxed)),
+    )
 }
 
 /// Fill colour for the interior of a Fill-tool stroke. The auto-closing
@@ -1135,23 +1359,18 @@ fn airbrush_color(c: [u8; 4], layer_opacity: f32) -> egui::Color32 {
 /// variation). Spacing is ~10 % of the average stamp diameter so a
 /// hold-still pen accumulates many overlapping stamps in the same
 /// place and the user sees the colour build toward solid.
-fn paint_airbrush_stamps(
-    painter: &egui::Painter,
-    to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
+fn emit_airbrush_stamps(
+    sink: &mut impl InkSink,
     points: &[[f32; 2]],
     widths: &[f32],
     color: egui::Color32,
-    zoom: f32,
 ) {
     let n = points.len();
     if n == 0 { return; }
 
     // First stamp anchors the head of the stroke at the pen-down
     // position so the user always sees ink land where they pressed.
-    let r0 = widths[0] * 0.5 * zoom;
-    if r0 >= 0.4 {
-        painter.circle_filled(to_screen(points[0]), r0, color);
-    }
+    sink.disc(points[0], widths[0] * 0.5, DiscRule::Stamp, color);
     if n == 1 { return; }
 
     let mut residual = 0.0_f32;
@@ -1173,10 +1392,7 @@ fn paint_airbrush_stamps(
             let t   = d / seg_len;
             let pos = [p0[0] + dx * t, p0[1] + dy * t];
             let w   = widths[i] + (widths[i + 1] - widths[i]) * t;
-            let r   = w * 0.5 * zoom;
-            if r >= 0.4 {
-                painter.circle_filled(to_screen(pos), r, color);
-            }
+            sink.disc(pos, w * 0.5, DiscRule::Stamp, color);
             d += spacing;
         }
         residual = (seg_len - (d - spacing)).max(0.0);
@@ -1186,13 +1402,11 @@ fn paint_airbrush_stamps(
 /// Pencil renderer: walk the polyline at constant arc-length intervals
 /// and stamp a filled disc at each step. Disc radius is per-stamp
 /// jittered for graphite-like edge irregularity.
-fn paint_pencil_stamps(
-    painter: &egui::Painter,
-    to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
+fn emit_pencil_stamps(
+    sink: &mut impl InkSink,
     points: &[[f32; 2]],
     widths: &[f32],
     color: egui::Color32,
-    zoom: f32,
 ) {
     let n = points.len();
     if n == 0 { return; }
@@ -1203,10 +1417,7 @@ fn paint_pencil_stamps(
     let mut last_pos = points[0];
     {
         let j = 0.78 + 0.32 * hash01(stamp_id);
-        let r = widths[0] * 0.5 * j * zoom;
-        if r >= 0.4 {
-            painter.circle_filled(to_screen(points[0]), r, color);
-        }
+        sink.disc(points[0], widths[0] * 0.5 * j, DiscRule::Stamp, color);
         stamp_id += 1;
     }
 
@@ -1260,11 +1471,8 @@ fn paint_pencil_stamps(
             if euc >= min_euc {
                 let w   = w0 + (w1 - w0) * t;
                 let j   = 0.78 + 0.32 * hash01(stamp_id);
-                let r   = w * 0.5 * j * zoom;
                 stamp_id += 1;
-                if r >= 0.4 {
-                    painter.circle_filled(to_screen(pos), r, color);
-                }
+                sink.disc(pos, w * 0.5 * j, DiscRule::Stamp, color);
                 last_pos = pos;
             }
             d += spacing;
@@ -1904,5 +2112,80 @@ mod rotation_tests {
         assert!(b.blue() > 200 && b.red() < 60, "expected blue at {blue_at:?}, got {b:?}");
         // Nothing left behind where the unrotated image used to reach.
         assert_eq!(at([33.0, 50.0]).alpha(), 0);
+    }
+}
+
+#[cfg(test)]
+mod ink_tests {
+    use super::*;
+    use crate::canvas::stroke::PenSample;
+
+    fn stroke(style: StrokeStyle, width: f32) -> Stroke {
+        let mut s = Stroke::with_style([90, 200, 255, 255], width, style);
+        for i in 0..60 {
+            let t = i as f32;
+            let pressure = 0.2 + 0.8 * (t * 0.1).sin().abs();
+            s.samples.push(PenSample { pos: [t * 4.0, (t * 0.2).sin() * 30.0], pressure, tilt: [0.0; 2] });
+        }
+        s.build_cache();
+        s
+    }
+
+    /// Vertices egui ends up with for `s` painted at `zoom`.
+    fn tessellated_vertices(s: &Stroke, zoom: f32) -> usize {
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let to_screen = |p: [f32; 2]| egui::pos2(100.0 + p[0] * zoom, 100.0 + p[1] * zoom);
+            paint_stroke(&painter, &to_screen, s, zoom, 3, 1.0);
+        });
+        ctx.tessellate(out.shapes, out.pixels_per_point)
+            .iter()
+            .map(|p| match &p.primitive {
+                egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// The egui path's budget is what keeps a frame's buffers under
+    /// wgpu's limit, so its estimate must never fall short.
+    #[test]
+    fn vertex_estimate_bounds_what_egui_builds() {
+        for style in [StrokeStyle::Default, StrokeStyle::Pencil, StrokeStyle::Marker, StrokeStyle::Airbrush] {
+            for width in [1.0, 4.0, 12.0, 40.0] {
+                for zoom in [0.05, 0.3, 1.0, 4.0] {
+                    let s = stroke(style, width);
+                    let estimate = stroke_vertex_cost(&s, zoom);
+                    let built = tessellated_vertices(&s, zoom);
+                    assert!(built <= estimate, "{style:?} width {width} zoom {zoom}: built {built} > estimate {estimate}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decimate_keeps_ends_and_spacing() {
+        let points: Vec<[f32; 2]> = (0..=100).map(|i| [i as f32 * 0.3, 0.0]).collect();
+        let widths: Vec<f32> = (0..=100).map(|i| i as f32).collect();
+        let (p, w) = decimate(&points, &widths, 2.0);
+        assert_eq!(p[0], points[0]);
+        assert_eq!(*p.last().unwrap(), points[100]);
+        assert_eq!(*w.last().unwrap(), 100.0);
+        assert_eq!(p.len(), w.len());
+        for pair in p.windows(2) {
+            assert!(pair[1][0] - pair[0][0] >= 2.0 - 1e-4, "{pair:?}");
+        }
+        // Nothing to merge at a gap below the node spacing.
+        assert_eq!(decimate(&points, &widths, 0.1).0.len(), points.len());
+    }
+
+    #[test]
+    fn disc_rules() {
+        assert_eq!(DiscRule::Cap.radius(2.0, 1.0), Some(1.5));
+        assert_eq!(DiscRule::Cap.radius(0.1, 1.0), Some(0.4));
+        assert_eq!(DiscRule::Stamp.radius(0.3, 1.0), None);
+        assert_eq!(DiscRule::Stamp.radius(0.3, 2.0), Some(0.6));
+        assert_eq!(DiscRule::Plain.radius(0.3, 1.0), Some(0.3));
     }
 }
