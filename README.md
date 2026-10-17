@@ -26,9 +26,10 @@ input.
   self-intersecting outlines)
 - **Laser pointer** — strokes fade ~1 s after pen-up
 - **Spotlight** — dims everything except a square around the cursor
-- **Lasso erase** — draw a closed loop, ink inside gets removed (with undo)
-- **Lasso capture** — draw a closed loop, the screen pixels inside become
-  an image on the active layer
+- **Lasso erase** — draw a closed loop, or click corner by corner for a
+  polygon; ink inside gets removed (with undo)
+- **Lasso capture** — draw a closed loop, or click corner by corner for a
+  polygon; the screen pixels inside become an image on the active layer
 - **Select** — pick objects, then move / resize / rotate them with
   handles; multi-select, duplicate, copy / paste, recolour, re-order
 - **Text labels** — click to place, type, Enter to commit
@@ -120,8 +121,8 @@ the binary on first launch.
 | Laser pointer | `L` | Strokes fade after pen-up |
 | Text | `T` | Click anywhere, type, Enter commits |
 | Spotlight | `S` | Press again to exit |
-| Lasso erase | `X` | Draw closed loop |
-| Lasso capture | `Shift+X` | Draw closed loop → image object on the active layer |
+| Lasso erase | `X` | Draw closed loop, or click corners for a polygon (closes like Lasso capture's) |
+| Lasso capture | `Shift+X` | Draw closed loop → image object on the active layer. Or click corners for a polygon: click the first corner, double-click or `Enter` to close, `Backspace` takes back a corner |
 | Select | `V` | See [Selecting and transforming](#selecting-and-transforming) |
 | Eyedropper | `I` | One-shot — next click picks a pixel |
 | Eraser | `Ctrl` (hold) | Modifier — pen erases the ink it touches while held |

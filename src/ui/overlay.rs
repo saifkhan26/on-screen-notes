@@ -441,32 +441,52 @@ pub fn show(
                 // pointer move is an input event, which repaints at once.
             }
 
-            // Lasso-erase preview — dashed grey loop tracking the
-            // user's in-progress drag. We paint in screen-space, so
-            // we map each canvas-local sample through the active
-            // canvas's pan/zoom. The first sample is also appended at
-            // the end so the loop reads as closed during the drag —
-            // gives the user a clear "what you'll cut" preview.
+            // Lasso preview — dashed grey loop tracking the user's
+            // in-progress path. We paint in screen-space, so we map each
+            // canvas-local point through the active canvas's pan/zoom.
+            // The first point is also appended at the end so the loop
+            // reads as closed — gives the user a clear "what you'll cut"
+            // preview. Between the clicks of a polygon the next edge
+            // follows the pointer and the corners are dotted; when a
+            // click would close the shape, the corner it would close on
+            // is ringed and the loop shows the finished shape. The app
+            // keeps frames coming for the marching dashes while a path
+            // is open.
             if matches!(tool.kind, ToolKind::LassoErase | ToolKind::LassoSelect) {
-                if let Some(poly) = tool.in_progress_lasso.as_ref() {
-                    if poly.len() >= 2 {
-                        let canvas = manager.active();
-                        let zoom = canvas.zoom;
-                        let ox = rect.min.x + canvas.pan[0];
-                        let oy = rect.min.y + canvas.pan[1];
-                        let mut pts: Vec<egui::Pos2> = poly
-                            .iter()
-                            .map(|p| egui::pos2(ox + p[0] * zoom, oy + p[1] * zoom))
-                            .collect();
+                let lasso = &tool.lasso;
+                if !lasso.points().is_empty() {
+                    let canvas = manager.active();
+                    let zoom = canvas.zoom;
+                    let ox = rect.min.x + canvas.pan[0];
+                    let oy = rect.min.y + canvas.pan[1];
+                    let to_screen = |p: [f32; 2]| egui::pos2(ox + p[0] * zoom, oy + p[1] * zoom);
+                    let mut pts: Vec<egui::Pos2> = lasso.points().iter().map(|p| to_screen(*p)).collect();
+                    let mut ring = None;
+                    if lasso.is_polygon() && !lasso.pressing() {
+                        if let Some(h) = ctx.input(|i| i.pointer.hover_pos()) {
+                            ring = lasso.closes_at([(h.x - ox) / zoom, (h.y - oy) / zoom], zoom);
+                            if ring.is_none() {
+                                pts.push(h);
+                            }
+                        }
+                    }
+                    let light = egui::Color32::from_rgba_unmultiplied(220, 222, 230, 220);
+                    let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+                    let painter = ui.painter();
+                    if pts.len() >= 2 {
                         // Close the loop visually.
                         pts.push(pts[0]);
-                        let stroke = egui::Stroke::new(
-                            1.5,
-                            egui::Color32::from_rgba_unmultiplied(220, 222, 230, 220),
-                        );
-                        render::paint_dashed_polyline(ui.painter(), &pts, stroke, zoom);
-                        // Animated dashes need repaint each frame.
-                        ctx.request_repaint();
+                        render::paint_dashed_polyline(painter, &pts, egui::Stroke::new(1.5, light), zoom);
+                    }
+                    for c in lasso.corners() {
+                        let c = to_screen(c);
+                        painter.circle_filled(c, 3.5, under);
+                        painter.circle_filled(c, 2.5, light);
+                    }
+                    if let Some(c) = ring {
+                        let c = to_screen(c);
+                        painter.circle_stroke(c, 7.0, egui::Stroke::new(3.0, under));
+                        painter.circle_stroke(c, 7.0, egui::Stroke::new(1.5, light));
                     }
                 }
             }

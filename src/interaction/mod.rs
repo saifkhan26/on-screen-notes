@@ -99,10 +99,31 @@ pub fn react_tool_shortcut(
     // bindings — modal cancel is a UX primitive, not a shortcut.
     if key == egui::Key::Escape && !mods.ctrl && !mods.shift && !mods.alt {
         tool.eyedropper_pending = false;
-        tool.in_progress_lasso  = None;
+        tool.lasso.clear();
         // First Esc drops an in-flight move / resize / rotate, the next
         // one drops the selection.
         tool.select.cancel();
+    }
+}
+
+/// Keys for an open lasso polygon: Enter closes it (erasing or capturing
+/// what is inside; `canvas` is the active one), a bare Backspace takes
+/// back the last corner.
+pub fn react_lasso_keys(
+    key: egui::Key,
+    mods: egui::Modifiers,
+    tool: &mut ActiveTool,
+    canvas: &mut crate::canvas::canvas::Canvas,
+) {
+    if !matches!(tool.kind, ToolKind::LassoErase | ToolKind::LassoSelect)
+        || mods.ctrl || mods.shift || mods.alt
+    {
+        return;
+    }
+    match key {
+        egui::Key::Enter => tool.finish_lasso(canvas),
+        egui::Key::Backspace => tool.lasso.undo_corner(),
+        _ => {}
     }
 }
 

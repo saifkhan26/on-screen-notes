@@ -11,6 +11,7 @@
 
 pub mod arrow_tool;
 pub mod eraser_tool;
+pub mod lasso_tool;
 pub mod pen_tool;
 pub mod select_tool;
 pub mod shape_tool;
@@ -69,17 +70,18 @@ pub enum ToolKind {
     /// size of the bright region is `ActiveTool::spotlight_size`,
     /// adjustable via the scroll wheel.
     Spotlight,
-    /// Lasso erase. The user drags a closed polygon; on pen-up
-    /// every stroke / shape on the active layer whose centroid lies
-    /// inside the polygon is removed (with undo). More surgical
-    /// than the point-radius eraser when cleaning up around dense
-    /// ink.
+    /// Lasso erase. The user drags a closed loop, or clicks a polygon
+    /// corner by corner (see `lasso_tool`); once it closes, every
+    /// stroke / shape on the active layer whose centroid lies inside
+    /// is removed (with undo). More surgical than the point-radius
+    /// eraser when cleaning up around dense ink.
     LassoErase,
-    /// Lasso select. Same freeform-polygon collection as `LassoErase`,
-    /// but on pen-up the on-screen pixels *inside* the polygon are
-    /// captured and dropped onto the active layer as an image object,
-    /// selected and ready to move. The capture itself runs in the app
-    /// loop — `end` only stashes the polygon in `pending_lasso_capture`.
+    /// Lasso select. Same loop / polygon collection as `LassoErase`.
+    /// Once the shape closes, the on-screen pixels
+    /// *inside* it are captured and dropped onto the active layer as an
+    /// image object, selected and ready to move. The capture itself runs
+    /// in the app loop — `end` only stashes the polygon in
+    /// `pending_lasso_capture`.
     LassoSelect,
     /// Object select. Click an object on the active layer to select it
     /// (Shift+click adds / removes, dragging empty space rubber-bands),
@@ -185,13 +187,12 @@ pub struct ActiveTool {
     /// Adjusted by the scroll wheel; reset to a sensible default when
     /// the user re-enters the tool.
     pub spotlight_size: f32,
-    /// In-progress lasso polyline (canvas-local coords) used by the
-    /// lasso-erase tool. Begin pushes the first sample; update
-    /// appends; end closes the polygon and erases every stroke /
-    /// shape on the active layer whose centroid lies inside.
-    pub in_progress_lasso: Option<Vec<[f32; 2]>>,
+    /// In-progress lasso path of the two lasso tools: a freehand loop
+    /// while the pen is down, or Lasso capture's polygon, which stays
+    /// open between presses until it is closed.
+    pub lasso: lasso_tool::LassoPath,
     /// Pending lasso-select polygon (canvas-local coords). Set by the
-    /// `LassoSelect` tool on pen-up; the app loop picks it up next
+    /// `LassoSelect` tool once the shape closes; the app loop picks it up next
     /// frame and runs the deferred screen capture (it needs the HWND,
     /// DPI, and the 2-frame chrome-hide that only the app has).
     /// Cleared once consumed.
@@ -227,7 +228,7 @@ impl ActiveTool {
             eyedropper_pending: false,
             pending_fill_at: None,
             spotlight_size: 120.0,
-            in_progress_lasso: None,
+            lasso: lasso_tool::LassoPath::default(),
             pending_lasso_capture: None,
             select: select_tool::SelectState::default(),
             smoothing: cfg.smoothing,
@@ -305,11 +306,12 @@ impl ActiveTool {
                 self.kind = ToolKind::Pen;
             }
             ToolKind::LassoErase | ToolKind::LassoSelect => {
-                // Start a fresh lasso path. The render layer paints
-                // the in-progress polyline as a dashed grey loop.
-                // Erase and Select share the collection + preview;
-                // they only differ in what `end` does with the polygon.
-                self.in_progress_lasso = Some(vec![sample.pos]);
+                // Start a fresh lasso path, or the next corner of an open
+                // polygon. The render layer paints the in-progress path
+                // as a dashed grey loop. Erase and Select share the
+                // collection + preview; they only differ in what `end`
+                // does with the polygon.
+                self.lasso.begin(sample.pos);
             }
             ToolKind::Rect | ToolKind::Ellipse | ToolKind::Line | ToolKind::Arrow => {
                 self.in_progress_shape = Some((sample.pos, sample.pos));
@@ -344,21 +346,7 @@ impl ActiveTool {
                 // Spotlight follows the cursor passively. Nothing to
                 // do on pen-move.
             }
-            ToolKind::LassoErase | ToolKind::LassoSelect => {
-                if let Some(poly) = self.in_progress_lasso.as_mut() {
-                    // Skip duplicate samples (Wintab often re-emits the
-                    // same coord at idle). Keeps the rendered polyline
-                    // smooth and the polygon vertex count bounded.
-                    let last = poly.last().copied();
-                    if last.map_or(true, |p| {
-                        let dx = p[0] - sample.pos[0];
-                        let dy = p[1] - sample.pos[1];
-                        dx * dx + dy * dy >= 1.0
-                    }) {
-                        poly.push(sample.pos);
-                    }
-                }
-            }
+            ToolKind::LassoErase | ToolKind::LassoSelect => self.lasso.update(sample.pos),
             ToolKind::Eraser => {
                 if let Some(s) = self.in_progress_stroke.as_mut() {
                     s.push(sample);
@@ -476,27 +464,11 @@ impl ActiveTool {
                 // passive display tool. The render layer follows the
                 // pointer each frame.
             }
-            ToolKind::LassoErase => {
-                if let Some(mut poly) = self.in_progress_lasso.take() {
-                    poly.push(sample.pos);
-                    // Need at least a triangle for a real polygon.
-                    if poly.len() >= 3 {
-                        canvas.erase_in_polygon(&poly);
-                    }
-                }
-            }
-            ToolKind::LassoSelect => {
-                // Same close-the-polygon step as erase, but instead of
-                // mutating the canvas we hand the polygon to the app
-                // loop, which captures the screen pixels inside it and
-                // adds them to the active layer as an image. Canvas is
-                // untouched here.
-                let _ = canvas;
-                if let Some(mut poly) = self.in_progress_lasso.take() {
-                    poly.push(sample.pos);
-                    if poly.len() >= 3 {
-                        self.pending_lasso_capture = Some(poly);
-                    }
+            ToolKind::LassoErase | ToolKind::LassoSelect => {
+                // A click only lays a corner, so the shape may not be
+                // closed yet.
+                if let Some(poly) = self.lasso.end(sample.pos, canvas.zoom) {
+                    self.use_lasso(poly, canvas);
                 }
             }
             ToolKind::Rect => {
@@ -548,12 +520,35 @@ impl ActiveTool {
         }
     }
 
-    /// Cancel an in-progress drag (e.g. user pressed Escape).
+    /// Enter: close an open lasso polygon and use it, as pen-up does
+    /// with a shape that closes.
+    pub fn finish_lasso(&mut self, canvas: &mut Canvas) {
+        if let Some(poly) = self.lasso.finish() {
+            self.use_lasso(poly, canvas);
+        }
+    }
+
+    /// Act on a closed lasso shape. Erase cuts the ink inside it; capture
+    /// hands it to the app loop instead, which grabs the screen pixels
+    /// inside and adds them to the active layer as an image — the canvas
+    /// is untouched here.
+    fn use_lasso(&mut self, poly: Vec<[f32; 2]>, canvas: &mut Canvas) {
+        match self.kind {
+            ToolKind::LassoErase => {
+                canvas.erase_in_polygon(&poly);
+            }
+            ToolKind::LassoSelect => self.pending_lasso_capture = Some(poly),
+            _ => {}
+        }
+    }
+
+    /// Cancel an in-progress drag (e.g. user pressed Escape). A lasso
+    /// polygon only loses the press in flight, not its earlier corners.
     #[allow(dead_code)]
     pub fn cancel(&mut self) {
         self.in_progress_stroke = None;
         self.in_progress_shape  = None;
-        self.in_progress_lasso  = None;
+        self.lasso.cancel_press();
         self.select.gesture     = None;
     }
 
@@ -592,5 +587,45 @@ mod tests {
         assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Pencil, 0.5), 16.0, "zoomed out, wider on the canvas");
         assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Marker, 4.0), 8.0, "the marker keeps canvas units");
         assert_eq!(width_drawn(ToolKind::FreehandArrow, StrokeStyle::Default, 4.0), 8.0);
+    }
+
+    #[test]
+    fn lasso_capture_clicks_a_polygon_and_enter_closes_it() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = ToolKind::LassoSelect;
+        let mut canvas = Canvas { zoom: 2.0, ..Canvas::default() };
+        let corners = [[10.0, 10.0], [60.0, 10.0], [60.0, 40.0], [10.0, 40.0]];
+        for p in corners {
+            tool.begin(PenSample::from_pos(p), &mut canvas);
+            tool.end(PenSample::from_pos([p[0] + 0.5, p[1]]), &mut canvas);
+            assert!(tool.pending_lasso_capture.is_none(), "a click only lays a corner");
+        }
+        crate::interaction::react_lasso_keys(egui::Key::Backspace, egui::Modifiers::NONE, &mut tool, &mut canvas);
+        crate::interaction::react_lasso_keys(egui::Key::Enter, egui::Modifiers::NONE, &mut tool, &mut canvas);
+        assert_eq!(tool.pending_lasso_capture.as_deref(), Some(&corners[..3]));
+        assert!(tool.lasso.points().is_empty());
+    }
+
+    #[test]
+    fn lasso_erase_clicks_a_polygon_too() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = ToolKind::LassoErase;
+        let mut canvas = Canvas::default();
+        let dot = |x: f32, y: f32| {
+            let mut s = Stroke::with_style_and_smoothing([0, 0, 0, 255], 4.0, StrokeStyle::Default, SmoothingOptions::default());
+            s.push(PenSample::from_pos([x, y]));
+            s.push(PenSample::from_pos([x + 2.0, y]));
+            s
+        };
+        canvas.add_stroke(dot(30.0, 30.0));
+        canvas.add_stroke(dot(200.0, 200.0));
+        let strokes = |c: &Canvas| c.layers[c.active_layer].strokes.len();
+        for p in [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0], [1.0, 1.0]] {
+            tool.begin(PenSample::from_pos(p), &mut canvas);
+            assert_eq!(strokes(&canvas), 2, "nothing goes until the shape closes");
+            tool.end(PenSample::from_pos(p), &mut canvas);
+        }
+        assert_eq!(strokes(&canvas), 1, "the click on the first corner erased the ink inside");
+        assert!(tool.lasso.points().is_empty());
     }
 }

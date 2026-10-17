@@ -764,6 +764,8 @@ impl OnScreenNotesApp {
             || self.pin_picking
             || self.pen.seen_within(PEN_NEARBY)
             || !self.tool.laser_strokes.is_empty()
+            // The lasso's dashes march.
+            || !self.tool.lasso.points().is_empty()
             || !self.pureref_jobs.is_empty()
             || !self.media_imports.is_empty()
             || self.canvases.is_loading()
@@ -1898,6 +1900,7 @@ impl eframe::App for OnScreenNotesApp {
                 self.canvases.active_index(),
                 self.canvases.active(),
             );
+            self.tool.lasso.sync(self.tool.kind, self.canvases.active_index());
             let (prev_color, prev_size) = (self.tool.color, self.tool.size);
             let mut insert_media = false;
             let toolbar_clicked = if self.ui_visible {
@@ -2132,7 +2135,9 @@ impl eframe::App for OnScreenNotesApp {
                 // "precision aim" cue rather than a generic arrow.
                 let tool_wants_crosshair = matches!(
                     self.tool.kind,
-                    crate::tools::ToolKind::Fill | crate::tools::ToolKind::LassoSelect,
+                    crate::tools::ToolKind::Fill
+                        | crate::tools::ToolKind::LassoErase
+                        | crate::tools::ToolKind::LassoSelect,
                 );
                 let hover = ctx.input(|i| i.pointer.hover_pos());
                 let on_ui = hover
@@ -2642,6 +2647,7 @@ impl eframe::App for OnScreenNotesApp {
                     if let egui::Event::Key { key, pressed: true, .. } = ev {
                         // Tool switch shortcuts.
                         interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
+                        interaction::react_lasso_keys(*key, mods, &mut self.tool, self.canvases.active_mut());
                         // Canvas + layer navigation.
                         interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys);
                         interaction::react_layer_nav (*key, mods, &mut self.canvases, keys);

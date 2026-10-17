@@ -53,8 +53,8 @@ pub fn show(
                     interacted |= tool_btn(ui, tool, ToolKind::Laser,         "Laser pointer — L  (fades after pen-up)");
                     interacted |= tool_btn(ui, tool, ToolKind::Text,          "Text — T  (click to place, Enter to commit, Shift+Enter newline)");
                     interacted |= tool_btn(ui, tool, ToolKind::Spotlight,     "Spotlight — S  (dim everything except a square around the cursor; wheel resizes)");
-                    interacted |= tool_btn(ui, tool, ToolKind::LassoErase,    "Lasso erase — X  (draw a closed loop; ink whose centroid lands inside is removed)");
-                    interacted |= tool_btn(ui, tool, ToolKind::LassoSelect,   "Lasso capture — Shift+X  (draw a closed loop; the screen pixels inside become an image on the active layer)");
+                    interacted |= tool_btn(ui, tool, ToolKind::LassoErase,    "Lasso erase — X  (draw a closed loop, or click corner by corner for a polygon and close it on the first corner, with a double click or Enter; ink whose centroid lands inside is removed)");
+                    interacted |= tool_btn(ui, tool, ToolKind::LassoSelect,   "Lasso capture — Shift+X  (draw a closed loop, or click corner by corner for a polygon and close it on the first corner, with a double click or Enter; the screen pixels inside become an image on the active layer)");
                     interacted |= tool_btn(ui, tool, ToolKind::Select,        "Select — V  (click an object, Shift+click for more, drag empty space to box-select; handles move / resize / rotate; Delete removes)");
                     spacer(ui);
 
@@ -429,6 +429,7 @@ fn help_btn(ui: &mut egui::Ui) -> bool {
                     row(ui, "Spotlight",          "S");
                     row(ui, "Lasso erase",        "X");
                     row(ui, "Lasso capture",      "Shift + X  (screen → image on active layer)");
+                    row(ui, "  lasso polygon",    "click corners; first corner / double click / Enter closes, Backspace = undo corner");
                     row(ui, "Select",             "V  (Shift+click = add / remove, drag = box)");
                     row(ui, "  move / resize / rotate", "drag inside / handles / top knob (Shift = 15°)");
                     row(ui, "  delete / duplicate", "Delete / Ctrl+D");
