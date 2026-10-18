@@ -2,16 +2,7 @@
 //!
 //! ## Why this module exists
 //!
-//! eframe / winit hand us a window with a basic extended style set. For
-//! the "click-through but stay focused" UX we want, we need two extra
-//! extended-style bits that eframe does not expose:
-//!
-//! * `WS_EX_NOACTIVATE` — when set, clicks **on** this window do not
-//!   activate it. Combined with the existing `WS_EX_TRANSPARENT`
-//!   toggle (driven by `ViewportCommand::MousePassthrough`), this
-//!   keeps the OSN window from grabbing focus when the user lets go
-//!   of Alt and clicks back into it. It also helps the floating
-//!   activator button stay out of the way of normal alt-tabbing.
+//! Window queries eframe / winit do not expose, plus:
 //!
 //! * Foreground reclaim — after a click-through, the app *behind* OSN
 //!   activates (that is OS behaviour we cannot suppress without an
@@ -21,7 +12,11 @@
 //!   to processes that already own the foreground, so we use the
 //!   well-known `AttachThreadInput` hack to bypass it.
 //!
-//! Both helpers are best-effort: any error from the Win32 API is
+//! The window is an ordinary activating window. It used to carry
+//! `WS_EX_NOACTIVATE`, which made it open unfocused and ignore
+//! activation from clicks on its toolbar and popups.
+//!
+//! The helpers are best-effort: any error from the Win32 API is
 //! logged and swallowed so a temporary failure does not crash the
 //! drawing app.
 
@@ -29,40 +24,13 @@ use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    WindowFromPoint, GA_ROOT, GWL_EXSTYLE, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_NOACTIVATE,
+    GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+    SetForegroundWindow, SetWindowDisplayAffinity, WindowFromPoint, GA_ROOT, WDA_EXCLUDEFROMCAPTURE,
+    WDA_NONE,
 };
 
-/// Set `WS_EX_NOACTIVATE` on the window identified by `hwnd_raw` (an
-/// HWND cast to `isize`, which is how raw-window-handle reports it).
-///
-/// Idempotent: if the bit is already set we leave it.
-pub fn set_no_activate(hwnd_raw: isize) {
-    if hwnd_raw == 0 {
-        log::warn!("set_no_activate called with null HWND");
-        return;
-    }
-    // SAFETY: we cast the integer back to an HWND we received from
-    // raw-window-handle, which is the OS's authoritative pointer for
-    // our own window. The two Win32 calls below only read/write
-    // window state, never deref the pointer.
-    unsafe {
-        let hwnd = HWND(hwnd_raw);
-        let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let want = cur | (WS_EX_NOACTIVATE.0 as isize);
-        if cur == want { return; }
-        let res = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
-        if res == 0 {
-            // SetWindowLongPtrW returns 0 on success when the prior
-            // value was 0; check GetLastError to distinguish.
-            // Practically we just log — a failure here is non-fatal.
-            log::debug!("SetWindowLongPtrW(GWL_EXSTYLE | WS_EX_NOACTIVATE) returned 0");
-        }
-    }
-}
-
-/// Force `hwnd_raw` to the foreground using the `AttachThreadInput`
+/// Force `hwnd_raw` (an HWND cast to `isize`, as raw-window-handle
+/// reports it) to the foreground using the `AttachThreadInput`
 /// bypass. Windows allows `SetForegroundWindow` to succeed when the
 /// caller's input is attached to the current-foreground thread's
 /// input queue, so we attach for the duration of the call and detach
@@ -72,9 +40,9 @@ pub fn set_no_activate(hwnd_raw: isize) {
 /// already in the foreground.
 pub fn reclaim_foreground(hwnd_raw: isize) {
     if hwnd_raw == 0 { return; }
-    // SAFETY: same justification as `set_no_activate`. Each call below
-    // takes an HWND pointer and never dereferences it on the Rust
-    // side; the kernel handles the underlying object.
+    // SAFETY: the integer is the HWND raw-window-handle gave us for our
+    // own window. Each call below takes it by value and never
+    // dereferences it on the Rust side; the kernel handles the object.
     unsafe {
         let hwnd = HWND(hwnd_raw);
         let fg = GetForegroundWindow();

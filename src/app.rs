@@ -121,8 +121,8 @@ pub struct OnScreenNotesApp {
     /// Native window handle of the overlay viewport, stored as the
     /// platform-native integer (HWND cast to `isize` on Windows, 0 on
     /// other platforms or when capture fails). Used by
-    /// `crate::platform` to set `WS_EX_NOACTIVATE` and to reclaim the
-    /// foreground after a click-through. 0 disables both calls.
+    /// `crate::platform` to reclaim the foreground after a click-through,
+    /// among other things. 0 disables those calls.
     osn_hwnd: isize,
 
     /// Screen-recording state machine. Idle by default; toggled on /
@@ -483,8 +483,8 @@ impl OnScreenNotesApp {
         eraser_override.kind = crate::tools::ToolKind::Eraser;
 
         // Grab the overlay's native window handle once — `crate::platform`
-        // uses it to set `WS_EX_NOACTIVATE` and to reclaim the foreground
-        // after the user's clicks pass through to the app behind. A
+        // uses it to reclaim the foreground after the user's clicks pass
+        // through to the app behind, among other things. A
         // failure here is non-fatal: the platform helpers silently no-op
         // when the handle is 0.
         let osn_hwnd: isize = {
@@ -1593,12 +1593,11 @@ impl eframe::App for OnScreenNotesApp {
         // window in passthrough mode.
         if self.first_frame {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
-            // OS-level: ensure clicks on the overlay don't activate the
-            // window when it's already in passthrough. Combined with
-            // the foreground-reclaim on each pen Down (below), this
-            // gives the "click-through but OSN stays focused"
-            // behaviour. No-op on non-Windows targets.
-            crate::platform::set_no_activate(self.osn_hwnd);
+            // Open focused, like any app. (The window used to be made
+            // `WS_EX_NOACTIVATE` here, so it opened unfocused and clicks
+            // on the toolbar or a popup never focused it; a press on the
+            // canvas still reclaims the foreground after a click-through.)
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.idle_frame = refresh_period(self.osn_hwnd);
             self.first_frame = false;
             log::info!("on-screen-notes started: overlay visible, input enabled");
