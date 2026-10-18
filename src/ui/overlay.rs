@@ -254,6 +254,8 @@ pub fn show(
     // Live frames for videos and GIFs; their poster frame stands in
     // until a player has one.
     media: &crate::media::MediaHub,
+    // Media types to highlight; the rest of the slide fades back.
+    media_filter: crate::ui::media_filter::MediaFilter,
 ) -> egui::Rect {
     // Select-tool gesture in flight: the selected objects preview under
     // its transform until pen-up commits it.
@@ -542,6 +544,13 @@ pub fn show(
                         painter.circle_stroke(c, 7.0, egui::Stroke::new(1.5, light));
                     }
                 }
+            }
+
+            // Media filter — under the selection chrome, so a selection
+            // made with "Select these" still shows its frame on top. Kept
+            // out of screenshots and recordings like the chrome is.
+            if media_filter.any() && chrome_visible && show_selection {
+                crate::ui::media_filter::paint(&ui.painter_at(rect), rect, manager.active(), media_filter);
             }
 
             // Select tool — frame, resize handles, rotate knob and the

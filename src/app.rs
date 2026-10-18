@@ -216,6 +216,8 @@ pub struct OnScreenNotesApp {
     media: crate::media::MediaHub,
     /// Their playback bars, and the FFmpeg setup window.
     media_ui: ui::media_controls::MediaUi,
+    /// Media types the toolbar's filter highlights.
+    media_filter: ui::media_filter::MediaFilter,
     /// Files being copied in and read as videos / GIFs.
     media_imports: Vec<crate::media::import::ImportJob>,
     /// Videos picked or dropped before FFmpeg was set up, with where
@@ -268,6 +270,7 @@ const CLIP_MARKER: &str = "on-screen-notes:selection";
 enum SelAction {
     Delete,
     Duplicate,
+    CopyToNewSlide,
     ToFront,
     ToBack,
     Copy,
@@ -549,6 +552,7 @@ impl OnScreenNotesApp {
             mouse_gesture: false,
             media: crate::media::MediaHub::new(),
             media_ui: ui::media_controls::MediaUi::new(),
+            media_filter: ui::media_filter::MediaFilter::default(),
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
             media_dialog: None,
@@ -1075,6 +1079,57 @@ impl OnScreenNotesApp {
         self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
+    /// Select every object the media filter highlights. A selection
+    /// lives on one layer: the active layer's matches, or, when it has
+    /// none, those of the topmost visible layer that does.
+    fn select_media_matches(&mut self) {
+        let c = self.canvases.active();
+        let visible = |li: usize| c.layers.get(li).is_some_and(|l| l.visible && l.opacity > 0.0);
+        let found = std::iter::once(c.active_layer)
+            .chain((0..c.layers.len()).rev().filter(|&li| li != c.active_layer))
+            .filter(|&li| visible(li))
+            .map(|li| (li, ui::media_filter::matches_on(c, li, self.media_filter)))
+            .find(|(_, shapes)| !shapes.is_empty());
+        let Some((li, shapes)) = found else { return };
+        if li != c.active_layer {
+            self.canvases.active_mut().active_layer = li;
+        }
+        self.tool.kind = crate::tools::ToolKind::Select;
+        self.tool.select.gesture = None;
+        self.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
+        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+    }
+
+    /// Copy the selected objects onto a new slide and go there, with the
+    /// copies selected, at the same spot and in the same view. The slide
+    /// goes after the last one: putting it in mid-deck would renumber,
+    /// and so rewrite, every slide file after it.
+    fn copy_selection_to_new_slide(&mut self) {
+        let (strokes, shapes) = self.selected_objects();
+        let count = strokes.len() + shapes.len();
+        if count == 0 { return; }
+        let (pan, zoom) = { let c = self.canvases.active(); (c.pan, c.zoom) };
+        let (canvas, sel) = crate::canvas::canvas::Canvas::with_objects(strokes, shapes, pan, zoom);
+        let idx = self.canvases.push_canvas(canvas);
+        self.tool.kind = crate::tools::ToolKind::Select;
+        self.tool.select.gesture = None;
+        self.tool.select.sel = sel;
+        self.tool.select.rebind(idx, self.canvases.active());
+        let what = if count == 1 { "1 object".to_string() } else { format!("{count} objects") };
+        self.toast = Some((format!("Copied {what} to new slide {}", idx + 1), Instant::now()));
+    }
+
+    /// Pack, group, align or distribute the selection, as one undo step.
+    fn arrange_selection(&mut self, op: crate::tools::arrange::Arrange) {
+        let c = self.canvases.active();
+        let li = c.active_layer;
+        let Some(layer) = c.layers.get(li) else { return };
+        let (strokes, shapes) = crate::tools::arrange::plan(layer, &self.tool.select.sel, op, c.zoom);
+        if !self.canvases.active_mut().move_objects_each(li, &strokes, &shapes) {
+            self.toast = Some(("Nothing to move".to_string(), std::time::Instant::now()));
+        }
+    }
+
     /// Run one Select-tool command against the current selection.
     fn apply_sel_action(&mut self, action: SelAction, canvas_rect: egui::Rect, pixels_per_point: f32) {
         // One nudge so a copy does not sit exactly on its original. Kept
@@ -1093,6 +1148,7 @@ impl OnScreenNotesApp {
                 let (strokes, shapes) = self.selected_objects();
                 self.insert_and_select(strokes, shapes, [step, step]);
             }
+            SelAction::CopyToNewSlide if has_selection => self.copy_selection_to_new_slide(),
             SelAction::ToFront | SelAction::ToBack if has_selection => {
                 let to_front = matches!(action, SelAction::ToFront);
                 let c = self.canvases.active_mut();
@@ -1926,6 +1982,8 @@ impl eframe::App for OnScreenNotesApp {
             self.tool.lasso.sync(self.tool.kind, self.canvases.active_index());
             let (prev_color, prev_size) = (self.tool.color, self.tool.size);
             let mut insert_media = false;
+            let mut select_filtered = false;
+            let media_counts = ui::media_filter::counts(self.canvases.active());
             let toolbar_clicked = if self.ui_visible {
                 ui::toolbar::show(
                     ctx,
@@ -1939,10 +1997,30 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
                     &mut insert_media,
+                    &mut self.media_filter,
+                    media_counts,
+                    &mut select_filtered,
                 )
             } else {
                 false
             };
+            if select_filtered {
+                self.select_media_matches();
+            }
+            // Arrange bar for a selection of two or more objects; hidden
+            // mid-gesture so it doesn't flicker over a drag.
+            let selected_count = self.tool.select.sel.strokes.len() + self.tool.select.sel.shapes.len();
+            if self.ui_visible
+                && self.tool.kind == crate::tools::ToolKind::Select
+                && selected_count >= 2
+                && self.tool.select.gesture.is_none()
+            {
+                match ui::arrange_bar::show(ctx, selected_count) {
+                    Some(ui::arrange_bar::BarAction::Arrange(op)) => self.arrange_selection(op),
+                    Some(ui::arrange_bar::BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
+                    None => {}
+                }
+            }
             if insert_media && self.media_dialog.is_none() {
                 let mut exts = vec!["gif"];
                 exts.extend_from_slice(crate::media::import::VIDEO_EXTS);
@@ -2008,6 +2086,7 @@ impl eframe::App for OnScreenNotesApp {
                 layer_xform,
                 show_selection,
                 &self.media,
+                self.media_filter,
             );
 
             // ---- Videos & GIFs ------------------------------------------
@@ -2647,6 +2726,8 @@ impl eframe::App for OnScreenNotesApp {
                                 sel_actions.push(SelAction::Delete);
                             } else if hit(c.duplicate) {
                                 sel_actions.push(SelAction::Duplicate);
+                            } else if hit(c.copy_to_new_slide) {
+                                sel_actions.push(SelAction::CopyToNewSlide);
                             } else if hit(c.bring_front) {
                                 sel_actions.push(SelAction::ToFront);
                             } else if hit(c.send_back) {

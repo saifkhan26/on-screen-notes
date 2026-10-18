@@ -5,11 +5,12 @@
 //! tinted at render time. SVGs scale crisply at any DPI, are easy to swap,
 //! and ship inside the binary via `include_image!`.
 
-use crate::canvas::shape::BorderStyle;
+use crate::canvas::shape::{BorderStyle, MediaType};
 use crate::canvas::smoothing::{SmoothingOptions, SmoothingType};
 use crate::canvas::stroke::StrokeStyle;
 use crate::config::SmoothingLevel;
 use crate::tools::{ActiveTool, ToolKind};
+use crate::ui::media_filter::{self, MediaFilter};
 use crate::ui::theme;
 use egui::{Color32, Rounding, Stroke, Vec2};
 
@@ -28,6 +29,11 @@ pub fn show(
     pin_picking: &mut bool,
     // Set when the "Insert video / GIF" button is clicked.
     insert_media: &mut bool,
+    media_filter: &mut MediaFilter,
+    // Pictures / GIFs / videos on the slide, for the filter popup.
+    media_counts: [usize; 3],
+    // Set when the filter's "Select these" is clicked.
+    select_filtered: &mut bool,
 ) -> bool {
     let mut interacted = false;
 
@@ -89,6 +95,7 @@ pub fn show(
 
                     // Group 5: utilities (insert media + pin + settings + help)
                     interacted |= insert_media_btn(ui, insert_media);
+                    interacted |= filter_btn(ui, media_filter, media_counts, select_filtered);
                     interacted |= pin_btn(ui, pinned_hwnd, pin_picking);
                     interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve);
                     interacted |= help_btn(ui);
@@ -195,6 +202,66 @@ fn insert_media_btn(ui: &mut egui::Ui, clicked: &mut bool) -> bool {
         return true;
     }
     response.hovered() || response.is_pointer_button_down_on()
+}
+
+/// Media filter: highlights pictures, GIFs and / or videos on the slide.
+/// Lit while any type is on; the popup picks the types.
+fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: [usize; 3], select: &mut bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
+    let bg = if filter.any() {
+        theme::ACCENT
+    } else if response.hovered() {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+    let icon_rect = rect.shrink(rect.width() * 0.24);
+    egui::Image::new(egui::include_image!("../../assets/icons/filter.svg"))
+        .tint(theme::TEXT_PRIMARY)
+        .fit_to_exact_size(icon_rect.size())
+        .paint_at(ui, icon_rect);
+    let response = response.on_hover_text("Highlight pictures, GIFs or videos");
+    let popup_id = ui.make_persistent_id("osn_media_filter_popup");
+    let mut interacted = response.hovered() || response.is_pointer_button_down_on();
+    if response.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+        interacted = true;
+    }
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui: &mut egui::Ui| {
+            ui.set_min_width(200.0);
+            ui.label(egui::RichText::new("Highlight media").small().color(theme::TEXT_MUTED));
+            ui.add_space(2.0);
+            for (t, n) in MediaType::ALL.into_iter().zip(counts) {
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.5, media_filter::color(t));
+                    ui.toggle_value(filter.flag(t), format!("{}  ({n})", media_filter::label(t)));
+                });
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let matching: usize = MediaType::ALL.into_iter().zip(counts).filter(|(t, _)| filter.shows(*t)).map(|(_, n)| n).sum();
+                if ui
+                    .add_enabled(matching > 0, egui::Button::new("Select these"))
+                    .on_hover_text("Select the highlighted objects, ready to arrange")
+                    .clicked()
+                {
+                    *select = true;
+                    ui.memory_mut(|m| m.close_popup());
+                }
+                if ui.add_enabled(filter.any(), egui::Button::new("Clear")).clicked() {
+                    *filter = MediaFilter::default();
+                }
+            });
+        },
+    );
+    interacted
 }
 
 /// Render the SVG icon for a tool inside `rect`, tinted to `color`.
@@ -433,6 +500,9 @@ fn help_btn(ui: &mut egui::Ui) -> bool {
                     row(ui, "Select",             "V  (Shift+click = add / remove, drag = box)");
                     row(ui, "  move / resize / rotate", "drag inside / handles / top knob (Shift = 15°)");
                     row(ui, "  delete / duplicate", "Delete / Ctrl+D");
+                    row(ui, "  copy to new slide", "Ctrl+Shift+D  (new slide after the last)");
+                    row(ui, "  arrange (2+ selected)", "bar under the toolbar: pack, group by type, align, distribute");
+                    row(ui, "Highlight pictures / GIFs / videos", "funnel button; \"Select these\" selects them");
                     row(ui, "  copy / cut / paste", "Ctrl+C / Ctrl+X / Ctrl+V  (also pastes images)");
                     row(ui, "  to front / to back", "Ctrl+↑ / Ctrl+↓");
                     row(ui, "  recolour / resize line", "pick a colour / move the size slider");

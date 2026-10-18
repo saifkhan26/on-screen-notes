@@ -384,6 +384,26 @@ impl Default for Canvas {
 }
 
 impl Canvas {
+    /// A new slide holding copies of `strokes` and `shapes` where they sat,
+    /// seen through the same `pan` / `zoom`, and the selection of all of
+    /// them. They are its starting content, not an undo step. Videos and
+    /// GIFs get fresh player ids, so each copy plays on its own.
+    pub fn with_objects(mut strokes: Vec<Stroke>, mut shapes: Vec<Shape>, pan: [f32; 2], zoom: f32) -> (Self, hit::Selection) {
+        for s in &mut strokes {
+            s.build_cache();
+        }
+        for s in &mut shapes {
+            if let Shape::Raster { media: Some(m), .. } = s {
+                m.id = crate::canvas::shape::fresh_media_id();
+            }
+        }
+        let sel = hit::Selection { strokes: (0..strokes.len()).collect(), shapes: (0..shapes.len()).collect() };
+        let mut canvas = Self { pan, zoom, ..Self::default() };
+        canvas.layers[0].strokes = strokes;
+        canvas.layers[0].shapes = shapes;
+        (canvas, sel)
+    }
+
     /// Migrate an old-format canvas (flat strokes/shapes, no layers) into
     /// the new layered representation. Idempotent: re-runs are no-ops.
     /// Always called after deserialise and after default-construction so
@@ -893,8 +913,8 @@ impl Canvas {
         li: usize,
         strokes: &[usize],
         shapes: &[usize],
-        mut edit_stroke: impl FnMut(&mut Stroke),
-        mut edit_shape: impl FnMut(&mut Shape),
+        mut edit_stroke: impl FnMut(usize, &mut Stroke),
+        mut edit_shape: impl FnMut(usize, &mut Shape),
     ) -> bool {
         let Some(layer) = self.layers.get_mut(li) else { return false };
         let mut stroke_log = Vec::with_capacity(strokes.len());
@@ -902,14 +922,14 @@ impl Canvas {
         for &i in strokes {
             if let Some(s) = layer.strokes.get_mut(i) {
                 let before = s.clone();
-                edit_stroke(s);
+                edit_stroke(i, s);
                 stroke_log.push((i, before, s.clone()));
             }
         }
         for &i in shapes {
             if let Some(s) = layer.shapes.get_mut(i) {
                 let before = s.clone();
-                edit_shape(s);
+                edit_shape(i, s);
                 shape_log.push((i, before, s.clone()));
             }
         }
@@ -927,7 +947,30 @@ impl Canvas {
     /// space.
     pub fn transform_objects(&mut self, li: usize, strokes: &[usize], shapes: &[usize], m: &Affine) {
         if m.is_identity() { return; }
-        self.edit_objects(li, strokes, shapes, |s| s.apply_affine(m), |s| s.apply_affine(m));
+        self.edit_objects(li, strokes, shapes, |_, s| s.apply_affine(m), |_, s| s.apply_affine(m));
+    }
+
+    /// Shift each chosen object by its own offset, all in one undo step
+    /// — what Arrange does. `strokes` / `shapes` pair an index with its
+    /// offset, ascending by index. Zero offsets are left out of the
+    /// step; returns false when nothing moved.
+    pub fn move_objects_each(&mut self, li: usize, strokes: &[(usize, [f32; 2])], shapes: &[(usize, [f32; 2])]) -> bool {
+        let moved = |list: &[(usize, [f32; 2])]| -> Vec<(usize, [f32; 2])> {
+            list.iter().copied().filter(|(_, d)| d[0] != 0.0 || d[1] != 0.0).collect()
+        };
+        let (strokes, shapes) = (moved(strokes), moved(shapes));
+        let offset = |list: &[(usize, [f32; 2])], i: usize| {
+            list.binary_search_by_key(&i, |e| e.0).map_or([0.0, 0.0], |k| list[k].1)
+        };
+        let stroke_ix: Vec<usize> = strokes.iter().map(|e| e.0).collect();
+        let shape_ix: Vec<usize> = shapes.iter().map(|e| e.0).collect();
+        self.edit_objects(
+            li,
+            &stroke_ix,
+            &shape_ix,
+            |i, s| s.translate(offset(&strokes, i)),
+            |i, s| s.translate(offset(&shapes, i)),
+        )
     }
 
     /// Recolour and / or re-width the chosen objects.
@@ -986,7 +1029,7 @@ impl Canvas {
                 }
             }
         }
-        self.edit_objects(li, strokes, shapes, edit_stroke, edit_shape);
+        self.edit_objects(li, strokes, shapes, |_, s| edit_stroke(s), |_, s| edit_shape(s));
     }
 
     /// Remove the chosen objects in one undo step.
@@ -1765,6 +1808,26 @@ mod object_edit_tests {
         c.redo();
         assert_eq!(tags(&c), vec![0, 1, 7, 8]);
         assert_eq!(c.layers[0].shapes.len(), 1);
+    }
+
+    #[test]
+    fn a_slide_made_from_objects_holds_copies_in_place_and_selected() {
+        use crate::canvas::shape::{MediaKind, MediaRef};
+        let video = |id: u64| {
+            let mut s = raster(RasterKind::Image);
+            if let Shape::Raster { media, .. } = &mut s {
+                *media = Some(Box::new(MediaRef { file: "v.mp4".into(), kind: MediaKind::Video, source_name: String::new(), meta: None, id }));
+            }
+            s
+        };
+        let (c, sel) = Canvas::with_objects(vec![stroke(7, 30.0)], vec![raster(RasterKind::Image), video(42)], [5.0, -3.0], 0.25);
+        assert_eq!((c.pan, c.zoom), ([5.0, -3.0], 0.25), "seen as it was on the old slide");
+        assert_eq!(sel, hit::Selection { strokes: vec![0], shapes: vec![0, 1] });
+        assert_eq!(c.layers[0].strokes[0].samples[0].pos, [30.0, 0.0], "copies stay where they were");
+        assert!(c.undo_log.is_empty(), "the copies are the slide's content, not an undo step");
+        assert!(c.dirty, "a new slide must be saved");
+        let id = c.layers[0].shapes[1].media().map(|m| m.id);
+        assert!(id.is_some_and(|id| id != 42), "the copied video plays on its own");
     }
 
     #[test]

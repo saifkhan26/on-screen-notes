@@ -3,9 +3,11 @@
 //! Each submodule is one self-contained widget. The top-level `App::update`
 //! composes them.
 
+pub mod arrange_bar;
 pub mod layer_panel;
 pub mod loupe;
 pub mod media_controls;
+pub mod media_filter;
 pub mod overlay;
 pub mod picture_cache;
 pub mod status;

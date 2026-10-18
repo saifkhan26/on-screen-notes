@@ -52,6 +52,19 @@ pub enum MediaKind {
     Video,
 }
 
+/// The kinds of media object the media filter tells apart. Runtime
+/// only; never saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaType {
+    Picture,
+    Gif,
+    Video,
+}
+
+impl MediaType {
+    pub const ALL: [MediaType; 3] = [MediaType::Picture, MediaType::Gif, MediaType::Video];
+}
+
 /// Stream facts measured at import, so the control bar can show the
 /// length and frame count before a player has started.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -361,6 +374,19 @@ impl Shape {
     pub fn media(&self) -> Option<&MediaRef> {
         match self {
             Shape::Raster { media: Some(m), .. } => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Picture, GIF or video — what the media filter and Arrange's
+    /// "group by type" sort by. Fill stickers and drawn shapes are none.
+    pub fn media_type(&self) -> Option<MediaType> {
+        match self {
+            Shape::Raster { media: Some(m), .. } => Some(match m.kind {
+                MediaKind::Gif => MediaType::Gif,
+                MediaKind::Video => MediaType::Video,
+            }),
+            Shape::Raster { kind: RasterKind::Image, .. } => Some(MediaType::Picture),
             _ => None,
         }
     }

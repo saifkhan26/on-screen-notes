@@ -9,6 +9,7 @@
 //! with explicit variants is cleaner, faster, and easier to reason about
 //! for a Rust beginner than dyn dispatch.
 
+pub mod arrange;
 pub mod arrow_tool;
 pub mod eraser_tool;
 pub mod lasso_tool;

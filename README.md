@@ -165,6 +165,7 @@ layer makes that layer the active one.
 | Drag the knob above the frame | Rotate (`Shift` snaps to 15°) |
 | `Delete` / `Backspace` | Delete the selection |
 | `Ctrl+D` | Duplicate |
+| `Ctrl+Shift+D` | Copy to a new slide (added after the last) |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste (works across slides and layers; on Windows the copy also pastes as a picture in other apps) |
 | `Ctrl+V` with an image on the clipboard | Paste it as an image object |
 | `Ctrl+↑` / `Ctrl+↓` | Bring to front / send to back |
@@ -173,12 +174,25 @@ layer makes that layer the active one.
 
 Every action is one undo step. Things worth knowing:
 
-- An image (lasso capture, pasted picture) is selected by a **click**.
-  Dragging from an unselected image draws the selection box instead, so
-  you can box-select ink drawn over a screenshot without dragging the
-  screenshot away. Clicks pass through the transparent parts of an
-  image to whatever is visible underneath. Neither eraser removes
-  images — delete them here.
+- An image, video or GIF on the **active layer** is picked up and moved
+  as soon as you drag it. One on **another layer** (say, a screenshot
+  under the ink you are drawing) is selected by a **click**; dragging
+  from it draws the selection box instead, so you can box-select ink
+  drawn over a screenshot without dragging the screenshot away. Clicks
+  pass through the transparent parts of an image to whatever is visible
+  underneath. Neither eraser removes images — delete them here.
+- With **two or more objects selected**, a bar under the toolbar arranges
+  them: pack into a tight block, group by type (pictures, GIFs, videos,
+  everything else), align edges or centres, distribute evenly. Pictures,
+  GIFs and videos move one by one, taking the ink drawn on them along;
+  other ink moves in touching clusters, so handwriting stays in one
+  piece. Its last button copies the selection to a new slide.
+- **Copy to a new slide** (`Ctrl+Shift+D`, any selection) adds a slide
+  after the last one holding copies of the selected objects, in the same
+  spot and view, and goes there with them selected.
+- The **funnel** button highlights pictures, GIFs and/or videos on the
+  slide (each type outlined in its own colour, the rest dimmed), and
+  "Select these" selects them, ready to arrange or copy.
 - Captures made by older versions, and frozen frames, are stored as a
   layer's background rather than as objects. Clicking one turns it into
   an ordinary image object in place — nothing moves — and from then on
@@ -299,6 +313,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Toggle floating UI | `Tab` |
 | Cancel pending (eyedropper / lasso / text / selection) | `Esc` |
 | Selection: delete / duplicate | `Delete` / `Ctrl+D` |
+| Selection: copy to a new slide | `Ctrl+Shift+D` |
 | Selection: copy / cut / paste | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` |
 | Selection: bring to front / send to back | `Ctrl+↑` / `Ctrl+↓` |
 | Text mode: newline | `Shift+Enter` |
@@ -391,6 +406,7 @@ preview_layer = "q"
 # Select-tool actions (only act while objects are selected).
 delete_selection = "delete"
 duplicate   = "ctrl+d"
+copy_to_new_slide = "ctrl+shift+d"
 bring_front = "ctrl+arrowup"
 send_back   = "ctrl+arrowdown"
 

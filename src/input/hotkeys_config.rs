@@ -318,6 +318,8 @@ pub struct CanvasSection {
     // selected, so `delete` and the arrow chords stay free otherwise.
     #[serde(default = "d_delete_selection")] pub delete_selection: String,
     #[serde(default = "d_duplicate")]        pub duplicate: String,
+    /// Copy the selection onto a new slide (added after the last one).
+    #[serde(default = "d_copy_to_new_slide")] pub copy_to_new_slide: String,
     /// Paint the selection above everything else of its kind on the layer.
     #[serde(default = "d_bring_front")]      pub bring_front: String,
     /// Paint the selection below everything else of its kind on the layer.
@@ -351,6 +353,7 @@ impl Default for CanvasSection {
             preview_layer: d_preview_layer(),
             delete_selection: d_delete_selection(),
             duplicate: d_duplicate(),
+            copy_to_new_slide: d_copy_to_new_slide(),
             bring_front: d_bring_front(),
             send_back: d_send_back(),
             media_play_pause: d_media_play_pause(),
@@ -388,6 +391,7 @@ fn d_op_inc() -> String { "=".into() }
 fn d_preview_layer() -> String { "q".into() }
 fn d_delete_selection() -> String { "delete".into() }
 fn d_duplicate()   -> String { "ctrl+d".into() }
+fn d_copy_to_new_slide() -> String { "ctrl+shift+d".into() }
 fn d_bring_front() -> String { "ctrl+arrowup".into() }
 fn d_send_back()   -> String { "ctrl+arrowdown".into() }
 fn d_media_play_pause() -> String { "k".into() }
@@ -448,6 +452,7 @@ pub struct CanvasBindings {
     pub preview_layer: Option<Binding>,
     pub delete_selection: Option<Binding>,
     pub duplicate: Option<Binding>,
+    pub copy_to_new_slide: Option<Binding>,
     pub bring_front: Option<Binding>,
     pub send_back: Option<Binding>,
     pub media_play_pause: Option<Binding>,
@@ -525,6 +530,7 @@ impl HotkeysConfig {
                 preview_layer: p("canvas.preview_layer", &self.canvas.preview_layer),
                 delete_selection: p("canvas.delete_selection", &self.canvas.delete_selection),
                 duplicate:   p("canvas.duplicate",   &self.canvas.duplicate),
+                copy_to_new_slide: p("canvas.copy_to_new_slide", &self.canvas.copy_to_new_slide),
                 bring_front: p("canvas.bring_front", &self.canvas.bring_front),
                 send_back:   p("canvas.send_back",   &self.canvas.send_back),
                 media_play_pause: p("canvas.media_play_pause", &self.canvas.media_play_pause),
