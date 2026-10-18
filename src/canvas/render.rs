@@ -652,6 +652,16 @@ fn paint_shape(
             // line height; matches what most browsers default to.
             let line_h = size * 1.25;
             let top_left = to_screen(*pos);
+            // Off screen: skip it. Laying it out would still rasterise its
+            // glyphs at the zoomed size; zoomed far in, labels nowhere near
+            // the view filled the font atlas and stalled every frame.
+            // `reach` is generous: no glyph is wider than its size, and the
+            // label may be turned any way about its top-left corner.
+            let longest = content.split('\n').map(|l| l.chars().count()).max().unwrap_or(0) as f32;
+            let reach = longest * size + content.split('\n').count() as f32 * line_h;
+            if !painter.clip_rect().expand(reach).contains(top_left) {
+                return;
+            }
             // Each line is its own galley turned about its top-left,
             // stepped down the label's turned "down" direction so the
             // lines stay stacked.
@@ -670,7 +680,49 @@ fn paint_shape(
 /// panics on one wider than the atlas (about 8k pixels), which zooming
 /// far into a label would reach; bigger text is laid out at this size
 /// and its mesh stretched, so it is a little soft but the right size.
-const MAX_GLYPH_PX: f32 = 512.0;
+/// Kept modest: zooming in rasterises a label once per step up to here,
+/// and at 512 the atlas grew to 8192×4096 in one zoom, a stall of
+/// almost half a second while it was re-uploaded.
+const MAX_GLYPH_PX: f32 = 256.0;
+
+/// Glyphs bigger than this (physical px) are rasterised at the next of a
+/// few fixed sizes up, and the mesh shrunk to fit. Zooming changes the
+/// size every frame; rasterising at each exact size filled egui's font
+/// atlas until it was cleared and re-uploaded whole, again and again.
+const EXACT_GLYPH_PX: f32 = 24.0;
+/// Fixed sizes are this far apart (a factor of 2^¼, so a glyph is at most
+/// ~16 % bigger than shown).
+const GLYPH_STEPS_PER_OCTAVE: f32 = 4.0;
+
+/// The size (physical px) to rasterise glyphs at to show them `px` tall.
+fn glyph_px(px: f32) -> f32 {
+    if px <= EXACT_GLYPH_PX {
+        return px;
+    }
+    let steps = (px.log2() * GLYPH_STEPS_PER_OCTAVE).ceil();
+    (steps / GLYPH_STEPS_PER_OCTAVE).exp2().min(MAX_GLYPH_PX)
+}
+
+#[cfg(test)]
+mod glyph_tests {
+    use super::*;
+
+    #[test]
+    fn glyph_sizes_snap_to_a_few_steps_above_small_text() {
+        // Small text stays exact, so it stays crisp.
+        assert_eq!(glyph_px(13.0), 13.0);
+        // Above, every size within a step rasterises at the same size,
+        // never smaller than shown, within a quarter octave.
+        let a = glyph_px(100.0);
+        assert_eq!(glyph_px(101.0), a);
+        assert!(a >= 100.0 && a <= 100.0 * 2f32.powf(0.25) + 1e-3);
+        // A zoom from 25 px to far past the cap touches only a few sizes.
+        let mut seen: Vec<f32> = (25..=4000).map(|p| glyph_px(p as f32)).collect();
+        seen.dedup();
+        assert!(seen.len() <= 15, "{} sizes", seen.len());
+        assert_eq!(glyph_px(5000.0), MAX_GLYPH_PX);
+    }
+}
 
 /// One line of a text label, `size` logical px tall, its top-left at
 /// `lp`, turned by `angle` about that corner.
@@ -685,10 +737,12 @@ fn paint_text_line(
 ) {
     let ctx = painter.ctx();
     let ppp = ctx.pixels_per_point();
-    let drawn = size.min(MAX_GLYPH_PX / ppp);
+    let px = size * ppp;
+    let glyph = glyph_px(px);
+    let drawn = if glyph == px { size } else { glyph / ppp };
     let galley = painter.layout_no_wrap(line.to_string(), egui::FontId::new(drawn, family.clone()), color);
     let shape = egui::epaint::TextShape::new(lp, galley, color).with_angle(angle);
-    if drawn >= size {
+    if drawn == size {
         painter.add(shape);
         return;
     }

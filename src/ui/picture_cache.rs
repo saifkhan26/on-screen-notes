@@ -232,6 +232,15 @@ impl PictureCache {
         !self.ready.is_empty() || self.entries.values().any(|e| e.pending > 0)
     }
 
+    /// For the perf log: pictures known, loads in flight, copies waiting
+    /// to upload, broken files, and MB of full-size textures.
+    pub fn stats(&self) -> String {
+        let pending = self.entries.values().filter(|e| e.pending > 0).count();
+        let broken = self.entries.values().filter(|e| e.broken).count();
+        let bytes: usize = self.entries.values().filter_map(|e| e.tex.as_ref()).map(|(_, t)| t.byte_size()).sum();
+        format!("pics {} pending {pending} ready {} broken {broken} tex {} MB", self.entries.len(), self.ready.len(), bytes >> 20)
+    }
+
     fn ask(&mut self, picture: &PictureRef, side: u32) {
         if !self.workers_started {
             self.workers_started = true;

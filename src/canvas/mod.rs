@@ -61,6 +61,11 @@ pub struct CanvasManager {
     /// The views `views.ron` held at startup, given to each slide as it
     /// is read.
     file_views: Vec<SlideView>,
+    /// A background save is writing. Only one runs at a time: two
+    /// writing the same slide share its `.tmp` file and could leave a
+    /// mix of both renamed over the slide, and on a big slide (a 1 GB
+    /// one takes ~15 s) back-to-back edits stacked up several at once.
+    saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Stand-in for a slot whose file is missing or unreadable. It keeps
@@ -186,6 +191,7 @@ impl CanvasManager {
             loading: None,
             saved_views: Vec::new(),
             file_views: crate::persistence::load_views(),
+            saving: Default::default(),
         };
         // Every slot up to the highest file on disk gets an entry. A gap
         // or an unreadable file becomes a blank placeholder instead of
@@ -245,6 +251,7 @@ impl CanvasManager {
             loading: None,
             saved_views,
             file_views: Vec::new(),
+            saving: Default::default(),
         }
     }
 
@@ -404,6 +411,23 @@ impl CanvasManager {
         c
     }
 
+    /// Run an input event (a pen or mouse gesture step, a key) that may
+    /// or may not edit the active canvas, flagging it for the autosave
+    /// only if it did. Most presses edit nothing — a click that only
+    /// selects, a laser-pointer stroke — and on a slide of hundreds of
+    /// megabytes each needless save is seconds of work. Every edit
+    /// records an undo step or changes an object count, a layer's `rev`
+    /// or the active layer, which `Canvas::edit_stamp` covers.
+    pub fn edit_active<R>(&mut self, f: impl FnOnce(&mut Canvas) -> R) -> R {
+        let c = self.canvases[self.active].as_mut().expect("the active slide is always loaded");
+        let before = c.edit_stamp();
+        let r = f(c);
+        if c.edit_stamp() != before {
+            c.dirty = true;
+        }
+        r
+    }
+
     /// The active canvas's pan and zoom, for moving the view. Unlike
     /// `active_mut` this does not flag the canvas for the autosave:
     /// looking around is not an edit, and rewriting a big slide every
@@ -545,6 +569,11 @@ impl CanvasManager {
     /// whose file name is not known yet, so no media is deleted now —
     /// what is left waits for `save_all_blocking` at exit.
     pub fn save_all(&mut self, media_in_use: Option<&HashSet<String>>) {
+        // One save at a time. The slides stay dirty, so the next tick
+        // after this one finishes writes their newest state.
+        if self.saving.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         if let Some(views) = self.take_changed_views() {
             std::thread::spawn(move || {
                 if let Err(e) = crate::persistence::save_views(&views) {
@@ -581,7 +610,11 @@ impl CanvasManager {
             _ => Vec::new(),
         };
         crate::perf::line(format!("autosave: copied {} slide(s) on the UI thread in {:.1} ms", dirty.len(), crate::perf::ms(copy_started.elapsed())));
+        self.saving.store(true, std::sync::atomic::Ordering::Release);
+        let done = SaveDone(std::sync::Arc::clone(&self.saving));
         std::thread::spawn(move || {
+            // Cleared however the thread ends, panic included.
+            let _done = done;
             for (i, c) in dirty {
                 let t = std::time::Instant::now();
                 if let Err(e) = crate::persistence::save_canvas(i, &c) {
@@ -628,6 +661,11 @@ impl CanvasManager {
     /// dirty canvas hits disk so a forced kill after `on_exit` can't
     /// drop edits.
     pub fn save_all_blocking(&mut self) {
+        // A background save may still be writing; writing the same slide
+        // alongside it could corrupt the file. Wait it out.
+        while self.saving.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         if let Some(views) = self.take_changed_views() {
             if let Err(e) = crate::persistence::save_views(&views) {
                 log::warn!("failed to save slide views: {e}");
@@ -652,6 +690,15 @@ impl CanvasManager {
             let unused = self.unused_media(&HashSet::new());
             delete_media_files(&unused);
         }
+    }
+}
+
+/// Clears `CanvasManager::saving` when the save thread ends.
+struct SaveDone(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SaveDone {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -822,6 +869,54 @@ mod view_tests {
         assert_eq!(m.take_changed_views(), None, "written once, then quiet until the next change");
         // A real edit still flags the slide.
         m.active_mut();
+        assert!(m.active().dirty);
+    }
+
+    #[test]
+    fn a_save_waits_for_the_one_in_flight() {
+        let mut m = CanvasManager::for_tests(vec![clean()]);
+        m.active_mut();
+        m.saving.store(true, std::sync::atomic::Ordering::Release);
+        // Returns before touching the disk or the dirty flags.
+        m.save_all(None);
+        assert!(m.active().dirty, "kept for the save after this one");
+        // The flag clears however the save thread ends.
+        drop(SaveDone(std::sync::Arc::clone(&m.saving)));
+        assert!(!m.saving.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn only_gestures_that_edit_flag_the_slide() {
+        use crate::canvas::stroke::PenSample;
+        use crate::tools::{ActiveTool, ToolKind};
+        let mut m = CanvasManager::for_tests(vec![clean()]);
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        let mut gesture = |m: &mut CanvasManager, tool: &mut ActiveTool, from: [f32; 2], to: [f32; 2]| {
+            m.edit_active(|c| tool.begin(PenSample::from_pos(from), c));
+            m.edit_active(|c| tool.update(PenSample::from_pos(to), c));
+            m.edit_active(|c| tool.end(PenSample::from_pos(to), c));
+        };
+
+        // A laser-pointer stroke leaves nothing on the slide.
+        tool.kind = ToolKind::Laser;
+        gesture(&mut m, &mut tool, [0.0, 0.0], [100.0, 0.0]);
+        assert!(!m.active().dirty, "the laser is not an edit");
+
+        // Ink is.
+        tool.kind = ToolKind::Pen;
+        gesture(&mut m, &mut tool, [0.0, 0.0], [100.0, 0.0]);
+        assert!(m.active().dirty);
+        assert_eq!(m.active().layers[0].strokes.len(), 1);
+        m.active_mut().dirty = false;
+
+        // Clicking the ink only selects it…
+        tool.kind = ToolKind::Select;
+        tool.select.sync(true, 0, m.active());
+        gesture(&mut m, &mut tool, [50.0, 0.0], [50.0, 0.0]);
+        assert!(!tool.select.sel.is_empty());
+        assert!(!m.active().dirty, "selecting is not an edit");
+        // …dragging it moves it.
+        gesture(&mut m, &mut tool, [50.0, 0.0], [80.0, 30.0]);
         assert!(m.active().dirty);
     }
 

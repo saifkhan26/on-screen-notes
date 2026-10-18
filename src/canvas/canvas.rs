@@ -452,6 +452,18 @@ impl Canvas {
     }
 
     /// Undo the most recent edit if any. Pushes inverse onto redo log.
+    /// Changes whenever the slide's saved content does: the undo and
+    /// redo history, the active layer, and each layer's object counts
+    /// and edit `rev`. See `CanvasManager::edit_active`.
+    pub fn edit_stamp(&self) -> (usize, usize, usize, Vec<(usize, usize, u64)>) {
+        (
+            self.undo_log.len(),
+            self.redo_log.len(),
+            self.active_layer,
+            self.layers.iter().map(|l| (l.strokes.len(), l.shapes.len(), l.rev)).collect(),
+        )
+    }
+
     pub fn undo(&mut self) {
         let Some(entry) = self.undo_log.pop() else { return };
         self.dirty = true;

@@ -14,6 +14,7 @@ use crate::canvas::stroke::{PenSample, Stroke};
 use crate::tools::{ActiveTool, ToolKind};
 use crate::ui::loupe::LoupeState;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Per-frame state retained across frames. Holds GPU texture handles
 /// for image-backed layers (frozen frames) keyed by
@@ -22,14 +23,18 @@ use std::collections::HashMap;
 /// new frame into the same layer slot.
 #[derive(Default)]
 pub struct OverlayCache {
-    images: HashMap<(usize, usize), (usize, egui::TextureHandle)>,
+    /// Each texture here also carries when, and in which `show` call, it
+    /// was last drawn; see `evict_idle`.
+    images: HashMap<(usize, usize), (usize, egui::TextureHandle, Used)>,
     /// Per-shape texture cache for `Shape::Raster` fills. Keyed by
     /// `(canvas, layer, shape_index)`; value carries `(PNG length,
     /// address of the shared PNG buffer)` as a fingerprint. The address
     /// is what catches a *different* image arriving at the same index —
     /// deleting, re-ordering or pasting shapes shifts indices, and two
     /// images can easily differ without differing in byte length.
-    shape_images: HashMap<(usize, usize, usize), ((usize, usize), egui::TextureHandle)>,
+    shape_images: HashMap<(usize, usize, usize), ((usize, usize), egui::TextureHandle, Used)>,
+    /// Number of `show` calls so far.
+    shows: u64,
     /// Per-layer preview thumbnails — keyed by `(canvas, layer)`. The
     /// fingerprint is `(strokes_len, shapes_len, image_png_len,
     /// layer.rev)` and is cheap to recompute every frame; mismatch
@@ -43,12 +48,51 @@ pub struct OverlayCache {
     last_canvas_rect: Option<egui::Rect>,
 }
 
+/// When a texture was last drawn: the `show` call and the time.
+#[derive(Clone, Copy)]
+struct Used(u64, Instant);
+
+/// A picture or frozen frame of a slide not drawn for this long (and for
+/// `KEEP_SHOWS` frames) gives its texture back. Without this, every slide
+/// visited kept its full-size pictures on the GPU for the rest of the
+/// run — one media-heavy slide alone holds close to 1 GB.
+const KEEP_FOR: Duration = Duration::from_secs(60);
+/// Frames count too, so hiding the overlay for a while (no frames) does
+/// not throw away the active slide's pictures.
+const KEEP_SHOWS: u64 = 600;
+
 impl OverlayCache {
     pub fn new() -> Self { Self::default() }
+
+    /// Drop the textures of pictures and frozen frames that have not been
+    /// drawn for a while. Runs before anything is drawn in a frame, so a
+    /// texture is never made and freed in the same frame (egui-wgpu
+    /// aborts on that; see `PictureCache::begin_frame`).
+    fn evict_idle(&mut self) {
+        self.shows += 1;
+        let (shows, now) = (self.shows, Instant::now());
+        let keep = |u: &Used| shows.saturating_sub(u.0) <= KEEP_SHOWS || now.saturating_duration_since(u.1) <= KEEP_FOR;
+        self.images.retain(|_, (_, _, u)| keep(u));
+        self.shape_images.retain(|_, (_, _, u)| keep(u));
+    }
 
     /// Stored pictures are still loading at their on-screen size.
     pub fn pictures_busy(&self) -> bool {
         self.pictures.busy()
+    }
+
+    /// For the perf log: picture cache state, and the per-slide textures
+    /// kept for inline pictures and frozen frames.
+    pub fn stats(&self) -> String {
+        let shape_mb: usize = self.shape_images.values().map(|(_, t, _)| t.byte_size()).sum::<usize>() >> 20;
+        let plate_mb: usize = self.images.values().map(|(_, t, _)| t.byte_size()).sum::<usize>() >> 20;
+        format!("{} | inline {} tex {shape_mb} MB, plates {} tex {plate_mb} MB", self.pictures.stats(), self.shape_images.len(), self.images.len())
+    }
+
+    /// Where the canvas was drawn last frame (the whole screen before the
+    /// first frame).
+    pub fn canvas_rect(&self, ctx: &egui::Context) -> egui::Rect {
+        self.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect())
     }
 
     /// Ensure a thumbnail texture exists for the given layer. Returns
@@ -108,9 +152,10 @@ impl OverlayCache {
     ) -> Option<egui::TextureId> {
         let key = (canvas_idx, layer_idx);
         let needs_upload = match self.images.get(&key) {
-            Some((cached_len, _)) => *cached_len != image.png.len(),
+            Some((cached_len, _, _)) => *cached_len != image.png.len(),
             None => true,
         };
+        let used = Used(self.shows, Instant::now());
         if needs_upload {
             let decoded = match image::load_from_memory(&image.png) {
                 Ok(d) => d.to_rgba8(),
@@ -131,9 +176,12 @@ impl OverlayCache {
                 color_image,
                 egui::TextureOptions::LINEAR,
             );
-            self.images.insert(key, (image.png.len(), handle));
+            self.images.insert(key, (image.png.len(), handle, used));
         }
-        self.images.get(&key).map(|(_, h)| h.id())
+        self.images.get_mut(&key).map(|(_, h, u)| {
+            *u = used;
+            h.id()
+        })
     }
 
     /// Same upload-on-mismatch pattern for `Shape::Raster` PNG bytes.
@@ -151,9 +199,10 @@ impl OverlayCache {
         let key = (canvas_idx, layer_idx, shape_idx);
         let fingerprint = (png.len(), std::sync::Arc::as_ptr(png) as usize);
         let needs_upload = match self.shape_images.get(&key) {
-            Some((cached, _)) => *cached != fingerprint,
+            Some((cached, _, _)) => *cached != fingerprint,
             None => true,
         };
+        let used = Used(self.shows, Instant::now());
         if needs_upload {
             let decoded = match image::load_from_memory(png) {
                 Ok(d) => d.to_rgba8(),
@@ -174,9 +223,12 @@ impl OverlayCache {
                 color_image,
                 egui::TextureOptions::LINEAR,
             );
-            self.shape_images.insert(key, (fingerprint, handle));
+            self.shape_images.insert(key, (fingerprint, handle, used));
         }
-        self.shape_images.get(&key).map(|(_, h)| h.id())
+        self.shape_images.get_mut(&key).map(|(_, h, u)| {
+            *u = used;
+            h.id()
+        })
     }
 }
 
@@ -218,6 +270,7 @@ pub fn show(
     // before the renderer runs. Scope the temporary so the `active`
     // borrow of `manager` ends before the closure below re-borrows.
     let canvas_idx = manager.active_index();
+    cache.evict_idle();
     let layer_image_textures: Vec<Option<egui::TextureId>> = {
         let active = manager.active();
         active
@@ -680,4 +733,36 @@ fn predict_ahead(stroke: &Stroke) -> Stroke {
         tilt: last.tilt,
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png() -> std::sync::Arc<Vec<u8>> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(2, 2).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        std::sync::Arc::new(out.into_inner())
+    }
+
+    #[test]
+    fn picture_textures_go_only_after_frames_and_time_both_pass() {
+        let ctx = egui::Context::default();
+        let mut cache = OverlayCache::new();
+        let (a, b) = (png(), png());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            cache.evict_idle();
+            cache.ensure_shape_texture(ctx, 0, 0, 0, &a);
+            cache.ensure_shape_texture(ctx, 1, 0, 0, &b);
+        });
+        let long_ago = Instant::now().checked_sub(KEEP_FOR * 2).expect("clock far enough along");
+        // Slide 0: drawn long ago and many frames back. Slide 1: many
+        // frames back but recently (the overlay was hidden meanwhile).
+        cache.shape_images.get_mut(&(0, 0, 0)).unwrap().2 = Used(0, long_ago);
+        cache.shape_images.get_mut(&(1, 0, 0)).unwrap().2 = Used(0, Instant::now());
+        cache.shows = KEEP_SHOWS * 2;
+        cache.evict_idle();
+        assert!(!cache.shape_images.contains_key(&(0, 0, 0)), "idle slide's picture is let go");
+        assert!(cache.shape_images.contains_key(&(1, 0, 0)), "recently drawn picture stays");
+    }
 }

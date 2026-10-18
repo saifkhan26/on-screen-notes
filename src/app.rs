@@ -738,7 +738,10 @@ impl OnScreenNotesApp {
     /// latency is what this app is for) and while a capture or recording
     /// counts frames.
     fn needs_live_frames(&self) -> bool {
-        self.pen.is_down()
+        // A pen gesture in another app's window is swallowed
+        // (`pen_blocked`); it needs no frames here, let alone uncapped
+        // ones while the user draws elsewhere.
+        (self.pen.is_down() && !self.pen_blocked)
             || self.tool.in_progress_stroke.is_some()
             || self.pending_screenshot.is_some()
             || self.pending_freeze.is_some()
@@ -1557,11 +1560,30 @@ impl eframe::App for OnScreenNotesApp {
         let _perf = crate::perf::frame(|| {
             let c = self.canvases.active();
             let (strokes, shapes) = c.layers.iter().fold((0, 0), |(a, b), l| (a + l.strokes.len(), b + l.shapes.len()));
+            // Why frames are uncapped, when they are, and pen state.
+            let live = [
+                (self.pen.is_down() && !self.pen_blocked, "pen-down"),
+                (self.pen.is_down() && self.pen_blocked, "pen-down-elsewhere"),
+                (self.tool.in_progress_stroke.is_some(), "stroke"),
+                (self.pending_screenshot.is_some() || self.pending_freeze.is_some() || self.pending_lasso.is_some(), "capture"),
+                (self.recorder.is_recording(), "recording"),
+            ]
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(",");
+            let (atlas, fill) = ctx.fonts(|f| (f.font_image_size(), f.font_atlas_fill_ratio()));
             format!(
-                "slide {}/{} strokes {strokes} shapes {shapes} zoom {:.3}",
+                "slide {}/{} strokes {strokes} shapes {shapes} zoom {:.3}{} | {} | font atlas {}x{} {:.0}%",
                 self.canvases.active_index() + 1,
                 self.canvases.count(),
                 c.zoom,
+                if live.is_empty() { String::new() } else { format!(" flags {live}") },
+                self.overlay_cache.stats(),
+                atlas[0],
+                atlas[1],
+                fill * 100.0,
             )
         });
         // ---- First-frame init -------------------------------------------
@@ -1968,7 +1990,8 @@ impl eframe::App for OnScreenNotesApp {
             let layer_xform = self.layer_xform_for_render();
             // Advance video / GIF playback and upload new frames before
             // the canvas paints them.
-            self.media.sync(ctx, self.canvases.active(), ctx.pixels_per_point());
+            let view = self.overlay_cache.canvas_rect(ctx);
+            self.media.sync(ctx, self.canvases.active(), ctx.pixels_per_point(), view);
             // Selection handles must stay out of anything that grabs the
             // screen.
             let show_selection = self.pending_screenshot.is_none()
@@ -2304,11 +2327,7 @@ impl eframe::App for OnScreenNotesApp {
                     } else {
                         &mut self.tool
                     };
-                    crate::input::pen::dispatch(
-                        dispatched,
-                        target_tool,
-                        self.canvases.active_mut(),
-                    );
+                    self.canvases.edit_active(|c| crate::input::pen::dispatch(dispatched, target_tool, c));
                     if matches!(ev, PenEvent::Up(_)) {
                         // Gesture done — release the lock so the next
                         // Down can re-evaluate Ctrl state.
@@ -2407,7 +2426,7 @@ impl eframe::App for OnScreenNotesApp {
                             } else {
                                 &mut self.tool
                             };
-                            crate::input::pen::dispatch(ev, target_tool, self.canvases.active_mut());
+                            self.canvases.edit_active(|c| crate::input::pen::dispatch(ev, target_tool, c));
                             if matches!(ev, PenEvent::Up(_)) {
                                 self.mouse_gesture = false;
                                 self.pen_using_eraser = false;
@@ -2649,7 +2668,9 @@ impl eframe::App for OnScreenNotesApp {
                     if let egui::Event::Key { key, pressed: true, .. } = ev {
                         // Tool switch shortcuts.
                         interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
-                        interaction::react_lasso_keys(*key, mods, &mut self.tool, self.canvases.active_mut());
+                        // Every key passes through here: only an edit may
+                        // flag the slide for the autosave.
+                        self.canvases.edit_active(|c| interaction::react_lasso_keys(*key, mods, &mut self.tool, c));
                         // Canvas + layer navigation.
                         interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys);
                         interaction::react_layer_nav (*key, mods, &mut self.canvases, keys);

@@ -323,6 +323,11 @@ fn read_frames(mut out: impl Read, tx: SyncSender<Msg>, generation: u64, start: 
 }
 
 enum Probe {
+    /// Not started. The poster frame stands in until the video is
+    /// played, stepped or sought, or shown bigger than the poster (see
+    /// `MediaHub::sync`). A slide can hold hundreds of videos; starting
+    /// ffprobe and ffmpeg for all of them at once swamped the machine.
+    Dormant,
     Pending(Receiver<Result<VideoInfo>>),
     Ready(VideoInfo),
     Failed,
@@ -369,6 +374,7 @@ impl VideoPlayer {
     /// in seconds to open at.
     /// A video starts paused on the frame at `resume` seconds (the first
     /// without one), unless `playing`, which starts it once it can.
+    /// Paused at the start, it stays dormant (no ffmpeg) until `wake`.
     pub fn new(path: PathBuf, tools: Option<Tools>, resume: Option<f64>, playing: bool) -> Self {
         let mut error = None;
         let probe = match (&tools, path.is_file()) {
@@ -377,16 +383,9 @@ impl VideoPlayer {
                 Probe::Failed
             }
             (None, true) => Probe::Failed,
-            (Some(t), true) => {
-                let (tx, rx) = mpsc::channel();
-                let (t, p) = (t.clone(), path.clone());
-                let _ = std::thread::Builder::new()
-                    .name("osn-video-probe".into())
-                    .spawn(move || { let _ = tx.send(probe(&t, &p)); });
-                Probe::Pending(rx)
-            }
+            (Some(_), true) => Probe::Dormant,
         };
-        Self {
+        let mut player = Self {
             path,
             tools,
             probe,
@@ -404,7 +403,37 @@ impl VideoPlayer {
             pending_resume: resume,
             pending_play: playing,
             resize_since: None,
+        };
+        if playing || resume.is_some_and(|t| t > 0.0) {
+            player.wake();
         }
+        player
+    }
+
+    /// Start probing a dormant video, so it can decode frames.
+    pub fn wake(&mut self) {
+        let (Probe::Dormant, Some(t)) = (&self.probe, &self.tools) else { return };
+        let (tx, rx) = mpsc::channel();
+        let (t, p) = (t.clone(), self.path.clone());
+        let _ = std::thread::Builder::new()
+            .name("osn-video-probe".into())
+            .spawn(move || { let _ = tx.send(probe(&t, &p)); });
+        self.probe = Probe::Pending(rx);
+    }
+
+    pub fn is_dormant(&self) -> bool {
+        matches!(self.probe, Probe::Dormant)
+    }
+
+    /// Woken and still on its way to a first frame: probing, or waiting
+    /// for the decoder.
+    pub fn is_starting(&self) -> bool {
+        self.error.is_none()
+            && match self.probe {
+                Probe::Pending(_) => true,
+                Probe::Ready(_) => self.shown.is_none(),
+                Probe::Dormant | Probe::Failed => false,
+            }
     }
 
     pub fn set_on_screen(&mut self, px: [f32; 2]) {
@@ -654,7 +683,22 @@ impl VideoPlayer {
     }
 
     pub fn command(&mut self, cmd: Cmd, now: Instant) {
-        let Some(fps) = self.info().map(VideoInfo::fps) else { return };
+        if cmd != Cmd::ToggleLoop {
+            self.wake();
+        }
+        let Some(fps) = self.info().map(VideoInfo::fps) else {
+            // Still probing: keep the request for when the probe is in.
+            match cmd {
+                Cmd::TogglePlay => self.pending_play = !self.pending_play,
+                Cmd::Step(d) => {
+                    self.pending_play = false;
+                    self.want = self.want.saturating_add_signed(d);
+                }
+                Cmd::Seek { secs, .. } => self.pending_resume = Some(secs),
+                Cmd::ToggleLoop => self.looping = !self.looping,
+            }
+            return;
+        };
         match cmd {
             Cmd::TogglePlay => {
                 if self.clock.is_some() {
@@ -689,6 +733,7 @@ impl VideoPlayer {
         let frames = self.frame_count().or_else(|| meta.map(|m| u64::from(m.frames)));
         let loading = self.error.is_none()
             && self.tools.is_some()
+            && !self.is_dormant()
             && (matches!(self.probe, Probe::Pending(_))
                 || (self.clock.is_none() && self.shown.as_ref().map(|(i, _)| *i) != Some(self.want)));
         PlayerStatus {
@@ -711,6 +756,30 @@ impl VideoPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paused_video_stays_dormant_until_asked_for() {
+        // Any existing file will do: a dormant player never opens it.
+        let path = PathBuf::from(file!());
+        let tools = Tools { ffmpeg: "no-such-ffmpeg".into(), ffprobe: "no-such-ffprobe".into(), version: None };
+        let mut v = VideoPlayer::new(path.clone(), Some(tools.clone()), None, false);
+        assert!(v.is_dormant() && !v.is_starting());
+        v.tick(Instant::now());
+        assert!(v.is_dormant(), "ticking alone must not start ffmpeg");
+        let st = v.status(None);
+        assert!(!st.loading && !st.playing, "dormant is not loading: no repaints for it");
+        // Looping is a setting, not a reason to decode.
+        v.command(Cmd::ToggleLoop, Instant::now());
+        assert!(v.is_dormant() && v.status(None).looping);
+        // Play wakes it, and the request waits for the probe.
+        v.command(Cmd::TogglePlay, Instant::now());
+        assert!(!v.is_dormant() && v.is_playing());
+
+        // Coming back to a spot past the start, or playing, wakes at once.
+        assert!(!VideoPlayer::new(path.clone(), Some(tools.clone()), Some(3.0), false).is_dormant());
+        assert!(!VideoPlayer::new(path.clone(), Some(tools.clone()), None, true).is_dormant());
+        assert!(VideoPlayer::new(path, Some(tools), Some(0.0), false).is_dormant());
+    }
 
     const PHONE: &str = "\
 [STREAM]

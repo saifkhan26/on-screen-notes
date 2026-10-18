@@ -116,6 +116,15 @@ impl Entry {
 /// slide does not decode it again.
 const GIF_KEEP: Duration = Duration::from_secs(90);
 
+/// Most videos woken for a sharper frame that may be starting up (probe
+/// and first decode) at once. A play or step from the user wakes its
+/// video regardless.
+const MAX_STARTING: usize = 2;
+
+/// A dormant video is woken for a sharp frame once it is shown this
+/// many times bigger than its poster.
+const BLURRY_POSTER: f32 = 1.5;
+
 /// Players for the media objects on the active slide.
 #[derive(Default)]
 pub struct MediaHub {
@@ -136,16 +145,33 @@ impl MediaHub {
     }
 
     /// Once per frame, before painting: start players for the media on
-    /// `canvas`'s visible layers, stop those no longer there, advance
-    /// every clock and upload new frames. `ppp` is pixels per point.
-    pub fn sync(&mut self, ctx: &egui::Context, canvas: &Canvas, ppp: f32) {
+    /// `canvas`'s visible layers that are in `view` (the canvas area on
+    /// screen), stop the rest, advance every clock and upload new
+    /// frames. `ppp` is pixels per point.
+    ///
+    /// Off screen, an object needs no player: its poster is all that
+    /// could show. A video paused at its start stays dormant too, until
+    /// it is played or shown bigger than its poster; at most
+    /// `MAX_STARTING` videos start up at a time.
+    pub fn sync(&mut self, ctx: &egui::Context, canvas: &Canvas, ppp: f32, view: egui::Rect) {
         self.tick += 1;
         let tick = self.tick;
         let now = Instant::now();
         let dir = crate::persistence::paths::media_dir().ok();
+        let near = view.expand(view.width().max(view.height()) * 0.25);
+        // Dormant videos shown bigger than their poster: (id, how much
+        // bigger).
+        let mut blurry: Vec<(u64, f32)> = Vec::new();
         for layer in canvas.layers.iter().filter(|l| l.visible) {
             for shape in &layer.shapes {
                 let Some(m) = shape.media() else { continue };
+                let bb = shape.obb().aabb();
+                let to_screen = |x: f32, y: f32| {
+                    egui::pos2(view.min.x + canvas.pan[0] + x * canvas.zoom, view.min.y + canvas.pan[1] + y * canvas.zoom)
+                };
+                if !egui::Rect::from_two_pos(to_screen(bb[0], bb[1]), to_screen(bb[2], bb[3])).intersects(near) {
+                    continue;
+                }
                 let half = shape.obb().half;
                 let on_screen = [half[0] * 2.0 * canvas.zoom * ppp, half[1] * 2.0 * canvas.zoom * ppp];
                 let entry = match self.entries.entry(m.id) {
@@ -180,6 +206,16 @@ impl MediaHub {
                 entry.seen = tick;
                 if let Player::Video(v) = &mut entry.player {
                     v.set_on_screen(on_screen);
+                    if v.is_dormant() && view.intersects(egui::Rect::from_two_pos(to_screen(bb[0], bb[1]), to_screen(bb[2], bb[3]))) {
+                        let poster = match shape {
+                            crate::canvas::shape::Shape::Raster { px_size, .. } => px_size[0].max(px_size[1]).max(1) as f32,
+                            _ => 1.0,
+                        };
+                        let ratio = on_screen[0].max(on_screen[1]) / poster;
+                        if ratio > BLURRY_POSTER {
+                            blurry.push((m.id, ratio));
+                        }
+                    }
                 }
                 if m.kind == MediaKind::Gif {
                     if let Some(g) = self.gifs.get_mut(&m.file) { g.1 = now; }
@@ -188,13 +224,25 @@ impl MediaHub {
         }
 
         // Objects gone from view: remember where they were, then drop
-        // the player (which stops its decoder).
+        // the player (which stops its decoder). A dormant video has
+        // nothing to remember, and must come back dormant.
         let resume = &mut self.resume;
         self.entries.retain(|id, e| {
             if e.seen == tick { return true; }
-            resume.insert(*id, (e.player.position(), e.player.is_playing()));
+            if !matches!(&e.player, Player::Video(v) if v.is_dormant()) {
+                resume.insert(*id, (e.player.position(), e.player.is_playing()));
+            }
             false
         });
+
+        // Wake the most blurred dormant videos, a few at a time.
+        let starting = self.entries.values().filter(|e| matches!(&e.player, Player::Video(v) if v.is_starting())).count();
+        blurry.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (id, _) in blurry.into_iter().take(MAX_STARTING.saturating_sub(starting)) {
+            if let Some(Entry { player: Player::Video(v), .. }) = self.entries.get_mut(&id) {
+                v.wake();
+            }
+        }
         if resume.len() > 512 { resume.clear(); }
         self.gifs.retain(|_, (data, used)| {
             let keep = Arc::strong_count(data) > 1 || now.duration_since(*used) < GIF_KEEP;
