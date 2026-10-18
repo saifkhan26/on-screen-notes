@@ -891,7 +891,7 @@ mod view_tests {
         use crate::tools::{ActiveTool, ToolKind};
         let mut m = CanvasManager::for_tests(vec![clean()]);
         let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
-        let mut gesture = |m: &mut CanvasManager, tool: &mut ActiveTool, from: [f32; 2], to: [f32; 2]| {
+        let gesture = |m: &mut CanvasManager, tool: &mut ActiveTool, from: [f32; 2], to: [f32; 2]| {
             m.edit_active(|c| tool.begin(PenSample::from_pos(from), c));
             m.edit_active(|c| tool.update(PenSample::from_pos(to), c));
             m.edit_active(|c| tool.end(PenSample::from_pos(to), c));
