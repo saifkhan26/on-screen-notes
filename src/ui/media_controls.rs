@@ -3,8 +3,9 @@
 //!
 //! The bar sits just *below* the object (above it when there is no room)
 //! rather than over it, so drawing on a video is never blocked by its
-//! controls. It shows while the pointer is over the object or the bar,
-//! for a moment after it leaves, and whenever the object is selected.
+//! controls. It shows while the pointer is over the object, the bar or
+//! the gap between them, while its seek bar is being dragged, and
+//! whenever the object is selected.
 
 use crate::canvas::canvas::Canvas;
 use crate::media::ffmpeg::{self, Installer};
@@ -14,10 +15,6 @@ use egui::{Color32, Pos2, Rect, Rounding, Vec2};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
-
-/// How long the bar stays after the pointer leaves the object.
-const LINGER: Duration = Duration::from_millis(1200);
 const BTN: f32 = 26.0;
 const BAR_H: f32 = 34.0;
 
@@ -64,10 +61,11 @@ pub fn hotkey_target(objs: &[OnScreen], selected: Option<u64>, pointer: Option<P
 /// Control-bar state kept across frames.
 #[derive(Default)]
 pub struct MediaUi {
-    /// When the pointer was last over each object or its bar.
-    hovered_at: HashMap<u64, Instant>,
     /// Where each bar was drawn last frame.
     bar_rects: HashMap<u64, Rect>,
+    /// The object whose seek bar was being dragged last frame; its bar
+    /// stays up even when the drag wanders off it.
+    scrubbing: Option<u64>,
     /// The FFmpeg setup window is open.
     pub ffmpeg_window: bool,
     installer: Option<Installer>,
@@ -107,22 +105,19 @@ impl MediaUi {
         show_bars: bool,
     ) -> MediaUiOut {
         let mut out = MediaUiOut::default();
-        let now = Instant::now();
         let pointer = ctx.input(|i| i.pointer.hover_pos());
-        if let Some(p) = pointer {
-            // Only the topmost object under the pointer counts.
-            let over = objs.iter().rev().find(|o| o.rect.contains(p)).map(|o| o.id);
-            for id in over.into_iter().chain(self.bar_rects.iter().filter(|(_, r)| r.contains(p)).map(|(id, _)| *id)) {
-                self.hovered_at.insert(id, now);
-            }
-        }
-        self.hovered_at.retain(|_, t| now.duration_since(*t) < LINGER * 4);
+        // Only the topmost object under the pointer counts.
+        let over = pointer.and_then(|p| objs.iter().rev().find(|o| o.rect.contains(p)).map(|o| o.id));
+        let scrubbing = self.scrubbing.take();
 
         let mut drawn = HashMap::new();
         if show_bars {
             for o in objs {
-                let lingering = self.hovered_at.get(&o.id).is_some_and(|t| now.duration_since(*t) < LINGER);
-                if !(lingering || selected == Some(o.id)) { continue; }
+                let on_bar = pointer
+                    .zip(self.bar_rects.get(&o.id))
+                    .is_some_and(|(p, bar)| bar.contains(p) || gap(o.rect, *bar).contains(p));
+                let shown = over == Some(o.id) || on_bar || scrubbing == Some(o.id) || selected == Some(o.id);
+                if !shown { continue; }
                 let Some(status) = hub.status(o.id) else { continue };
                 let rect = self.bar(ctx, o, &status, canvas_rect, &mut out);
                 drawn.insert(o.id, rect);
@@ -179,7 +174,9 @@ impl MediaUi {
                         let galley = ui.painter().layout_no_wrap(label, egui::FontId::proportional(11.0), theme::TEXT_MUTED);
                         let reserved = galley.size().x + BTN + 14.0 + if st.loading { 16.0 } else { 0.0 };
                         let scrub_w = (ui.available_width() - reserved).max(40.0);
-                        if let Some(c) = scrubber(ui, scrub_w, st) { cmd(c, out); }
+                        let (seek, held) = scrubber(ui, scrub_w, st);
+                        if let Some(c) = seek { cmd(c, out); }
+                        if held { self.scrubbing = Some(id); }
                         if st.loading {
                             ui.add(egui::Spinner::new().size(12.0));
                         }
@@ -303,9 +300,19 @@ fn time_label(st: &PlayerStatus) -> String {
     }
 }
 
-/// Seek bar. Dragging seeks continuously (previews); letting go or a
-/// click seeks for real.
-fn scrubber(ui: &mut egui::Ui, width: f32, st: &PlayerStatus) -> Option<Cmd> {
+/// The strip between an object and its bar, so the pointer can cross
+/// from one to the other without the bar hiding. Empty when the bar sits
+/// inside the object.
+fn gap(obj: Rect, bar: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(obj.left().min(bar.left()), obj.bottom().min(bar.bottom())),
+        Pos2::new(obj.right().max(bar.right()), obj.top().max(bar.top())),
+    )
+}
+
+/// Seek bar, and whether it is being dragged. Dragging seeks
+/// continuously (previews); letting go or a click seeks for real.
+fn scrubber(ui: &mut egui::Ui, width: f32, st: &PlayerStatus) -> (Option<Cmd>, bool) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, BTN), egui::Sense::click_and_drag());
     let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width() - 12.0, 4.0));
     let duration = st.duration.filter(|d| *d > 0.0);
@@ -317,16 +324,18 @@ fn scrubber(ui: &mut egui::Ui, width: f32, st: &PlayerStatus) -> Option<Cmd> {
     let knob_r = if resp.hovered() || resp.dragged() { 6.0 } else { 4.5 };
     painter.circle_filled(Pos2::new(fill.right(), track.center().y), knob_r, theme::TEXT_PRIMARY);
 
-    let d = duration?;
+    let held = resp.dragged();
+    let Some(d) = duration else { return (None, held) };
     let at = |p: Pos2| (((p.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0) as f64) * d;
     let p = resp.interact_pointer_pos();
-    if resp.drag_stopped() || resp.clicked() {
-        return p.map(|p| Cmd::Seek { secs: at(p), preview: false });
-    }
-    if resp.dragged() {
-        return p.map(|p| Cmd::Seek { secs: at(p), preview: true });
-    }
-    None
+    let seek = if resp.drag_stopped() || resp.clicked() {
+        p.map(|p| Cmd::Seek { secs: at(p), preview: false })
+    } else if held {
+        p.map(|p| Cmd::Seek { secs: at(p), preview: true })
+    } else {
+        None
+    };
+    (seek, held)
 }
 
 #[derive(Clone, Copy)]
@@ -427,6 +436,24 @@ mod tests {
         assert_eq!(hotkey_target(&objs, None, Some(Pos2::new(75.0, 10.0))), Some(2));
         assert_eq!(hotkey_target(&objs, None, Some(Pos2::new(500.0, 10.0))), None);
         assert_eq!(hotkey_target(&objs[..1], None, None), Some(1));
+    }
+
+    #[test]
+    fn gap_bridges_object_and_bar() {
+        let o = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 100.0));
+        // Bar below, wider than the object.
+        let below = Rect::from_min_max(Pos2::new(-100.0, 106.0), Pos2::new(200.0, 140.0));
+        assert!(gap(o, below).contains(Pos2::new(50.0, 103.0)));
+        assert!(gap(o, below).contains(Pos2::new(150.0, 103.0)));
+        assert!(!gap(o, below).contains(Pos2::new(50.0, 50.0)));
+        assert!(!gap(o, below).contains(Pos2::new(50.0, 150.0)));
+        // Bar above.
+        let above = Rect::from_min_max(Pos2::new(0.0, -40.0), Pos2::new(100.0, -6.0));
+        assert!(gap(o, above).contains(Pos2::new(50.0, -3.0)));
+        assert!(!gap(o, above).contains(Pos2::new(50.0, 50.0)));
+        // Bar inside: nothing to bridge.
+        let inside = Rect::from_min_max(Pos2::new(0.0, 60.0), Pos2::new(100.0, 94.0));
+        assert!(!gap(o, inside).contains(Pos2::new(50.0, 97.0)));
     }
 
     #[test]

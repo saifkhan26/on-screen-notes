@@ -426,26 +426,36 @@ impl SelectState {
         }
 
         match picked {
-            // 4) Ink on another layer: go to that layer and take it.
+            // 4) A picture on the active layer (image, video, GIF, fill):
+            //    take it and move it in one go, like ink. Only after the
+            //    frame, so a selection over a picture can still be
+            //    dragged by its empty middle.
+            Some(CanvasHit::Object(li, obj)) if li == active => {
+                if self.shift { self.sel.toggle(obj); } else { self.sel.set_only(obj); }
+                if self.sel.contains(obj) {
+                    self.gesture = Some(Gesture::Move { start: p, cur: p });
+                }
+            }
+            // 5) Ink on another layer: go to that layer and take it.
             Some(CanvasHit::Object(li, obj)) if !is_raster(canvas, li, obj) => {
                 canvas.active_layer = li;
                 self.sel.set_only(obj);
                 self.rebind_here(canvas);
                 self.gesture = Some(Gesture::Move { start: p, cur: p });
             }
-            // 5) A picture — an image object or a layer's background
+            // 6) A picture on another layer, or a layer's background
             //    plate. A screen capture can sit under most of the
-            //    slide; if pressing on one grabbed it straight away,
-            //    every attempt to rubber-band the ink drawn over it
-            //    would drag the picture instead. So an unselected
-            //    picture is only picked by a click that does not
-            //    travel (resolved in `end`); a drag from it draws the
-            //    marquee.
+            //    slide, below the layer being drawn on; if pressing on
+            //    one grabbed it straight away, every attempt to
+            //    rubber-band the ink drawn over it would drag the
+            //    picture instead. So such a picture is only picked by a
+            //    click that does not travel (resolved in `end`); a drag
+            //    from it draws the marquee.
             Some(target) => {
                 if !self.shift { self.sel.clear(); }
                 self.gesture = Some(Gesture::Marquee { start: p, cur: p, click_target: Some(target) });
             }
-            // 6) Nothing at all.
+            // 7) Nothing at all.
             None => {
                 if !self.shift { self.sel.clear(); }
                 self.gesture = Some(Gesture::Marquee { start: p, cur: p, click_target: None });
@@ -759,19 +769,37 @@ mod tests {
     }
 
     #[test]
-    fn dragging_from_an_unselected_image_draws_a_marquee_instead_of_moving_it() {
+    fn dragging_an_unselected_image_on_the_active_layer_moves_it_in_one_go() {
         let mut c = Canvas::default();
         c.layers[0].shapes.push(image([0.0, 0.0], [500.0, 500.0]));
         c.layers[0].strokes.push(stroke([100.0, 100.0], [200.0, 100.0]));
+        let mut t = tool(&c);
+        t.begin([400.0, 400.0], &mut c);
+        assert!(matches!(t.gesture, Some(Gesture::Move { .. })));
+        t.end([430.0, 420.0], &mut c);
+        assert_eq!(t.sel, Selection { strokes: vec![], shapes: vec![0] });
+        assert!(matches!(&c.layers[0].shapes[0], Shape::Raster { pos, .. } if *pos == [30.0, 20.0]));
+        assert_eq!(c.layers[0].strokes[0].samples[0].pos, [100.0, 100.0], "the ink stays put");
+    }
+
+    #[test]
+    fn dragging_from_an_image_on_another_layer_draws_a_marquee_instead_of_moving_it() {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(image([0.0, 0.0], [500.0, 500.0]));
+        c.layers.push(Layer::default());
+        c.layers[1].strokes.push(stroke([100.0, 100.0], [200.0, 100.0]));
+        c.active_layer = 1;
         let mut t = tool(&c);
         // Press on bare image, drag a box around the stroke.
         t.begin([80.0, 80.0], &mut c);
         t.end([220.0, 120.0], &mut c);
         assert_eq!(t.sel, Selection { strokes: vec![0], shapes: vec![] });
+        assert_eq!(c.active_layer, 1);
         assert!(c.undo_log.is_empty(), "the image must not have moved");
 
         // A click on the image that does not travel selects it.
         click(&mut t, &mut c, [400.0, 400.0]);
+        assert_eq!(c.active_layer, 0);
         assert_eq!(t.sel, Selection { strokes: vec![], shapes: vec![0] });
     }
 
