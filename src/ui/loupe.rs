@@ -1,6 +1,12 @@
 //! Magnifier loupe — a held-Z modal magnifier showing a live view of
 //! the desktop sampled around the cursor.
 //!
+//! Each frame is the screen under the OSN window's client area, taken
+//! from whichever monitors the window is on (see
+//! `screenshot::capture_client_area`). Its top-left is the client
+//! top-left, so a cursor position in egui points maps into it by
+//! `pixels_per_point` alone.
+//!
 //! A background worker thread continuously calls `xcap` and drops
 //! each captured frame into a shared slot. The main UI thread polls
 //! the slot every frame and re-uploads the texture when a new frame
@@ -10,6 +16,7 @@
 //! ~one capture-period of lag.
 
 use crate::error::Result;
+use crate::screenshot::capture_client_area;
 use egui::{Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOptions};
 use image::RgbaImage;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,8 +32,8 @@ pub struct LoupeState {
     /// `poll_and_update` whenever the worker drops a new frame.
     pub snapshot: TextureHandle,
     /// Physical pixel size of the most recently uploaded frame.
-    /// Needed to convert cursor-screen coords into normalised UV
-    /// space.
+    /// Needed to convert client-relative cursor coords into
+    /// normalised UV space.
     pub size_px: [u32; 2],
     /// Magnification factor. 3.0 = 3× zoom (a 60-px square of source
     /// becomes a 180-px square on screen). Adjusted via the scroll
@@ -62,7 +69,7 @@ impl LoupeState {
     pub fn start_live(ctx: &egui::Context, osn_hwnd: isize) -> Result<Self> {
         use crate::error::Context;
         crate::platform::set_window_capture_excluded(osn_hwnd, true);
-        let img = capture_primary().context("initial loupe capture")?;
+        let img = capture_client_area(osn_hwnd).context("initial loupe capture")?;
         let (w, h) = (img.width(), img.height());
         let snapshot = ctx.load_texture("osn_loupe", rgba_to_color_image(&img), TextureOptions::LINEAR);
 
@@ -73,7 +80,7 @@ impl LoupeState {
         let worker_ctx = ctx.clone();
         let worker = std::thread::Builder::new()
             .name("osn-loupe".into())
-            .spawn(move || worker_loop(worker_latest, worker_stop, worker_ctx))
+            .spawn(move || worker_loop(worker_latest, worker_stop, worker_ctx, osn_hwnd))
             .ok();
 
         Ok(Self {
@@ -119,14 +126,16 @@ impl Drop for LoupeState {
 /// Worker loop: grab a frame, drop it into `latest`, repeat until
 /// `stop` is set. Wakes the UI each successful capture so the
 /// magnifier sees the new frame without waiting for an unrelated
-/// event.
+/// event. The window rect is read afresh each capture, so moving OSN
+/// to another monitor while the loupe is up follows along.
 fn worker_loop(
     latest: Arc<Mutex<Option<RgbaImage>>>,
     stop: Arc<AtomicBool>,
     ctx: egui::Context,
+    osn_hwnd: isize,
 ) {
     while !stop.load(Ordering::Acquire) {
-        match capture_primary() {
+        match capture_client_area(osn_hwnd) {
             Ok(img) => {
                 if let Ok(mut slot) = latest.lock() {
                     *slot = Some(img);
@@ -144,16 +153,6 @@ fn worker_loop(
     }
 }
 
-fn capture_primary() -> Result<RgbaImage> {
-    use crate::error::Context;
-    let monitors = xcap::Monitor::all().context("listing monitors")?;
-    let monitor = monitors
-        .iter()
-        .find(|m| m.is_primary())
-        .unwrap_or(&monitors[0]);
-    monitor.capture_image().context("loupe capture_image")
-}
-
 fn rgba_to_color_image(img: &RgbaImage) -> ColorImage {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let pixels: Vec<Color32> = img
@@ -165,10 +164,10 @@ fn rgba_to_color_image(img: &RgbaImage) -> ColorImage {
 }
 
 /// Paint the loupe into the overlay. `cursor_logical` is the egui
-/// pointer position in logical pixels (same coord space as the canvas
-/// rect). `ppp` is `ctx.pixels_per_point()` — converts cursor logical
-/// → physical pixels so the uv sub-rect lines up with the captured
-/// frame.
+/// pointer position in logical pixels relative to the client top-left
+/// (same coord space as the canvas rect). `ppp` is
+/// `ctx.pixels_per_point()` — converts cursor logical → physical pixels
+/// so the uv sub-rect lines up with the captured frame.
 pub fn paint(
     painter: &egui::Painter,
     overlay_rect: Rect,
@@ -185,18 +184,56 @@ pub fn paint(
     let dest = dest.intersect(overlay_rect);
     if dest.width() <= 0.0 || dest.height() <= 0.0 { return; }
 
-    let cx_px = cursor_logical.x * ppp;
-    let cy_px = cursor_logical.y * ppp;
-    let half_px = (r / zoom) * ppp;
-    let sx0 = (cx_px - half_px).max(0.0);
-    let sy0 = (cy_px - half_px).max(0.0);
-    let sx1 = (cx_px + half_px).min(state.size_px[0] as f32);
-    let sy1 = (cy_px + half_px).min(state.size_px[1] as f32);
-    let (tw, th) = (state.size_px[0] as f32, state.size_px[1] as f32);
-    let uv = Rect::from_min_max(
-        egui::pos2(sx0 / tw, sy0 / th),
-        egui::pos2(sx1 / tw, sy1 / th),
-    );
-
+    let uv = source_uv(dest, cursor_logical, zoom, ppp, state.size_px);
     painter.image(state.snapshot.id(), dest, uv, Color32::WHITE);
+}
+
+/// The part of the captured frame (`size_px`, covering the client area)
+/// to stretch over `dest`. Each point `d` of `dest` shows the screen at
+/// `cursor + (d - cursor) / zoom` — the same magnification about the
+/// cursor that the ink is re-rendered with — so where `dest` is cut off
+/// by the window edge the picture is cut off too, not squeezed.
+fn source_uv(dest: Rect, cursor: Pos2, zoom: f32, ppp: f32, size_px: [u32; 2]) -> Rect {
+    let (tw, th) = (size_px[0].max(1) as f32, size_px[1].max(1) as f32);
+    let uv = |d: Pos2| {
+        let src = cursor + (d - cursor) / zoom;
+        egui::pos2(src.x * ppp / tw, src.y * ppp / th)
+    };
+    Rect::from_min_max(uv(dest.min), uv(dest.max))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn square(c: Pos2, r: f32) -> Rect {
+        Rect::from_center_size(c, egui::vec2(2.0 * r, 2.0 * r))
+    }
+
+    #[test]
+    fn the_cursor_maps_to_its_client_pixel() {
+        // A 1000×800 px client area at 150 %: point (100, 200) is pixel
+        // (150, 300), wherever the window sits on the desktop.
+        let c = egui::pos2(100.0, 200.0);
+        let uv = source_uv(square(c, 30.0), c, 3.0, 1.5, [1000, 800]);
+        assert!((uv.center().x - 0.15).abs() < 1e-6);
+        assert!((uv.center().y - 0.375).abs() < 1e-6);
+        // ±30 pt shown 3× = ±10 pt of source = ±15 px.
+        assert!((uv.width() * 1000.0 - 30.0).abs() < 1e-3);
+        assert!((uv.height() * 800.0 - 30.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_loupe_cut_off_by_the_window_edge_is_not_squeezed() {
+        // Cursor 10 pt from the left edge, radius 40, zoom 2: the left
+        // edge of `dest` (x = 0) shows x = 10 - 10/2 = 5 of the source.
+        let c = egui::pos2(10.0, 50.0);
+        let dest = square(c, 40.0).intersect(Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 200.0)));
+        let uv = source_uv(dest, c, 2.0, 1.0, [200, 200]);
+        assert!((uv.min.x * 200.0 - 5.0).abs() < 1e-4);
+        assert!((uv.max.x * 200.0 - 30.0).abs() < 1e-4);
+        // Same scale both ways: source spans half of `dest`.
+        assert!((uv.width() * 200.0 - dest.width() / 2.0).abs() < 1e-4);
+        assert!((uv.height() * 200.0 - dest.height() / 2.0).abs() < 1e-4);
+    }
 }

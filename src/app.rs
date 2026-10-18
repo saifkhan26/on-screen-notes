@@ -560,8 +560,8 @@ impl OnScreenNotesApp {
 
     /// Run the deferred screenshot once its frame countdown elapses. A
     /// `region_rect` captures only the user-selected rectangle (compositing
-    /// the overlay tint back in); otherwise the whole primary monitor is
-    /// grabbed. Logs success/failure but never panics.
+    /// the overlay tint back in); otherwise the whole monitor OSN is on
+    /// is grabbed. Logs success/failure but never panics.
     fn do_screenshot(&mut self, ps: &PendingShot) {
         let res = if let Some(rect) = ps.region_rect {
             crate::screenshot::capture_region_and_save(
@@ -579,6 +579,7 @@ impl OnScreenNotesApp {
                 self.canvases.active(),
                 &self.config,
                 ps.pixels_per_point,
+                self.osn_hwnd,
                 &self.media.current_frames(),
             )
         };
@@ -1852,10 +1853,11 @@ impl eframe::App for OnScreenNotesApp {
         }
 
         // ---- Magnifier loupe (Z-held modal) -----------------------------
-        // Rising edge → capture the primary monitor once and upload as
+        // Rising edge → start the live loupe, which captures the screen
+        // under the window on a worker thread and uploads each frame as
         // a texture. Falling edge → drop the state so the GPU memory
-        // is reclaimed. Captures cost ~30 ms; the one-shot model keeps
-        // the loupe at full overlay refresh while held.
+        // is reclaimed. Captures cost ~30 ms; keeping them off the UI
+        // thread keeps the loupe at full overlay refresh while held.
         //
         // Gated on !ctrl so Ctrl+Z (undo) and Ctrl+Shift+Z (redo) do
         // not accidentally arm the loupe.

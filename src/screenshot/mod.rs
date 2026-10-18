@@ -20,22 +20,102 @@ pub struct ShotResult {
     pub clipboard: bool,
 }
 
-/// Capture the primary monitor as a raw RGBA image. No file write,
-/// no compositing — used by the freeze-frame-to-layer feature to
-/// snapshot what is on screen behind the overlay for inline
-/// inclusion as a canvas layer.
+/// Capture the primary monitor as a raw RGBA image. The fallback for
+/// when the OSN window's rect cannot be read.
 pub fn capture_primary_image() -> Result<RgbaImage> {
     let monitors = xcap::Monitor::all().context("listing monitors")?;
     let monitor = monitors
         .iter()
         .find(|m| m.is_primary())
-        .unwrap_or(&monitors[0]);
-    let img = monitor.capture_image().context("capturing screen for freeze")?;
+        .or(monitors.first())
+        .ok_or_else(|| crate::error::anyhow!("no monitors"))?;
+    let img = monitor.capture_image().context("capturing screen")?;
     Ok(img)
 }
 
-/// Capture the primary monitor, crop to the OSN window's **client**
-/// area, and encode as PNG. The cropped image is positioned at
+/// The OSN window's client area in screen-physical pixels, as
+/// `(left, top, right, bottom)`. Prefers the client rect over the outer
+/// rect (see [`capture_freeze_layer`]); `None` when neither can be read
+/// or the area is empty.
+pub(crate) fn osn_client_rect(osn_hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    if osn_hwnd == 0 {
+        return None;
+    }
+    crate::platform::client_rect(osn_hwnd)
+        .or_else(|| crate::platform::window_rect(osn_hwnd))
+        .filter(|&(l, t, r, b)| r > l && b > t)
+}
+
+/// What is on screen under the OSN window's client area, at physical
+/// resolution — taken from whichever monitors the window sits on, not
+/// just the primary one. Falls back to the whole primary monitor when
+/// the window rect cannot be read.
+///
+/// Monitors and the client rect share one coordinate space: xcap places
+/// each monitor at its position on the virtual desktop in physical
+/// pixels, which is what `ClientToScreen` reports for a DPI-aware
+/// process. The primary monitor sits at (0, 0) and the others around
+/// it, at negative coordinates too.
+pub(crate) fn capture_client_area(osn_hwnd: isize) -> Result<RgbaImage> {
+    match osn_client_rect(osn_hwnd) {
+        Some(rect) => capture_desktop_rect(rect),
+        None => capture_primary_image(),
+    }
+}
+
+/// The screen under `(left, top, right, bottom)` on the virtual desktop,
+/// stitched from every monitor it overlaps. Parts on no monitor stay
+/// transparent.
+pub(crate) fn capture_desktop_rect((l, t, r, b): (i32, i32, i32, i32)) -> Result<RgbaImage> {
+    let mut out = RgbaImage::new((r - l) as u32, (b - t) as u32);
+    let mut any = false;
+    for m in xcap::Monitor::all().context("listing monitors")? {
+        let mon = [m.x(), m.y(), m.width() as i32, m.height() as i32];
+        if !overlaps([l, t], &out, mon) {
+            continue;
+        }
+        let img = m.capture_image().context("capturing screen")?;
+        any |= paste_monitor(&mut out, [l, t], [mon[0], mon[1]], &img);
+    }
+    if !any {
+        return Err(crate::error::anyhow!("the window is not on any monitor"));
+    }
+    Ok(out)
+}
+
+/// Does the monitor `[x, y, w, h]` overlap `out`, whose top-left sits
+/// at `origin` on the desktop?
+fn overlaps(origin: [i32; 2], out: &RgbaImage, mon: [i32; 4]) -> bool {
+    let (r, b) = (origin[0] + out.width() as i32, origin[1] + out.height() as i32);
+    mon[0] < r && origin[0] < mon[0] + mon[2] && mon[1] < b && origin[1] < mon[1] + mon[3]
+}
+
+/// Copy the part of a monitor's capture `img` (top-left at `mon` on the
+/// desktop) that falls inside `out` (top-left at `origin`). Returns
+/// whether any of it did.
+fn paste_monitor(out: &mut RgbaImage, origin: [i32; 2], mon: [i32; 2], img: &RgbaImage) -> bool {
+    let l = origin[0].max(mon[0]);
+    let t = origin[1].max(mon[1]);
+    let r = (origin[0] + out.width() as i32).min(mon[0] + img.width() as i32);
+    let b = (origin[1] + out.height() as i32).min(mon[1] + img.height() as i32);
+    if r <= l || b <= t {
+        return false;
+    }
+    // Row by row rather than pixel by pixel: the loupe and the recorder
+    // run this on every frame.
+    let row = (r - l) as usize * 4;
+    let (out_stride, img_stride) = (out.width() as usize * 4, img.width() as usize * 4);
+    let (src, dst) = (img.as_raw(), &mut **out);
+    for y in t..b {
+        let s = (y - mon[1]) as usize * img_stride + (l - mon[0]) as usize * 4;
+        let d = (y - origin[1]) as usize * out_stride + (l - origin[0]) as usize * 4;
+        dst[d..d + row].copy_from_slice(&src[s..s + row]);
+    }
+    true
+}
+
+/// Capture the screen under the OSN window's **client** area and
+/// encode it as PNG. The image is positioned at
 /// `(canvas_origin, logical_size)` so painting it covers exactly the
 /// area OSN sits over at the canvas's *current* pan and zoom —
 /// strokes drawn before the freeze stay in place; the captured pixels
@@ -51,10 +131,8 @@ pub fn capture_primary_image() -> Result<RgbaImage> {
 /// + `ClientToScreen((0,0))` returns the actual content rectangle
 /// the user draws into.
 ///
-/// We also clamp the crop to the captured monitor's bounds. If the
-/// OSN window straddles a secondary monitor (which xcap does not
-/// capture), the intersection with the primary monitor is what gets
-/// frozen — never a wild out-of-bounds slice.
+/// The pixels come from whichever monitors the window is on; a part of
+/// the window off every monitor stays transparent.
 ///
 /// `pixels_per_point` is the overlay's DPI scale; we divide physical
 /// px by it to record the logical-size rect the renderer will draw
@@ -66,45 +144,12 @@ pub fn capture_freeze_layer(
     canvas_pan: [f32; 2],
     canvas_zoom: f32,
 ) -> Result<crate::canvas::canvas::LayerImage> {
-    let img = capture_primary_image()?;
-    let full_w = img.width() as i32;
-    let full_h = img.height() as i32;
-
-    // Resolve crop region in monitor-physical pixels. Prefer client
-    // rect over outer rect (see doc comment above). Falls back to the
-    // whole monitor if we cannot read either.
-    let raw_rect = if osn_hwnd != 0 {
-        crate::platform::client_rect(osn_hwnd)
-            .or_else(|| crate::platform::window_rect(osn_hwnd))
-    } else {
-        None
-    };
-    let (cx, cy, cw, ch) = match raw_rect {
-        Some((l, t, r, b)) => {
-            let l = l.clamp(0, full_w);
-            let t = t.clamp(0, full_h);
-            let r = r.clamp(0, full_w);
-            let b = b.clamp(0, full_h);
-            if r > l && b > t {
-                (l, t, r - l, b - t)
-            } else {
-                // Window sits entirely off the primary monitor (or
-                // shrank to zero). Fall back to whole monitor so the
-                // user still gets *something* recognisable rather
-                // than an empty layer.
-                (0, 0, full_w, full_h)
-            }
-        }
-        None => (0, 0, full_w, full_h),
-    };
-
-    let cropped = image::imageops::crop_imm(&img, cx as u32, cy as u32, cw as u32, ch as u32)
-        .to_image();
-    let (w, h) = (cropped.width(), cropped.height());
+    let img = capture_client_area(osn_hwnd)?;
+    let (w, h) = (img.width(), img.height());
     let mut buf: Vec<u8> = Vec::new();
     {
         let mut cursor = std::io::Cursor::new(&mut buf);
-        cropped
+        img
             .write_to(&mut cursor, image::ImageFormat::Png)
             .context("encoding freeze PNG")?;
     }
@@ -143,30 +188,8 @@ pub fn capture_lasso_layer(
     canvas_zoom: f32,
     polygon: &[[f32; 2]],
 ) -> Result<crate::canvas::canvas::LayerImage> {
-    let img = capture_primary_image()?;
-    let full_w = img.width() as i32;
-    let full_h = img.height() as i32;
-
-    // Same crop region as the freeze path: prefer client rect, fall
-    // back to window rect, then to the whole monitor.
-    let raw_rect = if osn_hwnd != 0 {
-        crate::platform::client_rect(osn_hwnd).or_else(|| crate::platform::window_rect(osn_hwnd))
-    } else {
-        None
-    };
-    let (cx, cy, cw, ch) = match raw_rect {
-        Some((l, t, r, b)) => {
-            let l = l.clamp(0, full_w);
-            let t = t.clamp(0, full_h);
-            let r = r.clamp(0, full_w);
-            let b = b.clamp(0, full_h);
-            if r > l && b > t { (l, t, r - l, b - t) } else { (0, 0, full_w, full_h) }
-        }
-        None => (0, 0, full_w, full_h),
-    };
-
-    let mut cropped =
-        image::imageops::crop_imm(&img, cx as u32, cy as u32, cw as u32, ch as u32).to_image();
+    // Same client-area capture as the freeze path.
+    let mut cropped = capture_client_area(osn_hwnd)?;
     let (w, h) = (cropped.width(), cropped.height());
     if w == 0 || h == 0 {
         return Err(crate::error::anyhow!("empty client area for lasso capture"));
@@ -260,8 +283,9 @@ pub fn capture_lasso_layer(
     })
 }
 
-/// Capture the primary monitor, composite the active canvas on top,
-/// write a PNG, and push the same image to the system clipboard.
+/// Capture the monitor the OSN window is on, composite the active
+/// canvas on top, write a PNG, and push the same image to the system
+/// clipboard.
 ///
 /// `pixels_per_point` is the DPI scale egui is using for the overlay
 /// (1.0 at 100 % display scaling, 1.5 at 150 %, etc.). xcap captures at
@@ -275,26 +299,39 @@ pub fn capture_and_save(
     canvas: &Canvas,
     cfg: &AppConfig,
     pixels_per_point: f32,
+    osn_hwnd: isize,
     media_frames: &render::MediaFrames,
 ) -> Result<ShotResult> {
-    // 1) Pick the primary monitor. xcap returns a Vec; element 0 is usually
-    //    the primary, but we also look for the one flagged as primary.
-    let monitors = xcap::Monitor::all().context("listing monitors")?;
-    // xcap 0.0.14: `is_primary` returns `bool` directly. Pick that monitor
-    // if found, otherwise fall back to index 0.
-    let monitor = monitors
-        .iter()
-        .find(|m| m.is_primary())
-        .unwrap_or(&monitors[0]);
+    // 1) Pick the monitor under the middle of the OSN window, else the
+    //    primary one. The canvas is drawn from the window's client
+    //    top-left, so note where that sits on the monitor.
+    let client = osn_client_rect(osn_hwnd);
+    let under_window = client.and_then(|(l, t, r, b)| xcap::Monitor::from_point((l + r) / 2, (t + b) / 2).ok());
+    let monitor = match under_window {
+        Some(m) => m,
+        None => {
+            let monitors = xcap::Monitor::all().context("listing monitors")?;
+            let primary = monitors.iter().position(|m| m.is_primary()).unwrap_or(0);
+            monitors.into_iter().nth(primary).ok_or_else(|| crate::error::anyhow!("no monitors"))?
+        }
+    };
+    let client_at = match client {
+        Some((l, t, _, _)) => [l - monitor.x(), t - monitor.y()],
+        None => [0, 0],
+    };
 
     // 2) Capture the screen.
     let bg_image = monitor.capture_image().context("capturing screen")?;
     let (w, h) = (bg_image.width(), bg_image.height());
 
-    // 3) Rasterise the canvas to an RGBA buffer the same size as the
-    //    screen. tiny-skia owns the pixel buffer; we just borrow a mutable
-    //    view of it.
-    let mut pixmap = tiny_skia::Pixmap::new(w, h)
+    // 3) Rasterise the canvas to an RGBA buffer the size of the client
+    //    area (the whole monitor without one). tiny-skia owns the pixel
+    //    buffer; we just borrow a mutable view of it.
+    let (cw, ch) = match client {
+        Some((l, t, r, b)) => ((r - l) as u32, (b - t) as u32),
+        None => (w, h),
+    };
+    let mut pixmap = tiny_skia::Pixmap::new(cw, ch)
         .ok_or_else(|| crate::error::anyhow!("could not allocate pixmap"))?;
     {
         let mut view = pixmap.as_mut();
@@ -308,28 +345,30 @@ pub fn capture_and_save(
     //    straight-alpha RgbaImage. We un-premultiply so blend maths stays
     //    correct.
     let raw = pixmap.data().to_vec();
-    let mut fg = RgbaImage::from_raw(w, h, raw)
+    let mut ink = RgbaImage::from_raw(cw, ch, raw)
         .ok_or_else(|| crate::error::anyhow!("invalid pixmap data"))?;
-    unpremultiply(&mut fg);
+    unpremultiply(&mut ink);
 
-    // 5) Convert xcap's image (it returns `image::RgbaImage` already) into
-    //    a mutable RgbaImage for blending.
-    let mut bg = bg_image; // already RgbaImage
+    // 5) Lay the ink where the client area sits on the monitor, then
+    //    blend it over xcap's image (an `image::RgbaImage` already).
+    let mut fg = RgbaImage::new(w, h);
+    image::imageops::replace(&mut fg, &ink, client_at[0] as i64, client_at[1] as i64);
+    let mut bg = bg_image;
     compositor::alpha_blend(&mut bg, &fg);
 
     // 6) Save + push to clipboard (shared with the region-capture path).
     save_and_clipboard(bg, cfg)
 }
 
-/// Capture the primary monitor, crop to the user-selected rectangle,
-/// composite the overlay background tint + the active canvas's ink on top,
-/// write a PNG, and push it to the clipboard.
+/// Capture the screen under the OSN window, crop to the user-selected
+/// rectangle, composite the overlay background tint + the active canvas's
+/// ink on top, write a PNG, and push it to the clipboard.
 ///
 /// `rect_points` is the selection rectangle in egui **logical** (point)
 /// coordinates relative to the OSN window's client top-left, as
-/// `[min_x, min_y, max_x, max_y]`. We map it into monitor-physical pixels
-/// with the client origin (`GetClientRect` + `ClientToScreen`, same as the
-/// freeze path) times `pixels_per_point`.
+/// `[min_x, min_y, max_x, max_y]`. The capture covers that same client
+/// area (same as the freeze path), so the rect maps into it by
+/// `pixels_per_point` alone.
 ///
 /// `bg_color` / `bg_opacity` are the overlay window's configured tint. The
 /// deferred capture drops the real window opacity to 0 so xcap grabs a
@@ -345,40 +384,24 @@ pub fn capture_region_and_save(
     bg_opacity: f32,
     media_frames: &render::MediaFrames,
 ) -> Result<ShotResult> {
-    let monitors = xcap::Monitor::all().context("listing monitors")?;
-    let monitor = monitors
-        .iter()
-        .find(|m| m.is_primary())
-        .unwrap_or(&monitors[0]);
-    let bg_image = monitor.capture_image().context("capturing screen")?;
+    let bg_image = capture_client_area(osn_hwnd)?;
     let (w, h) = (bg_image.width(), bg_image.height());
 
-    // Client-area origin in monitor-physical pixels (prefer client rect,
-    // fall back to window rect, then to (0,0)) — same as the freeze path.
-    let origin = if osn_hwnd != 0 {
-        crate::platform::client_rect(osn_hwnd).or_else(|| crate::platform::window_rect(osn_hwnd))
-    } else {
-        None
-    };
-    let (ox, oy) = match origin {
-        Some((l, t, _, _)) => (l as f32, t as f32),
-        None => (0.0, 0.0),
-    };
-
     let ppp = pixels_per_point.max(0.01);
-    // Selection rect → monitor-physical pixels, clamped to the capture.
-    let x0 = (ox + rect_points[0] * ppp).floor().clamp(0.0, w as f32) as u32;
-    let y0 = (oy + rect_points[1] * ppp).floor().clamp(0.0, h as f32) as u32;
-    let x1 = (ox + rect_points[2] * ppp).ceil().clamp(0.0, w as f32) as u32;
-    let y1 = (oy + rect_points[3] * ppp).ceil().clamp(0.0, h as f32) as u32;
+    // Selection rect → client-physical pixels, clamped to the capture.
+    let x0 = (rect_points[0] * ppp).floor().clamp(0.0, w as f32) as u32;
+    let y0 = (rect_points[1] * ppp).floor().clamp(0.0, h as f32) as u32;
+    let x1 = (rect_points[2] * ppp).ceil().clamp(0.0, w as f32) as u32;
+    let y1 = (rect_points[3] * ppp).ceil().clamp(0.0, h as f32) as u32;
     let cw = x1.saturating_sub(x0);
     let ch = y1.saturating_sub(y0);
     if cw == 0 || ch == 0 {
         return Err(crate::error::anyhow!("empty screenshot region"));
     }
 
-    // Rasterise the annotation canvas full-screen at the same scale, then
-    // un-premultiply to straight alpha (identical to the full-screen path).
+    // Rasterise the annotation canvas over the client area at the same
+    // scale, then un-premultiply to straight alpha (identical to the
+    // full-screen path).
     let mut pixmap = tiny_skia::Pixmap::new(w, h)
         .ok_or_else(|| crate::error::anyhow!("could not allocate pixmap"))?;
     {
@@ -483,6 +506,58 @@ fn days_since_epoch_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filled(w: u32, h: u32, v: u8) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, image::Rgba([v, v, v, 255]))
+    }
+
+    #[test]
+    fn a_window_on_a_second_monitor_gets_that_monitors_pixels() {
+        // Primary 100×50 at the origin, a second one to its right.
+        let (primary, second) = (filled(100, 50, 1), filled(80, 60, 2));
+        let mut out = RgbaImage::new(30, 20);
+        let origin = [120, 10];
+        assert!(!paste_monitor(&mut out, origin, [0, 0], &primary));
+        assert!(paste_monitor(&mut out, origin, [100, 0], &second));
+        assert!(out.pixels().all(|p| p.0 == [2, 2, 2, 255]));
+    }
+
+    #[test]
+    fn a_window_across_two_monitors_is_stitched() {
+        // A second monitor to the left of the primary, at negative x.
+        let (primary, left) = (filled(100, 50, 1), filled(100, 50, 2));
+        let mut out = RgbaImage::new(40, 20);
+        let origin = [-10, 40];
+        assert!(paste_monitor(&mut out, origin, [-100, 0], &left));
+        assert!(paste_monitor(&mut out, origin, [0, 0], &primary));
+        assert_eq!(out.get_pixel(9, 0).0, [2, 2, 2, 255]);
+        assert_eq!(out.get_pixel(10, 0).0, [1, 1, 1, 255]);
+        // Below both monitors (y 50 and on) stays transparent.
+        assert_eq!(out.get_pixel(20, 10).0[3], 0);
+        assert!(overlaps(origin, &out, [-100, 0, 100, 50]));
+        assert!(!overlaps(origin, &out, [200, 0, 100, 50]));
+    }
+
+    #[test]
+    fn each_pasted_pixel_comes_from_the_same_desktop_spot() {
+        // A monitor at (100, 20) whose pixels carry their own position.
+        let mon = RgbaImage::from_fn(60, 40, |x, y| image::Rgba([x as u8, y as u8, 7, 255]));
+        let mut out = RgbaImage::new(30, 30);
+        let origin = [140, 45];
+        assert!(paste_monitor(&mut out, origin, [100, 20], &mon));
+        // Desktop (150, 50) is monitor pixel (50, 30) and out pixel (10, 5).
+        assert_eq!(out.get_pixel(10, 5).0, [50, 30, 7, 255]);
+        assert_eq!(out.get_pixel(0, 0).0, [40, 25, 7, 255]);
+        assert_eq!(out.get_pixel(19, 14).0, [59, 39, 7, 255]);
+        // Right of and below the monitor stays transparent.
+        assert_eq!(out.get_pixel(20, 0).0[3], 0);
+        assert_eq!(out.get_pixel(0, 15).0[3], 0);
+    }
 }
 
 /// Convert premultiplied RGBA → straight RGBA, in place. tiny-skia outputs

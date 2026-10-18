@@ -2,9 +2,9 @@
 //!
 //! The user toggles recording via `Ctrl+Shift+R` (or a toolbar button
 //! that fires the same event). A dedicated worker thread spawned at
-//! `start()` does the heavy lifting: each tick it captures the primary
-//! monitor with `xcap`, crops to the OSN window region, downsamples
-//! to half resolution, and **streams the encoded frame directly into
+//! `start()` does the heavy lifting: each tick it captures the screen
+//! under the OSN window with `xcap` (from whichever monitors the window
+//! is on), downsamples to half resolution, and **streams the encoded frame directly into
 //! the destination GIF on disk**. The main UI thread is untouched —
 //! the only synchronisation is a `Sender<()>` stop signal and an
 //! `Arc<Mutex<...>>` slot for the final result.
@@ -420,7 +420,7 @@ fn worker_loop(
         }
         next_capture = now + FRAME_INTERVAL;
 
-        match capture_primary(hwnd) {
+        match capture_frame(hwnd) {
             Ok(frame) => {
                 // Lazy encoder init — needs the first frame's size.
                 if encoder.is_none() {
@@ -546,101 +546,91 @@ fn init_gif_encoder(
     Ok(encoder)
 }
 
-/// Capture the primary monitor, optionally crop to the OSN window's
-/// screen rect, then downsample to 1/`DOWNSCALE`.
+/// Capture the screen under the OSN window's client area, downsample it
+/// to 1/`DOWNSCALE` and draw the cursor marker on it.
 ///
-/// When `hwnd != 0` on Windows, we crop the captured RGBA to the
-/// region returned by `GetWindowRect(hwnd)`. That makes the saved
-/// GIF contain only the user's target window (which OSN has been
-/// resized to cover) instead of the entire desktop. Cropping
-/// happens before downsample, so the destination dimensions still
-/// match the GIF encoder's first-frame size as long as the user
-/// doesn't resize OSN mid-recording — and even then `gif` will
-/// happily clip subsequent frames at the encoder's recorded size.
-fn capture_primary(hwnd: isize) -> Result<DownsampledFrame> {
-    let monitors = xcap::Monitor::all().context("listing monitors")?;
-    let monitor = monitors
-        .iter()
-        .find(|m| m.is_primary())
-        .unwrap_or(&monitors[0]);
-    let img = monitor.capture_image().context("capturing screen")?;
-    let src_w = img.width() as i32;
-    let src_h = img.height() as i32;
-    let src = img.into_raw();
-
-    // Resolve crop region in monitor-physical pixels. Fall back to
-    // the whole monitor if we cannot read OSN's rect.
-    let (cx, cy, cw, ch) = if hwnd != 0 {
-        match crate::platform::window_rect(hwnd) {
-            Some((l, t, r, b)) => {
-                let mut l = l.max(0);
-                let mut t = t.max(0);
-                let mut r = r.min(src_w);
-                let mut b = b.min(src_h);
-                if r <= l || b <= t {
-                    l = 0; t = 0; r = src_w; b = src_h;
-                }
-                (l, t, r - l, b - t)
-            }
-            None => (0, 0, src_w, src_h),
-        }
-    } else {
-        (0, 0, src_w, src_h)
+/// The pixels come from whichever monitors the window is on (see
+/// `screenshot::capture_desktop_rect`), so a window on a second monitor
+/// records that monitor; a part of the window off every monitor stays
+/// transparent. Without the window's rect it falls back to the whole
+/// primary monitor, which sits at (0, 0) on the virtual desktop.
+///
+/// The frame is the client area's size whatever monitor it is on, so it
+/// keeps matching the encoder's first-frame size as long as the user
+/// doesn't resize OSN mid-recording — and even then `gif` will happily
+/// clip subsequent frames at the encoder's recorded size.
+fn capture_frame(hwnd: isize) -> Result<DownsampledFrame> {
+    let (img, origin) = match crate::screenshot::osn_client_rect(hwnd) {
+        Some(rect) => (crate::screenshot::capture_desktop_rect(rect)?, [rect.0, rect.1]),
+        None => (crate::screenshot::capture_primary_image()?, [0, 0]),
     };
+    let mut frame = downsample(&img, DOWNSCALE);
 
-    let dst_w = ((cw as u32) / DOWNSCALE).max(2) as u16;
-    let dst_h = ((ch as u32) / DOWNSCALE).max(2) as u16;
-    let mut dst = vec![0u8; dst_w as usize * dst_h as usize * 4];
-    let scale = DOWNSCALE as i32;
-    let src_stride = src_w as usize * 4;
-    for y in 0..dst_h as i32 {
-        let sy = cy + y * scale;
-        if sy < 0 || sy >= src_h { continue; }
-        for x in 0..dst_w as i32 {
-            let sx = cx + x * scale;
-            if sx < 0 || sx >= src_w { continue; }
-            let s = sy as usize * src_stride + sx as usize * 4;
-            let d = (y as usize * dst_w as usize + x as usize) * 4;
-            if s + 4 > src.len() { continue; }
-            dst[d]     = src[s];
-            dst[d + 1] = src[s + 1];
-            dst[d + 2] = src[s + 2];
-            dst[d + 3] = src[s + 3];
-        }
-    }
     // Composite a synthetic cursor marker into the downsampled frame.
     // xcap (Win32 BitBlt) does NOT include the OS cursor; without
     // this, the recorded GIF shows no pointer and viewers can't tell
     // where the presenter is pointing. We draw a small filled disc
     // with a contrasting ring, switching to red while the mouse
     // button is down so clicks are visible too.
-    if let Some((csx, csy)) = crate::platform::cursor_pos() {
-        // Cursor in monitor-physical px → downsampled-frame px.
-        let fx = (csx - cx) / DOWNSCALE as i32;
-        let fy = (csy - cy) / DOWNSCALE as i32;
-        if fx >= 0 && fy >= 0 && fx < dst_w as i32 && fy < dst_h as i32 {
-            let down = crate::platform::lmb_down();
-            let core = if down { [240, 60, 60, 255] } else { [255, 255, 255, 255] };
-            let ring = [0u8, 0, 0, 180];
-            draw_cursor_marker(
-                &mut dst,
-                dst_w as i32,
-                dst_h as i32,
-                fx,
-                fy,
-                /* core_radius */ 4,
-                /* ring_radius */ 6,
-                core,
-                ring,
-            );
+    let size = [frame.width, frame.height];
+    let marker = crate::platform::cursor_pos()
+        .and_then(|(x, y)| cursor_in_frame([x, y], origin, DOWNSCALE, size));
+    if let Some([fx, fy]) = marker {
+        let down = crate::platform::lmb_down();
+        let core = if down { [240, 60, 60, 255] } else { [255, 255, 255, 255] };
+        let ring = [0u8, 0, 0, 180];
+        draw_cursor_marker(
+            &mut frame.rgba,
+            size[0] as i32,
+            size[1] as i32,
+            fx,
+            fy,
+            /* core_radius */ 4,
+            /* ring_radius */ 6,
+            core,
+            ring,
+        );
+    }
+    Ok(frame)
+}
+
+/// Every `scale`-th pixel of `img` in each direction (nearest-neighbour),
+/// at least 2×2.
+fn downsample(img: &image::RgbaImage, scale: u32) -> DownsampledFrame {
+    let (src_w, src_h) = (img.width() as usize, img.height() as usize);
+    let scale = scale.max(1) as usize;
+    let dst_w = (src_w / scale).max(2);
+    let dst_h = (src_h / scale).max(2);
+    let src = img.as_raw();
+    let mut dst = vec![0u8; dst_w * dst_h * 4];
+    for y in 0..dst_h {
+        let sy = y * scale;
+        if sy >= src_h { continue; }
+        for x in 0..dst_w {
+            let sx = x * scale;
+            if sx >= src_w { continue; }
+            let s = (sy * src_w + sx) * 4;
+            let d = (y * dst_w + x) * 4;
+            dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
         }
     }
-
-    Ok(DownsampledFrame {
-        width: dst_w,
-        height: dst_h,
+    DownsampledFrame {
+        width: dst_w as u16,
+        height: dst_h as u16,
         rgba: dst,
-    })
+    }
+}
+
+/// Where the cursor at `cursor` (desktop-physical px) lands in a frame
+/// of `size` downsampled by `scale` from a capture whose top-left sits
+/// at `origin` on the desktop. `None` when it falls outside the frame.
+fn cursor_in_frame(cursor: [i32; 2], origin: [i32; 2], scale: u32, size: [u16; 2]) -> Option<[i32; 2]> {
+    let scale = scale.max(1) as i32;
+    // `div_euclid` so a cursor just left of / above the capture rounds
+    // to -1, not into the frame's first column / row.
+    let fx = (cursor[0] - origin[0]).div_euclid(scale);
+    let fy = (cursor[1] - origin[1]).div_euclid(scale);
+    (fx >= 0 && fy >= 0 && fx < size[0] as i32 && fy < size[1] as i32).then_some([fx, fy])
 }
 
 /// Paint a filled disc + outer ring into `buf` (RGBA, row-major,
@@ -737,4 +727,39 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cursor_marker_lands_relative_to_the_capture_not_the_primary() {
+        // OSN's client area on a second monitor to the right of a
+        // 2560-wide primary: its top-left is frame pixel (0, 0).
+        let (origin, size) = ([2660, 100], [400, 300]);
+        assert_eq!(cursor_in_frame([2660, 100], origin, 2, size), Some([0, 0]));
+        assert_eq!(cursor_in_frame([2761, 301], origin, 2, size), Some([50, 100]));
+        // On the primary monitor, outside the recorded window.
+        assert_eq!(cursor_in_frame([500, 500], origin, 2, size), None);
+    }
+
+    #[test]
+    fn a_cursor_just_outside_the_capture_gets_no_marker() {
+        let (origin, size) = ([-300, 0], [100, 100]);
+        assert_eq!(cursor_in_frame([-301, 50], origin, 2, size), None);
+        assert_eq!(cursor_in_frame([-300, -1], origin, 2, size), None);
+        assert_eq!(cursor_in_frame([-100, 50], origin, 2, size), None);
+        assert_eq!(cursor_in_frame([-101, 199], origin, 2, size), Some([99, 99]));
+    }
+
+    #[test]
+    fn downsampling_keeps_every_other_pixel() {
+        // Each pixel's red channel is its index, so the picks show.
+        let img = image::RgbaImage::from_fn(5, 4, |x, y| image::Rgba([(y * 5 + x) as u8, 0, 0, 255]));
+        let f = downsample(&img, 2);
+        assert_eq!((f.width, f.height), (2, 2));
+        let reds: Vec<u8> = f.rgba.chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(reds, [0, 2, 10, 12]);
+    }
 }
