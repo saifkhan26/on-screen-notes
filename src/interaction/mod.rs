@@ -7,6 +7,7 @@ pub mod zoom_pan;
 use crate::canvas::CanvasManager;
 use crate::canvas::shape::Shape;
 use crate::canvas::stroke::{PenSample, StrokeStyle};
+use crate::config::SlideTabOrder;
 use crate::input::hotkeys_config::ParsedHotkeys;
 use crate::input::pen::PenEvent;
 use crate::tools::{ActiveTool, ToolKind};
@@ -128,15 +129,42 @@ pub fn react_lasso_keys(
 }
 
 /// React to canvas-navigation key events. Bindings come from
-/// `HotkeysConfig::canvas.{prev_canvas, next_canvas}`.
+/// `HotkeysConfig::canvas.{prev_canvas, next_canvas, cycle_*_slide,
+/// first_slide, last_slide}`; `order` says what the cycle keys step
+/// through.
 pub fn react_canvas_nav(
     key: egui::Key,
     mods: egui::Modifiers,
     manager: &mut CanvasManager,
     keys: &ParsedHotkeys,
+    order: SlideTabOrder,
 ) {
-    if let Some(b) = keys.canvas.prev_canvas { if b.matches(key, mods) { manager.prev(); return; }}
-    if let Some(b) = keys.canvas.next_canvas { if b.matches(key, mods) { manager.next(); }}
+    let c = &keys.canvas;
+    let recent = order == SlideTabOrder::RecentlyUsed;
+    if let Some(b) = c.prev_canvas      { if b.matches(key, mods) { manager.prev(); return; }}
+    if let Some(b) = c.next_canvas      { if b.matches(key, mods) { manager.next(); return; }}
+    if let Some(b) = c.cycle_prev_slide { if b.matches(key, mods) {
+        if recent { manager.walk_recent(false) } else { manager.prev() }
+        return;
+    }}
+    if let Some(b) = c.cycle_next_slide { if b.matches(key, mods) {
+        if recent { manager.walk_recent(true) } else { manager.cycle_next() }
+        return;
+    }}
+    if let Some(b) = c.first_slide      { if b.matches(key, mods) { manager.go_to(0); return; }}
+    if let Some(b) = c.last_slide       { if b.matches(key, mods) { manager.go_to(manager.count() - 1); }}
+}
+
+/// A recently-used walk lasts while the modifier its keys share stays
+/// down (Ctrl for the default Ctrl+Tab); letting go ends it. Keys bound
+/// without Ctrl or Alt end it at once, so each press flips between the
+/// last two slides.
+pub fn slide_walk_held(mods: egui::Modifiers, keys: &ParsedHotkeys) -> bool {
+    let c = &keys.canvas;
+    [c.cycle_next_slide, c.cycle_prev_slide]
+        .into_iter()
+        .flatten()
+        .any(|b| (b.ctrl && (mods.ctrl || mods.command)) || (b.alt && mods.alt))
 }
 
 /// React to layer-navigation key events on the active canvas. Up

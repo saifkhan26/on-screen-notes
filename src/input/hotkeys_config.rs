@@ -109,6 +109,8 @@ fn key_from_name(name: &str) -> Option<egui::Key> {
         "arrowright" | "right" => K::ArrowRight,
         "arrowup"    | "up"    => K::ArrowUp,
         "arrowdown"  | "down"  => K::ArrowDown,
+        "home" => K::Home,
+        "end"  => K::End,
         // Symbols
         "-" | "minus" => K::Minus,
         "=" | "equals" | "equal" => K::Equals,
@@ -287,6 +289,14 @@ pub struct CanvasSection {
     #[serde(default = "d_freeze_frame")]  pub freeze_frame: String,
     #[serde(default = "d_prev_canvas")]   pub prev_canvas: String,
     #[serde(default = "d_next_canvas")]   pub next_canvas: String,
+    /// Next / previous slide, wrapping at both ends. Unlike
+    /// `next_canvas` this never starts a new slide past the last one.
+    #[serde(default = "d_cycle_next_slide")] pub cycle_next_slide: String,
+    #[serde(default = "d_cycle_prev_slide")] pub cycle_prev_slide: String,
+    #[serde(default = "d_first_slide")]   pub first_slide: String,
+    #[serde(default = "d_last_slide")]    pub last_slide: String,
+    /// Name the active slide, in the slide panel.
+    #[serde(default = "d_rename_slide")]  pub rename_slide: String,
     #[serde(default = "d_prev_layer")]    pub prev_layer: String,
     #[serde(default = "d_next_layer")]    pub next_layer: String,
     #[serde(default = "d_toggle_ui")]     pub toggle_ui: String,
@@ -341,6 +351,9 @@ impl Default for CanvasSection {
             reset_layer_zoom: d_reset_layer_zoom(),
             freeze_frame: d_freeze_frame(),
             prev_canvas: d_prev_canvas(), next_canvas: d_next_canvas(),
+            cycle_next_slide: d_cycle_next_slide(), cycle_prev_slide: d_cycle_prev_slide(),
+            first_slide: d_first_slide(), last_slide: d_last_slide(),
+            rename_slide: d_rename_slide(),
             prev_layer: d_prev_layer(), next_layer: d_next_layer(),
             toggle_ui: d_toggle_ui(),
             opacity_0: d_op_0(), opacity_1: d_op_1(),
@@ -373,6 +386,11 @@ fn d_reset_layer_zoom() -> String { "ctrl+shift+9".into() }
 fn d_freeze_frame()  -> String { "ctrl+shift+f".into() }
 fn d_prev_canvas()   -> String { "arrowleft".into() }
 fn d_next_canvas()   -> String { "arrowright".into() }
+fn d_cycle_next_slide() -> String { "ctrl+tab".into() }
+fn d_cycle_prev_slide() -> String { "ctrl+shift+tab".into() }
+fn d_first_slide()   -> String { "home".into() }
+fn d_last_slide()    -> String { "end".into() }
+fn d_rename_slide()  -> String { "f2".into() }
 fn d_prev_layer()    -> String { "arrowdown".into() }
 fn d_next_layer()    -> String { "arrowup".into() }
 fn d_toggle_ui()     -> String { "tab".into() }
@@ -442,6 +460,11 @@ pub struct CanvasBindings {
     pub freeze_frame: Option<Binding>,
     pub prev_canvas: Option<Binding>,
     pub next_canvas: Option<Binding>,
+    pub cycle_next_slide: Option<Binding>,
+    pub cycle_prev_slide: Option<Binding>,
+    pub first_slide: Option<Binding>,
+    pub last_slide: Option<Binding>,
+    pub rename_slide: Option<Binding>,
     pub prev_layer: Option<Binding>,
     pub next_layer: Option<Binding>,
     pub toggle_ui: Option<Binding>,
@@ -510,6 +533,11 @@ impl HotkeysConfig {
                 freeze_frame:  p("canvas.freeze_frame",  &self.canvas.freeze_frame),
                 prev_canvas:   p("canvas.prev_canvas",   &self.canvas.prev_canvas),
                 next_canvas:   p("canvas.next_canvas",   &self.canvas.next_canvas),
+                cycle_next_slide: p("canvas.cycle_next_slide", &self.canvas.cycle_next_slide),
+                cycle_prev_slide: p("canvas.cycle_prev_slide", &self.canvas.cycle_prev_slide),
+                first_slide:   p("canvas.first_slide",   &self.canvas.first_slide),
+                last_slide:    p("canvas.last_slide",    &self.canvas.last_slide),
+                rename_slide:  p("canvas.rename_slide",  &self.canvas.rename_slide),
                 prev_layer:    p("canvas.prev_layer",    &self.canvas.prev_layer),
                 next_layer:    p("canvas.next_layer",    &self.canvas.next_layer),
                 toggle_ui:     p("canvas.toggle_ui",     &self.canvas.toggle_ui),
@@ -607,8 +635,8 @@ impl HotkeysConfig {
         })?;
         let header = "# On-Screen Notes — hotkeys.toml\n\
                       # Strings are case-insensitive. Modifiers: ctrl, shift, alt.\n\
-                      # Special keys: arrowleft/right/up/down, backspace, delete,\n\
-                      # enter, escape, tab, space, f1..f12.\n\n";
+                      # Special keys: arrowleft/right/up/down, home, end, backspace,\n\
+                      # delete, enter, escape, tab, space, f1..f12.\n\n";
         let full = format!("{header}{toml_str}");
         std::fs::write(&p, full)
     }
@@ -626,6 +654,20 @@ mod tests {
         assert_eq!(c.media_next_frame.map(|b| b.key), Some(egui::Key::Period));
         assert_eq!(parse(",").map(|b| b.key), Some(egui::Key::Comma));
         assert_eq!(parse("shift+.").map(|b| (b.key, b.shift)), Some((egui::Key::Period, true)));
+    }
+
+    #[test]
+    fn slide_keys_parse() {
+        let c = HotkeysConfig::default().parsed().canvas;
+        let b = |b: Option<Binding>| b.map(|b| (b.key, b.ctrl, b.shift));
+        assert_eq!(b(c.cycle_next_slide), Some((egui::Key::Tab, true, false)));
+        assert_eq!(b(c.cycle_prev_slide), Some((egui::Key::Tab, true, true)));
+        assert_eq!(b(c.first_slide), Some((egui::Key::Home, false, false)));
+        assert_eq!(b(c.last_slide), Some((egui::Key::End, false, false)));
+        assert_eq!(b(c.rename_slide), Some((egui::Key::F2, false, false)));
+        // Ctrl+Tab must not also toggle the UI (plain Tab).
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+        assert!(!c.toggle_ui.unwrap().matches(egui::Key::Tab, ctrl));
     }
 
     #[test]

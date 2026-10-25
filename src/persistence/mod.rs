@@ -201,6 +201,26 @@ pub fn load_views() -> Vec<SlideView> {
     })
 }
 
+/// Write every slide's name, in slide order, to `canvases/names.ron`.
+/// Kept apart from the slides like the views: renaming a slide is not
+/// an edit of it, and a big slide takes seconds to rewrite. An unnamed
+/// slide is an empty string.
+pub fn save_names(names: &[String]) -> Result<()> {
+    let path = paths::canvases_dir()?.join("names.ron");
+    atomic_write(&path, ron::ser::to_string(names)?.as_bytes())
+}
+
+/// The names `save_names` wrote, or none if the file is missing or
+/// unreadable (every slide is then unnamed).
+pub fn load_names() -> Vec<String> {
+    let Ok(path) = paths::canvases_dir().map(|d| d.join("names.ron")) else { return Vec::new() };
+    let Ok(s) = std::fs::read_to_string(&path) else { return Vec::new() };
+    ron::from_str(&s).unwrap_or_else(|e| {
+        log::warn!("names.ron could not be read ({e}); slides show unnamed");
+        Vec::new()
+    })
+}
+
 /// Atomic write helper: we write to `<path>.tmp` and rename onto `path`.
 ///
 /// Why: `std::fs::write` is not atomic — if the program crashes mid-write

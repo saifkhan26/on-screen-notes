@@ -40,6 +40,15 @@ input.
 - **PureRef boards** — drop a `.pur` file (PureRef 1.x or 2.x) to open it
   as a new slide. See [PureRef boards](#pureref-boards)
 - **Multiple canvases**, persistent on disk via RON
+- **Slide panel** — every slide listed in the top-left corner by number
+  and name: click one to go there, double-click (or `F2`) to name it,
+  `+` to add a slide, the arrow-to-line button (or `End`) for the last
+  one. `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle through the slides by
+  number; the clock button switches them to *recently used* order, like
+  `Alt+Tab` — a tap flips back to the slide you were on before, holding
+  `Ctrl` and tapping again goes further back. The `‹` button folds the
+  panel to a small `n/N` tab. Names are kept in `canvases/names.ron`,
+  so naming never rewrites a slide
 - **Multiple layers per canvas** (independent visibility + opacity, and
   each layer can be panned / zoomed on its own with `Shift+Space`)
 - **Click-through** while holding `Alt`
@@ -298,6 +307,9 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Clear active layer | `Ctrl+Delete` |
 | Delete active canvas | `Ctrl+Shift+Backspace` |
 | Previous / next canvas | `←` / `→` |
+| Previous / next slide, wrapping round (never adds a slide) — or, with the slide panel's clock button on, back / forward through recently used slides | `Ctrl+Shift+Tab` / `Ctrl+Tab` |
+| First / last slide | `Home` / `End` |
+| Name the active slide (in the slide panel) | `F2` |
 | Previous / next layer | `↓` / `↑` |
 | Reset pan + zoom | `Ctrl+0` |
 | Reset active layer position | `Ctrl+Shift+0` |

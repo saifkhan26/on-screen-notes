@@ -218,6 +218,8 @@ pub struct OnScreenNotesApp {
     media_ui: ui::media_controls::MediaUi,
     /// Media types the toolbar's filter highlights.
     media_filter: ui::media_filter::MediaFilter,
+    /// The slide panel (top-left): which slide is being named.
+    slide_panel: ui::slide_panel::SlidePanel,
     /// Files being copied in and read as videos / GIFs.
     media_imports: Vec<crate::media::import::ImportJob>,
     /// Videos picked or dropped before FFmpeg was set up, with where
@@ -553,6 +555,7 @@ impl OnScreenNotesApp {
             media: crate::media::MediaHub::new(),
             media_ui: ui::media_controls::MediaUi::new(),
             media_filter: ui::media_filter::MediaFilter::default(),
+            slide_panel: Default::default(),
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
             media_dialog: None,
@@ -1408,6 +1411,8 @@ impl OnScreenNotesApp {
                         &stem,
                     );
                     let idx = self.canvases.push_canvas(canvas);
+                    // The board's file name is the slide's first name.
+                    self.canvases.rename(idx, &stem);
                     let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
                     let mut msg = format!(
                         "Opened {name} as slide {} — {}, {}",
@@ -1941,7 +1946,8 @@ impl eframe::App for OnScreenNotesApp {
         {
             let z_held = ctx.input(|i| i.key_down(egui::Key::Z));
             let z_ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
-            let z_modal = z_held && !z_ctrl;
+            // A "z" typed into a slide name is not the loupe.
+            let z_modal = z_held && !z_ctrl && !self.slide_panel.is_renaming();
             if z_modal && self.loupe.is_none() {
                 match ui::loupe::LoupeState::start_live(ctx, self.osn_hwnd) {
                     Ok(l) => self.loupe = Some(l),
@@ -1962,7 +1968,7 @@ impl eframe::App for OnScreenNotesApp {
         // We treat Space as a *modal* pan key: while it is held, all pen +
         // mouse drags pan the active canvas instead of drawing. This is the
         // same convention used by Photoshop, Figma, Rnote, etc.
-        let space_held = ctx.input(|i| i.key_down(egui::Key::Space));
+        let space_held = ctx.input(|i| i.key_down(egui::Key::Space)) && !self.slide_panel.is_renaming();
 
         // ---- Main overlay ------------------------------------------------
         if self.overlay_visible {
@@ -2003,6 +2009,22 @@ impl eframe::App for OnScreenNotesApp {
                 )
             } else {
                 false
+            };
+            // Recently-used slide history: the active slide counts as
+            // visited, and letting go of Ctrl ends a Ctrl+Tab walk.
+            if !ctx.input(|i| interaction::slide_walk_held(i.modifiers, &self.hotkeys_cfg)) {
+                self.canvases.end_recent_walk();
+            }
+            self.canvases.note_visit();
+            // Slide panel. Going to a slide waits until after this frame's
+            // keys, where the arrow keys switch slides too: everything
+            // drawn before then still belongs to the current slide.
+            let slides = if self.ui_visible {
+                // Below the REC badge while it shows in the same corner.
+                let top = if self.recorder.is_recording() { 44.0 } else { 10.0 };
+                ui::slide_panel::show(ctx, &mut self.slide_panel, &mut self.config, top, &self.canvases)
+            } else {
+                Default::default()
             };
             if select_filtered {
                 self.select_media_matches();
@@ -2619,7 +2641,7 @@ impl eframe::App for OnScreenNotesApp {
             // lands in the undo history like any other move.
             if let Some(b) = self.hotkeys_cfg.canvas.reset_layer_pos {
                 let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) {
                     let c = self.canvases.active_mut();
                     let li = c.active_layer;
                     if let Some(m) = c.layers.get(li).map(|l| l.moved_by) {
@@ -2637,7 +2659,7 @@ impl eframe::App for OnScreenNotesApp {
             // original coordinates exactly.
             if let Some(b) = self.hotkeys_cfg.canvas.reset_layer_zoom {
                 let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) {
                     let c = self.canvases.active_mut();
                     let li = c.active_layer;
                     if let Some(layer) = c.layers.get(li) {
@@ -2654,7 +2676,7 @@ impl eframe::App for OnScreenNotesApp {
             }
             if let Some(b) = self.hotkeys_cfg.canvas.reset_view {
                 let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) {
                     let (pan, zoom) = self.canvases.active_view_mut();
                     *zoom = 1.0;
                     *pan  = [0.0, 0.0];
@@ -2662,7 +2684,7 @@ impl eframe::App for OnScreenNotesApp {
             }
             if let Some(b) = self.hotkeys_cfg.canvas.freeze_frame {
                 let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) {
                     self.queue_freeze(ctx.pixels_per_point());
                 }
             }
@@ -2672,7 +2694,8 @@ impl eframe::App for OnScreenNotesApp {
             // case we skip the tool-shortcut / undo / canvas-nav
             // dispatcher so typing "t" / "Ctrl+Z" lands in the label,
             // not as a tool change or an undo.
-            let text_consumed = interaction::route_text_input(ctx, &mut self.tool, &mut self.canvases);
+            // A slide name being typed owns the keys the same way.
+            let text_consumed = slides.typing || interaction::route_text_input(ctx, &mut self.tool, &mut self.canvases);
 
             // Select-tool commands found in this frame's events. They
             // are only collected inside the input closure and run after
@@ -2682,6 +2705,8 @@ impl eframe::App for OnScreenNotesApp {
             // a text field has the keyboard.
             let mut media_keys: Vec<crate::media::Cmd> = Vec::new();
             let media_keys_live = !ctx.wants_keyboard_input();
+            // F2 (name the active slide), applied after the input closure.
+            let mut rename_slide = false;
 
             ctx.input(|i| {
                 let mods = i.modifiers;
@@ -2752,13 +2777,16 @@ impl eframe::App for OnScreenNotesApp {
                         // flag the slide for the autosave.
                         self.canvases.edit_active(|c| interaction::react_lasso_keys(*key, mods, &mut self.tool, c));
                         // Canvas + layer navigation.
-                        interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys);
+                        interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys, self.config.slide_tab_order);
                         interaction::react_layer_nav (*key, mods, &mut self.canvases, keys);
                         // Toggle floating UI chrome.
                         if let Some(b) = keys.canvas.toggle_ui {
                             if b.matches(*key, mods) {
                                 self.ui_visible = !self.ui_visible;
                             }
+                        }
+                        if keys.canvas.rename_slide.is_some_and(|b| b.matches(*key, mods)) {
+                            rename_slide = true;
                         }
                         // Undo / redo / clear / delete-canvas.
                         if let Some(b) = keys.canvas.undo {
@@ -2854,7 +2882,8 @@ impl eframe::App for OnScreenNotesApp {
                     // unit mapping used inside `handle_scroll`.
                     raw_delta_y += zoom_delta_extra.ln() / 1.10_f32.ln();
                 }
-                if notches != 0 || raw_delta_y.abs() > 1e-4 {
+                // Over the slide panel the wheel scrolls its list instead.
+                if (notches != 0 || raw_delta_y.abs() > 1e-4) && !slides.hovered {
                     if let Some(l) = self.loupe.as_mut() {
                         if notches != 0 {
                             l.zoom = (l.zoom + notches as f32 * 0.25).clamp(1.5, 12.0);
@@ -2909,6 +2938,21 @@ impl eframe::App for OnScreenNotesApp {
                 for action in sel_actions {
                     self.apply_sel_action(action, canvas_rect, ppp);
                 }
+            }
+            match slides.action {
+                Some(ui::slide_panel::SlideAction::GoTo(i)) => self.canvases.go_to(i),
+                Some(ui::slide_panel::SlideAction::Rename(i, name)) => self.canvases.rename(i, &name),
+                Some(ui::slide_panel::SlideAction::Add) => {
+                    self.canvases.push_canvas(crate::canvas::canvas::Canvas::default());
+                }
+                None => {}
+            }
+            if rename_slide {
+                // The name field lives in the panel, so bring it up.
+                let i = self.canvases.active_index();
+                self.slide_panel.start_rename(i, self.canvases.name(i));
+                self.config.slide_panel_open = true;
+                self.ui_visible = true;
             }
             if !media_keys.is_empty() {
                 let pointer = ctx.input(|i| i.pointer.hover_pos());

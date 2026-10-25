@@ -67,6 +67,17 @@ pub enum RecordingFormat {
     Mp4IfAvailable,
 }
 
+/// What Ctrl+Tab / Ctrl+Shift+Tab step through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SlideTabOrder {
+    /// Next / previous slide by number, wrapping round.
+    #[default]
+    Sequential,
+    /// Slides in the order they were last visited, like Alt+Tab: a tap
+    /// flips back to the previous slide, holding Ctrl goes further back.
+    RecentlyUsed,
+}
+
 /// Persistent user preferences. Changing fields here is a breaking change to
 /// the on-disk format; if we add fields later, give them `#[serde(default)]`
 /// so old config files still load.
@@ -145,7 +156,19 @@ pub struct AppConfig {
     /// `media::ffmpeg`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ffmpeg_path: Option<std::path::PathBuf>,
+
+    /// The slide panel (top-left) is open rather than folded down to its
+    /// slide-count tab.
+    #[serde(default = "default_slide_panel_open")]
+    pub slide_panel_open: bool,
+
+    /// What Ctrl+Tab / Ctrl+Shift+Tab step through; switched from the
+    /// slide panel.
+    #[serde(default)]
+    pub slide_tab_order: SlideTabOrder,
 }
+
+fn default_slide_panel_open() -> bool { true }
 
 fn default_pressure_curve() -> f32 { 1.0 }
 
@@ -188,6 +211,8 @@ impl Default for AppConfig {
             recording_format: RecordingFormat::default(),
             smoothing: SmoothingOptions::default(),
             ffmpeg_path: None,
+            slide_panel_open: true,
+            slide_tab_order: SlideTabOrder::default(),
         }
     }
 }

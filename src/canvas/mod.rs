@@ -66,6 +66,18 @@ pub struct CanvasManager {
     /// mix of both renamed over the slide, and on a big slide (a 1 GB
     /// one takes ~15 s) back-to-back edits stacked up several at once.
     saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// One name per slide, empty for an unnamed one; always as long as
+    /// `canvases`. Kept here rather than on `Canvas` so a slide still
+    /// being read has its name too, and renaming never dirties a slide.
+    names: Vec<String>,
+    /// The names as `names.ron` last received them.
+    saved_names: Vec<String>,
+    /// Visited slides, most recent first. The active slide leads, except
+    /// during a recently-used walk, which settles the order when it ends.
+    recent: Vec<usize>,
+    /// Where in `recent` a recently-used walk (Ctrl held, Tab pressed
+    /// once or more) stands; `None` when no walk is under way.
+    recent_walk: Option<usize>,
 }
 
 /// Stand-in for a slot whose file is missing or unreadable. It keeps
@@ -192,6 +204,10 @@ impl CanvasManager {
             saved_views: Vec::new(),
             file_views: crate::persistence::load_views(),
             saving: Default::default(),
+            names: crate::persistence::load_names(),
+            saved_names: Vec::new(),
+            recent: vec![0],
+            recent_walk: None,
         };
         // Every slot up to the highest file on disk gets an entry. A gap
         // or an unreadable file becomes a blank placeholder instead of
@@ -233,6 +249,9 @@ impl CanvasManager {
             }
             m.saved_views = m.canvases.iter().map(|c| c.as_ref().map(view_of)).collect();
         }
+        // A short or missing `names.ron` leaves the rest unnamed.
+        m.names.resize(m.canvases.len(), String::new());
+        m.saved_names = m.names.clone();
         m
     }
 
@@ -240,7 +259,12 @@ impl CanvasManager {
     #[cfg(test)]
     pub(crate) fn for_tests(canvases: Vec<Canvas>) -> Self {
         let saved_views = canvases.iter().map(|c| Some(view_of(c))).collect();
+        let names = vec![String::new(); canvases.len()];
         Self {
+            saved_names: names.clone(),
+            names,
+            recent: vec![0],
+            recent_walk: None,
             canvases: canvases.into_iter().map(Some).collect(),
             active: 0,
             load_errors: Vec::new(),
@@ -270,6 +294,17 @@ impl CanvasManager {
         }
         self.saved_views = views.iter().copied().map(Some).collect();
         Some(views)
+    }
+
+    /// Every slide's name, if any changed since `names.ron` was last
+    /// written; they then count as written. Unlike the views these are
+    /// known for every slide from the start, read or not.
+    fn take_changed_names(&mut self) -> Option<Vec<String>> {
+        if self.names == self.saved_names {
+            return None;
+        }
+        self.saved_names = self.names.clone();
+        Some(self.names.clone())
     }
 
     /// Put a read slot in place and note what went wrong with it.
@@ -477,9 +512,16 @@ impl CanvasManager {
         if self.active + 1 >= self.canvases.len() {
             // At the end → grow a new blank canvas.
             self.canvases.push(Some(Canvas::default()));
+            self.names.push(String::new());
         }
         self.active += 1;
         self.ensure_loaded(self.active);
+    }
+
+    /// Move to the next canvas, wrapping from the last to the first —
+    /// cycling never grows the deck, unlike `next`.
+    pub fn cycle_next(&mut self) {
+        self.go_to((self.active + 1) % self.canvases.len());
     }
 
     /// Append a ready-made canvas (an opened PureRef board) as the last
@@ -488,8 +530,67 @@ impl CanvasManager {
     /// next autosave writes it.
     pub fn push_canvas(&mut self, canvas: Canvas) -> usize {
         self.canvases.push(Some(canvas));
+        self.names.push(String::new());
         self.active = self.canvases.len() - 1;
         self.active
+    }
+
+    /// Go to slide `idx`, reading it first if it is still loading.
+    pub fn go_to(&mut self, idx: usize) {
+        if idx < self.canvases.len() {
+            self.active = idx;
+            self.ensure_loaded(idx);
+        }
+    }
+
+    /// Note the active slide as the most recently visited. Call once a
+    /// frame; held back while a recently-used walk is under way.
+    pub fn note_visit(&mut self) {
+        if self.recent_walk.is_none() && self.recent.first() != Some(&self.active) {
+            let a = self.active;
+            self.recent.retain(|&i| i != a);
+            self.recent.insert(0, a);
+        }
+    }
+
+    /// Step through the visited slides in recently-used order, like
+    /// Alt+Tab: `older` goes back in time (Ctrl+Tab), else forward
+    /// (Ctrl+Shift+Tab). The first step back from the active slide goes
+    /// to the one visited before it, so a single tap flips between the
+    /// last two; more taps before `end_recent_walk` go further back.
+    /// With fewer than two slides visited it steps by slide number.
+    pub fn walk_recent(&mut self, older: bool) {
+        self.note_visit();
+        let n = self.recent.len();
+        if n < 2 {
+            if older { self.cycle_next() } else { self.prev() }
+            return;
+        }
+        let pos = self.recent_walk.unwrap_or(0);
+        let pos = if older { (pos + 1) % n } else { (pos + n - 1) % n };
+        self.recent_walk = Some(pos);
+        self.go_to(self.recent[pos]);
+    }
+
+    /// The walk is over (Ctrl let go): the slide it stopped on becomes
+    /// the most recent.
+    pub fn end_recent_walk(&mut self) {
+        if self.recent_walk.take().is_some() {
+            self.note_visit();
+        }
+    }
+
+    /// Slide `idx`'s name; empty when it has none.
+    pub fn name(&self, idx: usize) -> &str {
+        self.names.get(idx).map_or("", String::as_str)
+    }
+
+    /// Name slide `idx` (surrounding spaces dropped; empty unnames it).
+    /// Not an edit of the slide: only `names.ron` is written.
+    pub fn rename(&mut self, idx: usize, name: &str) {
+        if let Some(n) = self.names.get_mut(idx) {
+            *n = name.trim().to_string();
+        }
     }
 
     /// Move to the previous canvas. Wraps to the last when at the first
@@ -530,11 +631,19 @@ impl CanvasManager {
         self.media_cleanup_due = true;
         if self.canvases.len() == 1 {
             self.canvases[0] = Some(Canvas::default());
+            self.names[0].clear();
             self.active = 0;
             return;
         }
         let i = self.active;
         self.canvases.remove(i);
+        self.names.remove(i);
+        // Every later slide moved down one place in the history too.
+        self.recent_walk = None;
+        self.recent.retain(|&j| j != i);
+        for j in &mut self.recent {
+            if *j > i { *j -= 1; }
+        }
         if self.active >= self.canvases.len() {
             self.active = self.canvases.len() - 1;
         }
@@ -578,6 +687,13 @@ impl CanvasManager {
             std::thread::spawn(move || {
                 if let Err(e) = crate::persistence::save_views(&views) {
                     log::warn!("failed to save slide views: {e}");
+                }
+            });
+        }
+        if let Some(names) = self.take_changed_names() {
+            std::thread::spawn(move || {
+                if let Err(e) = crate::persistence::save_names(&names) {
+                    log::warn!("failed to save slide names: {e}");
                 }
             });
         }
@@ -669,6 +785,11 @@ impl CanvasManager {
         if let Some(views) = self.take_changed_views() {
             if let Err(e) = crate::persistence::save_views(&views) {
                 log::warn!("failed to save slide views: {e}");
+            }
+        }
+        if let Some(names) = self.take_changed_names() {
+            if let Err(e) = crate::persistence::save_names(&names) {
+                log::warn!("failed to save slide names: {e}");
             }
         }
         for (i, slot) in self.canvases.iter_mut().enumerate() {
@@ -936,6 +1057,86 @@ mod view_tests {
         assert_eq!((canvases[2].pan, canvases[2].zoom), ([0.0, 0.0], 3.0));
         assert!(canvases.iter().all(|c| !c.dirty));
     }
+
+    #[test]
+    fn cycling_wraps_both_ways_without_growing_the_deck() {
+        let mut m = CanvasManager::for_tests(vec![clean(), clean(), clean()]);
+        m.prev();
+        assert_eq!(m.active_index(), 2);
+        m.cycle_next();
+        assert_eq!((m.active_index(), m.count()), (0, 3));
+        // `next` off the end still starts a new slide.
+        m.go_to(2);
+        m.next();
+        assert_eq!((m.active_index(), m.count()), (3, 4));
+    }
+
+    #[test]
+    fn recently_used_walk_flips_with_one_tap_and_goes_deeper_while_held() {
+        let mut m = CanvasManager::for_tests((0..6).map(|_| clean()).collect());
+        // Before a second slide is visited it steps by number.
+        m.walk_recent(true);
+        m.end_recent_walk();
+        m.note_visit();
+        assert_eq!(m.active_index(), 1);
+        // Visit 3, then 5 (one frame each).
+        for i in [3, 5] {
+            m.go_to(i);
+            m.note_visit();
+        }
+        // Tap: back to 3; tap again: back to 5.
+        m.walk_recent(true);
+        m.end_recent_walk();
+        assert_eq!(m.active_index(), 3);
+        m.walk_recent(true);
+        m.end_recent_walk();
+        assert_eq!(m.active_index(), 5);
+        // Held: 3, then 1, then 0 — frames in between change nothing.
+        m.walk_recent(true);
+        m.note_visit();
+        m.walk_recent(true);
+        assert_eq!(m.active_index(), 1);
+        m.walk_recent(true);
+        assert_eq!(m.active_index(), 0);
+        // Shift steps forward again.
+        m.walk_recent(false);
+        assert_eq!(m.active_index(), 1);
+        m.end_recent_walk();
+        assert_eq!(m.recent, [1, 5, 3, 0], "where the walk stopped is now the most recent");
+
+        // Deleting a slide drops it and renumbers the rest.
+        m.go_to(3);
+        m.note_visit();
+        m.delete_active();
+        assert_eq!(m.recent, [1, 4, 0]);
+    }
+
+    #[test]
+    fn names_follow_their_slides() {
+        let mut m = CanvasManager::for_tests(vec![clean(), clean(), clean()]);
+        assert_eq!(m.take_changed_names(), None);
+        m.rename(1, "  Intro  ");
+        m.rename(2, "Outro");
+        assert_eq!(m.name(1), "Intro", "surrounding spaces dropped");
+        assert!(m.canvases.iter().flatten().all(|c| !c.dirty), "naming is not an edit");
+        assert_eq!(m.take_changed_names(), Some(vec!["".into(), "Intro".into(), "Outro".into()]));
+        assert_eq!(m.take_changed_names(), None, "written once, then quiet until the next change");
+
+        // New slides come unnamed; a deleted slide takes its name along.
+        m.push_canvas(clean());
+        m.go_to(1);
+        m.delete_active();
+        assert_eq!((m.name(0), m.name(1), m.name(2)), ("", "Outro", ""));
+        m.go_to(2);
+        m.next();
+        assert_eq!((m.count(), m.name(3)), (4, ""));
+
+        // Deleting the only slide clears it, name included.
+        let mut one = CanvasManager::for_tests(vec![clean()]);
+        one.rename(0, "Only");
+        one.delete_active();
+        assert_eq!((one.count(), one.name(0)), (1, ""));
+    }
 }
 
 #[cfg(test)]
@@ -976,15 +1177,18 @@ mod loader_tests {
         assert!(!dir.join("canvas_2.ron").exists());
         assert!(dir.join("canvas_3.ron").exists());
         assert!(!dir.join("views.ron").exists(), "no view moved, nothing to write");
+        assert!(!dir.join("names.ron").exists(), "nothing renamed, nothing to write");
 
-        // Looking around a slide writes only the views, which the next
-        // start picks up.
+        // Looking around a slide, or naming one, writes only the views
+        // and names, which the next start picks up.
         let slide_0 = std::fs::read_to_string(dir.join("canvas_0.ron")).unwrap();
         *m.active_view_mut().1 = 4.0;
+        m.rename(3, "Last");
         m.save_all_blocking();
         assert_eq!(std::fs::read_to_string(dir.join("canvas_0.ron")).unwrap(), slide_0);
         let m = CanvasManager::load_or_default(&AppConfig::default());
         assert_eq!(m.active().zoom, 4.0);
+        assert_eq!((m.name(0), m.name(3)), ("", "Last"));
 
         slides_still_loading_are_never_written(&dir);
 
@@ -1029,6 +1233,10 @@ mod loader_tests {
         wrap.prev();
         assert_eq!((wrap.active_index(), wrap.active().pan), (3, [13.0, 0.0]));
 
+        // A slide can be named before it is read.
+        m.rename(3, "Four");
+        assert_eq!(file(3), three, "naming is not an edit of the slide");
+
         // Delete slide 2: slides 3 and 4 are read first, then all shift.
         m.next();
         assert_eq!(m.active().pan, [11.0, 0.0]);
@@ -1039,6 +1247,7 @@ mod loader_tests {
         assert_eq!(pan(1), Canvas::default().pan, "the gap is now slot 1");
         assert_eq!(pan(2), [13.0, 0.0], "the last slide moved down, not lost");
         assert!(!dir.join("canvas_3.ron").exists());
+        assert_eq!(crate::persistence::load_names(), ["", "", "Four"], "its name moved down with it");
         assert!(m.take_load_errors().is_empty());
     }
 }
