@@ -442,7 +442,7 @@ mod tests {
             "set OSN_DATA_DIR to a copy of the data folder; this test overwrites slides"
         );
         let index: usize = std::env::var("OSN_TEST_SLIDE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let crate::persistence::LoadOutcome::Loaded(canvas) = crate::persistence::load_canvas(index, 0) else {
+        let crate::persistence::LoadOutcome::Loaded(canvas) = crate::persistence::load_canvas(index, 0, &Default::default()) else {
             panic!("could not load slide {index}")
         };
         let li = canvas.active_layer;

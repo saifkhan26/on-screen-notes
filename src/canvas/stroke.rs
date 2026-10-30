@@ -101,6 +101,12 @@ pub struct Stroke {
     #[serde(default)]
     pub filled: bool,
 
+    /// Id of the pin that keeps this stroke on screen, or 0. See
+    /// `canvas::pins`. A zero is not written, so an unpinned stroke keeps
+    /// its old on-disk form.
+    #[serde(default, skip_serializing_if = "crate::canvas::shape::is_unpinned")]
+    pub pin: u64,
+
     /// Pre-tessellated polyline cache built lazily on first paint and
     /// invalidated whenever samples change. We keep it out of the on-disk
     /// format (`#[serde(skip)]`) — it's pure render scratch. When this
@@ -457,6 +463,7 @@ impl Stroke {
             base_width,
             style,
             filled: false,
+            pin: 0,
             cache: None,
             filter: None,
             smoothing: SmoothingOptions::default(),
@@ -479,6 +486,7 @@ impl Stroke {
             base_width,
             style,
             filled: false,
+            pin: 0,
             cache: None,
             filter: None,
             smoothing,
@@ -499,6 +507,7 @@ impl Stroke {
             base_width,
             style: StrokeStyle::Default,
             filled: true,
+            pin: 0,
             cache: None,
             filter: None,
             smoothing: SmoothingOptions::default(),

@@ -11,6 +11,5 @@ pub mod media_filter;
 pub mod overlay;
 pub mod picture_cache;
 pub mod slide_panel;
-pub mod status;
 pub mod theme;
 pub mod toolbar;

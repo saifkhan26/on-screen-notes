@@ -42,6 +42,7 @@ pub enum RasterKind {
 fn is_zero(v: &f32) -> bool { *v == 0.0 }
 fn is_fill(k: &RasterKind) -> bool { *k == RasterKind::Fill }
 fn is_false(v: &bool) -> bool { !*v }
+pub(crate) fn is_unpinned(v: &u64) -> bool { *v == 0 }
 
 /// What a media picture plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +257,10 @@ pub enum Shape {
         /// untouched shape keeps its old on-disk form.
         #[serde(default, skip_serializing_if = "is_zero")]
         rotation: f32,
+        /// Id of the pin that keeps this shape on screen, or 0. See
+        /// `canvas::pins`. Like `rotation`, a zero is not written.
+        #[serde(default, skip_serializing_if = "is_unpinned")]
+        pin: u64,
     },
     /// Ellipse defined by its bounding rectangle (corners `a` and `b`).
     Ellipse {
@@ -270,6 +275,9 @@ pub enum Shape {
         /// Same meaning and save behaviour as `Rect::rotation`.
         #[serde(default, skip_serializing_if = "is_zero")]
         rotation: f32,
+        /// Same as `Rect::pin`.
+        #[serde(default, skip_serializing_if = "is_unpinned")]
+        pin: u64,
     },
     /// Straight line from `a` to `b`.
     Line {
@@ -283,6 +291,9 @@ pub enum Shape {
         /// snap still commits a `Stroke` so its line is unaffected.
         #[serde(default)]
         border: BorderStyle,
+        /// Same as `Rect::pin`.
+        #[serde(default, skip_serializing_if = "is_unpinned")]
+        pin: u64,
     },
     /// Arrow from `a` to `b`. Arrowhead is drawn at `b`. Only the
     /// shaft honours `border`; the head stays solid so the
@@ -294,6 +305,9 @@ pub enum Shape {
         stroke_width: f32,
         #[serde(default)]
         border: BorderStyle,
+        /// Same as `Rect::pin`.
+        #[serde(default, skip_serializing_if = "is_unpinned")]
+        pin: u64,
     },
     /// Free-floating text label anchored at `pos` (top-left of the
     /// first line's baseline box). Lines are split on `\n`. Rendered
@@ -312,6 +326,9 @@ pub enum Shape {
         /// rotation uses). Radians, clockwise on screen.
         #[serde(default, skip_serializing_if = "is_zero")]
         rotation: f32,
+        /// Same as `Rect::pin`.
+        #[serde(default, skip_serializing_if = "is_unpinned")]
+        pin: u64,
     },
     /// Raster sticker — a PNG-backed image dropped at `pos` with
     /// canvas-local `size`. Produced by the flood-fill tool (which
@@ -353,6 +370,9 @@ pub enum Shape {
         /// `media`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         picture: Option<Box<PictureRef>>,
+        /// Same as `Rect::pin`.
+        #[serde(default, skip_serializing_if = "is_unpinned")]
+        pin: u64,
     },
 }
 
@@ -367,6 +387,29 @@ impl Shape {
             Shape::Arrow   { color, .. } => *color,
             Shape::Text    { color, .. } => *color,
             Shape::Raster  { color, .. } => *color,
+        }
+    }
+
+    /// Id of the pin keeping this shape on screen; 0 when unpinned.
+    pub fn pin(&self) -> u64 {
+        match self {
+            Shape::Rect    { pin, .. }
+            | Shape::Ellipse { pin, .. }
+            | Shape::Line    { pin, .. }
+            | Shape::Arrow   { pin, .. }
+            | Shape::Text    { pin, .. }
+            | Shape::Raster  { pin, .. } => *pin,
+        }
+    }
+
+    pub fn set_pin(&mut self, id: u64) {
+        match self {
+            Shape::Rect    { pin, .. }
+            | Shape::Ellipse { pin, .. }
+            | Shape::Line    { pin, .. }
+            | Shape::Arrow   { pin, .. }
+            | Shape::Text    { pin, .. }
+            | Shape::Raster  { pin, .. } => *pin = id,
         }
     }
 
@@ -590,7 +633,7 @@ mod tests {
     use super::*;
 
     fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0 }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0 }
     }
 
     #[test]
@@ -624,6 +667,7 @@ mod tests {
             pos: [0.0, 0.0], size: [1.0, 1.0], png: Arc::new(vec![7]), px_size: [1, 1],
             color: [0; 4], rotation: 0.0, kind: RasterKind::Fill, media: None,
             picture: None,
+            pin: 0,
         };
         let text = ron::to_string(&raster).unwrap();
         assert!(!text.contains("rotation") && !text.contains("kind") && !text.contains("media"), "{text}");
@@ -635,6 +679,7 @@ mod tests {
             pos: [3.0, 4.0], size: [10.0, 6.0], png: Arc::new(vec![7, 8]), px_size: [2, 1],
             color: [0; 4], rotation: 0.5, kind: RasterKind::Image, media: None,
             picture: None,
+            pin: 0,
         };
         let back: Shape = ron::from_str(&ron::to_string(&raster).unwrap()).unwrap();
         assert!(matches!(back, Shape::Raster { rotation, kind: RasterKind::Image, .. } if (rotation - 0.5).abs() < 1e-6));
@@ -652,6 +697,7 @@ mod tests {
                 id: fresh_media_id(),
             })),
             picture: None,
+            pin: 0,
         }
     }
 
@@ -698,6 +744,7 @@ mod tests {
             pos: [3.0, 4.0], size: [10.0, 6.0], png: Arc::new(vec![7, 8]), px_size: [2, 1],
             color: [0; 4], rotation: 0.0, kind: RasterKind::Image, media: None,
             picture: Some(Box::new(PictureRef { file: "0123456789abcdef.jpg".into(), size: [400, 300], crop, mirror })),
+            pin: 0,
         }
     }
 
@@ -793,7 +840,7 @@ mod tests {
 
     #[test]
     fn text_turns_about_its_anchor() {
-        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0 };
+        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0, pin: 0 };
         t.apply_affine(&Affine::rotate_about([10.0, 10.0], 0.3).then(Affine::scale_about([10.0, 10.0], 2.0, 2.0)));
         assert!(matches!(t, Shape::Text { pos, font_size, rotation, .. }
             if (pos[0] - 10.0).abs() < 1e-3 && (font_size - 40.0).abs() < 1e-2 && (rotation - 0.3).abs() < 1e-4));

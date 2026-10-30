@@ -157,7 +157,7 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ffmpeg_path: Option<std::path::PathBuf>,
 
-    /// The slide panel (top-left) is open rather than folded down to its
+    /// The slide panel (bottom-left) is open rather than folded down to its
     /// slide-count tab.
     #[serde(default = "default_slide_panel_open")]
     pub slide_panel_open: bool,

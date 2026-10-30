@@ -258,6 +258,7 @@ pub fn route_text_input(
                     font_size: t.font_size,
                     color: t.color,
                     rotation: 0.0,
+                    pin: 0,
                 });
             }
         }

@@ -599,7 +599,7 @@ mod tests {
     }
 
     fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0 }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0 }
     }
 
     fn image(pos: [f32; 2], size: [f32; 2]) -> Shape {
@@ -607,6 +607,7 @@ mod tests {
             pos, size, png: Arc::new(Vec::new()), px_size: [1, 1], color: [0; 4],
             rotation: 0.0, kind: RasterKind::Image, media: None,
             picture: None,
+            pin: 0,
         }
     }
 
@@ -822,6 +823,7 @@ mod tests {
         c.layers[0].strokes.push(stroke([0.0, 0.0], [100.0, 0.0]));
         c.layers[0].shapes.push(Shape::Text {
             pos: [0.0, 50.0], content: "hi".into(), font_size: 20.0, color: [0; 4], rotation: 0.0,
+            pin: 0,
         });
         let mut t = tool(&c);
         t.sel = Selection { strokes: vec![0], shapes: vec![0] };

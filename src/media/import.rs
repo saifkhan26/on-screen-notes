@@ -220,7 +220,7 @@ fn copy_hashed(src: &Path) -> Result<String> {
 /// `copy_hashed_into` does for a file. Returns the name and whether this
 /// call created the file (`false`: the same content was already there,
 /// so something else may be using it).
-pub(super) fn store_bytes_into(dir: &Path, bytes: &[u8], ext: &str) -> Result<(String, bool)> {
+pub(crate) fn store_bytes_into(dir: &Path, bytes: &[u8], ext: &str) -> Result<(String, bool)> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut hash = FNV_OFFSET;
     for b in bytes {

@@ -40,7 +40,7 @@ input.
 - **PureRef boards** — drop a `.pur` file (PureRef 1.x or 2.x) to open it
   as a new slide. See [PureRef boards](#pureref-boards)
 - **Multiple canvases**, persistent on disk via RON
-- **Slide panel** — every slide listed in the top-left corner by number
+- **Slide panel** — every slide listed in the bottom-left corner by number
   and name: click one to go there, double-click (or `F2`) to name it,
   `+` to add a slide, the arrow-to-line button (or `End`) for the last
   one. `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle through the slides by
@@ -49,12 +49,30 @@ input.
   `Ctrl` and tapping again goes further back. The `‹` button folds the
   panel to a small `n/N` tab. Names are kept in `canvases/names.ron`,
   so naming never rewrites a slide
+- **Lock a slide** with `Ctrl+R` so nothing on it can change by
+  accident: a drag pans, the wheel zooms, the laser and spotlight still
+  work, and edit keys (undo, delete, paste…) are refused. A badge under
+  the toolbar shows the lock (click it, or `Ctrl+R` again, to unlock);
+  locked slides carry a lock in the slide panel. Kept in
+  `canvases/locks.ron`, so locking never rewrites a slide
+- **Big slides open without freezing the app** — a slide still being
+  read shows a progress bar while it opens, and its pictures load in
+  the background (faint boxes until they arrive) with a count of how
+  many are in
+- **Pictures are kept as files** — a pasted, captured or inserted
+  picture is moved in the background into the `media` folder, byte for
+  byte, and the slide keeps only its file name and a small preview, so a
+  slide of hundreds of screenshots stays a few MB and saves in a moment.
+  Slides from older versions are converted the same way when they load
 - **Multiple layers per canvas** (independent visibility + opacity, and
   each layer can be panned / zoomed on its own with `Shift+Space`)
 - **Click-through** while holding `Alt`
 - **Global hotkey screenshot** — saved PNG contains background + ink
 - **Screen recording** — GIF (built-in) or MP4 (if ffmpeg on PATH)
 - **Pin to window** — overlay follows another window's position
+- **Pins** — keep objects on screen as you pan and zoom their slide,
+  or on every slide, each pin moved and sized on its own. See
+  [Pinning](#pinning)
 - **Freeze frame** — bake the current screen behind into a new layer
 
 ---
@@ -175,6 +193,7 @@ layer makes that layer the active one.
 | `Delete` / `Backspace` | Delete the selection |
 | `Ctrl+D` | Duplicate |
 | `Ctrl+Shift+D` | Copy to a new slide (added after the last) |
+| `Ctrl+P` | Pin to every slide, or unpin (see [below](#pinning)) |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste (works across slides and layers; on Windows the copy also pastes as a picture in other apps) |
 | `Ctrl+V` with an image on the clipboard | Paste it as an image object |
 | `Ctrl+↑` / `Ctrl+↓` | Bring to front / send to back |
@@ -228,6 +247,52 @@ Every action is one undo step. Things worth knowing:
   Pasting back into this app still pastes the objects themselves, not
   a flattened picture of them. A big picture takes a moment to reach
   the clipboard.
+
+### Pinning
+
+Select some objects and press `Ctrl+P` (or the pin button on the bar
+under the toolbar) to keep them on screen. The objects stay where they
+are, on their own slide. A *pin* showing them appears a little off to
+the side, selected, ready to be dragged where it should stay. A pin
+holds its place on screen as the slide is panned and zoomed.
+
+- **Global or local.** A new pin is *global*: it shows on every slide,
+  the one its objects are on included. The selected pin's bar switches
+  it between **Every slide** and **This slide**; a local pin shows only
+  on its own slide. Pin things from as many slides as you like.
+
+- **A pin is a live view, not a copy.** Recolour the objects, edit the
+  text, draw over a pinned fill or play a pinned video, and the pin
+  shows it. Their layer's visibility and opacity do not touch the pin:
+  hide or fade the layer on its slide and the pin still shows in full.
+- **Moving, resizing and turning a pin never touches the objects.** With
+  the Select tool, drag a pin to move it, drag a corner to resize it
+  (proportions kept), or drag the knob above it to turn it (`Shift`
+  snaps to 15°). A global pin keeps the same place on every slide.
+- With the Select tool, pins show a faint outline and a pin badge, so
+  they can be told from the slide's own objects. A pin sits on top of
+  the slide, so press on it to take the pin; to reach what is under it,
+  move the pin aside first.
+- A selected pin's bar says which slide its objects are on, goes there
+  (or **double-click** the pin), sets it local or global, and unpins it. `Delete` or `Ctrl+P` on
+  a selected pin unpins it as well. Unpinning only stops the showing:
+  the objects stay on their slide.
+- Pinning and unpinning are undo steps on the objects' slide; moving a
+  pin or switching it between local and global is not an edit of any
+  slide. Pin places are kept in `canvases/pins.ron` beside the slides.
+  Without that file the pins still show, back over their objects and
+  global.
+- Hover a pinned video or GIF for its playback bar, or select its pin.
+  It is the same player as on its own slide, so it keeps playing as you
+  change slides.
+- Copies (duplicate, paste, copy to a new slide) are not pinned. Deleting
+  a slide removes the pins of its objects.
+- Screenshots and recordings include pins.
+- **Hide / show pins** with `Shift+P` or the eye button in the toolbar
+  (it appears once something is pinned, and stays lit while pins are
+  hidden). This hides every pin at once; their objects stay on their own
+  slides. Pins always show again when the app starts, and pinning
+  something new shows them too.
 
 ---
 
@@ -310,6 +375,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Previous / next slide, wrapping round (never adds a slide) — or, with the slide panel's clock button on, back / forward through recently used slides | `Ctrl+Shift+Tab` / `Ctrl+Tab` |
 | First / last slide | `Home` / `End` |
 | Name the active slide (in the slide panel) | `F2` |
+| Lock / unlock the active slide (pan and zoom only) | `Ctrl+R` |
 | Previous / next layer | `↓` / `↑` |
 | Reset pan + zoom | `Ctrl+0` |
 | Reset active layer position | `Ctrl+Shift+0` |
@@ -326,6 +392,8 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Cancel pending (eyedropper / lasso / text / selection) | `Esc` |
 | Selection: delete / duplicate | `Delete` / `Ctrl+D` |
 | Selection: copy to a new slide | `Ctrl+Shift+D` |
+| Selection: pin to every slide / unpin | `Ctrl+P` |
+| Hide / show all pins | `Shift+P` |
 | Selection: copy / cut / paste | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` |
 | Selection: bring to front / send to back | `Ctrl+↑` / `Ctrl+↓` |
 | Text mode: newline | `Shift+Enter` |
@@ -419,6 +487,8 @@ preview_layer = "q"
 delete_selection = "delete"
 duplicate   = "ctrl+d"
 copy_to_new_slide = "ctrl+shift+d"
+pin_selection = "ctrl+p"
+toggle_pins = "shift+p"
 bring_front = "ctrl+arrowup"
 send_back   = "ctrl+arrowdown"
 
@@ -492,8 +562,10 @@ duplicate (each copy plays on its own), put it on any layer.
 
 **Pictures** (PNG, JPEG, WebP, BMP) drop in the same way and become a
 still image, like a pasted one: turned upright if a phone stored it
-sideways, scaled down to 3840 px on the long side, and saved inside the
-slide (not in the `media` folder). A single-frame GIF does the same.
+sideways and scaled down to 3840 px on the long side. A single-frame GIF
+does the same. Any picture over 64 KB, pasted or inserted, then moves to
+the `media` folder within a second or so, with a small preview left in
+the slide.
 
 - **Formats** — GIF always; MP4, M4V, MOV, MKV, WebM, AVI, WMV through
   FFmpeg. Video plays **muted**.
@@ -519,10 +591,10 @@ slides (`%APPDATA%\OnScreenNotes\on-screen-notes\data\media\` on
 Windows), named after a hash of their content, so moving or deleting
 the original does not break the slide and inserting the same file twice
 stores it once. Slides keep only the file name plus a small poster
-frame.
+frame. Copying slides to another computer means copying `media` too.
 
 Deleting a slide (`Ctrl+Shift+Backspace`) also deletes the copies of its
-videos and GIFs — once the slides have been saved without it, and only
+videos, GIFs and pictures — once the slides have been saved without it, and only
 copies nothing else still uses: no other slide, no undo history on
 another slide, nothing in the in-app clipboard (those wait until the
 app closes). Deleting a single object leaves its file in place, since
@@ -659,7 +731,7 @@ src/
 ├── recording.rs      ─ frame capture, GIF / MP4 encode
 ├── screenshot/       ─ xcap composite + PNG write
 ├── tools/            ─ ActiveTool dispatch, per-tool helpers
-└── ui/               ─ toolbar, overlay, loupe, status, layer panel,
+└── ui/               ─ toolbar, overlay, loupe, slide panel, layer panel,
                         media playback bar
 ```
 

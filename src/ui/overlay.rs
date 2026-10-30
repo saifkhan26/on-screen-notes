@@ -10,6 +10,8 @@
 
 use crate::canvas::CanvasManager;
 use crate::canvas::render;
+use crate::canvas::shape::Shape;
+use crate::ui::picture_cache::Source;
 use crate::canvas::stroke::{PenSample, Stroke};
 use crate::tools::{ActiveTool, ToolKind};
 use crate::ui::loupe::LoupeState;
@@ -26,13 +28,6 @@ pub struct OverlayCache {
     /// Each texture here also carries when, and in which `show` call, it
     /// was last drawn; see `evict_idle`.
     images: HashMap<(usize, usize), (usize, egui::TextureHandle, Used)>,
-    /// Per-shape texture cache for `Shape::Raster` fills. Keyed by
-    /// `(canvas, layer, shape_index)`; value carries `(PNG length,
-    /// address of the shared PNG buffer)` as a fingerprint. The address
-    /// is what catches a *different* image arriving at the same index —
-    /// deleting, re-ordering or pasting shapes shifts indices, and two
-    /// images can easily differ without differing in byte length.
-    shape_images: HashMap<(usize, usize, usize), ((usize, usize), egui::TextureHandle, Used)>,
     /// Number of `show` calls so far.
     shows: u64,
     /// Per-layer preview thumbnails — keyed by `(canvas, layer)`. The
@@ -41,7 +36,8 @@ pub struct OverlayCache {
     /// triggers a re-render + re-upload. `rev` covers edits that move
     /// or restyle objects without changing how many there are.
     layer_thumbs: HashMap<(usize, usize), ((usize, usize, usize, u64), egui::TextureHandle)>,
-    /// Full-size pixels of stored pictures, loaded at the size shown.
+    /// Pixels of pictures, loaded at the size shown: stored ones, ones
+    /// kept in the slide, and video posters.
     pictures: crate::ui::picture_cache::PictureCache,
     /// Where the canvas was drawn last frame, to tell which pictures are
     /// on screen before this frame's layout runs.
@@ -52,7 +48,7 @@ pub struct OverlayCache {
 #[derive(Clone, Copy)]
 struct Used(u64, Instant);
 
-/// A picture or frozen frame of a slide not drawn for this long (and for
+/// A frozen frame of a slide not drawn for this long (and for
 /// `KEEP_SHOWS` frames) gives its texture back. Without this, every slide
 /// visited kept its full-size pictures on the GPU for the rest of the
 /// run — one media-heavy slide alone holds close to 1 GB.
@@ -64,8 +60,8 @@ const KEEP_SHOWS: u64 = 600;
 impl OverlayCache {
     pub fn new() -> Self { Self::default() }
 
-    /// Drop the textures of pictures and frozen frames that have not been
-    /// drawn for a while. Runs before anything is drawn in a frame, so a
+    /// Drop the textures of frozen frames that have not been drawn for a
+    /// while. Runs before anything is drawn in a frame, so a
     /// texture is never made and freed in the same frame (egui-wgpu
     /// aborts on that; see `PictureCache::begin_frame`).
     fn evict_idle(&mut self) {
@@ -73,20 +69,32 @@ impl OverlayCache {
         let (shows, now) = (self.shows, Instant::now());
         let keep = |u: &Used| shows.saturating_sub(u.0) <= KEEP_SHOWS || now.saturating_duration_since(u.1) <= KEEP_FOR;
         self.images.retain(|_, (_, _, u)| keep(u));
-        self.shape_images.retain(|_, (_, _, u)| keep(u));
     }
 
-    /// Stored pictures are still loading at their on-screen size.
+    /// Pictures that moved from their slide to the media folder keep what
+    /// was loaded for them (see `PictureCache::carry`).
+    pub fn carry_pictures(&mut self, swaps: &[(std::sync::Arc<Vec<u8>>, crate::canvas::shape::PictureRef)]) {
+        for (from, to) in swaps {
+            self.pictures.carry(from, to);
+        }
+    }
+
+    /// Pictures are still loading at their on-screen size.
     pub fn pictures_busy(&self) -> bool {
         self.pictures.busy()
     }
 
+    /// Of the pictures on screen last frame, how many have something to
+    /// show, and how many there are.
+    pub fn pictures_shown(&self) -> (usize, usize) {
+        self.pictures.shown()
+    }
+
     /// For the perf log: picture cache state, and the per-slide textures
-    /// kept for inline pictures and frozen frames.
+    /// kept for frozen frames.
     pub fn stats(&self) -> String {
-        let shape_mb: usize = self.shape_images.values().map(|(_, t, _)| t.byte_size()).sum::<usize>() >> 20;
         let plate_mb: usize = self.images.values().map(|(_, t, _)| t.byte_size()).sum::<usize>() >> 20;
-        format!("{} | inline {} tex {shape_mb} MB, plates {} tex {plate_mb} MB", self.pictures.stats(), self.shape_images.len(), self.images.len())
+        format!("{} | plates {} tex {plate_mb} MB", self.pictures.stats(), self.images.len())
     }
 
     /// Where the canvas was drawn last frame (the whole screen before the
@@ -183,53 +191,16 @@ impl OverlayCache {
             h.id()
         })
     }
+}
 
-    /// Same upload-on-mismatch pattern for `Shape::Raster` PNG bytes.
-    /// Cache key includes the shape's position in the layer, so
-    /// reordering or deletion can leak stale entries — acceptable
-    /// for the rare flood-fill action.
-    fn ensure_shape_texture(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_idx: usize,
-        layer_idx: usize,
-        shape_idx: usize,
-        png: &std::sync::Arc<Vec<u8>>,
-    ) -> Option<egui::TextureId> {
-        let key = (canvas_idx, layer_idx, shape_idx);
-        let fingerprint = (png.len(), std::sync::Arc::as_ptr(png) as usize);
-        let needs_upload = match self.shape_images.get(&key) {
-            Some((cached, _, _)) => *cached != fingerprint,
-            None => true,
-        };
-        let used = Used(self.shows, Instant::now());
-        if needs_upload {
-            let decoded = match image::load_from_memory(png) {
-                Ok(d) => d.to_rgba8(),
-                Err(e) => {
-                    log::warn!("decode raster shape failed: {e}");
-                    return None;
-                }
-            };
-            let (w, h) = (decoded.width() as usize, decoded.height() as usize);
-            let pixels: Vec<egui::Color32> = decoded
-                .into_raw()
-                .chunks_exact(4)
-                .map(|c| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
-                .collect();
-            let color_image = egui::ColorImage { size: [w, h], pixels };
-            let handle = ctx.load_texture(
-                format!("osn_raster_{canvas_idx}_{layer_idx}_{shape_idx}"),
-                color_image,
-                egui::TextureOptions::LINEAR,
-            );
-            self.shape_images.insert(key, (fingerprint, handle, used));
-        }
-        self.shape_images.get_mut(&key).map(|(_, h, u)| {
-            *u = used;
-            h.id()
-        })
-    }
+/// How the overlay should mark pins (see `canvas::pins`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PinMarks {
+    /// The pin whose frame and handles show.
+    pub selected: Option<u64>,
+    /// Outline every pin and badge it, so pins can be told apart from
+    /// the slide's own objects (Select tool, chrome on screen).
+    pub outlines: bool,
 }
 
 /// Render the central canvas area. Returns the rect we drew into so callers
@@ -256,6 +227,7 @@ pub fn show(
     media: &crate::media::MediaHub,
     // Media types to highlight; the rest of the slide fades back.
     media_filter: crate::ui::media_filter::MediaFilter,
+    pin_marks: PinMarks,
 ) -> egui::Rect {
     // Select-tool gesture in flight: the selected objects preview under
     // its transform until pen-up commits it.
@@ -295,7 +267,7 @@ pub fn show(
         let view = cache.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect());
         let ppp = ctx.pixels_per_point();
         let (pan, zoom) = (active.pan, active.zoom);
-        let footprint = |shape: &crate::canvas::shape::Shape| {
+        let footprint = |shape: &Shape| {
             let obb = shape.obb();
             let mut r = egui::Rect::NOTHING;
             for p in obb.corners() {
@@ -307,22 +279,58 @@ pub fn show(
         active
             .layers
             .iter()
-            .enumerate()
-            .map(|(li, layer)| {
+            .map(|layer| {
                 layer
                     .shapes
                     .iter()
-                    .enumerate()
-                    .map(|(si, shape)| match shape {
-                        crate::canvas::shape::Shape::Raster { png, media: m, picture, .. } => match (m, picture) {
-                            (Some(m), _) => media.texture(m.id).or_else(|| cache.ensure_shape_texture(ctx, canvas_idx, li, si, png)),
-                            (None, Some(p)) => {
-                                let (long, on_screen) = footprint(shape);
-                                cache.pictures.texture(ctx, p, png, long, on_screen && layer.visible)
+                    .map(|shape| match shape {
+                        Shape::Raster { png, media: m, picture, px_size, .. } => {
+                            // A video's live frame, else its poster.
+                            if let Some(tex) = m.as_ref().and_then(|m| media.texture(m.id)) {
+                                return Some(tex);
                             }
-                            (None, None) => cache.ensure_shape_texture(ctx, canvas_idx, li, si, png),
-                        },
+                            let (long, on_screen) = footprint(shape);
+                            let visible = on_screen && layer.visible;
+                            match picture {
+                                Some(p) => cache.pictures.texture(ctx, &Source::File((**p).clone()), Some(png), long, 0, visible),
+                                None => cache.pictures.texture(ctx, &Source::Inline(png.clone()), None, long, px_size[0].max(px_size[1]), visible),
+                            }
+                        }
                         _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    // Pins draw over the slide; their pictures and videos are looked up
+    // like the active slide's, by their own slide's index.
+    let pinned = manager.pinned();
+    let pin_textures: Vec<Vec<Option<egui::TextureId>>> = {
+        use crate::canvas::hit::ObjRef;
+        let view = cache.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect());
+        let ppp = ctx.pixels_per_point();
+        let near = view.expand(view.width().max(view.height()) * 0.25);
+        pinned
+            .iter()
+            .map(|p| {
+                p.members
+                    .iter()
+                    .map(|m| {
+                        let ObjRef::Shape(si) = m.obj else { return None };
+                        let layer = p.canvas.layers.get(m.layer)?;
+                        let shape = layer.shapes.get(si)?;
+                        let Shape::Raster { png, media: md, picture, px_size, .. } = shape else { return None };
+                        if let Some(tex) = md.as_ref().and_then(|md| media.texture(md.id)) {
+                            return Some(tex);
+                        }
+                        let o = p.shape_obb(shape);
+                        let [x0, y0, x1, y1] = o.aabb();
+                        let r = egui::Rect::from_min_max(view.min + egui::vec2(x0, y0), view.min + egui::vec2(x1, y1));
+                        let long = o.half[0].max(o.half[1]) * 2.0 * ppp;
+                        match picture {
+                            Some(pic) => cache.pictures.texture(ctx, &Source::File((**pic).clone()), Some(png), long, 0, r.intersects(near)),
+                            None => cache.pictures.texture(ctx, &Source::Inline(png.clone()), None, long, px_size[0].max(px_size[1]), r.intersects(near)),
+                        }
                     })
                     .collect()
             })
@@ -346,7 +354,8 @@ pub fn show(
                 .layers
                 .iter()
                 .any(|l| !l.strokes.is_empty() || !l.shapes.is_empty());
-            if !any_content && chrome_visible {
+            // Nor on a slide still opening, which only looks empty.
+            if !any_content && chrome_visible && manager.opening().is_none() {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -387,6 +396,21 @@ pub fn show(
                 layer_xform,
                 sel_preview,
             );
+
+            // Pins, over the slide and in the order they were last
+            // touched.
+            for (p, textures) in pinned.iter().zip(&pin_textures) {
+                render::paint_pinned(
+                    ui.painter(),
+                    rect.min,
+                    p.canvas,
+                    p.members,
+                    p.pin.rigid(p.anchor()),
+                    p.pin.scale,
+                    position_passes,
+                    textures,
+                );
+            }
 
             // Live preview of the in-progress text edit. Painted via
             // egui after canvas content so it always sits on top, and
@@ -604,6 +628,60 @@ pub fn show(
                 }
             }
 
+            // Pins: a faint outline and a badge on each, so they read as
+            // something apart from the slide; frame and handles on the
+            // selected one.
+            if (pin_marks.outlines || pin_marks.selected.is_some()) && show_selection {
+                let painter = ui.painter();
+                let at = |q: [f32; 2]| rect.min + egui::vec2(q[0], q[1]);
+                let line = egui::Color32::from_rgb(86, 160, 255);
+                let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+                for p in &pinned {
+                    let frame = p.frame();
+                    let corners: Vec<egui::Pos2> = frame.corners().iter().map(|c| at(*c)).collect();
+                    if pin_marks.selected == Some(p.pin.id) {
+                        painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(3.0, under)));
+                        painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(1.4, line)));
+                        let (top, knob) = crate::canvas::pins::rotate_knob(&frame);
+                        painter.line_segment([at(top), at(knob)], egui::Stroke::new(3.0, under));
+                        painter.line_segment([at(top), at(knob)], egui::Stroke::new(1.4, line));
+                        for (h, kind) in crate::canvas::pins::handles(&frame) {
+                            let h = at(h);
+                            match kind {
+                                crate::canvas::pins::PinHandle::Rotate => {
+                                    painter.circle_filled(h, 6.5, under);
+                                    painter.circle_filled(h, 5.0, egui::Color32::WHITE);
+                                    painter.circle_stroke(h, 5.0, egui::Stroke::new(1.4, line));
+                                }
+                                crate::canvas::pins::PinHandle::Corner { .. } => {
+                                    let outer = egui::Rect::from_center_size(h, egui::vec2(11.0, 11.0));
+                                    let inner = egui::Rect::from_center_size(h, egui::vec2(8.0, 8.0));
+                                    painter.rect_filled(outer, egui::Rounding::same(2.0), under);
+                                    painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
+                                    painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
+                                }
+                            }
+                        }
+                    } else if pin_marks.outlines {
+                        let mut ring = corners.clone();
+                        ring.push(corners[0]);
+                        let faint = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 150));
+                        painter.extend(egui::Shape::dashed_line(&ring, faint, 6.0, 4.0));
+                    }
+                    if pin_marks.outlines {
+                        // Badge on the top-right corner, turned with the pin
+                        // but kept upright.
+                        let c = at(frame.corners()[1]);
+                        painter.circle_filled(c, 9.0, egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220));
+                        let icon = egui::Rect::from_center_size(c, egui::vec2(11.0, 11.0));
+                        egui::Image::new(egui::include_image!("../../assets/icons/pin.svg"))
+                            .tint(line)
+                            .fit_to_exact_size(icon.size())
+                            .paint_at(ui, icon);
+                    }
+                }
+            }
+
             // Magnifier loupe — captured desktop image painted into
             // a square around the cursor, with the canvas content
             // re-rendered on top at the matching magnification so
@@ -662,10 +740,12 @@ pub fn show(
             // where size/colour preview makes sense (pen / eraser /
             // freehand-arrow). For shape tools, a ring would be misleading.
             let pointer = ctx.input(|i| i.pointer.hover_pos());
-            let preview_relevant = matches!(
-                tool.kind,
-                ToolKind::Pen | ToolKind::Eraser | ToolKind::FreehandArrow | ToolKind::Laser
-            );
+            // On a slide that takes no edits only the laser draws.
+            let preview_relevant = match tool.kind {
+                ToolKind::Laser => true,
+                ToolKind::Pen | ToolKind::Eraser | ToolKind::FreehandArrow => manager.active_editable(),
+                _ => false,
+            };
             // Ring paints regardless of `chrome_visible` so the
             // pointer indicator the user sees is identical whether
             // the UI is Tab-hidden or a recording is in flight —
@@ -744,34 +824,3 @@ fn predict_ahead(stroke: &Stroke) -> Stroke {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn png() -> std::sync::Arc<Vec<u8>> {
-        let mut out = std::io::Cursor::new(Vec::new());
-        image::RgbaImage::new(2, 2).write_to(&mut out, image::ImageFormat::Png).unwrap();
-        std::sync::Arc::new(out.into_inner())
-    }
-
-    #[test]
-    fn picture_textures_go_only_after_frames_and_time_both_pass() {
-        let ctx = egui::Context::default();
-        let mut cache = OverlayCache::new();
-        let (a, b) = (png(), png());
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            cache.evict_idle();
-            cache.ensure_shape_texture(ctx, 0, 0, 0, &a);
-            cache.ensure_shape_texture(ctx, 1, 0, 0, &b);
-        });
-        let long_ago = Instant::now().checked_sub(KEEP_FOR * 2).expect("clock far enough along");
-        // Slide 0: drawn long ago and many frames back. Slide 1: many
-        // frames back but recently (the overlay was hidden meanwhile).
-        cache.shape_images.get_mut(&(0, 0, 0)).unwrap().2 = Used(0, long_ago);
-        cache.shape_images.get_mut(&(1, 0, 0)).unwrap().2 = Used(0, Instant::now());
-        cache.shows = KEEP_SHOWS * 2;
-        cache.evict_idle();
-        assert!(!cache.shape_images.contains_key(&(0, 0, 0)), "idle slide's picture is let go");
-        assert!(cache.shape_images.contains_key(&(1, 0, 0)), "recently drawn picture stays");
-    }
-}

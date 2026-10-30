@@ -1,4 +1,5 @@
-//! Slide panel — floating card in the top-left corner listing every slide.
+//! Slide panel — floating card in the bottom-left corner listing every
+//! slide.
 //!
 //! One row per slide: its number and name. A click goes to the slide; a
 //! double-click (or F2, for the active slide) names it. The header
@@ -59,9 +60,10 @@ impl SlidePanel {
     }
 }
 
-/// Draw the panel, its top edge at `top` (or below the toolbar, when the
-/// screen is narrow enough for the two to meet). `cfg` holds whether it
-/// is folded and what Ctrl+Tab steps through.
+/// Draw the panel, growing up from the bottom-left corner no higher than
+/// `top` (nor the toolbar, when the screen is narrow enough for the two
+/// to meet). `cfg` holds whether it is folded and what Ctrl+Tab steps
+/// through.
 pub fn show(ctx: &egui::Context, state: &mut SlidePanel, cfg: &mut AppConfig, top: f32, manager: &CanvasManager) -> Shown {
     let count = manager.count();
     let active = manager.active_index();
@@ -73,20 +75,18 @@ pub fn show(ctx: &egui::Context, state: &mut SlidePanel, cfg: &mut AppConfig, to
     let open = &mut cfg.slide_panel_open;
     let tab_order = &mut cfg.slide_tab_order;
 
-    // Neighbours, as they were drawn last frame: the toolbar along the
-    // top, the layer panel in the bottom-left corner.
-    let (toolbar, layers) = ctx.memory(|m| (m.area_rect(egui::Id::new("osn_toolbar")), m.area_rect(egui::Id::new("osn_layer_panel"))));
-    let left = 10.0;
+    // The toolbar along the top, as it was drawn last frame.
+    let toolbar = ctx.memory(|m| m.area_rect(egui::Id::new("osn_toolbar")));
+    let (left, bottom) = (10.0, 10.0);
     let top = match toolbar {
         Some(t) if t.min.x < left + WIDTH + 20.0 => top.max(t.max.y + 8.0),
         _ => top,
     };
-    // Room for the list: down to the layer panel, less the header.
-    let floor = layers.map_or(ctx.screen_rect().max.y, |r| r.min.y) - 10.0;
-    let room = floor - top - 40.0;
+    // Room for the list: up to `top`, less the header.
+    let room = ctx.screen_rect().max.y - bottom - top - 40.0;
 
     let area = egui::Area::new(egui::Id::new("osn_slide_panel"))
-        .anchor(egui::Align2::LEFT_TOP, Vec2::new(left, top))
+        .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(left, -bottom))
         .show(ctx, |ui| {
             egui::Frame {
                 inner_margin: egui::Margin::symmetric(4.0, 4.0),
@@ -181,7 +181,13 @@ fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager,
         egui::FontId::proportional(12.0),
         theme::TEXT_MUTED,
     );
-    let name_rect = egui::Rect::from_min_max(egui::pos2(rect.min.x + NUM_W, rect.min.y), egui::pos2(rect.max.x - 4.0, rect.max.y));
+    let mut name_rect = egui::Rect::from_min_max(egui::pos2(rect.min.x + NUM_W, rect.min.y), egui::pos2(rect.max.x - 4.0, rect.max.y));
+    let locked = manager.is_locked(i);
+    if locked {
+        let r = egui::Rect::from_center_size(egui::pos2(rect.max.x - 4.0 - ICON * 0.5, rect.center().y), Vec2::splat(ICON)).shrink(3.0);
+        paint_svg(ui, r, egui::Image::new(egui::include_image!("../../assets/icons/lock.svg")), theme::TEXT_MUTED);
+        name_rect.max.x -= ICON + 2.0;
+    }
 
     if is_active && state.shown_active != Some(active) {
         response.scroll_to_me(None);
@@ -229,7 +235,10 @@ fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager,
     let pos = egui::pos2(name_rect.min.x + 4.0, name_rect.center().y - galley.size().y * 0.5);
     ui.painter().galley(pos, galley, colour);
 
-    let tip = if name.is_empty() { "Double-click to name".to_string() } else { format!("{name}\nDouble-click to rename") };
+    let mut tip = if name.is_empty() { "Double-click to name".to_string() } else { format!("{name}\nDouble-click to rename") };
+    if locked {
+        tip.push_str("\nLocked: pans and zooms, takes no edits");
+    }
     let response = response.on_hover_text(tip);
     if response.double_clicked() {
         state.start_rename(i, name);

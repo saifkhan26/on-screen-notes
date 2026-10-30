@@ -8,12 +8,14 @@
 //!   * We try hard not to crash on a corrupted file; instead we log a warning
 //!     and fall back to defaults.
 
+mod blobs;
 pub mod paths;
 
 use crate::canvas::canvas::Canvas;
 use crate::config::AppConfig;
 use crate::error::{Context, Result};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Read `AppConfig` from disk, or return `Default::default()` if the file
 /// is missing or fails to parse. Logs a warning on parse failure so you can
@@ -134,7 +136,7 @@ pub fn preserve_unreadable(index: usize) -> Result<std::path::PathBuf> {
 /// budget baked into each stroke's render cache — passed in from the
 /// user's current smoothing level so loaded strokes match what they
 /// would draw fresh today.
-pub fn load_canvas(index: usize, position_passes: usize) -> LoadOutcome {
+pub fn load_canvas(index: usize, position_passes: usize, progress: &LoadProgress) -> LoadOutcome {
     let path = match paths::canvases_dir() {
         Ok(d) => d.join(format!("canvas_{index}.ron")),
         Err(e) => return LoadOutcome::Unreadable(e.to_string()),
@@ -142,20 +144,78 @@ pub fn load_canvas(index: usize, position_passes: usize) -> LoadOutcome {
     if !path.exists() {
         return LoadOutcome::Missing;
     }
-    let s = match std::fs::read_to_string(&path) {
+    let s = match read_counting(&path, progress) {
         Ok(s) => s,
         Err(e) => return LoadOutcome::Unreadable(e.to_string()),
     };
-    match parse_canvas(&s, position_passes) {
+    match parse_canvas_counting(&s, position_passes, Some(&progress.parsed)) {
         Ok(c) => LoadOutcome::Loaded(c),
         Err(e) => LoadOutcome::Unreadable(e),
     }
 }
 
+/// How far reading one slide file has got, for a progress bar. Written
+/// by the thread reading it, read by the UI.
+#[derive(Debug, Default)]
+pub struct LoadProgress {
+    /// The file's size; 0 until known.
+    pub size: AtomicU64,
+    /// Bytes read from disk so far.
+    pub read: AtomicU64,
+    /// Bytes of picture lists parsed so far, which is nearly all of a
+    /// slide big enough to need a progress bar.
+    pub parsed: AtomicU64,
+}
+
+impl LoadProgress {
+    /// 0..=1. Reading the file takes about as long as parsing it.
+    pub fn fraction(&self) -> f32 {
+        let size = self.size.load(Ordering::Relaxed);
+        if size == 0 {
+            return 0.0;
+        }
+        let part = |a: &AtomicU64| (a.load(Ordering::Relaxed) as f64 / size as f64).min(1.0);
+        (0.4 * part(&self.read) + 0.6 * part(&self.parsed)) as f32
+    }
+
+    /// The file's size in bytes, once known.
+    pub fn size(&self) -> u64 {
+        self.size.load(Ordering::Relaxed)
+    }
+}
+
+/// `read_to_string`, counting the bytes into `progress` as they come.
+fn read_counting(path: &Path, progress: &LoadProgress) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let size = f.metadata().map_or(0, |m| m.len());
+    progress.size.store(size, Ordering::Relaxed);
+    let mut buf = Vec::with_capacity(size as usize);
+    loop {
+        let n = (&mut f).take(8 << 20).read_to_end(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        progress.read.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Parse one canvas file's text and bring it to the in-memory shape the
 /// rest of the app expects (layers migrated, stroke caches built).
+#[cfg(test)]
 pub(crate) fn parse_canvas(s: &str, position_passes: usize) -> std::result::Result<Canvas, String> {
-    let mut c = ron::from_str::<Canvas>(s).map_err(|e| e.to_string())?;
+    parse_canvas_counting(s, position_passes, None)
+}
+
+/// `parse_canvas`, counting the picture bytes parsed into `parsed`.
+fn parse_canvas_counting(s: &str, position_passes: usize, parsed: Option<&AtomicU64>) -> std::result::Result<Canvas, String> {
+    // Slides of pictures go the fast way when it accounts for every
+    // picture; anything else, or anything it is unsure of, the plain way.
+    let mut c = match blobs::parse(s, parsed) {
+        Some(c) => c,
+        None => ron::from_str::<Canvas>(s).map_err(|e| e.to_string())?,
+    };
     // Old canvases stored flat strokes/shapes; fold them into a
     // first layer before anyone else touches `c.layers`.
     c.ensure_migrated();
@@ -201,6 +261,27 @@ pub fn load_views() -> Vec<SlideView> {
     })
 }
 
+/// Write every pin's place to `canvases/pins.ron`. Kept apart from the
+/// slides for the same reason as the views: moving a pin is not an edit
+/// of the slide its objects live on. Each slide stores which of its
+/// objects are pinned, so without this file the pins still show, just
+/// back where their objects are on their own slide.
+pub fn save_pins(pins: &[crate::canvas::pins::Pin]) -> Result<()> {
+    let path = paths::canvases_dir()?.join("pins.ron");
+    atomic_write(&path, ron::ser::to_string(pins)?.as_bytes())
+}
+
+/// The places `save_pins` wrote, or none if the file is missing or
+/// unreadable.
+pub fn load_pins() -> Vec<crate::canvas::pins::Pin> {
+    let Ok(path) = paths::canvases_dir().map(|d| d.join("pins.ron")) else { return Vec::new() };
+    let Ok(s) = std::fs::read_to_string(&path) else { return Vec::new() };
+    ron::from_str(&s).unwrap_or_else(|e| {
+        log::warn!("pins.ron could not be read ({e}); pins go back over their objects");
+        Vec::new()
+    })
+}
+
 /// Write every slide's name, in slide order, to `canvases/names.ron`.
 /// Kept apart from the slides like the views: renaming a slide is not
 /// an edit of it, and a big slide takes seconds to rewrite. An unnamed
@@ -221,6 +302,25 @@ pub fn load_names() -> Vec<String> {
     })
 }
 
+/// Write which slides are locked, in slide order, to
+/// `canvases/locks.ron`. Kept apart from the slides like the names:
+/// locking a slide is not an edit of it.
+pub fn save_locks(locks: &[bool]) -> Result<()> {
+    let path = paths::canvases_dir()?.join("locks.ron");
+    atomic_write(&path, ron::ser::to_string(locks)?.as_bytes())
+}
+
+/// The locks `save_locks` wrote, or none if the file is missing or
+/// unreadable (every slide is then unlocked).
+pub fn load_locks() -> Vec<bool> {
+    let Ok(path) = paths::canvases_dir().map(|d| d.join("locks.ron")) else { return Vec::new() };
+    let Ok(s) = std::fs::read_to_string(&path) else { return Vec::new() };
+    ron::from_str(&s).unwrap_or_else(|e| {
+        log::warn!("locks.ron could not be read ({e}); slides show unlocked");
+        Vec::new()
+    })
+}
+
 /// Atomic write helper: we write to `<path>.tmp` and rename onto `path`.
 ///
 /// Why: `std::fs::write` is not atomic — if the program crashes mid-write
@@ -237,6 +337,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `canvas_N.ron`, not `views.ron` / `pins.ron` beside it.
+    fn is_slide_file(p: &std::path::Path) -> bool {
+        p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("canvas_") && n.ends_with(".ron"))
+    }
 
     /// Cheap fingerprint of everything a slide holds that must survive
     /// a load → save → load cycle.
@@ -272,7 +377,7 @@ mod tests {
         let dir = std::path::PathBuf::from(std::env::var_os("OSN_TEST_SLIDES_DIR").expect("set OSN_TEST_SLIDES_DIR"));
         let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "ron"))
+            .filter(|p| is_slide_file(p))
             .collect();
         files.sort();
         let (mut strokes_total, mut strokes_missed) = (0usize, 0usize);
@@ -312,7 +417,7 @@ mod tests {
         let dir = std::path::PathBuf::from(std::env::var_os("OSN_TEST_SLIDES_DIR").expect("set OSN_TEST_SLIDES_DIR"));
         let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "ron"))
+            .filter(|p| is_slide_file(p))
             .collect();
         files.sort();
         let render = |c: &Canvas| {
@@ -378,7 +483,7 @@ mod tests {
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "ron"))
+            .filter(|p| is_slide_file(p))
             .collect();
         files.sort();
         assert!(!files.is_empty(), "no .ron files in {dir:?}");
@@ -397,5 +502,46 @@ mod tests {
             println!("{name}: ok  {}", summary(&c).join(" | "));
         }
         println!("{} slides loaded; {identical} would be written back byte-for-byte identical", files.len());
+    }
+
+    /// Times reading and parsing each slide of a real data folder (or
+    /// only those named in `OSN_TEST_SLIDES`, comma-separated). Nothing
+    /// is written. Point it at a COPY, in release mode for real numbers:
+    ///
+    ///   OSN_TEST_SLIDES_DIR=<copy>/canvases cargo test --release real_slides_load_speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_slides_load_speed() {
+        let dir = std::path::PathBuf::from(std::env::var_os("OSN_TEST_SLIDES_DIR").expect("set OSN_TEST_SLIDES_DIR"));
+        let only: Vec<String> = std::env::var("OSN_TEST_SLIDES").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| is_slide_file(p))
+            .filter(|p| only.is_empty() || only.iter().any(|n| p.file_name().is_some_and(|f| f == n.as_str())))
+            .collect();
+        files.sort();
+        for path in &files {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let t = std::time::Instant::now();
+            let text = std::fs::read_to_string(path).unwrap();
+            let read = t.elapsed();
+            let t = std::time::Instant::now();
+            let fast = blobs::parse(&text, None);
+            let fast_ms = t.elapsed().as_secs_f64() * 1e3;
+            let t = std::time::Instant::now();
+            let plain: Canvas = ron::from_str(&text).unwrap();
+            let plain_ms = t.elapsed().as_secs_f64() * 1e3;
+            let shapes: usize = plain.layers.iter().map(|l| l.shapes.len()).sum();
+            println!(
+                "{name}: {:.1} MB, read {:.0} ms, ron {plain_ms:.0} ms, fast {}, {shapes} shapes",
+                text.len() as f64 / 1e6,
+                read.as_secs_f64() * 1e3,
+                if fast.is_some() { format!("{fast_ms:.0} ms") } else { format!("not used ({fast_ms:.0} ms)") },
+            );
+            if let Some(fast) = fast {
+                assert!(serialize_canvas(&fast).unwrap() == serialize_canvas(&plain).unwrap(), "{name}: the fast path read something else");
+            }
+        }
     }
 }

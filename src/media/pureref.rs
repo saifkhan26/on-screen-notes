@@ -44,7 +44,7 @@ const NOTE_COLOR: [u8; 4] = [255, 255, 255, 255];
 const MAX_COUNT: usize = 100_000;
 const MAX_DEPTH: usize = 64;
 /// Long side of the preview kept inside the slide for each picture.
-const PREVIEW_SIDE: u32 = 96;
+pub(crate) const PREVIEW_SIDE: u32 = 96;
 /// A 2.x database up to this size is opened in memory; a bigger one is
 /// reassembled into a temporary file instead, so opening a
 /// multi-gigabyte board does not need that much memory.
@@ -270,6 +270,7 @@ pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &s
                     kind: RasterKind::Image,
                     media: media.map(Box::new),
                     picture: picture.map(Box::new),
+                    pin: 0,
                 }
             }
             BoardItem::Note { text, pos, font_size, color, rotation } => Shape::Text {
@@ -278,6 +279,7 @@ pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &s
                 font_size: (font_size * s) as f32,
                 color,
                 rotation: rotation as f32,
+                pin: 0,
             },
         })
         .collect();
@@ -1631,7 +1633,7 @@ fn preview_of(img: &image::RgbaImage) -> image::RgbaImage {
 /// JPEG at `quality` for an opaque picture (a fraction of the PNG size
 /// for photos), PNG when any pixel is see-through. Everything that reads
 /// a raster's bytes sniffs the format, so a preview may be either.
-fn encode_picture(img: &image::RgbaImage, quality: u8) -> Result<(Vec<u8>, &'static str)> {
+pub(crate) fn encode_picture(img: &image::RgbaImage, quality: u8) -> Result<(Vec<u8>, &'static str)> {
     if img.pixels().all(|p| p[3] == 255) {
         let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
         let mut out = Vec::new();

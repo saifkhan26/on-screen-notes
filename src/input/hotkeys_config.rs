@@ -45,6 +45,18 @@ impl Binding {
             && self.alt   == mods.alt
     }
 
+    /// How the binding reads to the user, e.g. "Ctrl+R".
+    pub fn label(&self) -> String {
+        let mut s = String::new();
+        for (on, name) in [(self.ctrl, "Ctrl+"), (self.shift, "Shift+"), (self.alt, "Alt+")] {
+            if on {
+                s.push_str(name);
+            }
+        }
+        s.push_str(self.key.name());
+        s
+    }
+
     /// Build the `egui::Modifiers` flag set for this binding so callers
     /// can hand it to `KeyboardShortcut::new` / `consume_shortcut`.
     pub fn to_modifiers(&self) -> egui::Modifiers {
@@ -297,6 +309,9 @@ pub struct CanvasSection {
     #[serde(default = "d_last_slide")]    pub last_slide: String,
     /// Name the active slide, in the slide panel.
     #[serde(default = "d_rename_slide")]  pub rename_slide: String,
+    /// Lock the active slide against edits (it still pans and zooms), or
+    /// unlock it.
+    #[serde(default = "d_lock_slide")]    pub lock_slide: String,
     #[serde(default = "d_prev_layer")]    pub prev_layer: String,
     #[serde(default = "d_next_layer")]    pub next_layer: String,
     #[serde(default = "d_toggle_ui")]     pub toggle_ui: String,
@@ -330,6 +345,10 @@ pub struct CanvasSection {
     #[serde(default = "d_duplicate")]        pub duplicate: String,
     /// Copy the selection onto a new slide (added after the last one).
     #[serde(default = "d_copy_to_new_slide")] pub copy_to_new_slide: String,
+    /// Pin the selection to every slide, or unpin it if it all is.
+    #[serde(default = "d_pin_selection")] pub pin_selection: String,
+    /// Hide every pin, or show them again.
+    #[serde(default = "d_toggle_pins")] pub toggle_pins: String,
     /// Paint the selection above everything else of its kind on the layer.
     #[serde(default = "d_bring_front")]      pub bring_front: String,
     /// Paint the selection below everything else of its kind on the layer.
@@ -354,6 +373,7 @@ impl Default for CanvasSection {
             cycle_next_slide: d_cycle_next_slide(), cycle_prev_slide: d_cycle_prev_slide(),
             first_slide: d_first_slide(), last_slide: d_last_slide(),
             rename_slide: d_rename_slide(),
+            lock_slide: d_lock_slide(),
             prev_layer: d_prev_layer(), next_layer: d_next_layer(),
             toggle_ui: d_toggle_ui(),
             opacity_0: d_op_0(), opacity_1: d_op_1(),
@@ -367,6 +387,8 @@ impl Default for CanvasSection {
             delete_selection: d_delete_selection(),
             duplicate: d_duplicate(),
             copy_to_new_slide: d_copy_to_new_slide(),
+            pin_selection: d_pin_selection(),
+            toggle_pins: d_toggle_pins(),
             bring_front: d_bring_front(),
             send_back: d_send_back(),
             media_play_pause: d_media_play_pause(),
@@ -391,6 +413,7 @@ fn d_cycle_prev_slide() -> String { "ctrl+shift+tab".into() }
 fn d_first_slide()   -> String { "home".into() }
 fn d_last_slide()    -> String { "end".into() }
 fn d_rename_slide()  -> String { "f2".into() }
+fn d_lock_slide()    -> String { "ctrl+r".into() }
 fn d_prev_layer()    -> String { "arrowdown".into() }
 fn d_next_layer()    -> String { "arrowup".into() }
 fn d_toggle_ui()     -> String { "tab".into() }
@@ -410,6 +433,8 @@ fn d_preview_layer() -> String { "q".into() }
 fn d_delete_selection() -> String { "delete".into() }
 fn d_duplicate()   -> String { "ctrl+d".into() }
 fn d_copy_to_new_slide() -> String { "ctrl+shift+d".into() }
+fn d_pin_selection() -> String { "ctrl+p".into() }
+fn d_toggle_pins() -> String { "shift+p".into() }
 fn d_bring_front() -> String { "ctrl+arrowup".into() }
 fn d_send_back()   -> String { "ctrl+arrowdown".into() }
 fn d_media_play_pause() -> String { "k".into() }
@@ -465,6 +490,7 @@ pub struct CanvasBindings {
     pub first_slide: Option<Binding>,
     pub last_slide: Option<Binding>,
     pub rename_slide: Option<Binding>,
+    pub lock_slide: Option<Binding>,
     pub prev_layer: Option<Binding>,
     pub next_layer: Option<Binding>,
     pub toggle_ui: Option<Binding>,
@@ -476,6 +502,8 @@ pub struct CanvasBindings {
     pub delete_selection: Option<Binding>,
     pub duplicate: Option<Binding>,
     pub copy_to_new_slide: Option<Binding>,
+    pub pin_selection: Option<Binding>,
+    pub toggle_pins: Option<Binding>,
     pub bring_front: Option<Binding>,
     pub send_back: Option<Binding>,
     pub media_play_pause: Option<Binding>,
@@ -538,6 +566,7 @@ impl HotkeysConfig {
                 first_slide:   p("canvas.first_slide",   &self.canvas.first_slide),
                 last_slide:    p("canvas.last_slide",    &self.canvas.last_slide),
                 rename_slide:  p("canvas.rename_slide",  &self.canvas.rename_slide),
+                lock_slide:    p("canvas.lock_slide",    &self.canvas.lock_slide),
                 prev_layer:    p("canvas.prev_layer",    &self.canvas.prev_layer),
                 next_layer:    p("canvas.next_layer",    &self.canvas.next_layer),
                 toggle_ui:     p("canvas.toggle_ui",     &self.canvas.toggle_ui),
@@ -559,6 +588,8 @@ impl HotkeysConfig {
                 delete_selection: p("canvas.delete_selection", &self.canvas.delete_selection),
                 duplicate:   p("canvas.duplicate",   &self.canvas.duplicate),
                 copy_to_new_slide: p("canvas.copy_to_new_slide", &self.canvas.copy_to_new_slide),
+                pin_selection: p("canvas.pin_selection", &self.canvas.pin_selection),
+                toggle_pins: p("canvas.toggle_pins", &self.canvas.toggle_pins),
                 bring_front: p("canvas.bring_front", &self.canvas.bring_front),
                 send_back:   p("canvas.send_back",   &self.canvas.send_back),
                 media_play_pause: p("canvas.media_play_pause", &self.canvas.media_play_pause),
@@ -665,6 +696,13 @@ mod tests {
         assert_eq!(b(c.first_slide), Some((egui::Key::Home, false, false)));
         assert_eq!(b(c.last_slide), Some((egui::Key::End, false, false)));
         assert_eq!(b(c.rename_slide), Some((egui::Key::F2, false, false)));
+        assert_eq!(b(c.lock_slide), Some((egui::Key::R, true, false)));
+        // Ctrl+R is not the rectangle tool (plain R), nor is the
+        // recording hotkey (Ctrl+Shift+R) the lock.
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+        let tools = HotkeysConfig::default().parsed().tool;
+        assert!(!tools.rect.unwrap().matches(egui::Key::R, ctrl));
+        assert!(!c.lock_slide.unwrap().matches(egui::Key::R, egui::Modifiers { shift: true, ..ctrl }));
         // Ctrl+Tab must not also toggle the UI (plain Tab).
         let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
         assert!(!c.toggle_ui.unwrap().matches(egui::Key::Tab, ctrl));

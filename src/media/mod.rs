@@ -145,15 +145,16 @@ impl MediaHub {
     }
 
     /// Once per frame, before painting: start players for the media on
-    /// `canvas`'s visible layers that are in `view` (the canvas area on
-    /// screen), stop the rest, advance every clock and upload new
-    /// frames. `ppp` is pixels per point.
+    /// `canvas`'s visible layers and in `pins` that are in `view` (the
+    /// canvas area on screen), stop the rest, advance every clock and
+    /// upload new frames. `ppp` is pixels per point. A pinned video is
+    /// the same object as on its own slide, so both show one player.
     ///
     /// Off screen, an object needs no player: its poster is all that
     /// could show. A video paused at its start stays dormant too, until
     /// it is played or shown bigger than its poster; at most
     /// `MAX_STARTING` videos start up at a time.
-    pub fn sync(&mut self, ctx: &egui::Context, canvas: &Canvas, ppp: f32, view: egui::Rect) {
+    pub fn sync(&mut self, ctx: &egui::Context, canvas: &Canvas, pins: &[crate::canvas::pins::Pinned], ppp: f32, view: egui::Rect) {
         self.tick += 1;
         let tick = self.tick;
         let now = Instant::now();
@@ -162,64 +163,100 @@ impl MediaHub {
         // Dormant videos shown bigger than their poster: (id, how much
         // bigger).
         let mut blurry: Vec<(u64, f32)> = Vec::new();
+        // Every media object that shows: the shape, its box on screen,
+        // and its size there in pixels.
+        let mut shown: Vec<(&crate::canvas::shape::Shape, egui::Rect, [f32; 2])> = Vec::new();
         for layer in canvas.layers.iter().filter(|l| l.visible) {
-            for shape in &layer.shapes {
-                let Some(m) = shape.media() else { continue };
+            for shape in layer.shapes.iter().filter(|s| s.media().is_some()) {
                 let bb = shape.obb().aabb();
                 let to_screen = |x: f32, y: f32| {
                     egui::pos2(view.min.x + canvas.pan[0] + x * canvas.zoom, view.min.y + canvas.pan[1] + y * canvas.zoom)
                 };
-                if !egui::Rect::from_two_pos(to_screen(bb[0], bb[1]), to_screen(bb[2], bb[3])).intersects(near) {
-                    continue;
-                }
                 let half = shape.obb().half;
                 let on_screen = [half[0] * 2.0 * canvas.zoom * ppp, half[1] * 2.0 * canvas.zoom * ppp];
-                let entry = match self.entries.entry(m.id) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        let path = dir.as_ref().map(|d| d.join(&m.file)).unwrap_or_default();
-                        // Nothing autoplays: a player starts paused unless
-                        // the user had this object playing when it left the
-                        // screen. Ids are minted per run, so after a restart
-                        // every GIF and video waits for the user again.
-                        let (resume, playing) = match self.resume.remove(&m.id) {
-                            Some((pos, playing)) => (Some(pos), playing),
-                            None => (None, false),
-                        };
-                        let player = match m.kind {
-                            MediaKind::Gif => {
-                                let data = match self.gifs.get(&m.file) {
-                                    Some((d, _)) => Arc::clone(d),
-                                    None => {
-                                        let d = GifData::load(path);
-                                        self.gifs.insert(m.file.clone(), (Arc::clone(&d), now));
-                                        d
-                                    }
-                                };
-                                Player::Gif(GifPlayer::new(data, resume, playing))
-                            }
-                            MediaKind::Video => Player::Video(Box::new(VideoPlayer::new(path, ffmpeg::tools(), resume, playing))),
-                        };
-                        v.insert(Entry { player, meta: m.meta, texture: None, uploaded: None, seen: tick })
-                    }
-                };
-                entry.seen = tick;
-                if let Player::Video(v) = &mut entry.player {
-                    v.set_on_screen(on_screen);
-                    if v.is_dormant() && view.intersects(egui::Rect::from_two_pos(to_screen(bb[0], bb[1]), to_screen(bb[2], bb[3]))) {
-                        let poster = match shape {
-                            crate::canvas::shape::Shape::Raster { px_size, .. } => px_size[0].max(px_size[1]).max(1) as f32,
-                            _ => 1.0,
-                        };
-                        let ratio = on_screen[0].max(on_screen[1]) / poster;
-                        if ratio > BLURRY_POSTER {
-                            blurry.push((m.id, ratio));
+                shown.push((shape, egui::Rect::from_two_pos(to_screen(bb[0], bb[1]), to_screen(bb[2], bb[3])), on_screen));
+            }
+        }
+        for p in pins {
+            for m in p.members {
+                let crate::canvas::hit::ObjRef::Shape(i) = m.obj else { continue };
+                // A pin shows even when its layer is hidden.
+                let Some(layer) = p.canvas.layers.get(m.layer) else { continue };
+                let Some(shape) = layer.shapes.get(i).filter(|s| s.media().is_some()) else { continue };
+                let o = p.shape_obb(shape);
+                let [x0, y0, x1, y1] = o.aabb();
+                let rect = egui::Rect::from_min_max(view.min + egui::vec2(x0, y0), view.min + egui::vec2(x1, y1));
+                shown.push((shape, rect, [o.half[0] * 2.0 * ppp, o.half[1] * 2.0 * ppp]));
+            }
+        }
+        // An object on its slide and in its pin is one player: merge the
+        // two showings, the bigger size counting.
+        let mut merged: Vec<(&crate::canvas::shape::Shape, egui::Rect, [f32; 2])> = Vec::with_capacity(shown.len());
+        let mut at: HashMap<u64, usize> = HashMap::new();
+        for (shape, rect, size) in shown {
+            let id = shape.media().map_or(0, |m| m.id);
+            match at.get(&id) {
+                Some(&k) => {
+                    let e = &mut merged[k];
+                    e.1 = e.1.union(rect);
+                    e.2 = [e.2[0].max(size[0]), e.2[1].max(size[1])];
+                }
+                None => {
+                    at.insert(id, merged.len());
+                    merged.push((shape, rect, size));
+                }
+            }
+        }
+        for (shape, rect, on_screen) in merged {
+            let Some(m) = shape.media() else { continue };
+            if !rect.intersects(near) {
+                continue;
+            }
+            let entry = match self.entries.entry(m.id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let path = dir.as_ref().map(|d| d.join(&m.file)).unwrap_or_default();
+                    // Nothing autoplays: a player starts paused unless
+                    // the user had this object playing when it left the
+                    // screen. Ids are minted per run, so after a restart
+                    // every GIF and video waits for the user again.
+                    let (resume, playing) = match self.resume.remove(&m.id) {
+                        Some((pos, playing)) => (Some(pos), playing),
+                        None => (None, false),
+                    };
+                    let player = match m.kind {
+                        MediaKind::Gif => {
+                            let data = match self.gifs.get(&m.file) {
+                                Some((d, _)) => Arc::clone(d),
+                                None => {
+                                    let d = GifData::load(path);
+                                    self.gifs.insert(m.file.clone(), (Arc::clone(&d), now));
+                                    d
+                                }
+                            };
+                            Player::Gif(GifPlayer::new(data, resume, playing))
                         }
+                        MediaKind::Video => Player::Video(Box::new(VideoPlayer::new(path, ffmpeg::tools(), resume, playing))),
+                    };
+                    v.insert(Entry { player, meta: m.meta, texture: None, uploaded: None, seen: tick })
+                }
+            };
+            entry.seen = tick;
+            if let Player::Video(v) = &mut entry.player {
+                v.set_on_screen(on_screen);
+                if v.is_dormant() && view.intersects(rect) {
+                    let poster = match shape {
+                        crate::canvas::shape::Shape::Raster { px_size, .. } => px_size[0].max(px_size[1]).max(1) as f32,
+                        _ => 1.0,
+                    };
+                    let ratio = on_screen[0].max(on_screen[1]) / poster;
+                    if ratio > BLURRY_POSTER {
+                        blurry.push((m.id, ratio));
                     }
                 }
-                if m.kind == MediaKind::Gif {
-                    if let Some(g) = self.gifs.get_mut(&m.file) { g.1 = now; }
-                }
+            }
+            if m.kind == MediaKind::Gif {
+                if let Some(g) = self.gifs.get_mut(&m.file) { g.1 = now; }
             }
         }
 

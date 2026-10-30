@@ -13,6 +13,8 @@ pub mod affine;
 pub mod canvas;
 pub mod hit;
 pub mod ink_gpu;
+pub mod picture_store;
+pub mod pins;
 pub mod render;
 pub mod shape;
 pub mod smoothing;
@@ -20,7 +22,7 @@ pub mod stroke;
 
 use crate::canvas::canvas::Canvas;
 use crate::config::AppConfig;
-use crate::persistence::SlideView;
+use crate::persistence::{LoadProgress, SlideView};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -46,7 +48,8 @@ pub struct CanvasManager {
     /// trigger that cleanup — a short in-memory list on its own proves
     /// nothing about which files are safe to delete.
     prune_orphans: bool,
-    /// Video / GIF files that deleted slides used. Each is deleted from
+    /// Media files (videos, GIFs, stored pictures) that deleted slides
+    /// used. Each is deleted from
     /// the media folder once no slide, undo history or clipboard uses it.
     media_to_check: HashSet<String>,
     /// Set by `delete_active`: the next save rewrites the slide files
@@ -66,6 +69,9 @@ pub struct CanvasManager {
     /// mix of both renamed over the slide, and on a big slide (a 1 GB
     /// one takes ~15 s) back-to-back edits stacked up several at once.
     saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Pins: objects of one slide kept on screen, on that slide or on
+    /// every slide.
+    pins: pins::PinBoard,
     /// One name per slide, empty for an unnamed one; always as long as
     /// `canvases`. Kept here rather than on `Canvas` so a slide still
     /// being read has its name too, and renaming never dirties a slide.
@@ -78,6 +84,21 @@ pub struct CanvasManager {
     /// Where in `recent` a recently-used walk (Ctrl held, Tab pressed
     /// once or more) stands; `None` when no walk is under way.
     recent_walk: Option<usize>,
+    /// One flag per slide, always as long as `canvases`: a locked slide
+    /// takes no edits, only panning and zooming. Kept here rather than
+    /// on `Canvas` for the same reasons as `names`.
+    locks: Vec<bool>,
+    /// The locks as `locks.ron` last received them.
+    saved_locks: Vec<bool>,
+    /// What shows while the active slide is still being read: a blank
+    /// slide at the slide's stored view. The app takes no edits while a
+    /// slide opens, and this is never saved.
+    opening: Canvas,
+    /// Moves big pictures kept in slides out to the media folder.
+    pictures: picture_store::PictureStore,
+    /// The running save deletes unused media. Until it ends no picture is
+    /// stored or swapped in, as one could name a file about to go.
+    deleting_media: bool,
 }
 
 /// Stand-in for a slot whose file is missing or unreadable. It keeps
@@ -106,9 +127,9 @@ struct SlotLoad {
 
 /// Read slot `idx` from disk. A missing file becomes a placeholder; an
 /// unreadable one is copied aside and becomes a placeholder.
-fn load_slot(idx: usize, passes: usize) -> SlotLoad {
+fn load_slot(idx: usize, passes: usize, progress: &LoadProgress) -> SlotLoad {
     use crate::persistence::LoadOutcome;
-    match crate::persistence::load_canvas(idx, passes) {
+    match crate::persistence::load_canvas(idx, passes, progress) {
         LoadOutcome::Loaded(canvas) => SlotLoad { canvas, error: None, protected: false },
         LoadOutcome::Missing => {
             log::warn!("canvas_{idx}.ron is missing; leaving a blank slide in its place");
@@ -135,6 +156,20 @@ fn load_slot(idx: usize, passes: usize) -> SlotLoad {
     }
 }
 
+/// `load_slot` on a reader thread. A panic while reading is treated like
+/// an unreadable file that could not be copied aside, so whoever waits
+/// for the slot still gets it.
+fn read_slot(idx: usize, passes: usize, progress: &LoadProgress) -> SlotLoad {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_slot(idx, passes, progress))).unwrap_or_else(|_| {
+        log::warn!("reading canvas_{idx}.ron failed; its file is left untouched");
+        SlotLoad {
+            canvas: placeholder_canvas(),
+            error: Some(format!("Slide {} could not be read — its file is left untouched", idx + 1)),
+            protected: true,
+        }
+    })
+}
+
 /// The slides read on background threads after startup, so the window
 /// opens as soon as the first one is in.
 struct BackgroundLoad {
@@ -143,6 +178,11 @@ struct BackgroundLoad {
     /// Whoever flips it first reads the file; nobody else touches it.
     claims: Arc<Vec<AtomicBool>>,
     results: mpsc::Receiver<(usize, SlotLoad)>,
+    /// For reading a slide out of turn (`open`). Dropped once every slot
+    /// is claimed, so the channel closes when the last reader is done.
+    tx: Option<mpsc::Sender<(usize, SlotLoad)>>,
+    /// Per slot, how far reading it has got.
+    progress: Arc<Vec<LoadProgress>>,
     /// Smoothing passes for slides read from now on.
     passes: usize,
     /// Stroke caches were rebuilt (smoothing or pressure curve changed)
@@ -204,10 +244,16 @@ impl CanvasManager {
             saved_views: Vec::new(),
             file_views: crate::persistence::load_views(),
             saving: Default::default(),
+            pins: pins::PinBoard::new(crate::persistence::load_pins()),
             names: crate::persistence::load_names(),
             saved_names: Vec::new(),
             recent: vec![0],
             recent_walk: None,
+            locks: crate::persistence::load_locks(),
+            saved_locks: Vec::new(),
+            opening: placeholder_canvas(),
+            pictures: picture_store::PictureStore::new(crate::persistence::paths::media_dir().ok()),
+            deleting_media: false,
         };
         // Every slot up to the highest file on disk gets an entry. A gap
         // or an unreadable file becomes a blank placeholder instead of
@@ -216,20 +262,21 @@ impl CanvasManager {
         if let Some(max) = crate::persistence::max_canvas_index() {
             let started = Instant::now();
             m.canvases.resize_with(max + 1, || None);
-            m.install(0, load_slot(0, passes));
+            let progress: Arc<Vec<LoadProgress>> = Arc::new((0..=max).map(|_| LoadProgress::default()).collect());
+            m.install(0, load_slot(0, passes, &progress[0]));
             log::info!("slide 1 read in {:.0} ms; {max} more loading in the background", started.elapsed().as_secs_f64() * 1000.0);
             if max > 0 {
                 let claims: Arc<Vec<AtomicBool>> = Arc::new((0..=max).map(|i| AtomicBool::new(i == 0)).collect());
                 let order = Arc::new(load_order(max));
                 let (tx, results) = mpsc::channel();
                 for _ in 0..workers {
-                    let (claims, order, tx) = (claims.clone(), order.clone(), tx.clone());
+                    let (claims, order, tx, progress) = (claims.clone(), order.clone(), tx.clone(), progress.clone());
                     let spawned = std::thread::Builder::new().name("slide-loader".into()).spawn(move || {
                         for &idx in order.iter() {
                             if claims[idx].swap(true, Ordering::AcqRel) {
                                 continue; // another thread, or the UI, has it
                             }
-                            if tx.send((idx, load_slot(idx, passes))).is_err() {
+                            if tx.send((idx, read_slot(idx, passes, &progress[idx]))).is_err() {
                                 return; // the manager is gone
                             }
                         }
@@ -239,7 +286,7 @@ impl CanvasManager {
                         log::warn!("could not start a slide loader thread: {e}");
                     }
                 }
-                m.loading = Some(BackgroundLoad { claims, results, passes, caches_stale: false, started });
+                m.loading = Some(BackgroundLoad { claims, results, tx: Some(tx), progress, passes, caches_stale: false, started });
             }
         }
         // First-time boot: spin up some empty canvases.
@@ -249,9 +296,12 @@ impl CanvasManager {
             }
             m.saved_views = m.canvases.iter().map(|c| c.as_ref().map(view_of)).collect();
         }
-        // A short or missing `names.ron` leaves the rest unnamed.
+        // A short or missing `names.ron` leaves the rest unnamed, and
+        // `locks.ron` the rest unlocked.
         m.names.resize(m.canvases.len(), String::new());
         m.saved_names = m.names.clone();
+        m.locks.resize(m.canvases.len(), false);
+        m.saved_locks = m.locks.clone();
         m
     }
 
@@ -260,9 +310,13 @@ impl CanvasManager {
     pub(crate) fn for_tests(canvases: Vec<Canvas>) -> Self {
         let saved_views = canvases.iter().map(|c| Some(view_of(c))).collect();
         let names = vec![String::new(); canvases.len()];
+        let locks = vec![false; canvases.len()];
         Self {
             saved_names: names.clone(),
             names,
+            saved_locks: locks.clone(),
+            locks,
+            opening: placeholder_canvas(),
             recent: vec![0],
             recent_walk: None,
             canvases: canvases.into_iter().map(Some).collect(),
@@ -276,6 +330,9 @@ impl CanvasManager {
             saved_views,
             file_views: Vec::new(),
             saving: Default::default(),
+            pins: pins::PinBoard::default(),
+            pictures: picture_store::PictureStore::new(None),
+            deleting_media: false,
         }
     }
 
@@ -305,6 +362,16 @@ impl CanvasManager {
         }
         self.saved_names = self.names.clone();
         Some(self.names.clone())
+    }
+
+    /// Every slide's lock, if any changed since `locks.ron` was last
+    /// written; they then count as written.
+    fn take_changed_locks(&mut self) -> Option<Vec<bool>> {
+        if self.locks == self.saved_locks {
+            return None;
+        }
+        self.saved_locks = self.locks.clone();
+        Some(self.locks.clone())
     }
 
     /// Put a read slot in place and note what went wrong with it.
@@ -375,6 +442,11 @@ impl CanvasManager {
     /// Take in the slides the loader threads have finished. Never
     /// blocks; call once a frame.
     pub fn poll_loads(&mut self) {
+        if let Some(bg) = self.loading.as_mut() {
+            if bg.tx.is_some() && bg.claims.iter().all(|c| c.load(Ordering::Acquire)) {
+                bg.tx = None;
+            }
+        }
         while let Some(bg) = self.loading.as_ref() {
             match bg.results.try_recv() {
                 Ok((idx, load)) => self.install_from_thread(idx, load),
@@ -388,6 +460,18 @@ impl CanvasManager {
         self.check_loading_done();
     }
 
+    /// Move big pictures kept in the loaded slides out to the media
+    /// folder (see `picture_store`). Never blocks; call once a frame.
+    /// Returns each swapped picture's old bytes and new reference, so
+    /// what was loaded for it carries over.
+    pub fn store_pictures(&mut self) -> Vec<(Arc<Vec<u8>>, shape::PictureRef)> {
+        if self.deleting_media && self.saving.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.deleting_media = false;
+        self.pictures.tick(&mut self.canvases, self.active)
+    }
+
     /// Make sure slot `idx` is in memory: read it now if no loader
     /// thread has started on it, or wait for the thread that has.
     fn ensure_loaded(&mut self, idx: usize) {
@@ -396,7 +480,7 @@ impl CanvasManager {
         }
         let bg = self.loading.as_ref().expect("an unread slide while no loader is running");
         if !bg.claims[idx].swap(true, Ordering::AcqRel) {
-            let load = load_slot(idx, bg.passes);
+            let load = load_slot(idx, bg.passes, &bg.progress[idx]);
             self.install(idx, load);
         }
         while self.canvases[idx].is_none() {
@@ -407,6 +491,47 @@ impl CanvasManager {
             }
         }
         self.check_loading_done();
+    }
+
+    /// Get slot `idx` on its way into memory without waiting: if nobody
+    /// is reading it yet, a thread starts on it now rather than when the
+    /// loader threads get to it. Until `poll_loads` takes it in, the
+    /// active slide shows the `opening` stand-in.
+    fn open(&mut self, idx: usize) {
+        if self.canvases[idx].is_some() {
+            return;
+        }
+        self.opening = placeholder_canvas();
+        if let Some(v) = self.file_views.get(idx) {
+            apply_view(&mut self.opening, v);
+        }
+        let bg = self.loading.as_ref().expect("an unread slide while no loader is running");
+        if bg.claims[idx].swap(true, Ordering::AcqRel) {
+            return; // a loader thread has it
+        }
+        let (passes, progress) = (bg.passes, Arc::clone(&bg.progress));
+        // Every slot is claimed once `tx` is gone, and this one was not.
+        let tx = bg.tx.clone().expect("a slot is unclaimed");
+        let theirs = Arc::clone(&progress);
+        let spawned = std::thread::Builder::new().name("slide-opener".into()).spawn(move || {
+            let _ = tx.send((idx, read_slot(idx, passes, &theirs[idx])));
+        });
+        if let Err(e) = spawned {
+            log::warn!("could not start a thread to open slide {}: {e}", idx + 1);
+            let load = load_slot(idx, passes, &progress[idx]);
+            self.install(idx, load);
+            self.check_loading_done();
+        }
+    }
+
+    /// The active slide is still being read: how far along (0..=1), and
+    /// the size of its file in bytes.
+    pub fn opening(&self) -> Option<(f32, u64)> {
+        if self.canvases[self.active].is_some() {
+            return None;
+        }
+        let p = self.loading.as_ref()?.progress.get(self.active)?;
+        Some((p.fraction(), p.size()))
     }
 
     /// Slides are still being read in the background.
@@ -440,8 +565,13 @@ impl CanvasManager {
     /// deliberately errs toward over-saving: a caller that takes `&mut`
     /// and changes nothing costs one redundant write, whereas a missed
     /// mark would silently lose the user's work.
+    ///
+    /// A slide still opening is waited for: an edit must never land on
+    /// the stand-in, where it would be lost. The app takes no edits while
+    /// a slide opens, so this wait is a last resort.
     pub fn active_mut(&mut self) -> &mut Canvas {
-        let c = self.canvases[self.active].as_mut().expect("the active slide is always loaded");
+        self.ensure_loaded(self.active);
+        let c = self.canvases[self.active].as_mut().expect("the active slide is loaded");
         c.dirty = true;
         c
     }
@@ -453,8 +583,10 @@ impl CanvasManager {
     /// megabytes each needless save is seconds of work. Every edit
     /// records an undo step or changes an object count, a layer's `rev`
     /// or the active layer, which `Canvas::edit_stamp` covers.
+    /// Waits for a slide still opening, like `active_mut`.
     pub fn edit_active<R>(&mut self, f: impl FnOnce(&mut Canvas) -> R) -> R {
-        let c = self.canvases[self.active].as_mut().expect("the active slide is always loaded");
+        self.ensure_loaded(self.active);
+        let c = self.canvases[self.active].as_mut().expect("the active slide is loaded");
         let before = c.edit_stamp();
         let r = f(c);
         if c.edit_stamp() != before {
@@ -469,14 +601,34 @@ impl CanvasManager {
     /// few seconds while the user pans and zooms cost seconds of CPU
     /// per save. The autosave writes views to their own small file
     /// instead (`persistence::save_views`).
+    /// While the slide opens, the stand-in's view moves.
     pub fn active_view_mut(&mut self) -> (&mut [f32; 2], &mut f32) {
-        let c = self.canvases[self.active].as_mut().expect("the active slide is always loaded");
+        let c = self.canvases[self.active].as_mut().unwrap_or(&mut self.opening);
         (&mut c.pan, &mut c.zoom)
     }
 
-    /// Read-only access to the active canvas (used by renderer + screenshot).
+    /// Read-only access to the active canvas (used by renderer +
+    /// screenshot); a blank stand-in while it opens.
     pub fn active(&self) -> &Canvas {
-        self.canvases[self.active].as_ref().expect("the active slide is always loaded")
+        self.canvases[self.active].as_ref().unwrap_or(&self.opening)
+    }
+
+    /// Slide `idx` is locked: no edits, only panning and zooming.
+    pub fn is_locked(&self, idx: usize) -> bool {
+        self.locks.get(idx).copied().unwrap_or(false)
+    }
+
+    /// Lock or unlock slide `idx`. Not an edit of the slide: only
+    /// `locks.ron` is written.
+    pub fn set_locked(&mut self, idx: usize, locked: bool) {
+        if let Some(l) = self.locks.get_mut(idx) {
+            *l = locked;
+        }
+    }
+
+    /// The active slide takes edits: it is read and not locked.
+    pub fn active_editable(&self) -> bool {
+        self.canvases[self.active].is_some() && !self.is_locked(self.active)
     }
 
     /// Index of the active canvas (for status bar display).
@@ -513,9 +665,10 @@ impl CanvasManager {
             // At the end → grow a new blank canvas.
             self.canvases.push(Some(Canvas::default()));
             self.names.push(String::new());
+            self.locks.push(false);
         }
         self.active += 1;
-        self.ensure_loaded(self.active);
+        self.open(self.active);
     }
 
     /// Move to the next canvas, wrapping from the last to the first —
@@ -531,15 +684,17 @@ impl CanvasManager {
     pub fn push_canvas(&mut self, canvas: Canvas) -> usize {
         self.canvases.push(Some(canvas));
         self.names.push(String::new());
+        self.locks.push(false);
         self.active = self.canvases.len() - 1;
         self.active
     }
 
-    /// Go to slide `idx`, reading it first if it is still loading.
+    /// Go to slide `idx`. One still being read shows as opening until
+    /// it is in (see `open`).
     pub fn go_to(&mut self, idx: usize) {
         if idx < self.canvases.len() {
             self.active = idx;
-            self.ensure_loaded(idx);
+            self.open(idx);
         }
     }
 
@@ -593,6 +748,97 @@ impl CanvasManager {
         }
     }
 
+    // ---- pins ---------------------------------------------------------
+
+    /// Bring the pins up to date with the slides: once a frame, and after
+    /// anything that pins or unpins objects.
+    pub fn refresh_pins(&mut self) {
+        self.pins.refresh(&self.canvases);
+    }
+
+    /// The pins with objects to show on the active slide, bottom to top.
+    pub fn pinned(&self) -> Vec<pins::Pinned<'_>> {
+        self.pins.pinned(&self.canvases, self.active)
+    }
+
+    /// Some pin has objects to show on the active slide, whether or not
+    /// pins are hidden.
+    pub fn has_pins(&self) -> bool {
+        self.pins.any(self.active)
+    }
+
+    pub fn pins_hidden(&self) -> bool {
+        self.pins.hidden()
+    }
+
+    /// Hide every pin, or show them again (not an edit; not saved).
+    pub fn set_pins_hidden(&mut self, hidden: bool) {
+        self.pins.set_hidden(hidden);
+    }
+
+    /// Pin places, for moving, resizing and turning pins. Not an edit of
+    /// any slide.
+    pub fn pin_board(&mut self) -> &mut pins::PinBoard {
+        &mut self.pins
+    }
+
+    /// Pin the chosen objects of the active slide's layer `li` together as
+    /// one new pin, placed `offset` screen points from where they show
+    /// now; `local` shows it on this slide only. Objects in another pin
+    /// leave it. One undo step on the slide. Returns the new pin's id, or
+    /// `None` when nothing was chosen.
+    pub fn pin_objects(&mut self, li: usize, strokes: &[usize], shapes: &[usize], offset: [f32; 2], local: bool) -> Option<u64> {
+        let id = self.pins.fresh_id();
+        let c = self.canvases[self.active].as_mut()?;
+        let bounds = pins::objects_bounds(c.layers.get(li)?, strokes, shapes)?;
+        if !c.set_pin(li, strokes, shapes, id) {
+            return None;
+        }
+        let a = pins::center_of(bounds);
+        self.pins.add(pins::Pin {
+            id,
+            center: [c.pan[0] + a[0] * c.zoom + offset[0], c.pan[1] + a[1] * c.zoom + offset[1]],
+            scale: c.zoom,
+            angle: 0.0,
+            local,
+        });
+        self.refresh_pins();
+        Some(id)
+    }
+
+    /// Take the chosen objects of the active slide's layer `li` out of
+    /// whatever pin they are in. One undo step; false if none was pinned.
+    pub fn unpin_objects(&mut self, li: usize, strokes: &[usize], shapes: &[usize]) -> bool {
+        let unpinned = self.active_mut().set_pin(li, strokes, shapes, 0);
+        self.refresh_pins();
+        unpinned
+    }
+
+    /// Take every object out of pin `id`, on whichever slide it is (an
+    /// undo step there). The objects stay on their slide. False if the
+    /// pin has nothing to show.
+    pub fn unpin(&mut self, id: u64) -> bool {
+        let Some((slide, members)) = self.pins.members(id) else { return false };
+        let members = members.to_vec();
+        let Some(c) = self.canvases.get_mut(slide).and_then(Option::as_mut) else { return false };
+        let mut layers: Vec<usize> = members.iter().map(|m| m.layer).collect();
+        layers.dedup();
+        for li in layers {
+            let (mut strokes, mut shapes) = (Vec::new(), Vec::new());
+            for m in members.iter().filter(|m| m.layer == li) {
+                match m.obj {
+                    hit::ObjRef::Stroke(i) => strokes.push(i),
+                    hit::ObjRef::Shape(i) => shapes.push(i),
+                }
+            }
+            strokes.sort_unstable();
+            shapes.sort_unstable();
+            c.set_pin(li, &strokes, &shapes, 0);
+        }
+        self.refresh_pins();
+        true
+    }
+
     /// Move to the previous canvas. Wraps to the last when at the first
     /// (going-backwards is symmetrical: the user explicitly asked to leave
     /// the first sheet, so wrap them to the most recent one).
@@ -602,7 +848,7 @@ impl CanvasManager {
         } else {
             self.active -= 1;
         }
-        self.ensure_loaded(self.active);
+        self.open(self.active);
     }
 
     /// Delete the active canvas.
@@ -632,12 +878,14 @@ impl CanvasManager {
         if self.canvases.len() == 1 {
             self.canvases[0] = Some(Canvas::default());
             self.names[0].clear();
+            self.locks[0] = false;
             self.active = 0;
             return;
         }
         let i = self.active;
         self.canvases.remove(i);
         self.names.remove(i);
+        self.locks.remove(i);
         // Every later slide moved down one place in the history too.
         self.recent_walk = None;
         self.recent.retain(|&j| j != i);
@@ -647,6 +895,8 @@ impl CanvasManager {
         if self.active >= self.canvases.len() {
             self.active = self.canvases.len() - 1;
         }
+        // Pins are found by slide index, and every later slide just moved.
+        self.pins.forget_scans();
         // Removing a canvas shifts every later one down a file slot, so
         // their existing files now hold the wrong content — everything
         // has to be rewritten, not just the deleted index.
@@ -690,10 +940,24 @@ impl CanvasManager {
                 }
             });
         }
+        if let Some(pins) = self.pins.take_changed(self.loading.is_none()) {
+            std::thread::spawn(move || {
+                if let Err(e) = crate::persistence::save_pins(&pins) {
+                    log::warn!("failed to save pins: {e}");
+                }
+            });
+        }
         if let Some(names) = self.take_changed_names() {
             std::thread::spawn(move || {
                 if let Err(e) = crate::persistence::save_names(&names) {
                     log::warn!("failed to save slide names: {e}");
+                }
+            });
+        }
+        if let Some(locks) = self.take_changed_locks() {
+            std::thread::spawn(move || {
+                if let Err(e) = crate::persistence::save_locks(&locks) {
+                    log::warn!("failed to save slide locks: {e}");
                 }
             });
         }
@@ -721,10 +985,13 @@ impl CanvasManager {
             return;
         }
         let prune = std::mem::take(&mut self.prune_orphans);
+        // A picture being stored may have its file in place with no slide
+        // naming it yet.
         let media = match media_in_use {
-            Some(keep) if std::mem::take(&mut self.media_cleanup_due) => self.unused_media(keep),
+            Some(keep) if !self.pictures.busy() && std::mem::take(&mut self.media_cleanup_due) => self.unused_media(keep),
             _ => Vec::new(),
         };
+        self.deleting_media = !media.is_empty();
         crate::perf::line(format!("autosave: copied {} slide(s) on the UI thread in {:.1} ms", dirty.len(), crate::perf::ms(copy_started.elapsed())));
         self.saving.store(true, std::sync::atomic::Ordering::Release);
         let done = SaveDone(std::sync::Arc::clone(&self.saving));
@@ -787,9 +1054,20 @@ impl CanvasManager {
                 log::warn!("failed to save slide views: {e}");
             }
         }
+        self.refresh_pins();
+        if let Some(pins) = self.pins.take_changed(self.loading.is_none()) {
+            if let Err(e) = crate::persistence::save_pins(&pins) {
+                log::warn!("failed to save pins: {e}");
+            }
+        }
         if let Some(names) = self.take_changed_names() {
             if let Err(e) = crate::persistence::save_names(&names) {
                 log::warn!("failed to save slide names: {e}");
+            }
+        }
+        if let Some(locks) = self.take_changed_locks() {
+            if let Err(e) = crate::persistence::save_locks(&locks) {
+                log::warn!("failed to save slide locks: {e}");
             }
         }
         for (i, slot) in self.canvases.iter_mut().enumerate() {
@@ -901,6 +1179,7 @@ mod media_cleanup_tests {
                 file: file.into(), kind: MediaKind::Video, source_name: String::new(), meta: None, id: fresh_media_id(),
             })),
             picture: None,
+            pin: 0,
         }
     }
 
@@ -1112,6 +1391,32 @@ mod view_tests {
     }
 
     #[test]
+    fn locks_follow_their_slides_and_are_not_edits() {
+        let mut m = CanvasManager::for_tests(vec![clean(), clean(), clean()]);
+        assert_eq!(m.take_changed_locks(), None);
+        m.set_locked(1, true);
+        assert!(m.is_locked(1) && !m.is_locked(0));
+        assert!(m.canvases.iter().flatten().all(|c| !c.dirty), "locking is not an edit");
+        assert_eq!(m.take_changed_locks(), Some(vec![false, true, false]));
+        assert_eq!(m.take_changed_locks(), None, "written once, then quiet until the next change");
+        m.go_to(1);
+        assert!(!m.active_editable());
+        // It still pans and zooms.
+        *m.active_view_mut().1 = 2.0;
+        assert_eq!(m.active().zoom, 2.0);
+        assert!(!m.active().dirty);
+
+        // New slides come unlocked; a deleted slide takes its lock along.
+        m.push_canvas(clean());
+        m.go_to(0);
+        m.delete_active();
+        assert_eq!((m.is_locked(0), m.is_locked(1), m.is_locked(2)), (true, false, false));
+        m.go_to(2);
+        m.next();
+        assert_eq!((m.count(), m.is_locked(3)), (4, false));
+    }
+
+    #[test]
     fn names_follow_their_slides() {
         let mut m = CanvasManager::for_tests(vec![clean(), clean(), clean()]);
         assert_eq!(m.take_changed_names(), None);
@@ -1178,22 +1483,36 @@ mod loader_tests {
         assert!(dir.join("canvas_3.ron").exists());
         assert!(!dir.join("views.ron").exists(), "no view moved, nothing to write");
         assert!(!dir.join("names.ron").exists(), "nothing renamed, nothing to write");
+        assert!(!dir.join("locks.ron").exists(), "nothing locked, nothing to write");
 
         // Looking around a slide, or naming one, writes only the views
         // and names, which the next start picks up.
         let slide_0 = std::fs::read_to_string(dir.join("canvas_0.ron")).unwrap();
         *m.active_view_mut().1 = 4.0;
         m.rename(3, "Last");
+        m.set_locked(0, true);
         m.save_all_blocking();
         assert_eq!(std::fs::read_to_string(dir.join("canvas_0.ron")).unwrap(), slide_0);
         let m = CanvasManager::load_or_default(&AppConfig::default());
         assert_eq!(m.active().zoom, 4.0);
         assert_eq!((m.name(0), m.name(3)), ("", "Last"));
+        assert!(m.is_locked(0) && !m.is_locked(3), "locks come back with their slides");
 
         slides_still_loading_are_never_written(&dir);
 
         std::env::remove_var("OSN_DATA_DIR");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Take in slides as the app does, once a frame, until the active one
+    /// is in.
+    fn until_open(m: &mut CanvasManager) {
+        let t = Instant::now();
+        while m.opening().is_some() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the slide never opened");
+            m.poll_loads();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// A slide the background loader has not read yet is never written,
@@ -1228,10 +1547,16 @@ mod loader_tests {
         assert_eq!(file(3), three, "an unread slide is not written");
         assert!(!dir.join("canvas_2.ron").exists());
 
-        // Back from the first slide wraps to the last, which is read then.
+        // Back from the first slide wraps to the last, which opens then,
+        // without holding up the caller.
         let mut wrap = CanvasManager::start_loading_with(&AppConfig::default(), 0);
         wrap.prev();
-        assert_eq!((wrap.active_index(), wrap.active().pan), (3, [13.0, 0.0]));
+        assert_eq!(wrap.active_index(), 3);
+        assert!(wrap.opening().is_some(), "still being read");
+        assert!(!wrap.active_editable(), "nothing can be drawn on it yet");
+        until_open(&mut wrap);
+        assert_eq!(wrap.active().pan, [13.0, 0.0]);
+        assert!(wrap.active_editable());
 
         // A slide can be named before it is read.
         m.rename(3, "Four");
@@ -1239,6 +1564,7 @@ mod loader_tests {
 
         // Delete slide 2: slides 3 and 4 are read first, then all shift.
         m.next();
+        until_open(&mut m);
         assert_eq!(m.active().pan, [11.0, 0.0]);
         m.delete_active();
         assert_eq!(m.count(), 3);
@@ -1249,5 +1575,181 @@ mod loader_tests {
         assert!(!dir.join("canvas_3.ron").exists());
         assert_eq!(crate::persistence::load_names(), ["", "", "Four"], "its name moved down with it");
         assert!(m.take_load_errors().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::canvas::shape::{BorderStyle, Shape};
+    use crate::canvas::stroke::{PenSample, Stroke};
+
+    fn line(x: f32) -> Shape {
+        Shape::Line { a: [x, 0.0], b: [x + 10.0, 0.0], color: [255; 4], stroke_width: 4.0, border: BorderStyle::Solid, pin: 0 }
+    }
+
+    fn stroke(x: f32) -> Stroke {
+        let mut s = Stroke::with_style([255; 4], 3.0, Default::default());
+        s.push(PenSample::from_pos([x, 5.0]));
+        s.push(PenSample::from_pos([x + 20.0, 5.0]));
+        s
+    }
+
+    fn slide() -> Canvas {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.extend([line(0.0), line(100.0)]);
+        c.layers[0].strokes.push(stroke(0.0));
+        c.dirty = false;
+        c
+    }
+
+    #[test]
+    fn pinning_is_one_undo_step_on_its_slide_and_shows_everywhere() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide()]);
+        let id = m.pin_objects(0, &[0], &[1], [24.0, 24.0], false).expect("pinned");
+        assert!(m.active().dirty, "the tags are part of the slide");
+        assert_eq!(m.active().layers[0].shapes[1].pin(), id);
+        assert_eq!(m.active().layers[0].strokes[0].pin, id);
+        assert_eq!(m.active().layers[0].shapes[0].pin(), 0);
+        let pinned = m.pinned();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!((pinned[0].pin.id, pinned[0].slide, pinned[0].members.len()), (id, 0, 2));
+        drop(pinned);
+
+        // Seen from the other slide too, and moving it there is no edit.
+        m.next();
+        m.pin_board().get_mut(id).unwrap().center = [500.0, 500.0];
+        assert!(!m.active().dirty);
+        assert_eq!(m.pinned().len(), 1);
+
+        // Undo on its slide takes the objects out; redo puts them back,
+        // where the pin was left.
+        m.prev();
+        m.active_mut().undo();
+        m.refresh_pins();
+        assert!(m.pinned().is_empty());
+        m.active_mut().redo();
+        m.refresh_pins();
+        assert_eq!(m.pinned()[0].pin.center, [500.0, 500.0]);
+    }
+
+    #[test]
+    fn a_local_pin_stays_on_its_slide_until_made_global() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide()]);
+        let id = m.pin_objects(0, &[], &[0], [0.0, 0.0], true).unwrap();
+        assert_eq!(m.pinned().len(), 1);
+        m.next();
+        assert!(m.pinned().is_empty() && !m.has_pins(), "not on the other slide");
+        m.prev();
+        m.pin_board().get_mut(id).unwrap().local = false;
+        m.next();
+        assert_eq!(m.pinned().len(), 1);
+        assert!(!m.active().dirty, "scope is the pin's, not a slide edit");
+    }
+
+    #[test]
+    fn unpinning_from_another_slide_leaves_the_objects_where_they_are() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide()]);
+        let id = m.pin_objects(0, &[0], &[0, 1], [0.0, 0.0], false).unwrap();
+        let before = format!("{:?}", m.active().layers[0].shapes.iter().map(Shape::obb).collect::<Vec<_>>());
+        m.next();
+        assert!(m.unpin(id));
+        assert!(m.pinned().is_empty());
+        m.prev();
+        let c = m.active();
+        assert!(c.layers[0].shapes.iter().all(|s| s.pin() == 0) && c.layers[0].strokes[0].pin == 0);
+        assert_eq!(format!("{:?}", c.layers[0].shapes.iter().map(Shape::obb).collect::<Vec<_>>()), before);
+        // The unpin is an undo step on the objects' slide.
+        m.active_mut().undo();
+        m.refresh_pins();
+        assert_eq!(m.pinned().len(), 1);
+    }
+
+    #[test]
+    fn copies_are_in_no_pin_and_a_deleted_slide_takes_its_pins() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide(), slide()]);
+        let id = m.pin_objects(0, &[], &[0], [0.0, 0.0], false).unwrap();
+        let shapes = m.active().layers[0].shapes.clone();
+        let (copy, _) = Canvas::with_objects(Vec::new(), shapes, [0.0, 0.0], 1.0);
+        assert!(copy.layers[0].shapes.iter().all(|s| s.pin() == 0));
+
+        // Pins of slide 3 survive slide 2 going; slide 1's go with it.
+        m.go_to(2);
+        let later = m.pin_objects(0, &[], &[1], [0.0, 0.0], false).unwrap();
+        m.go_to(0);
+        m.delete_active();
+        m.refresh_pins();
+        let pinned = m.pinned();
+        assert_eq!(pinned.iter().map(|p| (p.pin.id, p.slide)).collect::<Vec<_>>(), vec![(later, 1)]);
+        assert!(!pinned.iter().any(|p| p.pin.id == id));
+    }
+
+    #[test]
+    fn unpinned_objects_save_exactly_as_before() {
+        let c = slide();
+        let text = crate::persistence::serialize_canvas(&c).unwrap();
+        assert!(!text.contains("pin"), "no pin field written for unpinned objects");
+        let mut pinned = slide();
+        pinned.set_pin(0, &[0], &[0], 42);
+        let text = crate::persistence::serialize_canvas(&pinned).unwrap();
+        let back = crate::persistence::parse_canvas(&text, 3).unwrap();
+        assert_eq!((back.layers[0].shapes[0].pin(), back.layers[0].strokes[0].pin), (42, 42));
+        assert_eq!(back.layers[0].shapes[1].pin(), 0);
+    }
+
+    #[test]
+    fn screenshots_draw_pins_where_the_overlay_does() {
+        let mut c = Canvas::default();
+        // A thick horizontal line, pinned and turned a quarter: on
+        // screen it stands upright through (50, 40..60).
+        c.layers[0].shapes.push(line(0.0));
+        let mut m = CanvasManager::for_tests(vec![c]);
+        let id = m.pin_objects(0, &[], &[0], [0.0, 0.0], false).unwrap();
+        {
+            let pin = m.pin_board().get_mut(id).unwrap();
+            pin.center = [50.0, 50.0];
+            pin.scale = 2.0;
+            pin.angle = std::f32::consts::FRAC_PI_2;
+        }
+        let mut pixmap = tiny_skia::Pixmap::new(100, 100).unwrap();
+        crate::canvas::render::render_pins(&mut pixmap.as_mut(), &m.pinned(), 1.0, None);
+        let alpha = |x: u32, y: u32| pixmap.pixel(x, y).unwrap().alpha();
+        assert!(alpha(50, 44) > 0 && alpha(50, 56) > 0, "drawn upright");
+        assert_eq!(alpha(42, 50), 0, "not where the unturned line would be");
+    }
+
+    #[test]
+    fn a_faded_or_hidden_layer_leaves_its_pins_showing() {
+        use crate::canvas::shape::RasterKind;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(Shape::Raster {
+            pos: [0.0, 0.0], size: [20.0, 20.0], png: std::sync::Arc::new(png.into_inner()), px_size: [4, 4],
+            color: [0; 4], rotation: 0.0, kind: RasterKind::Image, media: None, picture: None, pin: 0,
+        });
+        c.layers[0].opacity = 0.25;
+        let mut m = CanvasManager::for_tests(vec![c]);
+        let id = m.pin_objects(0, &[], &[0], [0.0, 0.0], false).unwrap();
+        m.pin_board().get_mut(id).unwrap().center = [50.0, 50.0];
+
+        // The slide itself draws the picture faded…
+        let mut slide = tiny_skia::Pixmap::new(100, 100).unwrap();
+        crate::canvas::render::render_canvas(&mut slide.as_mut(), m.active(), None, None, 1.0, None);
+        assert!(slide.pixel(10, 10).unwrap().alpha() < 128);
+        // …its pin does not.
+        let mut pinned = tiny_skia::Pixmap::new(100, 100).unwrap();
+        crate::canvas::render::render_pins(&mut pinned.as_mut(), &m.pinned(), 1.0, None);
+        assert_eq!(pinned.pixel(50, 50).unwrap().alpha(), 255);
+
+        // Faded all the way out, and hidden, the pin still shows and can
+        // be taken.
+        m.active_mut().layers[0].opacity = 0.0;
+        m.active_mut().layers[0].visible = false;
+        let mut pinned = tiny_skia::Pixmap::new(100, 100).unwrap();
+        crate::canvas::render::render_pins(&mut pinned.as_mut(), &m.pinned(), 1.0, None);
+        assert_eq!(pinned.pixel(50, 50).unwrap().alpha(), 255);
+        let mut tool = crate::canvas::pins::PinTool::default();
+        assert_eq!(tool.press([50.0, 50.0], &m.pinned()), crate::canvas::pins::Press::Took);
     }
 }

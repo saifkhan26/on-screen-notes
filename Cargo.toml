@@ -118,6 +118,11 @@ global-hotkey = "0.6"
 serde = { version = "1", features = ["derive", "rc"] }
 ron    = "0.8"
 
+# memchr = SIMD byte search. Finds the end of each picture's byte list
+# when reading a slide (`persistence::blobs`); already built for other
+# dependencies, so it adds nothing to the download.
+memchr = "2"
+
 # toml = hand-edited hotkeys file format. We pick TOML over YAML
 # because YAML's indent-significance is a constant footgun for hand-
 # edited config and `serde_yaml` was archived in 2024. TOML is the
@@ -215,6 +220,8 @@ opt-level = 3
 [profile.release.package.weezl]
 opt-level = 3
 [profile.release.package.png]
+opt-level = 3
+[profile.release.package.memchr]
 opt-level = 3
 
 # Dev profile keeps incremental compilation and debug info (faster edit-test

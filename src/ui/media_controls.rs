@@ -43,6 +43,32 @@ pub fn media_on_screen(canvas: &Canvas, canvas_rect: Rect) -> Vec<OnScreen> {
     out
 }
 
+/// Media objects shown in `pins`, bottom pin to top, placed on screen the
+/// way the renderer places them.
+pub fn pinned_media_on_screen(pins: &[crate::canvas::pins::Pinned], canvas_rect: Rect) -> Vec<OnScreen> {
+    let mut out = Vec::new();
+    for p in pins {
+        for m in p.members {
+            let crate::canvas::hit::ObjRef::Shape(i) = m.obj else { continue };
+            // A pin shows whatever its layer's visibility and opacity.
+            let Some(layer) = p.canvas.layers.get(m.layer) else { continue };
+            let Some(shape) = layer.shapes.get(i) else { continue };
+            let Some(media) = shape.media() else { continue };
+            let [x0, y0, x1, y1] = p.shape_obb(shape).aabb();
+            out.push(OnScreen { id: media.id, rect: Rect::from_min_max(canvas_rect.min + Vec2::new(x0, y0), canvas_rect.min + Vec2::new(x1, y1)) });
+        }
+    }
+    out
+}
+
+/// The video or GIF that pin `id` shows, when it shows that one object.
+pub fn pinned_media(pins: &[crate::canvas::pins::Pinned], id: u64) -> Option<u64> {
+    let p = pins.iter().find(|p| p.pin.id == id)?;
+    let [m] = p.members else { return None };
+    let crate::canvas::hit::ObjRef::Shape(i) = m.obj else { return None };
+    p.canvas.layers.get(m.layer)?.shapes.get(i)?.media().map(|media| media.id)
+}
+
 /// The media object selected on its own in the Select tool, if any.
 pub fn selected_media(canvas: &Canvas, sel: &crate::canvas::hit::Selection) -> Option<u64> {
     if sel.shapes.len() != 1 || !sel.strokes.is_empty() { return None; }
@@ -107,12 +133,21 @@ impl MediaUi {
         let mut out = MediaUiOut::default();
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         // Only the topmost object under the pointer counts.
-        let over = pointer.and_then(|p| objs.iter().rev().find(|o| o.rect.contains(p)).map(|o| o.id));
+        let topmost = pointer.and_then(|p| objs.iter().rposition(|o| o.rect.contains(p)));
+        let over = topmost.map(|k| objs[k].id);
         let scrubbing = self.scrubbing.take();
+        // One object can show twice — on its slide and in a pin — but it
+        // has one player, so one bar: by the showing under the pointer,
+        // else the topmost.
+        let mut showing: HashMap<u64, usize> = objs.iter().enumerate().map(|(k, o)| (o.id, k)).collect();
+        if let Some(k) = topmost {
+            showing.insert(objs[k].id, k);
+        }
 
         let mut drawn = HashMap::new();
         if show_bars {
-            for o in objs {
+            for (k, o) in objs.iter().enumerate() {
+                if showing.get(&o.id) != Some(&k) { continue; }
                 let on_bar = pointer
                     .zip(self.bar_rects.get(&o.id))
                     .is_some_and(|(p, bar)| bar.contains(p) || gap(o.rect, *bar).contains(p));

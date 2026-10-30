@@ -218,7 +218,11 @@ pub struct OnScreenNotesApp {
     media_ui: ui::media_controls::MediaUi,
     /// Media types the toolbar's filter highlights.
     media_filter: ui::media_filter::MediaFilter,
-    /// The slide panel (top-left): which slide is being named.
+    /// The Select tool's hold on pins (objects kept on screen, on their
+    /// own slide or on every slide):
+    /// which one is selected, and the move / resize / turn in flight.
+    pin_tool: crate::canvas::pins::PinTool,
+    /// The slide panel (bottom-left): which slide is being named.
     slide_panel: ui::slide_panel::SlidePanel,
     /// Files being copied in and read as videos / GIFs.
     media_imports: Vec<crate::media::import::ImportJob>,
@@ -236,6 +240,10 @@ pub struct OnScreenNotesApp {
     /// paste that finds it there pastes the objects instead. Set by the
     /// thread that builds it.
     clip_image: std::sync::Arc<std::sync::Mutex<Option<crate::clipboard::Fingerprint>>>,
+
+    /// Since when the slide-loading bar has had something to show, so a
+    /// quick load does not flash it.
+    progress_since: Option<Instant>,
 }
 
 /// How long after the pen was last used the pointer still counts as
@@ -273,6 +281,7 @@ enum SelAction {
     Delete,
     Duplicate,
     CopyToNewSlide,
+    TogglePin,
     ToFront,
     ToBack,
     Copy,
@@ -555,6 +564,7 @@ impl OnScreenNotesApp {
             media: crate::media::MediaHub::new(),
             media_ui: ui::media_controls::MediaUi::new(),
             media_filter: ui::media_filter::MediaFilter::default(),
+            pin_tool: Default::default(),
             slide_panel: Default::default(),
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
@@ -562,6 +572,7 @@ impl OnScreenNotesApp {
             pureref_jobs: Vec::new(),
             last_frame_at: None,
             clip_image: Default::default(),
+            progress_since: None,
         }
     }
 
@@ -573,6 +584,7 @@ impl OnScreenNotesApp {
         let res = if let Some(rect) = ps.region_rect {
             crate::screenshot::capture_region_and_save(
                 self.canvases.active(),
+                &self.canvases.pinned(),
                 &self.config,
                 ps.pixels_per_point,
                 self.osn_hwnd,
@@ -584,6 +596,7 @@ impl OnScreenNotesApp {
         } else {
             crate::screenshot::capture_and_save(
                 self.canvases.active(),
+                &self.canvases.pinned(),
                 &self.config,
                 ps.pixels_per_point,
                 self.osn_hwnd,
@@ -1021,6 +1034,7 @@ impl OnScreenNotesApp {
                     kind: crate::canvas::shape::RasterKind::Image,
                     media: None,
                     picture: None,
+                    pin: 0,
                 };
                 let c = self.canvases.active_mut();
                 c.add_shape(shape);
@@ -1065,9 +1079,14 @@ impl OnScreenNotesApp {
         offset: [f32; 2],
     ) {
         if strokes.is_empty() && shapes.is_empty() { return; }
-        for s in &mut strokes { s.translate(offset); }
+        // Copies are in no pin: a pin shows its own objects only.
+        for s in &mut strokes {
+            s.translate(offset);
+            s.pin = 0;
+        }
         for s in &mut shapes {
             s.translate(offset);
+            s.set_pin(0);
             // A copy of a video or GIF plays on its own.
             if let crate::canvas::shape::Shape::Raster { media: Some(m), .. } = s {
                 m.id = crate::canvas::shape::fresh_media_id();
@@ -1133,6 +1152,175 @@ impl OnScreenNotesApp {
         }
     }
 
+    /// Every selected object is in a pin.
+    fn selection_pinned(&self) -> bool {
+        let c = self.canvases.active();
+        let Some(layer) = c.layers.get(c.active_layer) else { return false };
+        let sel = &self.tool.select.sel;
+        !sel.is_empty()
+            && sel.strokes.iter().all(|&i| layer.strokes.get(i).is_some_and(|s| s.pin != 0))
+            && sel.shapes.iter().all(|&i| layer.shapes.get(i).is_some_and(|s| s.pin() != 0))
+    }
+
+    /// Pin the selection to every slide as one pin, or — when all of it
+    /// is pinned already — take it out of its pins. The new pin starts a
+    /// little off its objects, so it can be seen, and is selected, so it
+    /// can be dragged where it should stay; its bar can then keep it to
+    /// this slide.
+    fn toggle_pin_selection(&mut self) {
+        let sel = self.tool.select.sel.clone();
+        if self.tool.kind != crate::tools::ToolKind::Select || sel.is_empty() { return; }
+        let li = self.canvases.active().active_layer;
+        if self.selection_pinned() {
+            if self.canvases.unpin_objects(li, &sel.strokes, &sel.shapes) {
+                self.toast = Some(("Unpinned — the objects stay on this slide".to_string(), Instant::now()));
+            }
+        } else if let Some(id) = self.canvases.pin_objects(li, &sel.strokes, &sel.shapes, [24.0, 24.0], false) {
+            // A new pin must be seen to be placed.
+            self.canvases.set_pins_hidden(false);
+            self.tool.select.sel.clear();
+            self.tool.select.gesture = None;
+            self.pin_tool.selected = Some(id);
+            self.toast = Some(("Pinned to every slide — drag the pin where it should stay".to_string(), Instant::now()));
+        }
+    }
+
+    /// Show pin `id` on its own slide only (`local`), or on every slide.
+    /// Not an edit of any slide: only `pins.ron` is written.
+    fn set_pin_local(&mut self, id: u64, local: bool) {
+        let Some(slide) = self.canvases.pin_board().members(id).map(|(s, _)| s) else { return };
+        let Some(pin) = self.canvases.pin_board().get_mut(id) else { return };
+        if pin.local == local { return; }
+        pin.local = local;
+        let msg = match local {
+            false => "Pinned to every slide".to_string(),
+            true if slide == self.canvases.active_index() => "Pinned to this slide only".to_string(),
+            true => format!("Pinned to slide {} only", slide + 1),
+        };
+        self.toast = Some((msg, Instant::now()));
+    }
+
+    /// Hide every pin, or show them again. Hiding lets go of a selected
+    /// pin.
+    fn set_pins_hidden(&mut self, hidden: bool) {
+        if hidden == self.canvases.pins_hidden() { return; }
+        self.canvases.set_pins_hidden(hidden);
+        if hidden {
+            self.pin_tool.clear();
+        }
+        let msg = if hidden { "Pins hidden — Shift+P shows them again" } else { "Pins shown" };
+        self.toast = Some((msg.to_string(), Instant::now()));
+    }
+
+    /// Unpin the selected pin. Its objects stay on their slide, where the
+    /// unpin is an undo step.
+    fn unpin_selected_pin(&mut self) {
+        let Some(id) = self.pin_tool.selected else { return };
+        let slide = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| p.slide);
+        self.pin_tool.clear();
+        if self.canvases.unpin(id) {
+            let msg = match slide {
+                Some(s) if s != self.canvases.active_index() => format!("Unpinned — the objects stay on slide {}", s + 1),
+                _ => "Unpinned — the objects stay on this slide".to_string(),
+            };
+            self.toast = Some((msg, Instant::now()));
+        }
+    }
+
+    /// Go to the slide pin `id`'s objects are on, with them selected and
+    /// moved into the middle of the canvas area (`area` across). The zoom
+    /// stays as it was.
+    fn open_pin_slide(&mut self, id: u64, area: egui::Vec2) {
+        let found = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| (p.slide, p.members.to_vec(), p.anchor()));
+        let Some((slide, members, anchor)) = found else { return };
+        self.canvases.go_to(slide);
+        self.pin_tool.clear();
+        // Only the view moves, so the slide is not flagged for the autosave.
+        let (pan, zoom) = self.canvases.active_view_mut();
+        *pan = [area.x * 0.5 - anchor[0] * *zoom, area.y * 0.5 - anchor[1] * *zoom];
+        // A selection lives on one layer: that of the pin's first object.
+        let Some(li) = members.first().map(|m| m.layer) else { return };
+        let mut sel = crate::canvas::hit::Selection::default();
+        for m in members.iter().filter(|m| m.layer == li) {
+            sel.insert(m.obj);
+        }
+        // Only a real layer switch may flag the slide for the autosave.
+        if self.canvases.active().active_layer != li {
+            self.canvases.active_mut().active_layer = li;
+        }
+        self.tool.kind = crate::tools::ToolKind::Select;
+        self.tool.select.gesture = None;
+        self.tool.select.sel = sel;
+        self.tool.select.rebind(slide, self.canvases.active());
+        self.toast = Some((format!("Slide {} — the pin's objects are selected", slide + 1), Instant::now()));
+    }
+
+    /// Offer a pointer event to the pins. With the Select tool a press on
+    /// a pin is the pin's, and so is the rest of that gesture; `q` is in
+    /// points from the canvas area's top-left, `snap` turns in steps.
+    /// A pin let go of keeps its centre inside the canvas area (`area`
+    /// across), so it can always be grabbed again. Returns true when a
+    /// pin took the event, which the Select tool must then not see.
+    fn pin_pointer(&mut self, ev: crate::input::pen::PenEvent, q: [f32; 2], snap: bool, area: egui::Vec2) -> bool {
+        use crate::canvas::pins::Press;
+        use crate::input::pen::PenEvent;
+        match ev {
+            PenEvent::Down(_) => {
+                if self.tool.kind != crate::tools::ToolKind::Select { return false; }
+                let pinned = self.canvases.pinned();
+                let press = self.pin_tool.press(q, &pinned);
+                drop(pinned);
+                match press {
+                    Press::Missed => false,
+                    Press::Took => {
+                        if let Some(id) = self.pin_tool.selected {
+                            self.canvases.pin_board().raise(id);
+                        }
+                        // A pin and the slide's objects are never selected
+                        // together.
+                        self.tool.select.sel.clear();
+                        self.tool.select.gesture = None;
+                        true
+                    }
+                    Press::Open(id) => {
+                        self.open_pin_slide(id, area);
+                        true
+                    }
+                }
+            }
+            PenEvent::Move(_) | PenEvent::Up(_) if self.pin_tool.busy() => {
+                let board = self.canvases.pin_board();
+                if matches!(ev, PenEvent::Up(_)) {
+                    self.pin_tool.release(q, snap, board);
+                    if let Some(pin) = self.pin_tool.selected.and_then(|id| board.get_mut(id)) {
+                        pin.center = [pin.center[0].clamp(0.0, area.x.max(0.0)), pin.center[1].clamp(0.0, area.y.max(0.0))];
+                    }
+                } else {
+                    self.pin_tool.drag(q, snap, board);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The selected pin's bar: where its objects are, and buttons to go
+    /// there, show it on one slide or every slide, or unpin it.
+    fn show_pin_bar(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.pin_tool.selected else { return };
+        if !self.ui_visible || self.tool.kind != crate::tools::ToolKind::Select || self.pin_tool.dragging() { return; }
+        let Some((slide, local)) = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| (p.slide, p.pin.local)) else { return };
+        match ui::arrange_bar::show_pin(ctx, slide, slide == self.canvases.active_index(), local) {
+            Some(ui::arrange_bar::PinBarAction::Open) => {
+                let area = self.overlay_cache.canvas_rect(ctx).size();
+                self.open_pin_slide(id, area);
+            }
+            Some(ui::arrange_bar::PinBarAction::SetLocal(local)) => self.set_pin_local(id, local),
+            Some(ui::arrange_bar::PinBarAction::Unpin) => self.unpin_selected_pin(),
+            None => {}
+        }
+    }
+
     /// Run one Select-tool command against the current selection.
     fn apply_sel_action(&mut self, action: SelAction, canvas_rect: egui::Rect, pixels_per_point: f32) {
         // One nudge so a copy does not sit exactly on its original. Kept
@@ -1141,6 +1329,10 @@ impl OnScreenNotesApp {
         let sel = self.tool.select.sel.clone();
         let has_selection = self.tool.kind == crate::tools::ToolKind::Select && !sel.is_empty();
         match action {
+            // Deleting a selected pin unpins it; its objects stay.
+            SelAction::Delete if self.pin_tool.selected.is_some() => self.unpin_selected_pin(),
+            SelAction::TogglePin if has_selection => self.toggle_pin_selection(),
+            SelAction::TogglePin if self.pin_tool.selected.is_some() => self.unpin_selected_pin(),
             SelAction::Delete if has_selection => {
                 let c = self.canvases.active_mut();
                 let li = c.active_layer;
@@ -1282,6 +1474,7 @@ impl OnScreenNotesApp {
             kind: crate::canvas::shape::RasterKind::Image,
             media: None,
             picture: None,
+            pin: 0,
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
@@ -1374,6 +1567,9 @@ impl OnScreenNotesApp {
         for (path, at, name, result) in finished {
             use crate::media::import::ImportError;
             match result {
+                Ok(_) if self.canvases.is_locked(self.canvases.active_index()) => {
+                    self.toast = Some((format!("Not inserted: this slide is locked — {} unlocks it", self.lock_key()), Instant::now()));
+                }
                 Ok(imported) => {
                     self.insert_media(imported, at, canvas_rect, ctx.pixels_per_point());
                     self.toast = Some((format!("Inserted {name}"), Instant::now()));
@@ -1520,6 +1716,7 @@ impl OnScreenNotesApp {
             kind: crate::canvas::shape::RasterKind::Image,
             media: imported.media.map(Box::new),
             picture: None,
+            pin: 0,
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
     }
@@ -1547,6 +1744,134 @@ impl OnScreenNotesApp {
         }
         if let Some(t) = out.toast {
             self.toast = Some((t, Instant::now()));
+        }
+    }
+
+    /// How the lock key reads, for messages ("Ctrl+R" unless rebound).
+    fn lock_key(&self) -> String {
+        self.hotkeys_cfg.canvas.lock_slide.map_or_else(|| "its hotkey".into(), |b| b.label())
+    }
+
+    /// Whether the active slide takes an edit now. If not, a toast says
+    /// why: it is locked, or still opening.
+    fn may_edit(&mut self) -> bool {
+        if self.canvases.active_editable() {
+            return true;
+        }
+        let msg = if self.canvases.opening().is_some() {
+            "This slide is still opening".to_string()
+        } else {
+            format!("This slide is locked — {} unlocks it", self.lock_key())
+        };
+        self.toast = Some((msg, Instant::now()));
+        false
+    }
+
+    /// Lock the active slide against edits, or unlock it.
+    fn toggle_lock(&mut self) {
+        let i = self.canvases.active_index();
+        let locked = !self.canvases.is_locked(i);
+        self.canvases.set_locked(i, locked);
+        if locked {
+            // Nothing half-done carries on into the lock: a stroke or
+            // shape being drawn, a move, a layer drag.
+            self.tool.cancel();
+            self.eraser_override.cancel();
+            self.mouse_gesture = false;
+            self.pen_using_eraser = false;
+            self.pin_tool.clear();
+            self.layer_xform = None;
+            self.pan_drag_anchor = None;
+        }
+        let msg = if locked {
+            format!("Slide {} locked — drag to pan, wheel to zoom · {} unlocks", i + 1, self.lock_key())
+        } else {
+            format!("Slide {} unlocked", i + 1)
+        };
+        self.toast = Some((msg, Instant::now()));
+    }
+
+    /// While the active slide loads, a bar saying how far it has got:
+    /// its file first, then its pictures. On a locked slide, a badge
+    /// that unlocks it when clicked.
+    fn show_slide_status(&mut self, ctx: &egui::Context) {
+        let idx = self.canvases.active_index();
+        let work = match self.canvases.opening() {
+            Some((done, size)) => Some((format!("Opening slide {} · {}", idx + 1, size_label(size)), done)),
+            None => {
+                let (ready, all) = self.overlay_cache.pictures_shown();
+                (ready < all).then(|| (format!("Loading pictures · {ready} of {all}"), ready as f32 / all as f32))
+            }
+        };
+        match work {
+            Some(_) => {
+                self.progress_since.get_or_insert_with(Instant::now);
+            }
+            None => self.progress_since = None,
+        }
+        let work = work.filter(|_| self.progress_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(150)));
+        let locked = self.canvases.is_locked(idx) && self.ui_visible;
+        // Kept out of screenshots and captures like the rest of the chrome.
+        let capturing = self.pending_screenshot.is_some()
+            || self.pending_freeze.is_some()
+            || self.pending_lasso.is_some()
+            || self.region_select.is_some();
+        if capturing || (work.is_none() && !locked) {
+            return;
+        }
+        // Under the toolbar while it shows.
+        let toolbar = ctx.memory(|m| m.area_rect(egui::Id::new("osn_toolbar")));
+        let top = toolbar.filter(|_| self.ui_visible).map_or(12.0, |r| r.max.y + 8.0);
+        let key = self.lock_key();
+        let mut unlock = false;
+        egui::Area::new(egui::Id::new("osn_slide_status"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, top))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    let card = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+                        egui::Frame::none()
+                            .fill(ui::theme::GLASS_FILL)
+                            .rounding(8.0)
+                            .shadow(ui::theme::card_shadow())
+                            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                            .show(ui, |ui| add(ui))
+                            .response
+                    };
+                    if locked {
+                        let r = card(ui, &mut |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let icon = egui::Image::new(egui::include_image!("../assets/icons/lock.svg"))
+                                    .tint(ui::theme::TEXT_PRIMARY)
+                                    .fit_to_exact_size(egui::vec2(14.0, 14.0));
+                                ui.add(icon);
+                                ui.label(egui::RichText::new("Locked").color(ui::theme::TEXT_PRIMARY));
+                                ui.label(egui::RichText::new("pan and zoom only").small().color(ui::theme::TEXT_MUTED));
+                            });
+                        });
+                        let r = ui.interact(r.rect, egui::Id::new("osn_unlock_badge"), egui::Sense::click());
+                        if r.hovered() {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if r.on_hover_text(format!("Click or press {key} to unlock")).clicked() {
+                            unlock = true;
+                        }
+                    }
+                    if let Some((label, done)) = &work {
+                        card(ui, &mut |ui| {
+                            ui.label(egui::RichText::new(label.as_str()).small().color(ui::theme::TEXT_PRIMARY));
+                            let (bar, _) = ui.allocate_exact_size(egui::vec2(240.0, 4.0), egui::Sense::hover());
+                            let p = ui.painter();
+                            p.rect_filled(bar, 2.0, egui::Color32::from_white_alpha(28));
+                            let filled = egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * done.clamp(0.0, 1.0), bar.height()));
+                            p.rect_filled(filled, 2.0, egui::Color32::from_rgb(86, 160, 255));
+                        });
+                    }
+                });
+            });
+        if unlock {
+            self.toggle_lock();
         }
     }
 
@@ -1670,6 +1995,9 @@ impl eframe::App for OnScreenNotesApp {
         // so on screen rather than only in the log (reported once every
         // slide is in).
         self.canvases.poll_loads();
+        let stored = self.canvases.store_pictures();
+        self.overlay_cache.carry_pictures(&stored);
+        self.canvases.refresh_pins();
         let errs = self.canvases.take_load_errors();
         if !errs.is_empty() {
             let msg = match errs.len() {
@@ -1879,9 +2207,12 @@ impl eframe::App for OnScreenNotesApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
             }
         }
-        // Esc also closes the layer-preview popup.
+        // Esc also closes the layer-preview popup, and lets go of a pin.
         if self.show_layer_preview && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.show_layer_preview = false;
+        }
+        if self.pin_tool.selected.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.pin_tool.clear();
         }
         if self.pin_picking {
             // Force click-through so the visible click lands on the
@@ -1980,16 +2311,28 @@ impl eframe::App for OnScreenNotesApp {
             // this frame reads it: it is dropped the moment the tool,
             // the slide, the layer or the layer's object count changes
             // underneath it.
+            // A locked slide, or one still opening, keeps no selection.
             self.tool.select.sync(
-                self.tool.kind == crate::tools::ToolKind::Select,
+                self.tool.kind == crate::tools::ToolKind::Select && self.canvases.active_editable(),
                 self.canvases.active_index(),
                 self.canvases.active(),
             );
             self.tool.lasso.sync(self.tool.kind, self.canvases.active_index());
+            // Pins are picked with the Select tool: leaving it lets go of
+            // the pin, and so does unpinning it some other way (an undo).
+            if self.tool.kind != crate::tools::ToolKind::Select || !self.canvases.active_editable() {
+                self.pin_tool.clear();
+            } else if let Some(id) = self.pin_tool.selected {
+                if !self.canvases.pinned().iter().any(|p| p.pin.id == id) {
+                    self.pin_tool.clear();
+                }
+            }
             let (prev_color, prev_size) = (self.tool.color, self.tool.size);
             let mut insert_media = false;
             let mut select_filtered = false;
             let media_counts = ui::media_filter::counts(self.canvases.active());
+            let mut pins_hidden = self.canvases.pins_hidden();
+            let has_pins = self.canvases.has_pins();
             let toolbar_clicked = if self.ui_visible {
                 ui::toolbar::show(
                     ctx,
@@ -2006,10 +2349,12 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.media_filter,
                     media_counts,
                     &mut select_filtered,
+                    has_pins.then_some(&mut pins_hidden),
                 )
             } else {
                 false
             };
+            self.set_pins_hidden(pins_hidden);
             // Recently-used slide history: the active slide counts as
             // visited, and letting go of Ctrl ends a Ctrl+Tab walk.
             if !ctx.input(|i| interaction::slide_walk_held(i.modifiers, &self.hotkeys_cfg)) {
@@ -2020,29 +2365,32 @@ impl eframe::App for OnScreenNotesApp {
             // keys, where the arrow keys switch slides too: everything
             // drawn before then still belongs to the current slide.
             let slides = if self.ui_visible {
-                // Below the REC badge while it shows in the same corner.
+                // No higher than the REC badge (top-left) while it shows.
                 let top = if self.recorder.is_recording() { 44.0 } else { 10.0 };
                 ui::slide_panel::show(ctx, &mut self.slide_panel, &mut self.config, top, &self.canvases)
             } else {
                 Default::default()
             };
-            if select_filtered {
+            if select_filtered && self.may_edit() {
                 self.select_media_matches();
             }
-            // Arrange bar for a selection of two or more objects; hidden
-            // mid-gesture so it doesn't flicker over a drag.
+            // Arrange bar for a selection (only its copy and pin buttons
+            // for a single object); hidden mid-gesture so it doesn't
+            // flicker over a drag. A selected pin gets its own bar there.
             let selected_count = self.tool.select.sel.strokes.len() + self.tool.select.sel.shapes.len();
             if self.ui_visible
                 && self.tool.kind == crate::tools::ToolKind::Select
-                && selected_count >= 2
+                && selected_count >= 1
                 && self.tool.select.gesture.is_none()
             {
-                match ui::arrange_bar::show(ctx, selected_count) {
+                match ui::arrange_bar::show(ctx, selected_count, self.selection_pinned()) {
                     Some(ui::arrange_bar::BarAction::Arrange(op)) => self.arrange_selection(op),
                     Some(ui::arrange_bar::BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
+                    Some(ui::arrange_bar::BarAction::TogglePin) => self.toggle_pin_selection(),
                     None => {}
                 }
             }
+            self.show_pin_bar(ctx);
             if insert_media && self.media_dialog.is_none() {
                 let mut exts = vec!["gif"];
                 exts.extend_from_slice(crate::media::import::VIDEO_EXTS);
@@ -2090,7 +2438,7 @@ impl eframe::App for OnScreenNotesApp {
             // Advance video / GIF playback and upload new frames before
             // the canvas paints them.
             let view = self.overlay_cache.canvas_rect(ctx);
-            self.media.sync(ctx, self.canvases.active(), ctx.pixels_per_point(), view);
+            self.media.sync(ctx, self.canvases.active(), &self.canvases.pinned(), ctx.pixels_per_point(), view);
             // Selection handles must stay out of anything that grabs the
             // screen.
             let show_selection = self.pending_screenshot.is_none()
@@ -2109,6 +2457,10 @@ impl eframe::App for OnScreenNotesApp {
                 show_selection,
                 &self.media,
                 self.media_filter,
+                ui::overlay::PinMarks {
+                    selected: self.pin_tool.selected,
+                    outlines: self.ui_visible && self.tool.kind == crate::tools::ToolKind::Select,
+                },
             );
 
             // ---- Videos & GIFs ------------------------------------------
@@ -2116,18 +2468,23 @@ impl eframe::App for OnScreenNotesApp {
             // then the playback bars. Drawn before the pen dispatch below
             // so a tap on a bar counts as UI, never as ink.
             self.poll_media_inputs(ctx, canvas_rect);
-            let media_objs = ui::media_controls::media_on_screen(self.canvases.active(), canvas_rect);
+            let mut media_objs = ui::media_controls::media_on_screen(self.canvases.active(), canvas_rect);
+            let pinned = self.canvases.pinned();
+            media_objs.extend(ui::media_controls::pinned_media_on_screen(&pinned, canvas_rect));
             let media_selected = if self.tool.kind == crate::tools::ToolKind::Select {
                 ui::media_controls::selected_media(self.canvases.active(), &self.tool.select.sel)
+                    .or_else(|| self.pin_tool.selected.and_then(|id| ui::media_controls::pinned_media(&pinned, id)))
             } else {
                 None
             };
+            drop(pinned);
             let show_media_bars = self.ui_visible
                 && show_selection
                 && !click_through_now
                 && !self.recorder.is_recording()
                 && self.tool.in_progress_stroke.is_none()
-                && self.tool.select.gesture.is_none();
+                && self.tool.select.gesture.is_none()
+                && !self.pin_tool.dragging();
             let mut media_out =
                 self.media_ui.show(ctx, &self.media, &media_objs, media_selected, canvas_rect, show_media_bars);
             self.media_ui.ffmpeg_window(ctx, self.osn_hwnd, &mut media_out);
@@ -2153,18 +2510,34 @@ impl eframe::App for OnScreenNotesApp {
             //      via the polled Wintab queue. So we route them explicitly.
             //   2. Mouse / trackpad via egui's pointer state. Used when
             //      there is no tablet (mouse fallback path).
-            if space_held {
+            //
+            // On a slide that takes no edits (locked, or still opening) a
+            // plain drag pans too. The laser and the spotlight still work
+            // on a locked slide: they never change it.
+            let editable = self.canvases.active_editable();
+            let passive_tool = matches!(self.tool.kind, crate::tools::ToolKind::Laser | crate::tools::ToolKind::Spotlight);
+            let drag_pans = space_held || (!editable && !(passive_tool && self.canvases.opening().is_none()));
+            let pen_owns_pointer = !pen_events.is_empty()
+                || self.pen.is_down()
+                || self.pen.used_within(PEN_OWNS_POINTER);
+            if drag_pans {
                 // Holding Shift as well retargets the drag from the
                 // viewport to the *active layer*: its ink slides while
                 // every other layer stays nailed down. The mode is
                 // latched at pointer-down by `begin_pan_gesture`, so
                 // this per-frame read only drives the cursor hint.
-                let layer_mode = ctx.input(|i| i.modifiers.shift);
-                ctx.set_cursor_icon(if layer_mode || self.layer_xform.is_some() {
-                    egui::CursorIcon::Move
-                } else {
-                    egui::CursorIcon::Grabbing
-                });
+                let layer_mode = ctx.input(|i| i.modifiers.shift) && editable;
+                // Without Space it is the slide's own drag: an open hand
+                // until it grabs, and the arrow over the toolbar.
+                let over_ui = |p: egui::Pos2| ctx.layer_id_at(p).is_some_and(|l| l.order > egui::Order::Background);
+                let hover_ui = ctx.input(|i| i.pointer.hover_pos()).is_some_and(over_ui);
+                if layer_mode || self.layer_xform.is_some() {
+                    ctx.set_cursor_icon(egui::CursorIcon::Move);
+                } else if space_held || self.pan_drag_anchor.is_some() {
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                } else if !hover_ui {
+                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                }
 
                 use crate::input::pen::PenEvent;
                 let mut had_pen = false;
@@ -2178,16 +2551,33 @@ impl eframe::App for OnScreenNotesApp {
                     let here = egui::pos2(s.pos[0], s.pos[1]);
                     match ev {
                         PenEvent::Down(_) => {
+                            // A tap on the toolbar, or on another app's
+                            // window over ours, is not a pan.
+                            let elsewhere = {
+                                let w = crate::platform::top_level_window_at(client_origin[0] + s.pos[0] as i32, client_origin[1] + s.pos[1] as i32);
+                                w != 0 && w != self.osn_hwnd
+                            };
+                            if over_ui(here) || elsewhere {
+                                self.pen_blocked = true;
+                                continue;
+                            }
+                            self.pen_blocked = false;
                             self.begin_pan_gesture(layer_mode);
                             self.pan_drag_anchor = Some(here);
                         }
                         PenEvent::Move(_) => {
+                            if self.pen_blocked {
+                                continue;
+                            }
                             if let Some(anchor) = self.pan_drag_anchor {
                                 self.apply_pan_delta(here.x - anchor.x, here.y - anchor.y);
                             }
                             self.pan_drag_anchor = Some(here);
                         }
                         PenEvent::Up(_) => {
+                            if std::mem::take(&mut self.pen_blocked) {
+                                continue;
+                            }
                             // Only a real drag ends here. A wheel-only
                             // layer zoom stays open until Space is
                             // released, so a stray pen tap mid-zoom
@@ -2205,10 +2595,13 @@ impl eframe::App for OnScreenNotesApp {
                 // state is read out of `ctx.input` first and acted on
                 // afterwards, so no canvas mutation happens while egui's
                 // input lock is held.
-                if !had_pen {
-                    let (primary, cursor) = ctx.input(|i| {
+                // Without Space, the mouse pans only when the pen is not the
+                // one moving it (the tablet driver presses the button too).
+                if !had_pen && (space_held || !pen_owns_pointer) {
+                    let (primary, pressed, cursor) = ctx.input(|i| {
                         (
                             i.pointer.primary_down(),
+                            i.pointer.primary_pressed(),
                             i.pointer
                                 .hover_pos()
                                 .or(i.pointer.interact_pos())
@@ -2217,13 +2610,20 @@ impl eframe::App for OnScreenNotesApp {
                     });
                     if primary {
                         if let Some(p) = cursor {
+                            // Without Space a drag starts only with a press
+                            // here on the slide: one on the toolbar, or
+                            // held since before, is not a pan.
+                            let may_start = space_held || (pressed && !toolbar_clicked && !over_ui(p));
                             match self.pan_drag_anchor {
                                 Some(anchor) => self.apply_pan_delta(p.x - anchor.x, p.y - anchor.y),
                                 // No anchor yet: the button just went
                                 // down, so this is the gesture start.
-                                None => self.begin_pan_gesture(layer_mode),
+                                None if may_start => self.begin_pan_gesture(layer_mode),
+                                None => {}
                             }
-                            self.pan_drag_anchor = Some(p);
+                            if self.pan_drag_anchor.is_some() || may_start {
+                                self.pan_drag_anchor = Some(p);
+                            }
                         }
                     } else if self.pan_drag_anchor.take().is_some() {
                         // Button-up ends a drag; same reasoning as the
@@ -2282,7 +2682,16 @@ impl eframe::App for OnScreenNotesApp {
                             ((p.x - canvas_rect.min.x) - c.pan[0]) / c.zoom,
                             ((p.y - canvas_rect.min.y) - c.pan[1]) / c.zoom,
                         ];
-                        if let Some(icon) = select_cursor(&self.tool.select, local, c) {
+                        // Pins sit on top, so they answer first — unless
+                        // the slide's own objects are being dragged.
+                        let q = [p.x - canvas_rect.min.x, p.y - canvas_rect.min.y];
+                        let icon = if self.tool.select.gesture.is_some() {
+                            select_cursor(&self.tool.select, local, c)
+                        } else {
+                            pin_cursor(&self.pin_tool, q, &self.canvases.pinned())
+                                .or_else(|| select_cursor(&self.tool.select, local, c))
+                        };
+                        if let Some(icon) = icon {
                             ctx.set_cursor_icon(icon);
                         }
                     }
@@ -2310,10 +2719,12 @@ impl eframe::App for OnScreenNotesApp {
             if !pen_events.is_empty() && self.mouse_gesture {
                 self.tool.cancel();
                 self.eraser_override.cancel();
+                // One tap, not two presses: no double-click.
+                self.pin_tool.forget_press();
                 self.mouse_gesture = false;
                 self.pen_using_eraser = false;
             }
-            if !space_held && self.loupe.is_none() && self.region_select.is_none() {
+            if !drag_pans && self.loupe.is_none() && self.region_select.is_none() {
                 // Mirror the current tool's size onto the eraser
                 // override so the temporary erase uses the same brush
                 // size as the active pen — feels natural while letting
@@ -2405,7 +2816,7 @@ impl eframe::App for OnScreenNotesApp {
                             // this gesture: if Ctrl was held at Down,
                             // route every Move + Up to the eraser
                             // override regardless of Ctrl state later.
-                            self.pen_using_eraser = ctrl_held && !select_active;
+                            self.pen_using_eraser = ctrl_held && !select_active && editable;
                         }
                         PenEvent::Move(_) => {
                             if self.pen_blocked || self.pen_picking { continue; }
@@ -2420,6 +2831,11 @@ impl eframe::App for OnScreenNotesApp {
                                 continue;
                             }
                         }
+                    }
+                    // Pins sit over the slide; see `pin_pointer`.
+                    let q = [s.pos[0] - canvas_rect.min.x, s.pos[1] - canvas_rect.min.y];
+                    if editable && !self.pen_using_eraser && self.pin_pointer(*ev, q, shift_held, canvas_rect.size()) {
+                        continue;
                     }
                     let dispatched = transform_pen_event(*ev, canvas_rect, self.canvases.active());
                     let target_tool: &mut ActiveTool = if self.pen_using_eraser {
@@ -2444,10 +2860,7 @@ impl eframe::App for OnScreenNotesApp {
             // events must be ignored or every pen stroke would be drawn
             // twice. With the pen out of range — or no tablet at all —
             // the mouse has the canvas to itself.
-            let pen_owns_pointer = !pen_events.is_empty()
-                || self.pen.is_down()
-                || self.pen.used_within(PEN_OWNS_POINTER);
-            if !space_held && !pen_owns_pointer && !click_through_now
+            if !drag_pans && !pen_owns_pointer && !click_through_now
                 && self.region_select.is_none() && self.loupe.is_none()
             {
                 let (shift_held, ctrl_held, primary_now, cursor) = ctx.input(|i| {
@@ -2517,16 +2930,20 @@ impl eframe::App for OnScreenNotesApp {
                                 // keyboard shortcuts flowing here, and
                                 // let Ctrl turn this drag into an erase.
                                 crate::platform::reclaim_foreground(self.osn_hwnd);
-                                self.pen_using_eraser = ctrl_held && !select_active;
+                                self.pen_using_eraser = ctrl_held && !select_active && editable;
                             }
                         }
                         if self.mouse_gesture {
-                            let target_tool: &mut ActiveTool = if self.pen_using_eraser {
-                                &mut self.eraser_override
-                            } else {
-                                &mut self.tool
-                            };
-                            self.canvases.edit_active(|c| crate::input::pen::dispatch(ev, target_tool, c));
+                            // Pins sit over the slide; see `pin_pointer`.
+                            let to_pin = editable && !self.pen_using_eraser && self.pin_pointer(ev, cursor_screen, shift_held, canvas_rect.size());
+                            if !to_pin {
+                                let target_tool: &mut ActiveTool = if self.pen_using_eraser {
+                                    &mut self.eraser_override
+                                } else {
+                                    &mut self.tool
+                                };
+                                self.canvases.edit_active(|c| crate::input::pen::dispatch(ev, target_tool, c));
+                            }
                             if matches!(ev, PenEvent::Up(_)) {
                                 self.mouse_gesture = false;
                                 self.pen_using_eraser = false;
@@ -2589,7 +3006,7 @@ impl eframe::App for OnScreenNotesApp {
             // The Fill tool's pen-down arms `tool.pending_fill_at`; we
             // run the actual flood here so it has access to the
             // viewport size + DPI.
-            if let Some(p) = self.tool.pending_fill_at.take() {
+            if let Some(p) = self.tool.pending_fill_at.take().filter(|_| self.canvases.active_editable()) {
                 let viewport = [canvas_rect.width(), canvas_rect.height()];
                 let ppp = ctx.pixels_per_point();
                 let result = crate::flood_fill::flood_fill_active(
@@ -2618,7 +3035,7 @@ impl eframe::App for OnScreenNotesApp {
             // run the (chrome-hidden) screen capture here where the HWND +
             // DPI are available, then insert the masked region as a bottom
             // image layer.
-            if let Some(poly) = self.tool.pending_lasso_capture.take() {
+            if let Some(poly) = self.tool.pending_lasso_capture.take().filter(|_| self.canvases.active_editable()) {
                 self.queue_lasso_capture(poly, ctx.pixels_per_point());
             }
 
@@ -2641,7 +3058,7 @@ impl eframe::App for OnScreenNotesApp {
             // lands in the undo history like any other move.
             if let Some(b) = self.hotkeys_cfg.canvas.reset_layer_pos {
                 let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) && self.may_edit() {
                     let c = self.canvases.active_mut();
                     let li = c.active_layer;
                     if let Some(m) = c.layers.get(li).map(|l| l.moved_by) {
@@ -2659,7 +3076,7 @@ impl eframe::App for OnScreenNotesApp {
             // original coordinates exactly.
             if let Some(b) = self.hotkeys_cfg.canvas.reset_layer_zoom {
                 let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) && self.may_edit() {
                     let c = self.canvases.active_mut();
                     let li = c.active_layer;
                     if let Some(layer) = c.layers.get(li) {
@@ -2684,7 +3101,7 @@ impl eframe::App for OnScreenNotesApp {
             }
             if let Some(b) = self.hotkeys_cfg.canvas.freeze_frame {
                 let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+                if !slides.typing && ctx.input_mut(|i| i.consume_shortcut(&sc)) && self.may_edit() {
                     self.queue_freeze(ctx.pixels_per_point());
                 }
             }
@@ -2705,8 +3122,15 @@ impl eframe::App for OnScreenNotesApp {
             // a text field has the keyboard.
             let mut media_keys: Vec<crate::media::Cmd> = Vec::new();
             let media_keys_live = !ctx.wants_keyboard_input();
-            // F2 (name the active slide), applied after the input closure.
+            // Shift+P, applied after the input closure.
+            let mut toggle_pins = false;
+            // F2 (name the active slide), likewise.
             let mut rename_slide = false;
+            // Ctrl+R (lock or unlock it), likewise.
+            let mut toggle_lock = false;
+            // An edit key on a slide that takes no edits, to say why
+            // nothing happened.
+            let mut refused = false;
 
             ctx.input(|i| {
                 let mods = i.modifiers;
@@ -2753,6 +3177,8 @@ impl eframe::App for OnScreenNotesApp {
                                 sel_actions.push(SelAction::Duplicate);
                             } else if hit(c.copy_to_new_slide) {
                                 sel_actions.push(SelAction::CopyToNewSlide);
+                            } else if hit(c.pin_selection) {
+                                sel_actions.push(SelAction::TogglePin);
                             } else if hit(c.bring_front) {
                                 sel_actions.push(SelAction::ToFront);
                             } else if hit(c.send_back) {
@@ -2774,19 +3200,44 @@ impl eframe::App for OnScreenNotesApp {
                         // Tool switch shortcuts.
                         interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
                         // Every key passes through here: only an edit may
-                        // flag the slide for the autosave.
-                        self.canvases.edit_active(|c| interaction::react_lasso_keys(*key, mods, &mut self.tool, c));
-                        // Canvas + layer navigation.
+                        // flag the slide for the autosave. Checked per key:
+                        // the one before may have gone to another slide.
+                        let editable = self.canvases.active_editable();
+                        if editable {
+                            self.canvases.edit_active(|c| interaction::react_lasso_keys(*key, mods, &mut self.tool, c));
+                        }
+                        // Canvas + layer navigation. A slide's active layer is
+                        // part of it, so it stays put on a locked slide.
                         interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys, self.config.slide_tab_order);
-                        interaction::react_layer_nav (*key, mods, &mut self.canvases, keys);
+                        if editable {
+                            interaction::react_layer_nav(*key, mods, &mut self.canvases, keys);
+                        }
                         // Toggle floating UI chrome.
                         if let Some(b) = keys.canvas.toggle_ui {
                             if b.matches(*key, mods) {
                                 self.ui_visible = !self.ui_visible;
                             }
                         }
+                        if keys.canvas.toggle_pins.is_some_and(|b| b.matches(*key, mods)) {
+                            toggle_pins = !toggle_pins;
+                        }
                         if keys.canvas.rename_slide.is_some_and(|b| b.matches(*key, mods)) {
                             rename_slide = true;
+                        }
+                        if keys.canvas.lock_slide.is_some_and(|b| b.matches(*key, mods)) {
+                            toggle_lock = !toggle_lock;
+                        }
+                        // Undo, redo, clear, delete the slide and the layer
+                        // opacity keys all edit the slide.
+                        let kc = &keys.canvas;
+                        let edit_key = [kc.undo, kc.redo, kc.clear_layer, kc.delete_canvas, kc.opacity_dec, kc.opacity_inc]
+                            .into_iter()
+                            .chain(kc.opacity)
+                            .flatten()
+                            .any(|b| b.matches(*key, mods));
+                        if !editable && edit_key {
+                            refused = true;
+                            continue;
                         }
                         // Undo / redo / clear / delete-canvas.
                         if let Some(b) = keys.canvas.undo {
@@ -2888,7 +3339,7 @@ impl eframe::App for OnScreenNotesApp {
                         if notches != 0 {
                             l.zoom = (l.zoom + notches as f32 * 0.25).clamp(1.5, 12.0);
                         }
-                    } else if space_held && shift {
+                    } else if space_held && shift && self.canvases.active_editable() {
                         // Shift+Space + wheel zooms the *active layer*
                         // about the cursor — the wheel counterpart of
                         // the Shift+Space drag that pans it. Same
@@ -2936,8 +3387,22 @@ impl eframe::App for OnScreenNotesApp {
             if !sel_actions.is_empty() {
                 let ppp = ctx.pixels_per_point();
                 for action in sel_actions {
+                    // Copying changes nothing here; the rest wait for a
+                    // slide that takes edits.
+                    if !matches!(action, SelAction::Copy | SelAction::CopyToNewSlide) && !self.may_edit() {
+                        continue;
+                    }
                     self.apply_sel_action(action, canvas_rect, ppp);
                 }
+            }
+            if toggle_lock {
+                self.toggle_lock();
+            }
+            if refused {
+                self.may_edit();
+            }
+            if toggle_pins {
+                self.set_pins_hidden(!self.canvases.pins_hidden());
             }
             match slides.action {
                 Some(ui::slide_panel::SlideAction::GoTo(i)) => self.canvases.go_to(i),
@@ -2963,16 +3428,9 @@ impl eframe::App for OnScreenNotesApp {
                 }
             }
 
-            // ---- Status badge + layer panel ------------------------------
-            // Both hide when the master UI toggle is off.
+            // ---- Layer panel ---------------------------------------------
+            // Hidden when the master UI toggle is off.
             if self.ui_visible {
-                ui::status::show(
-                    ctx,
-                    self.canvases.active_index(),
-                    self.canvases.count(),
-                    click_through_now,
-                    self.pen.is_active(),
-                );
                 let canvas_idx = self.canvases.active_index();
                 // Pass the manager, not `active_mut()`: taking the mutable
                 // canvas borrow every frame just to paint would flag it
@@ -3113,6 +3571,11 @@ impl eframe::App for OnScreenNotesApp {
             }
         }
 
+        // ---- Slide loading bar + lock badge ------------------------------
+        if self.overlay_visible {
+            self.show_slide_status(ctx);
+        }
+
         // ---- Laser-stroke pruning ----------------------------------------
         // Drop laser strokes whose fade has run out. The render path
         // skips strokes with alpha <= 0 already, but holding onto them
@@ -3195,6 +3658,15 @@ impl eframe::App for OnScreenNotesApp {
     }
 }
 
+/// A file size for the user: "1.3 GB", "540 MB".
+fn size_label(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 10 << 20 => format!("{} MB", b >> 20),
+        b => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+    }
+}
+
 /// Transform a `PenEvent` whose sample is in *window-client* pixels into one
 /// whose sample is in *canvas-local* coordinates by:
 ///   1. Subtracting the canvas rect's top-left to get canvas-rect-relative.
@@ -3228,6 +3700,49 @@ fn transform_pen_event(
 }
 
 
+/// Nearest of the four resize cursors to the on-screen direction
+/// (radians, y down) a handle pulls in, which follows a turned frame.
+fn resize_cursor(direction: f32) -> egui::CursorIcon {
+    use egui::CursorIcon as C;
+    let deg = direction.to_degrees().rem_euclid(180.0);
+    if !(22.5..157.5).contains(&deg) {
+        C::ResizeHorizontal
+    } else if deg < 67.5 {
+        C::ResizeNwSe
+    } else if deg < 112.5 {
+        C::ResizeVertical
+    } else {
+        C::ResizeNeSw
+    }
+}
+
+/// Cursor for the Select tool over pins: what a press at `q` (points
+/// from the canvas area's top-left) would grab, or what the pin gesture
+/// in flight is doing. `None` when the pointer is over no pin.
+fn pin_cursor(
+    tool: &crate::canvas::pins::PinTool,
+    q: [f32; 2],
+    pins: &[crate::canvas::pins::Pinned],
+) -> Option<egui::CursorIcon> {
+    use crate::canvas::pins::PinHandle;
+    use egui::CursorIcon as C;
+    let corner = |x: i8, y: i8| {
+        let frame = tool.selected.and_then(|id| pins.iter().find(|p| p.pin.id == id)).map(|p| p.frame());
+        resize_cursor(frame.map_or(0.0, |f| (y as f32 * f.half[1]).atan2(x as f32 * f.half[0]) + f.angle))
+    };
+    if tool.busy() {
+        return Some(match tool.active_handle() {
+            Some(PinHandle::Corner { x, y }) => corner(x, y),
+            _ => C::Grabbing,
+        });
+    }
+    match tool.hover(q, pins)? {
+        Some(PinHandle::Corner { x, y }) => Some(corner(x, y)),
+        Some(PinHandle::Rotate) => Some(C::Grab),
+        None => Some(C::Move),
+    }
+}
+
 /// Cursor for the Select tool with the pointer at canvas point `p`: it
 /// previews what a press there would do (or shows what the gesture in
 /// flight is doing). `None` leaves the default arrow.
@@ -3238,20 +3753,7 @@ fn select_cursor(
 ) -> Option<egui::CursorIcon> {
     use crate::tools::select_tool::{Gesture, Handle, Hover};
     use egui::CursorIcon as C;
-    // Nearest of the four resize cursors to the direction the handle
-    // actually pulls in, which follows the frame when it is turned.
-    let resize = |x: i8, y: i8| {
-        let deg = state.handle_direction(x, y, canvas).to_degrees().rem_euclid(180.0);
-        if !(22.5..157.5).contains(&deg) {
-            C::ResizeHorizontal
-        } else if deg < 67.5 {
-            C::ResizeNwSe
-        } else if deg < 112.5 {
-            C::ResizeVertical
-        } else {
-            C::ResizeNeSw
-        }
-    };
+    let resize = |x: i8, y: i8| resize_cursor(state.handle_direction(x, y, canvas));
     match state.gesture {
         Some(Gesture::Move { .. }) | Some(Gesture::Rotate { .. }) => Some(C::Grabbing),
         Some(Gesture::Resize { x, y, .. }) => Some(resize(x, y)),

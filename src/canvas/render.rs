@@ -28,8 +28,9 @@
 
 use crate::canvas::affine::Affine;
 use crate::canvas::canvas::Canvas;
-use crate::canvas::hit::Selection;
+use crate::canvas::hit::{ObjRef, Selection};
 use crate::canvas::ink_gpu;
+use crate::canvas::pins::PinMember;
 use crate::canvas::shape::{BorderStyle, Shape};
 use crate::canvas::stroke::{Stroke, StrokeStyle};
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -325,6 +326,69 @@ pub fn paint_canvas_egui(
     }
 }
 
+/// Paint a pin (see `canvas::pins`): objects `members` of `canvas`,
+/// turned and moved by the rigid `m`, then scaled by `scale` about
+/// `origin`. A layer's visibility and opacity are not the pin's: hiding
+/// or fading a layer on its slide leaves its pinned objects showing as
+/// they are. `textures[k]` is the picture of `members[k]` when that is
+/// a raster.
+pub fn paint_pinned(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    canvas: &Canvas,
+    members: &[PinMember],
+    m: Affine,
+    scale: f32,
+    position_passes: usize,
+    textures: &[Option<egui::TextureId>],
+) {
+    let to_screen = |p: [f32; 2]| egui::pos2(origin.x + p[0] * scale, origin.y + p[1] * scale);
+    for (k, member) in members.iter().enumerate() {
+        let Some(layer) = canvas.layers.get(member.layer) else { continue };
+        match member.obj {
+            ObjRef::Shape(i) => {
+                let Some(shape) = layer.shapes.get(i) else { continue };
+                // Rotation and extents are stored fields, so a turned
+                // copy is painted (cheap: a raster shares its PNG).
+                let mut placed = shape.clone();
+                placed.apply_affine(&m);
+                paint_shape(painter, &to_screen, &placed, scale, 1.0, textures.get(k).copied().flatten());
+            }
+            ObjRef::Stroke(i) => {
+                let Some(stroke) = layer.strokes.get(i) else { continue };
+                let mut sink = RigidSink { m, inner: PainterSink { painter, to_screen: &to_screen, zoom: scale } };
+                emit_stroke(&mut sink, stroke, scale, position_passes, 1.0);
+            }
+        }
+    }
+}
+
+/// Passes ink to `inner` with every point moved by the rigid `m` first.
+/// A ribbon's edges are offset along normals worked out from its points,
+/// so the points must be turned before the ribbon is built — mapping
+/// them on the way to the screen would leave the edges facing the old
+/// way.
+struct RigidSink<S> {
+    m: Affine,
+    inner: S,
+}
+
+impl<S: InkSink> InkSink for RigidSink<S> {
+    fn disc(&mut self, c: [f32; 2], rc: f32, rule: DiscRule, color: egui::Color32) {
+        self.inner.disc(self.m.apply(c), rc, rule, color);
+    }
+
+    fn ribbon(&mut self, points: &[[f32; 2]], widths: &[f32], style: StrokeStyle, color: egui::Color32) {
+        let moved: Vec<[f32; 2]> = points.iter().map(|&p| self.m.apply(p)).collect();
+        self.inner.ribbon(&moved, widths, style, color);
+    }
+
+    fn fill(&mut self, points: &[[f32; 2]], color: egui::Color32) {
+        let moved: Vec<[f32; 2]> = points.iter().map(|&p| self.m.apply(p)).collect();
+        self.inner.fill(&moved, color);
+    }
+}
+
 /// Most vertices committed ink may add in one frame. egui puts a frame's
 /// vertices and indices into one GPU buffer each, and wgpu treats a
 /// buffer over its 256 MB limit as fatal, which aborts the app. Four
@@ -516,7 +580,7 @@ fn paint_shape(
                 }
             }
         }
-        Shape::Ellipse { a, b, color, stroke_width, border, rotation } => {
+        Shape::Ellipse { a, b, color, stroke_width, border, rotation, .. } => {
             // egui has no native ellipse stroke; approximate with a
             // 64-segment polyline.
             let cx = (a[0] + b[0]) * 0.5;
@@ -548,7 +612,7 @@ fn paint_shape(
                 }
             }
         }
-        Shape::Line { a, b, color, stroke_width, border } => {
+        Shape::Line { a, b, color, stroke_width, border, .. } => {
             let sa = to_screen(*a);
             let sb = to_screen(*b);
             let c = col(*color, layer_opacity);
@@ -562,7 +626,7 @@ fn paint_shape(
                 }
             }
         }
-        Shape::Arrow { a, b, color, stroke_width, border } => {
+        Shape::Arrow { a, b, color, stroke_width, border, .. } => {
             let w = *stroke_width * zoom;
             let c = col(*color, layer_opacity);
             let sa = to_screen(*a);
@@ -597,6 +661,18 @@ fn paint_shape(
                      b[1] - (-ux * s1 + uy * c1) * head_len];
             paint_round_line(painter, sb, to_screen(h1), w, c);
             paint_round_line(painter, sb, to_screen(h2), w, c);
+        }
+        // A picture still loading (or unreadable) shows as a faint box,
+        // so the slide's layout is there at once; a fill shows nothing
+        // until it is in.
+        Shape::Raster { kind, .. } if raster_tex.is_none() => {
+            if *kind == crate::canvas::shape::RasterKind::Image {
+                let a = (layer_opacity * 255.0).clamp(0.0, 255.0) / 255.0;
+                let fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, (18.0 * a) as u8);
+                let edge = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (48.0 * a) as u8));
+                let corners: Vec<egui::Pos2> = shape.obb().corners().into_iter().map(|p| to_screen(p)).collect();
+                painter.add(egui::Shape::convex_polygon(corners, fill, edge));
+            }
         }
         // `Painter::image` only takes an axis-aligned rect, so a turned
         // image goes out as its own two-triangle textured quad.
@@ -637,7 +713,7 @@ fn paint_shape(
                 );
             }
         }
-        Shape::Text { pos, content, font_size, color, rotation } => {
+        Shape::Text { pos, content, font_size, color, rotation, .. } => {
             let c = col(*color, layer_opacity);
             // The shape's `font_size` is in canvas-local logical px;
             // multiply by zoom so the on-screen height honours the
@@ -1754,6 +1830,39 @@ pub fn render_canvas(
     }
 }
 
+/// Draw pins (see `canvas::pins`) over a picture `render_canvas` made,
+/// where and as the overlay shows them: screenshots re-draw the slide
+/// rather than capture the overlay, so its pins must be drawn too.
+pub fn render_pins(
+    pixmap: &mut PixmapMut<'_>,
+    pins: &[crate::canvas::pins::Pinned],
+    pixels_per_point: f32,
+    media_frames: Option<&MediaFrames>,
+) {
+    let ppp = pixels_per_point.max(0.01);
+    for p in pins {
+        let m = p.pin.rigid(p.anchor());
+        let s = p.pin.scale * ppp;
+        let t = Transform::from_row(m.a, m.b, m.c, m.d, m.tx, m.ty).post_scale(s, s);
+        for member in p.members {
+            let Some(layer) = p.canvas.layers.get(member.layer) else { continue };
+            match member.obj {
+                // Whatever the layer's visibility and opacity, as on screen.
+                ObjRef::Shape(i) => {
+                    if let Some(shape) = layer.shapes.get(i) {
+                        draw_shape(pixmap, shape, t, 1.0, media_frames);
+                    }
+                }
+                ObjRef::Stroke(i) => {
+                    if let Some(stroke) = layer.strokes.get(i) {
+                        draw_stroke(pixmap, stroke, t);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn rgba_paint(color: [u8; 4]) -> Paint<'static> {
     let mut p = Paint::default();
     p.set_color_rgba8(color[0], color[1], color[2], color[3]);
@@ -1825,7 +1934,7 @@ fn draw_shape(
     media_frames: Option<&MediaFrames>,
 ) {
     match shape {
-        Shape::Rect { a, b, color, stroke_width, border, rotation } => {
+        Shape::Rect { a, b, color, stroke_width, border, rotation, .. } => {
             let t = turned(t, *rotation, (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5);
             let mut pb = PathBuilder::new();
             // Normalise corners so width/height are positive.
@@ -1853,7 +1962,7 @@ fn draw_shape(
                 pixmap.stroke_path(&path, &paint, &sk, t, None);
             }
         }
-        Shape::Ellipse { a, b, color, stroke_width, border, rotation } => {
+        Shape::Ellipse { a, b, color, stroke_width, border, rotation, .. } => {
             let cx = (a[0] + b[0]) * 0.5;
             let cy = (a[1] + b[1]) * 0.5;
             let rx = ((b[0] - a[0]) * 0.5).abs().max(1.0);
@@ -1876,7 +1985,7 @@ fn draw_shape(
                 }
             }
         }
-        Shape::Line { a, b, color, stroke_width, border } => {
+        Shape::Line { a, b, color, stroke_width, border, .. } => {
             match border {
                 BorderStyle::Solid => {
                     draw_line(pixmap, *a, *b, *color, *stroke_width, t);
@@ -1897,7 +2006,7 @@ fn draw_shape(
                 }
             }
         }
-        Shape::Arrow { a, b, color, stroke_width, border } => {
+        Shape::Arrow { a, b, color, stroke_width, border, .. } => {
             // 1) The shaft (dashed or solid).
             match border {
                 BorderStyle::Solid => {
@@ -1976,7 +2085,7 @@ fn draw_shape(
                 pixmap.draw_pixmap(0, 0, src.as_ref(), &opts, draw_t, None);
             }
         }
-        Shape::Text { pos, content, font_size, color, rotation } => {
+        Shape::Text { pos, content, font_size, color, rotation, .. } => {
             let t = turned(t, *rotation, pos[0], pos[1]);
             // tiny-skia has no built-in font rasteriser, so the
             // screenshot pipeline can't show glyphs yet. We paint a
@@ -2151,6 +2260,7 @@ mod rotation_tests {
             pos: [30.0, 40.0], size: [40.0, 20.0], png: Arc::new(png), px_size: [2, 1],
             color: [0; 4], rotation: std::f32::consts::FRAC_PI_2, kind: RasterKind::Image, media: None,
             picture: None,
+            pin: 0,
         };
         // Where `Obb` says the red (left) and blue (right) halves went.
         let o = shape.obb();

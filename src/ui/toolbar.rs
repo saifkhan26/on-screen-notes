@@ -34,6 +34,9 @@ pub fn show(
     media_counts: [usize; 3],
     // Set when the filter's "Select these" is clicked.
     select_filtered: &mut bool,
+    // Whether pins are hidden; `None` when there are no pins, which
+    // hides the button.
+    pins_hidden: Option<&mut bool>,
 ) -> bool {
     let mut interacted = false;
 
@@ -96,6 +99,9 @@ pub fn show(
                     // Group 5: utilities (insert media + pin + settings + help)
                     interacted |= insert_media_btn(ui, insert_media);
                     interacted |= filter_btn(ui, media_filter, media_counts, select_filtered);
+                    if let Some(hidden) = pins_hidden {
+                        interacted |= pins_btn(ui, hidden);
+                    }
                     interacted |= pin_btn(ui, pinned_hwnd, pin_picking);
                     interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve);
                     interacted |= help_btn(ui);
@@ -199,6 +205,38 @@ fn insert_media_btn(ui: &mut egui::Ui, clicked: &mut bool) -> bool {
     let response = response.on_hover_text("Insert picture / video / GIF  (or drop a file onto the canvas)");
     if response.clicked() {
         *clicked = true;
+        return true;
+    }
+    response.hovered() || response.is_pointer_button_down_on()
+}
+
+/// Show / hide every pin (objects kept on screen). Lit while they
+/// are hidden, so a hidden state is never forgotten.
+fn pins_btn(ui: &mut egui::Ui, hidden: &mut bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
+    let bg = if *hidden {
+        theme::ACCENT
+    } else if response.hovered() {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+    let icon = if *hidden {
+        egui::include_image!("../../assets/icons/eye-off.svg")
+    } else {
+        egui::include_image!("../../assets/icons/eye.svg")
+    };
+    let icon_rect = rect.shrink(rect.width() * 0.22);
+    egui::Image::new(icon).tint(theme::TEXT_PRIMARY).fit_to_exact_size(icon_rect.size()).paint_at(ui, icon_rect);
+    let tooltip = if *hidden {
+        "Pinned objects are hidden — click to show them again (Shift+P)"
+    } else {
+        "Hide all pins (Shift+P). Their originals stay on their own slides"
+    };
+    let response = response.on_hover_text(tooltip);
+    if response.clicked() {
+        *hidden = !*hidden;
         return true;
     }
     response.hovered() || response.is_pointer_button_down_on()
@@ -501,6 +539,8 @@ fn help_btn(ui: &mut egui::Ui) -> bool {
                     row(ui, "  move / resize / rotate", "drag inside / handles / top knob (Shift = 15°)");
                     row(ui, "  delete / duplicate", "Delete / Ctrl+D");
                     row(ui, "  copy to new slide", "Ctrl+Shift+D  (new slide after the last)");
+                    row(ui, "  pin to every slide", "Ctrl+P  (drag / resize / turn the pin; its bar: this slide only; Delete unpins)");
+                    row(ui, "Hide / show pins",   "Shift+P  (or the eye button)");
                     row(ui, "  arrange (2+ selected)", "bar under the toolbar: pack, group by type, align, distribute");
                     row(ui, "Highlight pictures / GIFs / videos", "funnel button; \"Select these\" selects them");
                     row(ui, "  copy / cut / paste", "Ctrl+C / Ctrl+X / Ctrl+V  (also pastes images)");

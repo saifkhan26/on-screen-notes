@@ -387,15 +387,18 @@ impl Canvas {
     /// A new slide holding copies of `strokes` and `shapes` where they sat,
     /// seen through the same `pan` / `zoom`, and the selection of all of
     /// them. They are its starting content, not an undo step. Videos and
-    /// GIFs get fresh player ids, so each copy plays on its own.
+    /// GIFs get fresh player ids, so each copy plays on its own, and the
+    /// copies are in no pin: a pin shows its own objects only.
     pub fn with_objects(mut strokes: Vec<Stroke>, mut shapes: Vec<Shape>, pan: [f32; 2], zoom: f32) -> (Self, hit::Selection) {
         for s in &mut strokes {
             s.build_cache();
+            s.pin = 0;
         }
         for s in &mut shapes {
             if let Shape::Raster { media: Some(m), .. } = s {
                 m.id = crate::canvas::shape::fresh_media_id();
             }
+            s.set_pin(0);
         }
         let sel = hit::Selection { strokes: (0..strokes.len()).collect(), shapes: (0..shapes.len()).collect() };
         let mut canvas = Self { pan, zoom, ..Self::default() };
@@ -973,6 +976,17 @@ impl Canvas {
         )
     }
 
+    /// Put the chosen objects in pin `id`, or take them out of any pin
+    /// with `id = 0` (see `canvas::pins`). One undo step; objects that
+    /// already are so are left out of it. Returns false when nothing
+    /// changed.
+    pub fn set_pin(&mut self, li: usize, strokes: &[usize], shapes: &[usize], id: u64) -> bool {
+        let Some(layer) = self.layers.get(li) else { return false };
+        let strokes: Vec<usize> = strokes.iter().copied().filter(|&i| layer.strokes.get(i).is_some_and(|s| s.pin != id)).collect();
+        let shapes: Vec<usize> = shapes.iter().copied().filter(|&i| layer.shapes.get(i).is_some_and(|s| s.pin() != id)).collect();
+        self.edit_objects(li, &strokes, &shapes, |_, s| s.pin = id, |_, s| s.set_pin(id))
+    }
+
     /// Recolour and / or re-width the chosen objects.
     ///
     /// `merge_into_last` folds this change into the undo entry on top of
@@ -1362,6 +1376,7 @@ fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
         kind: RasterKind::Image,
         media: None,
         picture: None,
+        pin: 0,
     });
     layer.rev += 1;
     Some(img.capture_zoom)
@@ -1503,6 +1518,7 @@ fn split_stroke_outside_polygon(stroke: &Stroke, polygon: &[[f32; 2]]) -> Vec<St
         if run.len() >= 2 {
             let mut s = Stroke::with_style(src.color, src.base_width, src.style);
             s.filled = src.filled;
+            s.pin = src.pin;
             s.samples = std::mem::take(run);
             s.cache = None;
             runs.push(s);
@@ -1639,6 +1655,8 @@ fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutco
         kind,
         media: None,
         picture: None,
+        // What is left of a pinned fill stays in its pin.
+        pin: shape.pin(),
     })
 }
 
@@ -1766,6 +1784,7 @@ mod object_edit_tests {
             pos: [0.0, 0.0], size: [200.0, 200.0], png: Arc::new(vec![1, 2, 3]), px_size: [1, 1],
             color: [0; 4], rotation: 0.0, kind, media: None,
             picture: None,
+            pin: 0,
         }
     }
 
@@ -1892,6 +1911,7 @@ mod object_edit_tests {
         c.layers[0].shapes.push(Shape::Rect {
             a: [0.0, 0.0], b: [40.0, 20.0], color: [1, 2, 3, 255], stroke_width: 2.0,
             border: BorderStyle::Solid, rotation: 0.0,
+            pin: 0,
         });
         c.transform_objects(0, &[], &[0], &Affine::rotate_about([20.0, 10.0], 0.5));
         c.restyle_objects(0, &[], &[0], Some([9, 9, 9, 255]), None, false);
@@ -1963,6 +1983,7 @@ mod object_edit_tests {
         });
         let line = |x: f32| Shape::Line {
             a: [x, 0.0], b: [x, 50.0], color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid,
+            pin: 0,
         };
         c.add_shape(line(1.0));
         c.add_shape(line(2.0));

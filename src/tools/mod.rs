@@ -444,6 +444,7 @@ impl ActiveTool {
                             font_size: prev.font_size,
                             color: prev.color,
                             rotation: 0.0,
+                            pin: 0,
                         });
                     }
                 }
@@ -481,6 +482,7 @@ impl ActiveTool {
                         stroke_width: self.size,
                         border: self.border_style,
                         rotation: 0.0,
+                        pin: 0,
                     });
                 }
             }
@@ -493,6 +495,7 @@ impl ActiveTool {
                         stroke_width: self.size,
                         border: self.border_style,
                         rotation: 0.0,
+                        pin: 0,
                     });
                 }
             }
@@ -504,6 +507,7 @@ impl ActiveTool {
                         color: self.color,
                         stroke_width: self.size,
                         border: self.border_style,
+                        pin: 0,
                     });
                 }
             }
@@ -515,6 +519,7 @@ impl ActiveTool {
                         color: self.color,
                         stroke_width: self.size,
                         border: self.border_style,
+                        pin: 0,
                     });
                 }
             }
@@ -558,10 +563,10 @@ impl ActiveTool {
     pub fn preview_shape(&self) -> Option<Shape> {
         let (a, b) = self.in_progress_shape?;
         Some(match self.kind {
-            ToolKind::Rect    => Shape::Rect    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0 },
-            ToolKind::Ellipse => Shape::Ellipse { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0 },
-            ToolKind::Line    => Shape::Line    { a, b, color: self.color, stroke_width: self.size, border: self.border_style },
-            ToolKind::Arrow   => Shape::Arrow   { a, b, color: self.color, stroke_width: self.size, border: self.border_style },
+            ToolKind::Rect    => Shape::Rect    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0, pin: 0 },
+            ToolKind::Ellipse => Shape::Ellipse { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0, pin: 0 },
+            ToolKind::Line    => Shape::Line    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, pin: 0 },
+            ToolKind::Arrow   => Shape::Arrow   { a, b, color: self.color, stroke_width: self.size, border: self.border_style, pin: 0 },
             _ => return None,
         })
     }

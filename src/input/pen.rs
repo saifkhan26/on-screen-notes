@@ -114,11 +114,6 @@ impl PenInput {
         }
     }
 
-    /// Whether a real pen backend is initialised. UI status badge uses this.
-    pub fn is_active(&self) -> bool {
-        !matches!(self.backend, Backend::Disabled)
-    }
-
     /// True while the pen tip is touching the tablet.
     pub fn is_down(&self) -> bool {
         match &self.backend {

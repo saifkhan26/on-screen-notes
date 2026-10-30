@@ -157,11 +157,11 @@ mod tests {
                 let (color, stroke_width, border) = (COLORS[i % COLORS.len()], rng.range(1.0, 6.0), BorderStyle::Solid);
                 let rotation = if i % 2 == 0 { 0.0 } else { rng.range(-1.0, 1.0) };
                 match i % 5 {
-                    0 => Shape::Rect { a, b, color, stroke_width, border, rotation },
-                    1 => Shape::Ellipse { a, b, color, stroke_width, border, rotation },
-                    2 => Shape::Line { a, b, color, stroke_width, border },
-                    3 => Shape::Arrow { a, b, color, stroke_width, border },
-                    _ => Shape::Text { pos: a, content: format!("label {i}\nsecond line"), font_size: rng.range(14.0, 48.0), color, rotation },
+                    0 => Shape::Rect { a, b, color, stroke_width, border, rotation, pin: 0 },
+                    1 => Shape::Ellipse { a, b, color, stroke_width, border, rotation, pin: 0 },
+                    2 => Shape::Line { a, b, color, stroke_width, border, pin: 0 },
+                    3 => Shape::Arrow { a, b, color, stroke_width, border, pin: 0 },
+                    _ => Shape::Text { pos: a, content: format!("label {i}\nsecond line"), font_size: rng.range(14.0, 48.0), color, rotation, pin: 0 },
                 }
             })
             .collect()
@@ -192,6 +192,7 @@ mod tests {
                     kind: RasterKind::Image,
                     media: None,
                     picture: None,
+                    pin: 0,
                 }
             })
             .collect()

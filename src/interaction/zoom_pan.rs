@@ -6,6 +6,9 @@
 //!   * Pen-style tool     → adjust pen size.
 //!   * Any other tool     → zoom the canvas around the cursor.
 //!
+//! A locked slide, or one still opening, takes no edits: there Shift +
+//! wheel does nothing and a pen-style tool zooms like any other.
+//!
 //! `Shift + Space + wheel` (zoom the active *layer*) never reaches this
 //! function — the app intercepts it while Space is held, because the
 //! gesture accumulates in app-side state until the user lets go of
@@ -63,9 +66,12 @@ pub fn handle_scroll(
         return;
     }
 
+    let view_only = !canvases.active_editable();
+
     // Shift + wheel: adjust the *active* layer's opacity. Same 1 % /
     // notch granularity as the background-opacity branch.
     if shift_held {
+        if view_only { return; }
         if notches == 0 { return; }
         // A real edit, so this one goes through `active_mut` and is saved.
         let canvas = canvases.active_mut();
@@ -80,7 +86,7 @@ pub fn handle_scroll(
         if notches == 0 { return; }
         const STEP: f32 = 5.0;
         tool.spotlight_size = (tool.spotlight_size + n_f * STEP).clamp(20.0, 800.0);
-    } else if matches!(tool.kind, ToolKind::Pen | ToolKind::Eraser | ToolKind::FreehandArrow | ToolKind::Fill) {
+    } else if !view_only && matches!(tool.kind, ToolKind::Pen | ToolKind::Eraser | ToolKind::FreehandArrow | ToolKind::Fill) {
         if notches == 0 { return; }
         const SIZE_MIN: f32 = 1.0;
         const SIZE_MAX: f32 = 80.0;
@@ -137,6 +143,24 @@ mod tests {
         assert!(!m.active().dirty, "zooming must not trigger a slide save");
         handle_scroll(1, 1.0, [100.0, 100.0], false, true, &mut tool, &mut m, &mut bg);
         assert!(m.active().dirty, "a layer-opacity change must be saved");
+    }
+
+    #[test]
+    fn on_a_locked_slide_the_wheel_only_zooms() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = ToolKind::Pen;
+        let size = tool.size;
+        let mut canvas = Canvas::default();
+        canvas.dirty = false;
+        let mut m = CanvasManager::for_tests(vec![canvas]);
+        m.set_locked(0, true);
+        let mut bg = 0.5;
+        handle_scroll(1, 1.0, [100.0, 100.0], false, false, &mut tool, &mut m, &mut bg);
+        assert!(m.active().zoom > 1.0, "the pen's wheel zooms instead");
+        assert_eq!(tool.size, size);
+        handle_scroll(1, 1.0, [100.0, 100.0], false, true, &mut tool, &mut m, &mut bg);
+        assert_eq!(m.active().layers[0].opacity, 1.0);
+        assert!(!m.active().dirty);
     }
 
     #[test]

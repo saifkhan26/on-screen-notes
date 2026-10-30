@@ -294,9 +294,11 @@ pub fn capture_lasso_layer(
 /// user sees on screen.
 ///
 /// `media_frames` holds the frame each video / GIF is showing, so the
-/// picture has what is on screen rather than the poster frame.
+/// picture has what is on screen rather than the poster frame. `pins` are
+/// drawn over the slide, as on screen.
 pub fn capture_and_save(
     canvas: &Canvas,
+    pins: &[crate::canvas::pins::Pinned],
     cfg: &AppConfig,
     pixels_per_point: f32,
     osn_hwnd: isize,
@@ -339,6 +341,7 @@ pub fn capture_and_save(
         // multiplied by the DPI scale so a 150 % display lays strokes at
         // the physical pixel positions the user sees on the live overlay.
         render::render_canvas(&mut view, canvas, None, None, pixels_per_point, Some(media_frames));
+        render::render_pins(&mut view, pins, pixels_per_point, Some(media_frames));
     }
 
     // 4) Convert tiny-skia's premultiplied RGBA into the `image` crate's
@@ -370,12 +373,15 @@ pub fn capture_and_save(
 /// area (same as the freeze path), so the rect maps into it by
 /// `pixels_per_point` alone.
 ///
+/// `pins` are drawn over the slide, as on screen.
+///
 /// `bg_color` / `bg_opacity` are the overlay window's configured tint. The
 /// deferred capture drops the real window opacity to 0 so xcap grabs a
 /// clean desktop; we re-apply the tint here in software so the saved image
 /// matches what the user sees *through* the semi-transparent overlay.
 pub fn capture_region_and_save(
     canvas: &Canvas,
+    pins: &[crate::canvas::pins::Pinned],
     cfg: &AppConfig,
     pixels_per_point: f32,
     osn_hwnd: isize,
@@ -407,6 +413,7 @@ pub fn capture_region_and_save(
     {
         let mut view = pixmap.as_mut();
         render::render_canvas(&mut view, canvas, None, None, ppp, Some(media_frames));
+        render::render_pins(&mut view, pins, ppp, Some(media_frames));
     }
     let raw = pixmap.data().to_vec();
     let mut fg = RgbaImage::from_raw(w, h, raw)
