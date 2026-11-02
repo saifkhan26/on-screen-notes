@@ -45,15 +45,26 @@ impl Binding {
             && self.alt   == mods.alt
     }
 
-    /// How the binding reads to the user, e.g. "Ctrl+R".
+    /// How the binding reads to the user, e.g. "Ctrl+R" or "Ctrl+↑".
     pub fn label(&self) -> String {
+        use egui::Key as K;
         let mut s = String::new();
         for (on, name) in [(self.ctrl, "Ctrl+"), (self.shift, "Shift+"), (self.alt, "Alt+")] {
             if on {
                 s.push_str(name);
             }
         }
-        s.push_str(self.key.name());
+        s.push_str(match self.key {
+            K::ArrowLeft  => "←",
+            K::ArrowRight => "→",
+            K::ArrowUp    => "↑",
+            K::ArrowDown  => "↓",
+            K::Comma  => ",",
+            K::Period => ".",
+            K::Minus  => "-",
+            K::Equals => "=",
+            k => k.name(),
+        });
         s
     }
 
@@ -78,7 +89,14 @@ pub fn parse(s: &str) -> Option<Binding> {
     let mut ctrl = false;
     let mut shift = false;
     let mut alt = false;
-    let mut key: Option<egui::Key> = None;
+    // A `-` at the end is the minus key itself ("-", "ctrl+-"), not a
+    // separator; the split below would drop it.
+    let s = s.trim();
+    let (s, minus) = match s.strip_suffix('-') {
+        Some(rest) if rest.is_empty() || rest.ends_with(['+', '-']) => (rest, true),
+        _ => (s, false),
+    };
+    let mut key: Option<egui::Key> = minus.then_some(egui::Key::Minus);
 
     for raw in s.split(|c: char| c == '+' || c == '-') {
         let tok = raw.trim().to_ascii_lowercase();
@@ -338,6 +356,8 @@ pub struct CanvasSection {
     /// active layer's content. Helpful for "what's on this layer?"
     /// when many layers exist.
     #[serde(default = "d_preview_layer")] pub preview_layer: String,
+    /// Hide the active layer, or show it again (the eye in the layer panel).
+    #[serde(default = "d_toggle_layer_visible")] pub toggle_layer_visible: String,
 
     // Select-tool actions. They only do anything while objects are
     // selected, so `delete` and the arrow chords stay free otherwise.
@@ -384,6 +404,7 @@ impl Default for CanvasSection {
             opacity_dec: d_op_dec(),
             opacity_inc: d_op_inc(),
             preview_layer: d_preview_layer(),
+            toggle_layer_visible: d_toggle_layer_visible(),
             delete_selection: d_delete_selection(),
             duplicate: d_duplicate(),
             copy_to_new_slide: d_copy_to_new_slide(),
@@ -430,6 +451,7 @@ fn d_op_9()   -> String { "9".into() }
 fn d_op_dec() -> String { "-".into() }
 fn d_op_inc() -> String { "=".into() }
 fn d_preview_layer() -> String { "q".into() }
+fn d_toggle_layer_visible() -> String { "h".into() }
 fn d_delete_selection() -> String { "delete".into() }
 fn d_duplicate()   -> String { "ctrl+d".into() }
 fn d_copy_to_new_slide() -> String { "ctrl+shift+d".into() }
@@ -499,6 +521,7 @@ pub struct CanvasBindings {
     pub opacity_dec: Option<Binding>,
     pub opacity_inc: Option<Binding>,
     pub preview_layer: Option<Binding>,
+    pub toggle_layer_visible: Option<Binding>,
     pub delete_selection: Option<Binding>,
     pub duplicate: Option<Binding>,
     pub copy_to_new_slide: Option<Binding>,
@@ -511,8 +534,19 @@ pub struct CanvasBindings {
     pub media_next_frame: Option<Binding>,
 }
 
+/// The `[global]` bindings, for showing them in the help panel. The OS
+/// hotkeys themselves are registered from the strings (`input::hotkeys`).
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalBindings {
+    pub toggle_overlay: Option<Binding>,
+    pub screenshot: Option<Binding>,
+    pub start_record: Option<Binding>,
+    pub pause_record: Option<Binding>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedHotkeys {
+    pub global: GlobalBindings,
     pub tool:   ToolBindings,
     pub canvas: CanvasBindings,
 }
@@ -532,6 +566,14 @@ impl HotkeysConfig {
             }
         };
         ParsedHotkeys {
+            // Not `p`: a global the OS takes but `parse` does not know
+            // (F13 and up) is no reason to warn, it just goes unlisted.
+            global: GlobalBindings {
+                toggle_overlay: parse(&self.global.toggle_overlay),
+                screenshot:     parse(&self.global.screenshot),
+                start_record:   parse(&self.global.start_record),
+                pause_record:   parse(&self.global.pause_record),
+            },
             tool: ToolBindings {
                 pen:            p("tool.pen",            &self.tool.pen),
                 pencil:         p("tool.pencil",         &self.tool.pencil),
@@ -585,6 +627,7 @@ impl HotkeysConfig {
                 opacity_dec: p("canvas.opacity_dec", &self.canvas.opacity_dec),
                 opacity_inc: p("canvas.opacity_inc", &self.canvas.opacity_inc),
                 preview_layer: p("canvas.preview_layer", &self.canvas.preview_layer),
+                toggle_layer_visible: p("canvas.toggle_layer_visible", &self.canvas.toggle_layer_visible),
                 delete_selection: p("canvas.delete_selection", &self.canvas.delete_selection),
                 duplicate:   p("canvas.duplicate",   &self.canvas.duplicate),
                 copy_to_new_slide: p("canvas.copy_to_new_slide", &self.canvas.copy_to_new_slide),
@@ -706,6 +749,40 @@ mod tests {
         // Ctrl+Tab must not also toggle the UI (plain Tab).
         let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
         assert!(!c.toggle_ui.unwrap().matches(egui::Key::Tab, ctrl));
+    }
+
+    #[test]
+    fn default_bindings_parse_and_do_not_collide() {
+        // Every `[tool]` and `[canvas]` default, found through serde so a
+        // binding added later is checked without listing it here.
+        let value = toml::Value::try_from(HotkeysConfig::default()).unwrap();
+        let mut seen: Vec<(String, Binding)> = Vec::new();
+        for section in ["tool", "canvas"] {
+            for (name, s) in value[section].as_table().unwrap() {
+                let s = s.as_str().unwrap();
+                let b = parse(s).unwrap_or_else(|| panic!("{section}.{name} = {s:?} does not parse"));
+                if let Some((other, _)) = seen.iter().find(|(_, o)| *o == b) {
+                    panic!("{section}.{name} and {other} are both {s:?}");
+                }
+                seen.push((format!("{section}.{name}"), b));
+            }
+        }
+        assert!(seen.iter().any(|(n, b)| n == "canvas.toggle_layer_visible" && b.key == egui::Key::H));
+    }
+
+    #[test]
+    fn labels_read_as_the_keys_do() {
+        let l = |s: &str| parse(s).unwrap().label();
+        assert_eq!(l("ctrl+arrowup"), "Ctrl+↑");
+        assert_eq!(l("-"), "-");
+        assert_eq!(l("ctrl+-"), "Ctrl+-");
+        assert_eq!(l("ctrl+minus"), "Ctrl+-");
+        assert_eq!(l("comma"), ",");
+        assert_eq!(l("="), "=");
+        assert_eq!(l("ctrl+shift+backspace"), "Ctrl+Shift+Backspace");
+        assert_eq!(l("ctrl+alt+shift+n"), "Ctrl+Shift+Alt+N");
+        let g = HotkeysConfig::default().parsed().global;
+        assert_eq!(g.screenshot.map(|b| (b.key, b.ctrl, b.shift)), Some((egui::Key::S, true, true)));
     }
 
     #[test]

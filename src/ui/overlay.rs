@@ -359,7 +359,8 @@ pub fn show(
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "Start drawing — Alt to pass clicks through · ←/→ to switch canvas",
+                    // Words, not ←/→: this font has no arrows.
+                    "Start drawing — Alt to pass clicks through · Left / Right to switch canvas · hover ? for every shortcut",
                     egui::FontId::proportional(14.0),
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
                 );

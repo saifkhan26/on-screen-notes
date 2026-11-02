@@ -2350,6 +2350,7 @@ impl eframe::App for OnScreenNotesApp {
                     media_counts,
                     &mut select_filtered,
                     has_pins.then_some(&mut pins_hidden),
+                    &self.hotkeys_cfg,
                 )
             } else {
                 false
@@ -3228,9 +3229,12 @@ impl eframe::App for OnScreenNotesApp {
                             toggle_lock = !toggle_lock;
                         }
                         // Undo, redo, clear, delete the slide and the layer
-                        // opacity keys all edit the slide.
+                        // opacity and visibility keys all edit the slide.
                         let kc = &keys.canvas;
-                        let edit_key = [kc.undo, kc.redo, kc.clear_layer, kc.delete_canvas, kc.opacity_dec, kc.opacity_inc]
+                        let edit_key = [
+                            kc.undo, kc.redo, kc.clear_layer, kc.delete_canvas,
+                            kc.opacity_dec, kc.opacity_inc, kc.toggle_layer_visible,
+                        ]
                             .into_iter()
                             .chain(kc.opacity)
                             .flatten()
@@ -3293,6 +3297,23 @@ impl eframe::App for OnScreenNotesApp {
                         if let Some(b) = keys.canvas.preview_layer {
                             if b.matches(*key, mods) {
                                 self.show_layer_preview = !self.show_layer_preview;
+                            }
+                        }
+                        // Same as the layer panel's eye. Said in a toast
+                        // too: an empty layer shows no change on screen.
+                        if let Some(b) = keys.canvas.toggle_layer_visible {
+                            if b.matches(*key, mods) {
+                                let c = self.canvases.active_mut();
+                                let li = c.active_layer;
+                                c.toggle_layer_visible(li);
+                                // Numbered from the bottom, as the panel's
+                                // hover preview counts them.
+                                let msg = if c.layers[li].visible {
+                                    format!("Layer {} shown", li + 1)
+                                } else {
+                                    format!("Layer {} hidden — {} shows it again", li + 1, b.label())
+                                };
+                                self.toast = Some((msg, Instant::now()));
                             }
                         }
                     }

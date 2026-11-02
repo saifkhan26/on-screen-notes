@@ -377,6 +377,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Name the active slide (in the slide panel) | `F2` |
 | Lock / unlock the active slide (pan and zoom only) | `Ctrl+R` |
 | Previous / next layer | `↓` / `↑` |
+| Hide / show the active layer | `H` |
 | Reset pan + zoom | `Ctrl+0` |
 | Reset active layer position | `Ctrl+Shift+0` |
 | Reset active layer zoom | `Ctrl+Shift+9` |
@@ -482,6 +483,7 @@ opacity_9 = "9"
 opacity_dec = "-"
 opacity_inc = "="
 preview_layer = "q"
+toggle_layer_visible = "h"
 
 # Select-tool actions (only act while objects are selected).
 delete_selection = "delete"
@@ -539,8 +541,9 @@ still, and draw with the mouse.
   last one (infinite on demand). `←` walks backward; wraps from the
   first.
 - Each canvas holds a stack of **layers** (strokes + shapes + optional
-  raster background). `↑` / `↓` walk the active layer. Per-layer
-  visibility + opacity edit lives in the layer panel.
+  raster background). `↑` / `↓` walk the active layer, `H` hides or
+  shows it. Per-layer visibility + opacity edit also lives in the
+  layer panel.
 - Both canvases and layers persist as RON files (`canvases\canvas_N.ron`,
   one per slide, plus `config.ron` and the `media` folder) under the
   platform's data dir: `%APPDATA%\OnScreenNotes\on-screen-notes\data\` on
