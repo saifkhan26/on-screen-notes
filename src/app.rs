@@ -1162,6 +1162,17 @@ impl OnScreenNotesApp {
             && sel.shapes.iter().all(|&i| layer.shapes.get(i).is_some_and(|s| s.pin() != 0))
     }
 
+    /// An eyedropper pick becomes the pen colour and also replaces the
+    /// toolbar swatch that held the old pen colour, so the picked colour
+    /// stays one click away. With no such swatch only the pen changes.
+    fn take_picked_color(&mut self, c: [u8; 4]) {
+        let old = self.tool.color;
+        if let Some(slot) = self.config.palette.iter_mut().find(|s| **s == old) {
+            *slot = c;
+        }
+        self.tool.color = c;
+    }
+
     /// Pin the selection to every slide as one pin, or — when all of it
     /// is pinned already — take it out of its pins. The new pin starts a
     /// little off its objects, so it can be seen, and is selected, so it
@@ -2157,6 +2168,7 @@ impl eframe::App for OnScreenNotesApp {
         // a second-stage smoother the user did not ask for. Only
         // Adaptive mode keeps it.
         let use_pen_filter = self.config.smoothing.use_upstream_pen_filter();
+        self.pen_filter.begin_batch(raw_pen_events.len());
         for ev in raw_pen_events {
             match ev {
                 PenEvent::Down(s) => {
@@ -2805,7 +2817,7 @@ impl eframe::App for OnScreenNotesApp {
                                 let sx = client_origin[0] + s.pos[0] as i32;
                                 let sy = client_origin[1] + s.pos[1] as i32;
                                 if let Some(c) = crate::input::picker::pick_screen_color(sx, sy) {
-                                    self.tool.color = c;
+                                    self.take_picked_color(c);
                                 }
                                 // One-shot eyedropper: clear the pending
                                 // flag so the next click draws normally.
@@ -2888,7 +2900,7 @@ impl eframe::App for OnScreenNotesApp {
                         let sx = client_origin[0] + (p.x * ppp) as i32;
                         let sy = client_origin[1] + (p.y * ppp) as i32;
                         if let Some(c) = crate::input::picker::pick_screen_color(sx, sy) {
-                            self.tool.color = c;
+                            self.take_picked_color(c);
                         }
                     }
                     // One-shot eyedropper: clear after a successful pick.

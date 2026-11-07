@@ -182,6 +182,42 @@ mod windows_backend {
         LOGCONTEXT, WTI, WTPKT,
     };
 
+    /// `WTGetA`: reads an open context's settings back. wintab_lite does
+    /// not wrap it.
+    type WTGet = unsafe extern "system" fn(*mut wintab_lite::HCTX, *mut LOGCONTEXT) -> i32;
+
+    /// Linear map from a context's output space to screen pixels: the
+    /// output area of the context as opened onto the one the default
+    /// context reports, which is the screen. Extents are kept positive;
+    /// the sign only says which way the axis runs, and that is the same
+    /// in both.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub(super) struct CoordMap {
+        pub(super) out_org: [f64; 2],
+        pub(super) out_ext: [f64; 2],
+        pub(super) screen_org: [f64; 2],
+        pub(super) screen_ext: [f64; 2],
+    }
+
+    impl CoordMap {
+        /// The map that leaves `ctx`'s output coordinates unchanged.
+        pub(super) fn from_context(ctx: &LOGCONTEXT) -> Self {
+            let org = [ctx.lcOutOrgXYZ.x as f64, ctx.lcOutOrgXYZ.y as f64];
+            let ext = [
+                (ctx.lcOutExtXYZ.x as f64).abs().max(1.0),
+                (ctx.lcOutExtXYZ.y as f64).abs().max(1.0),
+            ];
+            Self { out_org: org, out_ext: ext, screen_org: org, screen_ext: ext }
+        }
+
+        pub(super) fn to_screen(&self, x: i32, y: i32) -> [f64; 2] {
+            let f = |i: usize, v: i32| {
+                self.screen_org[i] + (v as f64 - self.out_org[i]) * self.screen_ext[i] / self.out_ext[i]
+            };
+            [f(0, x), f(1, y)]
+        }
+    }
+
     /// One open Wintab context.
     ///
     /// `wintab_lite` defines its function-pointer types (e.g. `WTOpen`) as
@@ -200,6 +236,9 @@ mod windows_backend {
         /// Tablet pressure max value reported by the driver. We divide
         /// `pkNormalPressure` by this to get a 0..1 float.
         pressure_max: f32,
+
+        /// Packet coordinates → screen pixels.
+        map: CoordMap,
 
         /// True between Down and Up — used to emit synthetic `Move` only
         /// while the pen is in contact.
@@ -283,6 +322,26 @@ mod windows_backend {
             let default_y_extent = log_context.lcOutExtXYZ.y;
             log_context.lcOutExtXYZ.y = -default_y_extent;
 
+            // 6b) Sub-pixel positions. The default output space is whole
+            //     screen pixels, so every packet is rounded to a pixel: a
+            //     slow or shallow line becomes a staircase, and a stroke
+            //     drawn zoomed out shows its steps blown up when zoomed in.
+            //     Asking for an output space `k` times finer over the same
+            //     screen area keeps the mapping and adds the tablet's own
+            //     precision. `k` stays within the tablet's resolution.
+            let screen = CoordMap::from_context(&log_context);
+            let wt_get: Option<WTGet> = unsafe { lib.get(c"WTGetA".to_bytes()) }.ok().map(|s| *s);
+            let k = if wt_get.is_some() {
+                let per_px = log_context.lcInExtXYZ.x / log_context.lcOutExtXYZ.x.abs().max(1);
+                per_px.clamp(1, 16)
+            } else {
+                1
+            };
+            log_context.lcOutOrgXYZ.x *= k;
+            log_context.lcOutOrgXYZ.y *= k;
+            log_context.lcOutExtXYZ.x *= k;
+            log_context.lcOutExtXYZ.y *= k;
+
             // 7) Look up tablet pressure axis to know its max value (used
             //    later to normalise to 0..=1). Drivers commonly report
             //    1023 or 8191; we read whatever the device says.
@@ -306,8 +365,17 @@ mod windows_backend {
                 return Err(anyhow!("WTOpen returned null (driver refused)"));
             }
 
+            // Read back the output space the driver settled on, so a
+            // driver that ignored the finer one still maps 1:1.
+            let mut opened = log_context;
+            let out = match wt_get {
+                Some(get) if unsafe { get(ctx_handle, &mut opened) } != 0 => CoordMap::from_context(&opened),
+                _ => CoordMap::from_context(&log_context),
+            };
+            let map = CoordMap { screen_org: screen.out_org, screen_ext: screen.out_ext, ..out };
+
             log::info!(
-                "Wintab opened: pressure_max = {pressure_max}, ctx = {:?}",
+                "Wintab opened: pressure_max = {pressure_max}, ctx = {:?}, {map:?}",
                 ctx_handle
             );
 
@@ -317,6 +385,7 @@ mod windows_backend {
                 wt_data_get,
                 ctx_handle,
                 pressure_max,
+                map,
                 is_down: false,
                 last_sample: None,
                 last_used: None,
@@ -374,9 +443,10 @@ mod windows_backend {
             }
 
             for p in &packets[..removed] {
+                let s = self.map.to_screen(p.pkXYZ.x, p.pkXYZ.y);
                 let pos = [
-                    (p.pkXYZ.x - client_origin[0]) as f32,
-                    (p.pkXYZ.y - client_origin[1]) as f32,
+                    (s[0] - client_origin[0] as f64) as f32,
+                    (s[1] - client_origin[1] as f64) as f32,
                 ];
                 let pressure = (p.pkNormalPressure as f32 / self.pressure_max).clamp(0.0, 1.0);
                 let sample = PenSample {
@@ -426,6 +496,42 @@ mod windows_backend {
         fn drop(&mut self) {
             // Close the Wintab context before letting the DLL unload.
             let _ = unsafe { (self.wt_close)(self.ctx_handle) };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A default context for a desktop whose left screen starts at x = -1920.
+        fn desktop() -> LOGCONTEXT {
+            let mut c = LOGCONTEXT::default();
+            c.lcOutOrgXYZ.x = -1920;
+            c.lcOutOrgXYZ.y = 0;
+            c.lcOutExtXYZ.x = 4480;
+            c.lcOutExtXYZ.y = -1440;
+            c
+        }
+
+        #[test]
+        fn an_unchanged_context_maps_one_to_one() {
+            let c = desktop();
+            let m = CoordMap::from_context(&c);
+            assert_eq!(m.to_screen(-1920, 0), [-1920.0, 0.0]);
+            assert_eq!(m.to_screen(1234, 567), [1234.0, 567.0]);
+        }
+
+        #[test]
+        fn a_finer_output_space_gives_fractions_of_a_pixel() {
+            let c = desktop();
+            let mut fine = c;
+            for v in [&mut fine.lcOutOrgXYZ.x, &mut fine.lcOutOrgXYZ.y, &mut fine.lcOutExtXYZ.x, &mut fine.lcOutExtXYZ.y] {
+                *v *= 8;
+            }
+            let screen = CoordMap::from_context(&c);
+            let m = CoordMap { screen_org: screen.out_org, screen_ext: screen.out_ext, ..CoordMap::from_context(&fine) };
+            assert_eq!(m.to_screen(-1920 * 8, 0), [-1920.0, 0.0]);
+            assert_eq!(m.to_screen(1234 * 8 + 3, 567 * 8 + 4), [1234.375, 567.5]);
         }
     }
 }
