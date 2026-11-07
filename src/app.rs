@@ -225,6 +225,8 @@ pub struct OnScreenNotesApp {
     pin_tool: crate::canvas::pins::PinTool,
     /// The slide panel (bottom-left): which slide is being named.
     slide_panel: ui::slide_panel::SlidePanel,
+    /// The second window showing one slide, while it is open.
+    slide_window: Option<ui::slide_window::SlideWindow>,
     /// Files being copied in and read as videos / GIFs.
     media_imports: Vec<crate::media::import::ImportJob>,
     /// Videos picked or dropped before FFmpeg was set up, with where
@@ -569,6 +571,7 @@ impl OnScreenNotesApp {
             media_filter: ui::media_filter::MediaFilter::default(),
             pin_tool: Default::default(),
             slide_panel: Default::default(),
+            slide_window: None,
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
             media_dialog: None,
@@ -2233,7 +2236,9 @@ impl eframe::App for OnScreenNotesApp {
             if lmb_now && !self.pin_prev_lmb {
                 if let Some((cx, cy)) = crate::platform::cursor_pos() {
                     let hwnd = crate::platform::top_level_window_at(cx, cy);
-                    if hwnd != 0 && hwnd != self.osn_hwnd {
+                    // Our own windows are no pin targets.
+                    let ours = hwnd == self.osn_hwnd || self.slide_window.as_ref().is_some_and(|w| w.hwnd() == hwnd);
+                    if hwnd != 0 && !ours {
                         self.pinned_hwnd = Some(hwnd);
                         self.pinned_last_rect = None;
                         self.toast = Some((
@@ -3272,7 +3277,17 @@ impl eframe::App for OnScreenNotesApp {
                             if b.matches(*key, mods) { self.canvases.active_mut().clear(); }
                         }
                         if let Some(b) = keys.canvas.delete_canvas {
-                            if b.matches(*key, mods) { self.canvases.delete_active(); }
+                            if b.matches(*key, mods) {
+                                let (gone, before) = (self.canvases.active_index(), self.canvases.count());
+                                self.canvases.delete_active();
+                                // The slide window follows its slide to
+                                // its new number, or closes with it.
+                                if self.canvases.count() < before
+                                    && self.slide_window.as_mut().is_some_and(|w| !w.slide_removed(gone))
+                                {
+                                    self.slide_window = None;
+                                }
+                            }
                         }
                         // Layer opacity: 1..9 set absolute N·10 %,
                         // 0 sets 0 %. `-` / `=` step ±10 %. All
@@ -3442,6 +3457,14 @@ impl eframe::App for OnScreenNotesApp {
                 Some(ui::slide_panel::SlideAction::Add) => {
                     self.canvases.push_canvas(crate::canvas::canvas::Canvas::default());
                 }
+                Some(ui::slide_panel::SlideAction::OpenWindow(i)) => match self.slide_window.as_mut() {
+                    // One slide window: asking again shows the slide there.
+                    Some(win) => {
+                        win.set_slide(i);
+                        ctx.send_viewport_cmd_to(ui::slide_window::SlideWindow::viewport_id(), egui::ViewportCommand::Focus);
+                    }
+                    None => self.slide_window = Some(ui::slide_window::SlideWindow::new(i)),
+                },
                 None => {}
             }
             if rename_slide {
@@ -3620,6 +3643,34 @@ impl eframe::App for OnScreenNotesApp {
             self.tool
                 .laser_strokes
                 .retain(|(_, up_at)| up_at.elapsed().as_secs_f32() < fade);
+        }
+
+        // ---- Slide window ------------------------------------------------
+        // After the overlay drew this frame: the window shares its
+        // texture cache, whose once-a-frame start the overlay ran — or,
+        // with the overlay hidden, runs here.
+        if let Some(win) = self.slide_window.as_mut() {
+            if !self.overlay_visible {
+                self.overlay_cache.begin_frame(ctx);
+            }
+            // It looks like the overlay, and follows it live.
+            let look = ui::slide_window::Look {
+                background: ui::slide_window::Look::background(self.config.bg_color, self.config.bg_opacity),
+                chrome: self.ui_visible,
+                owner: self.osn_hwnd,
+            };
+            let open = ui::slide_window::show(
+                ctx,
+                win,
+                &mut self.overlay_cache,
+                &mut self.canvases,
+                self.config.smoothing_level.position_passes(),
+                &self.media,
+                &look,
+            );
+            if !open {
+                self.slide_window = None;
+            }
         }
 
         // ---- Auto-save (debounced) ---------------------------------------

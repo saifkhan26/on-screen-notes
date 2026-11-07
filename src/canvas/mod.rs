@@ -505,6 +505,15 @@ impl CanvasManager {
         if let Some(v) = self.file_views.get(idx) {
             apply_view(&mut self.opening, v);
         }
+        self.read_in_background(idx);
+    }
+
+    /// Start reading slide `idx` on a thread of its own, unless it is in
+    /// already or a loader thread has it.
+    fn read_in_background(&mut self, idx: usize) {
+        if self.canvases[idx].is_some() {
+            return;
+        }
         let bg = self.loading.as_ref().expect("an unread slide while no loader is running");
         if bg.claims[idx].swap(true, Ordering::AcqRel) {
             return; // a loader thread has it
@@ -611,6 +620,20 @@ impl CanvasManager {
     /// screenshot); a blank stand-in while it opens.
     pub fn active(&self) -> &Canvas {
         self.canvases[self.active].as_ref().unwrap_or(&self.opening)
+    }
+
+    /// Slide `idx` to look at, if it is read (see `prefetch`).
+    pub fn slide(&self, idx: usize) -> Option<&Canvas> {
+        self.canvases.get(idx)?.as_ref()
+    }
+
+    /// Have slide `idx` read soon, without going to it: a slide shown
+    /// somewhere other than the canvas (the slide window) asks for itself
+    /// here. Does nothing for a slide that is in, or being read.
+    pub fn prefetch(&mut self, idx: usize) {
+        if idx < self.canvases.len() {
+            self.read_in_background(idx);
+        }
     }
 
     /// Slide `idx` is locked: no edits, only panning and zooming.

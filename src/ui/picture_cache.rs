@@ -107,6 +107,9 @@ struct Entry {
     seen: u64,
     seen_at: Instant,
     on_screen: bool,
+    /// Frame the counted window (the overlay) last drew it; `None` when
+    /// only another window has. See `PictureCache::count_shown`.
+    shown_at: Option<u64>,
     /// The picture could not be read; the preview, if any, stays.
     broken: bool,
 }
@@ -154,6 +157,10 @@ pub struct PictureCache {
     tick: u64,
     /// Pictures first seen this frame.
     fresh: usize,
+    /// Whether `texture` calls count towards `shown` (the overlay's
+    /// "loading pictures" progress). Off while the slide window asks for
+    /// its pictures, so that progress is the canvas's own.
+    counting: bool,
 }
 
 impl Default for PictureCache {
@@ -168,6 +175,7 @@ impl Default for PictureCache {
             workers_started: false,
             tick: 0,
             fresh: 0,
+            counting: true,
         }
     }
 }
@@ -341,15 +349,20 @@ impl PictureCache {
                     full,
                     seen: tick,
                     seen_at: Instant::now(),
-                    on_screen: visible,
+                    on_screen: false,
+                    shown_at: None,
                     broken: false,
                 },
             );
         }
+        let counting = self.counting;
         let e = self.entries.get_mut(source).expect("just made");
         e.seen = tick;
         e.seen_at = Instant::now();
-        e.on_screen = visible;
+        if counting {
+            e.on_screen = visible;
+            e.shown_at = Some(tick);
+        }
         let want = side_for(shown, e.full);
         e.want = want;
 
@@ -416,6 +429,12 @@ impl PictureCache {
         self.entries.insert(new, e);
     }
 
+    /// Count the `texture` calls that follow towards `shown`, or not (a
+    /// second window's pictures). On unless turned off.
+    pub fn count_shown(&mut self, on: bool) {
+        self.counting = on;
+    }
+
     /// Pictures are still being loaded or uploaded, so frames should keep
     /// coming for them to sharpen.
     pub fn busy(&self) -> bool {
@@ -425,7 +444,10 @@ impl PictureCache {
     /// Of the pictures on screen last frame, how many have something to
     /// show, and how many there are.
     pub fn shown(&self) -> (usize, usize) {
-        let on = self.entries.values().filter(|e| e.on_screen && self.tick.saturating_sub(e.seen) <= 1);
+        let on = self
+            .entries
+            .values()
+            .filter(|e| e.on_screen && e.shown_at.is_some_and(|t| self.tick.saturating_sub(t) <= 1));
         on.fold((0, 0), |(ready, all), e| (ready + usize::from(e.showable() || e.broken), all + 1))
     }
 
@@ -658,6 +680,34 @@ mod tests {
         let _ = frame(&ctx, |ctx| cache.begin_frame(ctx));
         assert!(!cache.entries.contains_key(&a), "idle slide's picture is let go");
         assert!(cache.entries[&b].tex.is_some(), "recently drawn picture stays");
+    }
+
+    /// The slide window shares this cache; the overlay's "loading
+    /// pictures" progress must count only what the overlay draws.
+    #[test]
+    fn a_second_windows_pictures_stay_out_of_the_progress() {
+        let ctx = egui::Context::default();
+        let mut cache = PictureCache::default();
+        let (mine, theirs) = (Source::Inline(png(2, 2)), Source::Inline(png(2, 2)));
+        let draw = |cache: &mut PictureCache, overlay_too: bool| {
+            let _ = frame(&ctx, |ctx| {
+                cache.begin_frame(ctx);
+                cache.texture(ctx, &mine, None, 2.0, 2, true);
+                if overlay_too {
+                    cache.texture(ctx, &theirs, None, 2.0, 2, true);
+                }
+                cache.count_shown(false);
+                cache.texture(ctx, &theirs, None, 2.0, 2, true);
+                cache.count_shown(true);
+            });
+        };
+        draw(&mut cache, false);
+        assert_eq!(cache.shown(), (1, 1), "only the overlay's picture");
+        draw(&mut cache, true);
+        assert_eq!(cache.shown(), (2, 2), "both windows show it now");
+        draw(&mut cache, false);
+        draw(&mut cache, false);
+        assert_eq!(cache.shown(), (1, 1), "the overlay moved on; the other window still draws it");
     }
 
     #[test]

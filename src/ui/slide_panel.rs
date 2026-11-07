@@ -36,6 +36,8 @@ pub enum SlideAction {
     Rename(usize, String),
     /// A new slide after the last one.
     Add,
+    /// Show the slide in the slide window (`ui::slide_window`).
+    OpenWindow(usize),
 }
 
 #[derive(Default)]
@@ -236,9 +238,16 @@ fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager,
     ui.painter().galley(pos, galley, colour);
 
     let mut tip = if name.is_empty() { "Double-click to name".to_string() } else { format!("{name}\nDouble-click to rename") };
+    tip.push_str("\nRight-click to open in a window");
     if locked {
         tip.push_str("\nLocked: pans and zooms, takes no edits");
     }
+    response.context_menu(|ui| {
+        if ui.button("Open in a window").clicked() {
+            action = Some(SlideAction::OpenWindow(i));
+            ui.close_menu();
+        }
+    });
     let response = response.on_hover_text(tip);
     if response.double_clicked() {
         state.start_rename(i, name);

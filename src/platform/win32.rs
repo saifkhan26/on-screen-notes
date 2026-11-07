@@ -149,6 +149,60 @@ pub fn set_window_capture_excluded(hwnd_raw: isize, excluded: bool) {
     }
 }
 
+/// A visible window of this thread, other than `except`, whose title
+/// starts with `prefix`; 0 if none. eframe does not hand out the handles
+/// of the windows it makes for extra viewports, so the slide window is
+/// found by its title.
+pub fn own_window_titled(prefix: &str, except: isize) -> isize {
+    use windows::Win32::Foundation::{BOOL, LPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{EnumThreadWindows, GetWindowTextW, IsWindowVisible};
+
+    struct Search {
+        prefix: Vec<u16>,
+        except: isize,
+        found: isize,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: `lparam` is the `Search` below, alive for the whole
+        // enumeration, which runs on this thread.
+        let s = unsafe { &mut *(lparam.0 as *mut Search) };
+        if hwnd.0 == s.except || !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            return true.into();
+        }
+        let mut buf = [0u16; 128];
+        // SAFETY: writes at most `buf.len()` characters into `buf`.
+        let n = unsafe { GetWindowTextW(hwnd, &mut buf) }.max(0) as usize;
+        if buf[..n].starts_with(&s.prefix) {
+            s.found = hwnd.0;
+            return false.into();
+        }
+        true.into()
+    }
+    let mut search = Search { prefix: prefix.encode_utf16().collect(), except, found: 0 };
+    // SAFETY: `visit` only reads windows of this thread and writes to
+    // `search`, which outlives the call.
+    unsafe {
+        let _ = EnumThreadWindows(GetCurrentThreadId(), Some(visit), LPARAM(&mut search as *mut Search as isize));
+    }
+    search.found
+}
+
+/// Make `owner` own the top-level window `hwnd`: Windows then keeps
+/// `hwnd` above `owner` and hides it with it, without making it
+/// always-on-top.
+pub fn set_owner(hwnd: isize, owner: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_HWNDPARENT};
+    if hwnd == 0 || owner == 0 {
+        return;
+    }
+    // SAFETY: both are our own windows; `GWLP_HWNDPARENT` on a top-level
+    // window sets its owner.
+    unsafe {
+        SetWindowLongPtrW(HWND(hwnd), GWLP_HWNDPARENT, owner);
+    }
+}
+
 /// Outer rect of `hwnd_raw` in screen-physical pixels as
 /// `(left, top, right, bottom)`. Returns `None` if the call fails
 /// or the HWND is 0.

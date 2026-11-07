@@ -301,7 +301,11 @@ pub(crate) fn enabled() -> bool {
 /// Split `strokes` into chunks and make sure each is stored, building
 /// the ones that are not. `opacity` is the layer's.
 pub(crate) fn plan_layer(ctx: &egui::Context, strokes: &[Stroke], opacity: f32) -> Vec<ChunkPlan> {
-    let frame = ctx.cumulative_pass_nr();
+    // The main window's frame count, whichever window draws: each window
+    // counts its own frames, and the store keeps one clock. The slide
+    // window draws inside the main window's frame, so the two share a
+    // number and a chunk either one drew this frame is in use.
+    let frame = ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT);
     let (fan_on, fan_step) = render::fan_corners();
     let seed = mix(mix(mix(1, opacity.to_bits() as u64), fan_on as u64), fan_step.to_bits() as u64);
     let mut st = store();

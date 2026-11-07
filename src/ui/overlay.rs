@@ -8,6 +8,7 @@
 //! into a tiny-skia pixmap and re-uploaded a multi-megabyte texture every
 //! frame.
 
+use crate::canvas::canvas::Canvas;
 use crate::canvas::CanvasManager;
 use crate::canvas::render;
 use crate::canvas::shape::Shape;
@@ -148,6 +149,88 @@ impl OverlayCache {
         Some(id)
     }
 
+    /// Once a frame, before any texture is asked for: let go of what has
+    /// not been drawn lately, take in finished picture loads. Eviction
+    /// comes first so nothing made this frame is freed in it (see
+    /// `PictureCache::begin_frame`). `show` runs it; with the overlay
+    /// hidden, the slide window does.
+    pub fn begin_frame(&mut self, ctx: &egui::Context) {
+        self.evict_idle();
+        self.pictures.begin_frame(ctx);
+    }
+
+    /// The textures slide `canvas_idx` paints with, shown in `view` (its
+    /// rect on screen) under `pan` and `zoom`: each layer's frozen frame,
+    /// and each shape's picture or video frame (`[layer][shape]`, `None`
+    /// for shapes without one). Stored pictures load at about the size
+    /// they show at, and only when on screen.
+    ///
+    /// Only makes textures, never frees one, so a second window may call
+    /// it in the same frame as the overlay; eviction is `begin_frame`'s,
+    /// once a frame. `overlay` is false for that second window, whose
+    /// pictures stay out of the overlay's loading progress.
+    #[allow(clippy::too_many_arguments)]
+    pub fn slide_textures(
+        &mut self,
+        ctx: &egui::Context,
+        canvas_idx: usize,
+        canvas: &Canvas,
+        view: egui::Rect,
+        pan: [f32; 2],
+        zoom: f32,
+        media: &crate::media::MediaHub,
+        overlay: bool,
+    ) -> (Vec<Option<egui::TextureId>>, Vec<Vec<Option<egui::TextureId>>>) {
+        let layer_images = canvas
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(li, layer)| layer.image.as_ref().and_then(|img| self.ensure_texture(ctx, canvas_idx, li, img)))
+            .collect();
+        // On-screen footprint of a shape, for stored pictures: how big
+        // to load it, and whether to load it at all.
+        let ppp = ctx.pixels_per_point();
+        let near = view.expand(view.width().max(view.height()) * 0.25);
+        let footprint = |shape: &Shape| {
+            let obb = shape.obb();
+            let mut r = egui::Rect::NOTHING;
+            for p in obb.corners() {
+                r.extend_with(egui::pos2(view.min.x + pan[0] + p[0] * zoom, view.min.y + pan[1] + p[1] * zoom));
+            }
+            let long = obb.half[0].max(obb.half[1]) * 2.0 * zoom * ppp;
+            (long, r.intersects(near))
+        };
+        let pictures = &mut self.pictures;
+        pictures.count_shown(overlay);
+        let shapes = canvas
+            .layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .shapes
+                    .iter()
+                    .map(|shape| match shape {
+                        Shape::Raster { png, media: m, picture, px_size, .. } => {
+                            // A video's live frame, else its poster.
+                            if let Some(tex) = m.as_ref().and_then(|m| media.texture(m.id)) {
+                                return Some(tex);
+                            }
+                            let (long, on_screen) = footprint(shape);
+                            let visible = on_screen && layer.visible;
+                            match picture {
+                                Some(p) => pictures.texture(ctx, &Source::File((**p).clone()), Some(png), long, 0, visible),
+                                None => pictures.texture(ctx, &Source::Inline(png.clone()), None, long, px_size[0].max(px_size[1]), visible),
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        pictures.count_shown(true);
+        (layer_images, shapes)
+    }
+
     /// Ensure a texture exists for the given layer's image. Uploads
     /// (or re-uploads on size mismatch) when needed. Returns a
     /// `TextureId` suitable for `Painter::image`.
@@ -244,63 +327,11 @@ pub fn show(
     // before the renderer runs. Scope the temporary so the `active`
     // borrow of `manager` ends before the closure below re-borrows.
     let canvas_idx = manager.active_index();
-    cache.evict_idle();
-    let layer_image_textures: Vec<Option<egui::TextureId>> = {
+    cache.begin_frame(ctx);
+    let (layer_image_textures, shape_textures) = {
         let active = manager.active();
-        active
-            .layers
-            .iter()
-            .enumerate()
-            .map(|(li, layer)| {
-                layer
-                    .image
-                    .as_ref()
-                    .and_then(|img| cache.ensure_texture(ctx, canvas_idx, li, img))
-            })
-            .collect()
-    };
-    cache.pictures.begin_frame(ctx);
-    let shape_textures: Vec<Vec<Option<egui::TextureId>>> = {
-        let active = manager.active();
-        // On-screen footprint of a shape, for stored pictures: how big
-        // to load it, and whether to load it at all.
         let view = cache.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect());
-        let ppp = ctx.pixels_per_point();
-        let (pan, zoom) = (active.pan, active.zoom);
-        let footprint = |shape: &Shape| {
-            let obb = shape.obb();
-            let mut r = egui::Rect::NOTHING;
-            for p in obb.corners() {
-                r.extend_with(egui::pos2(view.min.x + pan[0] + p[0] * zoom, view.min.y + pan[1] + p[1] * zoom));
-            }
-            let long = obb.half[0].max(obb.half[1]) * 2.0 * zoom * ppp;
-            (long, r.intersects(view.expand(view.width().max(view.height()) * 0.25)))
-        };
-        active
-            .layers
-            .iter()
-            .map(|layer| {
-                layer
-                    .shapes
-                    .iter()
-                    .map(|shape| match shape {
-                        Shape::Raster { png, media: m, picture, px_size, .. } => {
-                            // A video's live frame, else its poster.
-                            if let Some(tex) = m.as_ref().and_then(|m| media.texture(m.id)) {
-                                return Some(tex);
-                            }
-                            let (long, on_screen) = footprint(shape);
-                            let visible = on_screen && layer.visible;
-                            match picture {
-                                Some(p) => cache.pictures.texture(ctx, &Source::File((**p).clone()), Some(png), long, 0, visible),
-                                None => cache.pictures.texture(ctx, &Source::Inline(png.clone()), None, long, px_size[0].max(px_size[1]), visible),
-                            }
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .collect()
+        cache.slide_textures(ctx, canvas_idx, active, view, active.pan, active.zoom, media, true)
     };
     // Pins draw over the slide; their pictures and videos are looked up
     // like the active slide's, by their own slide's index.
