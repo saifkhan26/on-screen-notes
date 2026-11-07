@@ -784,6 +784,18 @@ impl CanvasManager {
         self.pins.pinned(&self.canvases, self.active)
     }
 
+    /// The global pins, for the slide window to show in place of the
+    /// canvas (see `set_globals_away`).
+    pub fn global_pins(&self) -> Vec<pins::Pinned<'_>> {
+        self.pins.globals(&self.canvases)
+    }
+
+    /// Show the global pins in the slide window instead of on the canvas:
+    /// `pinned` then leaves them out. Not an edit; not saved.
+    pub fn set_globals_away(&mut self, away: bool) {
+        self.pins.set_globals_away(away);
+    }
+
     /// Some pin has objects to show on the active slide, whether or not
     /// pins are hidden.
     pub fn has_pins(&self) -> bool {
@@ -1654,6 +1666,28 @@ mod pin_tests {
         m.active_mut().redo();
         m.refresh_pins();
         assert_eq!(m.pinned()[0].pin.center, [500.0, 500.0]);
+    }
+
+    #[test]
+    fn global_pins_can_move_to_the_slide_window_and_back() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide()]);
+        let global = m.pin_objects(0, &[0], &[], [0.0, 0.0], false).expect("pinned");
+        let local = m.pin_objects(0, &[], &[1], [0.0, 0.0], true).expect("pinned");
+        let ids = |v: Vec<pins::Pinned>| v.iter().map(|p| p.pin.id).collect::<Vec<_>>();
+        assert_eq!(ids(m.pinned()), [global, local]);
+
+        m.set_globals_away(true);
+        assert_eq!(ids(m.pinned()), [local], "the canvas keeps its local pin only");
+        assert_eq!(ids(m.global_pins()), [global], "the window gets the global one");
+        m.next();
+        assert!(m.pinned().is_empty(), "on another slide nothing is left on the canvas");
+        assert_eq!(ids(m.global_pins()), [global], "the window shows it whatever the slide");
+
+        m.set_pins_hidden(true);
+        assert!(m.global_pins().is_empty(), "hiding pins hides them in the window too");
+        m.set_pins_hidden(false);
+        m.set_globals_away(false);
+        assert_eq!(ids(m.pinned()), [global], "back on the canvas");
     }
 
     #[test]

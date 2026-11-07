@@ -58,6 +58,9 @@ pub struct SlideWindow {
     fit_pending: bool,
     /// Stay above every other window, not only the overlay.
     on_top: bool,
+    /// Show the global pins, and no slide, instead of the slide; the
+    /// canvas then leaves them out (`CanvasManager::set_globals_away`).
+    pins: bool,
     /// The window's native handle once found (0 before; Windows only).
     hwnd: isize,
     /// Frames spent looking for it.
@@ -95,6 +98,7 @@ impl SlideWindow {
             zoom: 1.0,
             fit_pending: true,
             on_top: false,
+            pins: false,
             hwnd: 0,
             find_tries: 0,
         }
@@ -107,6 +111,12 @@ impl SlideWindow {
     /// The window's native handle, 0 until it is known.
     pub fn hwnd(&self) -> isize {
         self.hwnd
+    }
+
+    /// The window shows the global pins instead of a slide, so the canvas
+    /// should not.
+    pub fn shows_pins(&self) -> bool {
+        self.pins
     }
 
     /// Show slide `idx` instead, fitted to the window.
@@ -150,16 +160,17 @@ pub fn show(
     manager.prefetch(win.slide);
     let manager: &CanvasManager = manager;
 
+    // Not shown on the window; Alt+Tab and the handle search use it.
+    let title = if win.pins { "Slide window · global pins".to_string() } else { format!("Slide {}", slide_label(manager, win.slide)) };
     let builder = egui::ViewportBuilder::default()
-        // Not shown on the window; Alt+Tab and the handle search use it.
-        .with_title(format!("Slide {}", slide_label(manager, win.slide)))
+        .with_title(title)
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(true)
         .with_taskbar(false)
         // Size on first opening only; the user's resizes stick after.
         .with_inner_size([720.0, 480.0])
-        .with_min_inner_size([460.0, 240.0])
+        .with_min_inner_size([520.0, 240.0])
         .with_window_level(if win.on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal });
     let open = ctx.show_viewport_immediate(SlideWindow::viewport_id(), builder, |ctx, class| {
         // A backend with one window would draw this over the canvas.
@@ -169,7 +180,11 @@ pub fn show(
         }
         let mut open = !ctx.input(|i| i.viewport().close_requested());
         let top = if look.chrome { CARD_INSET } else { 0.0 };
-        canvas_area(ctx, win, cache, manager, position_passes, media, look.background, top);
+        if win.pins {
+            pins_area(ctx, win, cache, manager, position_passes, media, look.background, top);
+        } else {
+            canvas_area(ctx, win, cache, manager, position_passes, media, look.background, top);
+        }
         if look.chrome {
             open &= card(ctx, win, manager);
         }
@@ -301,19 +316,38 @@ fn card(ctx: &egui::Context, win: &mut SlideWindow, manager: &CanvasManager) -> 
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     grip(ui);
-                    let prev = egui::Image::new(egui::include_image!("../../assets/icons/chevron-left.svg"));
-                    if icon_btn(ui, prev, "Previous slide", win.slide > 0) {
-                        win.set_slide(win.slide - 1);
+                    if win.pins {
+                        // No slide to step through while the pins show.
+                        // As wide as the arrows and the picker, so the
+                        // card keeps its size.
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(2.0 * BTN + 6.0 + PICKER_W, BTN), egui::Sense::hover());
+                        let text = egui::Pos2::new(rect.min.x + 8.0, rect.center().y);
+                        ui.painter().text(text, egui::Align2::LEFT_CENTER, "Global pins", egui::FontId::proportional(14.0), theme::TEXT_PRIMARY);
+                    } else {
+                        let prev = egui::Image::new(egui::include_image!("../../assets/icons/chevron-left.svg"));
+                        if icon_btn(ui, prev, "Previous slide", win.slide > 0) {
+                            win.set_slide(win.slide - 1);
+                        }
+                        let next = egui::Image::new(egui::include_image!("../../assets/icons/chevron-right.svg"));
+                        if icon_btn(ui, next, "Next slide", win.slide + 1 < count) {
+                            win.set_slide(win.slide + 1);
+                        }
+                        if let Some(i) = slide_picker(ui, win.slide, manager) {
+                            win.set_slide(i);
+                        }
                     }
-                    let next = egui::Image::new(egui::include_image!("../../assets/icons/chevron-right.svg"));
-                    if icon_btn(ui, next, "Next slide", win.slide + 1 < count) {
-                        win.set_slide(win.slide + 1);
-                    }
-                    if let Some(i) = slide_picker(ui, win.slide, manager) {
-                        win.set_slide(i);
+                    let tip = if win.pins {
+                        "Showing the pins on every slide here. Click to show the slide again and give the pins back to the main window"
+                    } else {
+                        "Show the pins on every slide here, without a slide. They leave the main window while this is on"
+                    };
+                    if text_btn(ui, "Pins", tip, win.pins) {
+                        win.pins = !win.pins;
+                        win.fit_pending = true;
                     }
                     ui.add_space(8.0);
-                    if text_btn(ui, "Fit", "Fit the slide to the window — or double-click it", false) {
+                    let fit_tip = if win.pins { "Fit the pins to the window — or double-click" } else { "Fit the slide to the window — or double-click it" };
+                    if text_btn(ui, "Fit", fit_tip, false) {
                         win.fit_pending = true;
                     }
                     ui.label(egui::RichText::new(zoom_label(win.zoom)).color(theme::TEXT_MUTED));
@@ -438,21 +472,8 @@ fn slide_view(
     media: &crate::media::MediaHub,
     top: f32,
 ) {
-    if win.fit_pending || response.double_clicked() {
+    if navigate(ctx, win, rect, response) {
         fit(win, slide, rect.size(), top);
-        win.fit_pending = false;
-    }
-    if response.dragged() {
-        let d = response.drag_delta();
-        win.pan[0] += d.x;
-        win.pan[1] += d.y;
-    }
-    if let Some(p) = response.hover_pos() {
-        let steps = ctx.input(wheel_steps);
-        if steps.abs() > 1e-4 {
-            zoom_about(win, 1.10_f32.powf(steps), p - rect.min);
-        }
-        ctx.set_cursor_icon(if response.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
     }
 
     let painter = ui.painter_at(rect);
@@ -478,6 +499,69 @@ fn slide_view(
     if empty {
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, "This slide is empty", egui::FontId::proportional(14.0), theme::TEXT_MUTED);
     }
+}
+
+/// The global pins alone, laid out as they are on the canvas, under the
+/// window's own pan and zoom (`fit` gathers them into view).
+#[allow(clippy::too_many_arguments)]
+fn pins_area(
+    ctx: &egui::Context,
+    win: &mut SlideWindow,
+    cache: &mut OverlayCache,
+    manager: &CanvasManager,
+    position_passes: usize,
+    media: &crate::media::MediaHub,
+    background: Color32,
+    top: f32,
+) {
+    egui::CentralPanel::default().frame(egui::Frame::none().fill(background)).show(ctx, |ui| {
+        let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        let pins = manager.global_pins();
+        if pins.is_empty() {
+            let text = if manager.pins_hidden() { "Pins are hidden — Shift+P shows them" } else { "No pins on every slide yet — Ctrl+P pins a selection" };
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(14.0), theme::TEXT_MUTED);
+        } else {
+            if navigate(ctx, win, rect, &response) {
+                let bounds = pins
+                    .iter()
+                    .map(|p| p.frame().aabb())
+                    .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
+                if let Some(b) = bounds {
+                    // No bigger than on the canvas: they were sized there.
+                    fit_bounds(win, b, rect.size(), top, 1.0);
+                }
+            }
+            let origin = rect.min + Vec2::new(win.pan[0], win.pan[1]);
+            let textures = cache.pin_textures(ctx, &pins, rect, origin, win.zoom, media, false);
+            let painter = ui.painter_at(rect);
+            for (p, textures) in pins.iter().zip(&textures) {
+                // The pin's own scale times the window's zoom; its turn
+                // and place (`rigid`) are the canvas's, so the layout
+                // is kept.
+                render::paint_pinned(&painter, origin, p.canvas, p.members, p.pin.rigid(p.anchor()), p.pin.scale * win.zoom, position_passes, textures);
+            }
+        }
+        resize_edges(ui, rect);
+    });
+}
+
+/// Pan with a drag, zoom with the wheel about the pointer; true when the
+/// view should be fitted (asked for, or a double-click).
+fn navigate(ctx: &egui::Context, win: &mut SlideWindow, rect: egui::Rect, response: &egui::Response) -> bool {
+    let fit = std::mem::take(&mut win.fit_pending) || response.double_clicked();
+    if response.dragged() {
+        let d = response.drag_delta();
+        win.pan[0] += d.x;
+        win.pan[1] += d.y;
+    }
+    if let Some(p) = response.hover_pos() {
+        let steps = ctx.input(wheel_steps);
+        if steps.abs() > 1e-4 {
+            zoom_about(win, 1.10_f32.powf(steps), p - rect.min);
+        }
+        ctx.set_cursor_icon(if response.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+    }
+    fit
 }
 
 /// Bands along the window's edges and corners that resize it, as a frame
@@ -554,14 +638,21 @@ fn content_bounds(slide: &Canvas) -> Option<[f32; 4]> {
 /// Fit the slide's content to a canvas area of `size`, centred in what
 /// is left below `top`. An empty slide gets the view it has on the canvas.
 fn fit(win: &mut SlideWindow, slide: &Canvas, size: Vec2, top: f32) {
-    let Some([x0, y0, x1, y1]) = content_bounds(slide) else {
-        win.pan = slide.pan;
-        win.zoom = slide.zoom;
-        return;
-    };
+    match content_bounds(slide) {
+        Some(b) => fit_bounds(win, b, size, top, FIT_MAX_ZOOM),
+        None => {
+            win.pan = slide.pan;
+            win.zoom = slide.zoom;
+        }
+    }
+}
+
+/// Fit `[x0, y0, x1, y1]` to a canvas area of `size`, centred in what is
+/// left below `top`, at most `max_zoom`.
+fn fit_bounds(win: &mut SlideWindow, [x0, y0, x1, y1]: [f32; 4], size: Vec2, top: f32, max_zoom: f32) {
     let (w, h) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
     let room = (size - Vec2::new(2.0 * FIT_MARGIN, 2.0 * FIT_MARGIN + top)).max(Vec2::splat(1.0));
-    let zoom = (room.x / w).min(room.y / h).clamp(MIN_ZOOM, FIT_MAX_ZOOM);
+    let zoom = (room.x / w).min(room.y / h).clamp(MIN_ZOOM, max_zoom);
     win.zoom = zoom;
     let centre_y = top + (size.y - top) * 0.5;
     win.pan = [size.x * 0.5 - (x0 + x1) * 0.5 * zoom, centre_y - (y0 + y1) * 0.5 * zoom];

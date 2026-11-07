@@ -231,6 +231,58 @@ impl OverlayCache {
         (layer_images, shapes)
     }
 
+    /// The textures pins paint their pictures and videos with
+    /// (`[pin][member]`, `None` for members without one). A pin's screen
+    /// point `q` shows at `origin + q · zoom` in `view`: the overlay draws
+    /// pins as placed (`origin` its canvas's top-left, `zoom` 1), the
+    /// slide window under its own pan and zoom. Like `slide_textures`, only
+    /// makes textures; `overlay` says whether they count towards the
+    /// overlay's loading progress.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pin_textures(
+        &mut self,
+        ctx: &egui::Context,
+        pinned: &[crate::canvas::pins::Pinned],
+        view: egui::Rect,
+        origin: egui::Pos2,
+        zoom: f32,
+        media: &crate::media::MediaHub,
+        overlay: bool,
+    ) -> Vec<Vec<Option<egui::TextureId>>> {
+        use crate::canvas::hit::ObjRef;
+        let ppp = ctx.pixels_per_point();
+        let near = view.expand(view.width().max(view.height()) * 0.25);
+        let pictures = &mut self.pictures;
+        pictures.count_shown(overlay);
+        let textures = pinned
+            .iter()
+            .map(|p| {
+                p.members
+                    .iter()
+                    .map(|m| {
+                        let ObjRef::Shape(si) = m.obj else { return None };
+                        let layer = p.canvas.layers.get(m.layer)?;
+                        let shape = layer.shapes.get(si)?;
+                        let Shape::Raster { png, media: md, picture, px_size, .. } = shape else { return None };
+                        if let Some(tex) = md.as_ref().and_then(|md| media.texture(md.id)) {
+                            return Some(tex);
+                        }
+                        let o = p.shape_obb(shape);
+                        let [x0, y0, x1, y1] = o.aabb();
+                        let r = egui::Rect::from_min_max(origin + egui::vec2(x0, y0) * zoom, origin + egui::vec2(x1, y1) * zoom);
+                        let long = o.half[0].max(o.half[1]) * 2.0 * zoom * ppp;
+                        match picture {
+                            Some(pic) => pictures.texture(ctx, &Source::File((**pic).clone()), Some(png), long, 0, r.intersects(near)),
+                            None => pictures.texture(ctx, &Source::Inline(png.clone()), None, long, px_size[0].max(px_size[1]), r.intersects(near)),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        pictures.count_shown(true);
+        textures
+    }
+
     /// Ensure a texture exists for the given layer's image. Uploads
     /// (or re-uploads on size mismatch) when needed. Returns a
     /// `TextureId` suitable for `Painter::image`.
@@ -336,36 +388,9 @@ pub fn show(
     // Pins draw over the slide; their pictures and videos are looked up
     // like the active slide's, by their own slide's index.
     let pinned = manager.pinned();
-    let pin_textures: Vec<Vec<Option<egui::TextureId>>> = {
-        use crate::canvas::hit::ObjRef;
+    let pin_textures = {
         let view = cache.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect());
-        let ppp = ctx.pixels_per_point();
-        let near = view.expand(view.width().max(view.height()) * 0.25);
-        pinned
-            .iter()
-            .map(|p| {
-                p.members
-                    .iter()
-                    .map(|m| {
-                        let ObjRef::Shape(si) = m.obj else { return None };
-                        let layer = p.canvas.layers.get(m.layer)?;
-                        let shape = layer.shapes.get(si)?;
-                        let Shape::Raster { png, media: md, picture, px_size, .. } = shape else { return None };
-                        if let Some(tex) = md.as_ref().and_then(|md| media.texture(md.id)) {
-                            return Some(tex);
-                        }
-                        let o = p.shape_obb(shape);
-                        let [x0, y0, x1, y1] = o.aabb();
-                        let r = egui::Rect::from_min_max(view.min + egui::vec2(x0, y0), view.min + egui::vec2(x1, y1));
-                        let long = o.half[0].max(o.half[1]) * 2.0 * ppp;
-                        match picture {
-                            Some(pic) => cache.pictures.texture(ctx, &Source::File((**pic).clone()), Some(png), long, 0, r.intersects(near)),
-                            None => cache.pictures.texture(ctx, &Source::Inline(png.clone()), None, long, px_size[0].max(px_size[1]), r.intersects(near)),
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
+        cache.pin_textures(ctx, &pinned, view, view.min, 1.0, media, true)
     };
     let mut canvas_rect = egui::Rect::NOTHING;
     egui::CentralPanel::default()

@@ -2014,6 +2014,9 @@ impl eframe::App for OnScreenNotesApp {
         let stored = self.canvases.store_pictures();
         self.overlay_cache.carry_pictures(&stored);
         self.canvases.refresh_pins();
+        // The global pins are on the canvas, or in the slide window when
+        // its "Pins" toggle is on; never both.
+        self.canvases.set_globals_away(self.slide_window.as_ref().is_some_and(|w| w.shows_pins()));
         let errs = self.canvases.take_load_errors();
         if !errs.is_empty() {
             let msg = match errs.len() {
@@ -2455,7 +2458,14 @@ impl eframe::App for OnScreenNotesApp {
             // Advance video / GIF playback and upload new frames before
             // the canvas paints them.
             let view = self.overlay_cache.canvas_rect(ctx);
-            self.media.sync(ctx, self.canvases.active(), &self.canvases.pinned(), ctx.pixels_per_point(), view);
+            // Pinned videos play wherever their pins are, the slide
+            // window included. Its pins count as placed on the canvas.
+            let mut pins = self.canvases.pinned();
+            if self.slide_window.as_ref().is_some_and(|w| w.shows_pins()) {
+                pins.extend(self.canvases.global_pins());
+            }
+            self.media.sync(ctx, self.canvases.active(), &pins, ctx.pixels_per_point(), view);
+            drop(pins);
             // Selection handles must stay out of anything that grabs the
             // screen.
             let show_selection = self.pending_screenshot.is_none()

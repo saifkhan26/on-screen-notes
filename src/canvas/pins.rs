@@ -270,6 +270,9 @@ pub struct PinBoard {
     /// Every pin is hidden for now (the toolbar toggle). Not saved: each
     /// run starts with the pins showing.
     hidden: bool,
+    /// The global pins show in the slide window instead of on the
+    /// canvas (its "Pins" toggle). Not saved: the slide window is not.
+    globals_away: bool,
 }
 
 impl PinBoard {
@@ -330,9 +333,22 @@ impl PinBoard {
     }
 
     /// The pins that have objects to show on slide `active`, bottom to
-    /// top: the global ones and its own local ones. None while the pins
-    /// are hidden, so nothing draws, plays or grabs them then.
+    /// top: the global ones and its own local ones — only its local ones
+    /// while the global pins are away in the slide window. None while
+    /// the pins are hidden, so nothing draws, plays or grabs them then.
     pub fn pinned<'a>(&'a self, canvases: &'a [Option<Canvas>], active: usize) -> Vec<Pinned<'a>> {
+        self.shown(canvases, |pin, slide| if pin.local { slide == active } else { !self.globals_away })
+    }
+
+    /// The global pins, bottom to top, wherever they show; none while the
+    /// pins are hidden.
+    pub fn globals<'a>(&'a self, canvases: &'a [Option<Canvas>]) -> Vec<Pinned<'a>> {
+        self.shown(canvases, |pin, _| !pin.local)
+    }
+
+    /// The pins `keep` takes (given the pin and its objects' slide) that
+    /// have objects to show.
+    fn shown<'a>(&'a self, canvases: &'a [Option<Canvas>], keep: impl Fn(&Pin, usize) -> bool) -> Vec<Pinned<'a>> {
         if self.hidden {
             return Vec::new();
         }
@@ -340,12 +356,18 @@ impl PinBoard {
             .iter()
             .filter_map(|pin| {
                 let &(slide, k) = self.located.get(&pin.id)?;
-                if pin.local && slide != active { return None; }
+                if !keep(pin, slide) { return None; }
                 let canvas = canvases.get(slide)?.as_ref()?;
                 let f = self.scans.get(slide)?.as_ref()?.found.get(k)?;
                 Some(Pinned { pin, slide, canvas, members: &f.members, bounds: f.bounds? })
             })
             .collect()
+    }
+
+    /// Show the global pins in the slide window instead of on the canvas,
+    /// or back on the canvas.
+    pub fn set_globals_away(&mut self, away: bool) {
+        self.globals_away = away;
     }
 
     /// Some pin has objects to show on slide `active` (hidden or not).
