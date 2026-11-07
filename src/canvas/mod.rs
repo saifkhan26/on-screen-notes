@@ -627,6 +627,29 @@ impl CanvasManager {
         self.canvases.get(idx)?.as_ref()
     }
 
+    /// Run `f` on slide `idx` as seen through `pan` / `zoom` instead of
+    /// its own view: how the slide window edits the slide it shows. The
+    /// tools read the zoom (pens and the eraser work at their size on
+    /// screen), and the Select tool its handle sizes. The slide's own view
+    /// is put back when `f` returns, so looking around in the window never
+    /// moves it. Flags the slide for the autosave only if `f` edited it
+    /// (see `edit_active`). `None` for a slide not read yet, which this
+    /// never waits for.
+    pub fn edit_slide_in_view<R>(&mut self, idx: usize, pan: [f32; 2], zoom: f32, f: impl FnOnce(&mut Canvas) -> R) -> Option<R> {
+        let c = self.canvases.get_mut(idx)?.as_mut()?;
+        let (own_pan, own_zoom) = (c.pan, c.zoom);
+        let before = c.edit_stamp();
+        c.pan = pan;
+        c.zoom = zoom;
+        let r = f(c);
+        c.pan = own_pan;
+        c.zoom = own_zoom;
+        if c.edit_stamp() != before {
+            c.dirty = true;
+        }
+        Some(r)
+    }
+
     /// Have slide `idx` read soon, without going to it: a slide shown
     /// somewhere other than the canvas (the slide window) asks for itself
     /// here. Does nothing for a slide that is in, or being read.

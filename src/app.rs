@@ -769,6 +769,9 @@ impl OnScreenNotesApp {
         // ones while the user draws elsewhere.
         (self.pen.is_down() && !self.pen_blocked)
             || self.tool.in_progress_stroke.is_some()
+            // Drawing in the slide window: its frames are the main
+            // window's (an immediate viewport).
+            || self.slide_window.as_ref().is_some_and(|w| w.busy())
             || self.pending_screenshot.is_some()
             || self.pending_freeze.is_some()
             || self.pending_lasso.is_some()
@@ -2229,6 +2232,11 @@ impl eframe::App for OnScreenNotesApp {
                 }
             }
         }
+        // A pen gesture that starts over the slide window is the window's:
+        // it replays it on the slide it shows (`ui::slide_edit`).
+        if let Some(win) = self.slide_window.as_mut() {
+            win.claim_pen(&mut pen_events, client_origin);
+        }
 
         // ---- Pin-to-window follow ---------------------------------------
         // Two phases:
@@ -3497,7 +3505,7 @@ impl eframe::App for OnScreenNotesApp {
                         win.set_slide(i);
                         ctx.send_viewport_cmd_to(ui::slide_window::SlideWindow::viewport_id(), egui::ViewportCommand::Focus);
                     }
-                    None => self.slide_window = Some(ui::slide_window::SlideWindow::new(i)),
+                    None => self.slide_window = Some(ui::slide_window::SlideWindow::new(i, &self.config)),
                 },
                 None => {}
             }
@@ -3693,6 +3701,11 @@ impl eframe::App for OnScreenNotesApp {
                 chrome: self.ui_visible,
                 owner: self.osn_hwnd,
             };
+            let input = ui::slide_edit::Input {
+                space: space_held,
+                pen_owns_pointer: self.pen.is_down() || self.pen.used_within(PEN_OWNS_POINTER),
+                keys: &self.hotkeys_cfg,
+            };
             let open = ui::slide_window::show(
                 ctx,
                 win,
@@ -3701,6 +3714,8 @@ impl eframe::App for OnScreenNotesApp {
                 self.config.smoothing_level.position_passes(),
                 &self.media,
                 &look,
+                &mut self.tool,
+                &input,
             );
             if !open {
                 self.slide_window = None;

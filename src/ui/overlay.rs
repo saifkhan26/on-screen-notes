@@ -639,50 +639,8 @@ pub fn show(
             // the handles stay the same size to grab at any zoom.
             if matches!(tool.kind, ToolKind::Select) && show_selection {
                 let canvas = manager.active();
-                let zoom = canvas.zoom;
-                let ox = rect.min.x + canvas.pan[0];
-                let oy = rect.min.y + canvas.pan[1];
-                let to_screen = |p: [f32; 2]| egui::pos2(ox + p[0] * zoom, oy + p[1] * zoom);
-                let chrome = tool.select.chrome(canvas);
-                let painter = ui.painter();
-                // The overlay sits on arbitrary desktop content, so every
-                // line is a light stroke over a dark one: it reads on
-                // both bright and dark backgrounds.
-                let line = egui::Color32::from_rgb(86, 160, 255);
-                let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
-
-                if let Some(m) = chrome.marquee {
-                    let r = egui::Rect::from_two_pos(to_screen([m[0], m[1]]), to_screen([m[2], m[3]]));
-                    painter.rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 28));
-                    painter.rect_stroke(r, egui::Rounding::ZERO, egui::Stroke::new(1.0, line));
-                }
-                if let Some(frame) = chrome.frame {
-                    let pts: Vec<egui::Pos2> = frame.iter().map(|p| to_screen(*p)).collect();
-                    painter.add(egui::Shape::closed_line(pts.clone(), egui::Stroke::new(3.0, under)));
-                    painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.4, line)));
-                    if let Some((top, knob)) = chrome.rotate_stem {
-                        let seg = [to_screen(top), to_screen(knob)];
-                        painter.line_segment(seg, egui::Stroke::new(3.0, under));
-                        painter.line_segment(seg, egui::Stroke::new(1.4, line));
-                    }
-                    for (p, handle) in &chrome.handles {
-                        let p = to_screen(*p);
-                        match handle {
-                            crate::tools::select_tool::Handle::Rotate => {
-                                painter.circle_filled(p, 6.5, under);
-                                painter.circle_filled(p, 5.0, egui::Color32::WHITE);
-                                painter.circle_stroke(p, 5.0, egui::Stroke::new(1.4, line));
-                            }
-                            crate::tools::select_tool::Handle::Scale { .. } => {
-                                let outer = egui::Rect::from_center_size(p, egui::vec2(11.0, 11.0));
-                                let inner = egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0));
-                                painter.rect_filled(outer, egui::Rounding::same(2.0), under);
-                                painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
-                                painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
-                            }
-                        }
-                    }
-                }
+                let origin = rect.min + egui::vec2(canvas.pan[0], canvas.pan[1]);
+                paint_select_chrome(ui.painter(), origin, canvas.zoom, &tool.select.chrome(canvas));
             }
 
             // Pins: a faint outline and a badge on each, so they read as
@@ -829,6 +787,51 @@ pub fn show(
     canvas_rect
 }
 
+/// The Select tool's frame, handles, rotate knob and rubber-band box, for
+/// a slide whose canvas point `p` shows at `origin + p · zoom`. Drawn in
+/// screen space at a fixed size, so the handles stay the same size to
+/// grab at any zoom. The canvas sits on arbitrary desktop content, so
+/// every line is a light stroke over a dark one: it reads on both bright
+/// and dark backgrounds.
+pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f32, chrome: &crate::tools::select_tool::Chrome) {
+    let to_screen = |p: [f32; 2]| egui::pos2(origin.x + p[0] * zoom, origin.y + p[1] * zoom);
+    let line = egui::Color32::from_rgb(86, 160, 255);
+    let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+
+    if let Some(m) = chrome.marquee {
+        let r = egui::Rect::from_two_pos(to_screen([m[0], m[1]]), to_screen([m[2], m[3]]));
+        painter.rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 28));
+        painter.rect_stroke(r, egui::Rounding::ZERO, egui::Stroke::new(1.0, line));
+    }
+    if let Some(frame) = chrome.frame {
+        let pts: Vec<egui::Pos2> = frame.iter().map(|p| to_screen(*p)).collect();
+        painter.add(egui::Shape::closed_line(pts.clone(), egui::Stroke::new(3.0, under)));
+        painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.4, line)));
+        if let Some((top, knob)) = chrome.rotate_stem {
+            let seg = [to_screen(top), to_screen(knob)];
+            painter.line_segment(seg, egui::Stroke::new(3.0, under));
+            painter.line_segment(seg, egui::Stroke::new(1.4, line));
+        }
+        for (p, handle) in &chrome.handles {
+            let p = to_screen(*p);
+            match handle {
+                crate::tools::select_tool::Handle::Rotate => {
+                    painter.circle_filled(p, 6.5, under);
+                    painter.circle_filled(p, 5.0, egui::Color32::WHITE);
+                    painter.circle_stroke(p, 5.0, egui::Stroke::new(1.4, line));
+                }
+                crate::tools::select_tool::Handle::Scale { .. } => {
+                    let outer = egui::Rect::from_center_size(p, egui::vec2(11.0, 11.0));
+                    let inner = egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0));
+                    painter.rect_filled(outer, egui::Rounding::same(2.0), under);
+                    painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
+                    painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
+                }
+            }
+        }
+    }
+}
+
 /// Build a "predicted" extension of the live stroke by extrapolating from
 /// the recent samples' velocity. Returns a clone of the input stroke with
 /// 1-2 predicted samples appended.
@@ -836,7 +839,7 @@ pub fn show(
 /// We use a damped linear extrapolation: each predicted sample is the last
 /// real sample plus the average velocity of the trailing window times a
 /// dampening factor (so we don't over-shoot if the user suddenly stops).
-fn predict_ahead(stroke: &Stroke) -> Stroke {
+pub fn predict_ahead(stroke: &Stroke) -> Stroke {
     let n = stroke.samples.len();
     let mut out = stroke.clone();
 
