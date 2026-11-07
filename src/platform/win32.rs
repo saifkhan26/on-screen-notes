@@ -4,13 +4,13 @@
 //!
 //! Window queries eframe / winit do not expose, plus:
 //!
-//! * Foreground reclaim — after a click-through, the app *behind* OSN
-//!   activates (that is OS behaviour we cannot suppress without an
-//!   intrusive low-level mouse hook). We call `SetForegroundWindow`
-//!   on the next pen event so OSN's keyboard shortcuts (P, B, T…)
-//!   keep working. Win10 normally restricts `SetForegroundWindow`
-//!   to processes that already own the foreground, so we use the
-//!   well-known `AttachThreadInput` hack to bypass it.
+//! * Foreground reclaim — after the user worked in another app, OSN
+//!   may not have the foreground when the pen lands on its canvas. We
+//!   call `SetForegroundWindow` on that pen event so OSN's keyboard
+//!   shortcuts (P, B, T…) keep working. Win10 normally restricts
+//!   `SetForegroundWindow` to processes that already own the
+//!   foreground, so we use the well-known `AttachThreadInput` hack to
+//!   bypass it.
 //!
 //! The window is an ordinary activating window. It used to carry
 //! `WS_EX_NOACTIVATE`, which made it open unfocused and ignore

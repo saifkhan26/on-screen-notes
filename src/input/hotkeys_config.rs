@@ -340,9 +340,8 @@ pub struct CanvasSection {
     /// place (the layer keeps its centre). Same modifier-superset rule
     /// as `reset_layer_pos` — it is checked before `reset_view`.
     ///
-    /// The default deliberately avoids `Alt`: holding Alt is the
-    /// click-through gesture, and on AltGr layouts `Ctrl+Alt+<digit>`
-    /// types a character instead of reaching us.
+    /// The default deliberately avoids `Alt`: on AltGr layouts
+    /// `Ctrl+Alt+<digit>` types a character instead of reaching us.
     #[serde(default = "d_reset_layer_zoom")] pub reset_layer_zoom: String,
     #[serde(default = "d_freeze_frame")]  pub freeze_frame: String,
     #[serde(default = "d_prev_canvas")]   pub prev_canvas: String,

@@ -4,9 +4,8 @@ A cross-platform pressure-sensitive on-screen pen-annotation app written in Rust
 
 Draw and write directly over anything on your screen — browser, IDE, video,
 slides — with a pressure-sensitive pen tablet. The window is transparent and
-borderless, holds multiple canvases (←/→ to flip), supports per-canvas layers,
-and can be made click-through with **Alt** so the app behind still receives
-input.
+borderless, holds multiple canvases (←/→ to flip) and supports per-canvas
+layers.
 
 ---
 
@@ -66,7 +65,6 @@ input.
   Slides from older versions are converted the same way when they load
 - **Multiple layers per canvas** (independent visibility + opacity, and
   each layer can be panned / zoomed on its own with `Shift+Space`)
-- **Click-through** while holding `Alt`
 - **Global hotkey screenshot** — saved PNG contains background + ink
 - **Screen recording** — GIF (built-in) or MP4 (if ffmpeg on PATH)
 - **Pin to window** — overlay follows another window's position
@@ -392,7 +390,6 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Reset active layer position | `Ctrl+Shift+0` |
 | Reset active layer zoom | `Ctrl+Shift+9` |
 | Freeze frame → layer | `Ctrl+Shift+F` |
-| Click-through (passthrough) | hold `Alt` |
 | Pan canvas | hold `Space` + drag |
 | Zoom canvas (any tool, the pen too) | hold `Space` + scroll |
 | Pan active layer | hold `Shift+Space` + drag |
@@ -517,7 +514,7 @@ media_next_frame = "period"
 Copy / cut / paste are fixed to `Ctrl+C` / `Ctrl+X` / `Ctrl+V`.
 
 Modifier-key gestures stay hard-coded (they are not shortcuts):
-`Ctrl` (eraser), `Alt` (passthrough), `Space` (pan), `Shift+Space`
+`Ctrl` (eraser), `Space` (pan), `Shift+Space`
 (pan / zoom the active layer instead of the view).
 
 ---
@@ -717,8 +714,7 @@ into Slack / Discord.
   and recording. Pen-pressure via octotablet is partial; mouse fallback
   always works.
 - **Linux X11** — pen pressure via XInput2.
-- **Linux Wayland** — pen pressure via tablet-v2. Click-through depends
-  on compositor support.
+- **Linux Wayland** — pen pressure via tablet-v2.
 
 ---
 
@@ -738,7 +734,6 @@ src/
 ├── input/
 │   ├── filter.rs     ─ wobble + One Euro pre-conditioner
 │   ├── hotkeys.rs    ─ global hotkey bindings
-│   ├── modifiers.rs  ─ Ctrl/Alt/Shift tracker
 │   ├── pen.rs        ─ Wintab queue → PenEvent
 │   └── picker.rs     ─ window-pick helpers
 ├── interaction/      ─ keyboard / mouse dispatch

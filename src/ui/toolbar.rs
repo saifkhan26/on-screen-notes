@@ -675,7 +675,6 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Background opacity",          s("Ctrl+Scroll")),
             ("Erase while drawing",         s("hold Ctrl")),
             ("Pick a colour",               s("hold Shift + tap")),
-            ("Click through",               s("hold Alt")),
             ("Recolour a swatch",           s("right-click it")),
             ("Pin to a window",             s("pin button")),
         ]),

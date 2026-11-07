@@ -17,11 +17,9 @@ use crate::canvas::CanvasManager;
 use crate::config::AppConfig;
 use crate::input::{
     hotkeys::{HotkeyId, Hotkeys},
-    modifiers::ModifierTracker,
     pen::{PenInput, RawHandleHolder},
 };
 use crate::interaction;
-use crate::interaction::click_through;
 use crate::tools::ActiveTool;
 use crate::ui;
 
@@ -34,7 +32,6 @@ pub struct OnScreenNotesApp {
     tool: ActiveTool,
     pen: PenInput,
     hotkeys: Option<Hotkeys>,
-    modifiers: ModifierTracker,
     overlay_cache: ui::overlay::OverlayCache,
 
     /// Whether the main overlay is shown. Toggled by the global hotkey
@@ -51,7 +48,7 @@ pub struct OnScreenNotesApp {
     idle_frame: Duration,
 
     /// Set to false after the very first `update` runs. Used to push
-    /// initial-state viewport commands (e.g. clear click-through).
+    /// initial-state viewport commands (take input, take focus).
     first_frame: bool,
 
     /// Anchor for "hold Space + drag to pan". `Some(p)` while the user is
@@ -121,8 +118,8 @@ pub struct OnScreenNotesApp {
     /// Native window handle of the overlay viewport, stored as the
     /// platform-native integer (HWND cast to `isize` on Windows, 0 on
     /// other platforms or when capture fails). Used by
-    /// `crate::platform` to reclaim the foreground after a click-through,
-    /// among other things. 0 disables those calls.
+    /// `crate::platform` to reclaim the foreground after the user worked
+    /// in another app, among other things. 0 disables those calls.
     osn_hwnd: isize,
 
     /// Screen-recording state machine. Idle by default; toggled on /
@@ -531,7 +528,6 @@ impl OnScreenNotesApp {
             tool,
             pen,
             hotkeys,
-            modifiers: ModifierTracker::default(),
             overlay_cache: ui::overlay::OverlayCache::new(),
             overlay_visible: true,
             mouse_was_down: false,
@@ -1992,15 +1988,14 @@ impl eframe::App for OnScreenNotesApp {
         });
         // ---- First-frame init -------------------------------------------
         // On startup, explicitly tell the OS: "we want input by default".
-        // This synchronises our `modifiers.alt_held = false` model with
-        // the actual OS window flag, in case the previous session left the
-        // window in passthrough mode.
+        // Only pin-picking makes the window pass clicks through, and only
+        // while it runs.
         if self.first_frame {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
             // Open focused, like any app. (The window used to be made
             // `WS_EX_NOACTIVATE` here, so it opened unfocused and clicks
             // on the toolbar or a popup never focused it; a press on the
-            // canvas still reclaims the foreground after a click-through.)
+            // canvas still reclaims the foreground from another app.)
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.idle_frame = refresh_period(self.osn_hwnd);
             self.first_frame = false;
@@ -2026,10 +2021,7 @@ impl eframe::App for OnScreenNotesApp {
         }
 
         // ---- Always-on subsystems ----------------------------------------
-        // 1) Click-through edge detection (Alt key).
-        let click_through_now = click_through::update(ctx, &mut self.modifiers);
-
-        // 2) Global hotkey events.
+        // Global hotkey events.
         if let Some(h) = self.hotkeys.as_ref() {
             for ev in h.poll() {
                 match ev {
@@ -2500,7 +2492,6 @@ impl eframe::App for OnScreenNotesApp {
             drop(pinned);
             let show_media_bars = self.ui_visible
                 && show_selection
-                && !click_through_now
                 && !self.recorder.is_recording()
                 && self.tool.in_progress_stroke.is_none()
                 && self.tool.select.gesture.is_none()
@@ -2789,7 +2780,7 @@ impl eframe::App for OnScreenNotesApp {
                             // us pen-down packets even when the tip is over
                             // another app's window — OSN is not
                             // always-on-top, so another window may sit
-                            // above it (or we may be in Alt-passthrough).
+                            // above it.
                             // Without this guard every such tap falls
                             // through to `reclaim_foreground` below and
                             // yanks focus back to OSN: the user clicks a
@@ -2809,10 +2800,10 @@ impl eframe::App for OnScreenNotesApp {
                             }
                             self.pen_blocked = false;
                             // Pen landed on the canvas — the user wants
-                            // to draw in OSN. If a prior click-through
-                            // had handed the foreground to another app,
-                            // reclaim it so keyboard shortcuts (P, B,
-                            // T…) keep flowing here. No-op on non-Win
+                            // to draw in OSN. If another app has the
+                            // foreground, reclaim it so keyboard
+                            // shortcuts (P, B, T…) keep flowing here.
+                            // No-op on non-Win
                             // targets and when OSN is already foreground.
                             crate::platform::reclaim_foreground(self.osn_hwnd);
                             // Shift-pick wins over the eraser modifier:
@@ -2880,7 +2871,7 @@ impl eframe::App for OnScreenNotesApp {
             // events must be ignored or every pen stroke would be drawn
             // twice. With the pen out of range — or no tablet at all —
             // the mouse has the canvas to itself.
-            if !drag_pans && !pen_owns_pointer && !click_through_now
+            if !drag_pans && !pen_owns_pointer
                 && self.region_select.is_none() && self.loupe.is_none()
             {
                 let (shift_held, ctrl_held, primary_now, cursor) = ctx.input(|i| {
@@ -2997,7 +2988,7 @@ impl eframe::App for OnScreenNotesApp {
                         .or(i.pointer.latest_pos()),
                 )
             });
-            if !middle_down || space_held || click_through_now
+            if !middle_down || space_held
                 || self.loupe.is_some() || self.region_select.is_some()
             {
                 self.middle_pan_anchor = None;

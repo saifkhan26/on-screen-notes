@@ -1,6 +1,6 @@
 //! OS-specific glue that does not fit into a single subsystem.
 //!
-//! Currently holds the Win32 click-through helpers; macOS / Linux stubs
+//! Currently holds the Win32 window helpers; macOS / Linux stubs
 //! re-export no-op versions so the call sites can stay portable.
 
 #[cfg(target_os = "windows")]

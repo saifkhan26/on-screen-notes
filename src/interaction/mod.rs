@@ -1,7 +1,6 @@
 //! Routes raw user input (egui events + pen events) to the active tool +
 //! canvas. Holds small, focused helpers in submodules.
 
-pub mod click_through;
 pub mod zoom_pan;
 
 use crate::canvas::CanvasManager;
