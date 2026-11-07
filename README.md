@@ -224,9 +224,12 @@ Every action is one undo step. Things worth knowing:
   where it shows now on screen through that slide's own view. One undo
   step on each slide; moved objects leave their pin.
 - **Slide window** — right-click a slide in the slide panel and pick
-  "Open in a window" to see it in a second window (pan, zoom, fit), or
-  turn on its **Pins** toggle to show the pins on every slide there
-  instead of on the canvas.
+  "Open in a window" to show it in a second window with its own pan and
+  zoom. The toolbar's tool works there too (pens, eraser, shapes, laser,
+  Select; Ctrl+Z on that slide); middle-drag or Space+drag pans. Drag a
+  selection from the canvas into the window, or back, to move it to the
+  other slide, landing where you let go. Its **Pins** toggle shows the
+  pins on every slide there instead of on the canvas.
 - The **funnel** button highlights pictures, GIFs and/or videos on the
   slide (each type outlined in its own colour, the rest dimmed), and
   "Select these" selects them, ready to arrange or copy.

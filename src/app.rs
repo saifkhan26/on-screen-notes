@@ -1150,6 +1150,46 @@ impl OnScreenNotesApp {
         self.toast = Some((format!("Copied {what} to new slide {}", idx + 1), Instant::now()));
     }
 
+    /// The Select tool was moving a selection on the canvas and let go
+    /// over the slide window at `screen` (physical pixels; `ppp` the
+    /// canvas's pixels per point): the objects move to the window's slide,
+    /// landing under the pointer at the same size on screen, and are
+    /// selected there. True when the release was such a drop (done or
+    /// refused), so it is not the Select tool's.
+    fn drop_on_slide_window(&mut self, screen: [f32; 2], ppp: f32) -> bool {
+        use crate::tools::select_tool::Gesture;
+        let Some(Gesture::Move { start, .. }) = self.tool.select.gesture else { return false };
+        if self.tool.kind != crate::tools::ToolKind::Select || self.tool.select.sel.is_empty() {
+            return false;
+        }
+        let Some(win) = self.slide_window.as_mut() else { return false };
+        if win.hwnd() == 0 || crate::platform::top_level_window_at(screen[0] as i32, screen[1] as i32) != win.hwnd() {
+            return false;
+        }
+        let Some((to, target, window_scale)) = win.canvas_at(screen) else { return false };
+        self.tool.select.gesture = None;
+        if self.canvases.is_locked(to) {
+            self.toast = Some((format!("Slide {} is locked — unlock it to move objects there", to + 1), Instant::now()));
+            return true;
+        }
+        let from = self.canvases.active_index();
+        let (li, zoom) = { let c = self.canvases.active(); (c.active_layer, c.zoom) };
+        let m = ui::slide_edit::drop_mapping(start, target, zoom * ppp / window_scale.max(1e-6));
+        let sel = std::mem::take(&mut self.tool.select.sel);
+        match self.canvases.drop_objects(from, to, li, &sel.strokes, &sel.shapes, &m) {
+            Some(placed) => {
+                let n = placed.strokes.len() + placed.shapes.len();
+                win.select_dropped(placed, &self.canvases);
+                if from != to {
+                    let what = if n == 1 { "1 object".to_string() } else { format!("{n} objects") };
+                    self.toast = Some((format!("Moved {what} to slide {}", to + 1), Instant::now()));
+                }
+            }
+            None => self.tool.select.sel = sel,
+        }
+        true
+    }
+
     /// Move the selected objects to slide `to`, where they show now (see
     /// `CanvasManager::move_objects_to`), and say so. The selection goes
     /// with them: nothing is left here to select.
@@ -2890,6 +2930,13 @@ impl eframe::App for OnScreenNotesApp {
                             }
                         }
                     }
+                    // A selection let go over the slide window moves there.
+                    if matches!(ev, PenEvent::Up(_)) && !self.pen_using_eraser {
+                        let screen = [client_origin[0] as f32 + s.pos[0], client_origin[1] as f32 + s.pos[1]];
+                        if self.drop_on_slide_window(screen, ctx.pixels_per_point()) {
+                            continue;
+                        }
+                    }
                     // Pins sit over the slide; see `pin_pointer`.
                     let q = [s.pos[0] - canvas_rect.min.x, s.pos[1] - canvas_rect.min.y];
                     if editable && !self.pen_using_eraser && self.pin_pointer(*ev, q, shift_held, canvas_rect.size()) {
@@ -2992,9 +3039,16 @@ impl eframe::App for OnScreenNotesApp {
                             }
                         }
                         if self.mouse_gesture {
+                            // A selection let go over the slide window
+                            // moves there.
+                            let dropped = matches!(ev, PenEvent::Up(_)) && !self.pen_using_eraser && {
+                                let ppp = ctx.pixels_per_point();
+                                let screen = [client_origin[0] as f32 + p.x * ppp, client_origin[1] as f32 + p.y * ppp];
+                                self.drop_on_slide_window(screen, ppp)
+                            };
                             // Pins sit over the slide; see `pin_pointer`.
-                            let to_pin = editable && !self.pen_using_eraser && self.pin_pointer(ev, cursor_screen, shift_held, canvas_rect.size());
-                            if !to_pin {
+                            let to_pin = !dropped && editable && !self.pen_using_eraser && self.pin_pointer(ev, cursor_screen, shift_held, canvas_rect.size());
+                            if !to_pin && !dropped {
                                 let target_tool: &mut ActiveTool = if self.pen_using_eraser {
                                     &mut self.eraser_override
                                 } else {
@@ -3701,10 +3755,28 @@ impl eframe::App for OnScreenNotesApp {
                 chrome: self.ui_visible,
                 owner: self.osn_hwnd,
             };
+            // Where the canvas is on screen, for a selection dragged out of
+            // the window onto it; and whether one dragged on the canvas is
+            // over the window now.
+            let ppp = ctx.pixels_per_point();
+            let canvas_min = self.overlay_cache.canvas_rect(ctx).min;
+            let main = crate::platform::client_rect(self.osn_hwnd).map(|(l, t, _, _)| ui::slide_edit::MainCanvas {
+                hwnd: self.osn_hwnd,
+                origin_px: [l as f32 + canvas_min.x * ppp, t as f32 + canvas_min.y * ppp],
+                ppp,
+            });
+            let dragging_selection = self.tool.kind == crate::tools::ToolKind::Select
+                && !self.tool.select.sel.is_empty()
+                && matches!(self.tool.select.gesture, Some(crate::tools::select_tool::Gesture::Move { .. }));
+            let drop_hover = dragging_selection
+                && win.hwnd() != 0
+                && crate::platform::cursor_pos().is_some_and(|(x, y)| crate::platform::top_level_window_at(x, y) == win.hwnd());
             let input = ui::slide_edit::Input {
                 space: space_held,
                 pen_owns_pointer: self.pen.is_down() || self.pen.used_within(PEN_OWNS_POINTER),
                 keys: &self.hotkeys_cfg,
+                main,
+                drop_hover,
             };
             let open = ui::slide_window::show(
                 ctx,
@@ -3717,6 +3789,9 @@ impl eframe::App for OnScreenNotesApp {
                 &mut self.tool,
                 &input,
             );
+            if let Some(msg) = win.take_notice() {
+                self.toast = Some((msg, Instant::now()));
+            }
             if !open {
                 self.slide_window = None;
             }

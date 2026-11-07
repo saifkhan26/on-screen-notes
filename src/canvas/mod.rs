@@ -816,41 +816,68 @@ impl CanvasManager {
     /// exist, or a locked one, and none from a locked slide.
     pub fn move_objects_to(&mut self, to: usize, li: usize, strokes: &[usize], shapes: &[usize]) -> usize {
         let from = self.active;
-        if to == from || to >= self.canvases.len() || self.is_locked(to) || self.is_locked(from) {
+        if to >= self.canvases.len() {
             return 0;
         }
         self.ensure_loaded(from);
         self.ensure_loaded(to);
         let (Some(src), Some(dst)) = (self.canvases[from].as_ref(), self.canvases[to].as_ref()) else { return 0 };
-        let Some(layer) = src.layers.get(li) else { return 0 };
-        let mut moved_strokes: Vec<stroke::Stroke> = strokes.iter().filter_map(|&i| layer.strokes.get(i).cloned()).collect();
-        let mut moved_shapes: Vec<shape::Shape> = shapes.iter().filter_map(|&i| layer.shapes.get(i).cloned()).collect();
-        let count = moved_strokes.len() + moved_shapes.len();
-        if count == 0 {
-            return 0;
-        }
         // Slide `from` point p shows at pan_f + p·zoom_f; slide `to`
         // shows the point (pan_f − pan_t + p·zoom_f) / zoom_t there.
         let k = src.zoom / dst.zoom.max(1e-6);
         let d = [(src.pan[0] - dst.pan[0]) / dst.zoom.max(1e-6), (src.pan[1] - dst.pan[1]) / dst.zoom.max(1e-6)];
         let m = affine::Affine::scale_about([0.0, 0.0], k, k).then(affine::Affine::translate(d));
+        self.transfer_objects(from, to, li, strokes, shapes, &m).map_or(0, |placed| placed.strokes.len() + placed.shapes.len())
+    }
+
+    /// Objects dragged from one window and let go over the other:
+    /// `transfer_objects` when the windows show different slides, or a
+    /// move in place (one undo step) when both show the same one. Returns
+    /// the dropped objects, to select.
+    pub fn drop_objects(&mut self, from: usize, to: usize, li: usize, strokes: &[usize], shapes: &[usize], m: &affine::Affine) -> Option<hit::Selection> {
+        if from != to {
+            return self.transfer_objects(from, to, li, strokes, shapes, m);
+        }
+        if self.is_locked(from) || (strokes.is_empty() && shapes.is_empty()) {
+            return None;
+        }
+        self.canvases.get_mut(from)?.as_mut()?.transform_objects(li, strokes, shapes, m);
+        Some(hit::Selection { strokes: strokes.to_vec(), shapes: shapes.to_vec() })
+    }
+
+    /// Move the chosen objects of slide `from`'s layer `li` to slide
+    /// `to`'s active layer, each point taken through `m` (slide `from`'s
+    /// units to slide `to`'s): what "Move to slide" and dragging between
+    /// the canvas and the slide window do. One undo step on each slide;
+    /// moved objects leave their pin. Returns where they landed on `to`,
+    /// ready to select; `None` (and nothing moved) when the slides are
+    /// the same, either is locked or not read yet, or nothing was chosen.
+    pub fn transfer_objects(&mut self, from: usize, to: usize, li: usize, strokes: &[usize], shapes: &[usize], m: &affine::Affine) -> Option<hit::Selection> {
+        if from == to || self.is_locked(to) || self.is_locked(from) {
+            return None;
+        }
+        let src = self.canvases.get(from)?.as_ref()?;
+        self.canvases.get(to)?.as_ref()?;
+        let layer = src.layers.get(li)?;
+        let mut moved_strokes: Vec<stroke::Stroke> = strokes.iter().filter_map(|&i| layer.strokes.get(i).cloned()).collect();
+        let mut moved_shapes: Vec<shape::Shape> = shapes.iter().filter_map(|&i| layer.shapes.get(i).cloned()).collect();
+        if moved_strokes.is_empty() && moved_shapes.is_empty() {
+            return None;
+        }
         for s in &mut moved_strokes {
-            s.apply_affine(&m);
+            s.apply_affine(m);
             s.pin = 0;
         }
         for s in &mut moved_shapes {
-            s.apply_affine(&m);
+            s.apply_affine(m);
             s.set_pin(0);
         }
-        if let Some(c) = self.canvases[from].as_mut() {
-            c.delete_objects(li, strokes, shapes);
-        }
-        if let Some(c) = self.canvases[to].as_mut() {
-            let target = c.active_layer;
-            c.insert_objects(target, moved_strokes, moved_shapes);
-        }
+        self.canvases[from].as_mut()?.delete_objects(li, strokes, shapes);
+        let dst = self.canvases[to].as_mut()?;
+        let target = dst.active_layer;
+        let placed = dst.insert_objects(target, moved_strokes, moved_shapes);
         self.refresh_pins();
-        count
+        Some(placed)
     }
 
     /// The global pins, for the slide window to show in place of the

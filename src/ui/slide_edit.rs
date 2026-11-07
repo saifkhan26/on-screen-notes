@@ -51,6 +51,9 @@ pub struct WindowEdit {
     pen: Option<Gesture>,
     mouse: Option<Gesture>,
     mouse_was_down: bool,
+    /// Something to tell the user (a drop done or refused), for the app's
+    /// toast.
+    notice: Option<String>,
 }
 
 /// Where the window's slide sits: the canvas area, and the window's pan
@@ -80,6 +83,22 @@ pub struct Input<'a> {
     /// tablet driver's copies of the pen's and must not draw twice.
     pub pen_owns_pointer: bool,
     pub keys: &'a ParsedHotkeys,
+    /// Where the canvas is, for a selection dragged out of the window and
+    /// let go over it.
+    pub main: Option<MainCanvas>,
+    /// A selection is being dragged on the canvas and the pointer is over
+    /// this window: letting go drops it here.
+    pub drop_hover: bool,
+}
+
+/// The canvas (main window), as a drop target.
+#[derive(Clone, Copy)]
+pub struct MainCanvas {
+    pub hwnd: isize,
+    /// The canvas area's top-left on screen, physical pixels.
+    pub origin_px: [f32; 2],
+    /// Physical pixels per point there.
+    pub ppp: f32,
 }
 
 fn sample_of(ev: &PenEvent) -> PenSample {
@@ -94,6 +113,16 @@ fn with_sample(ev: PenEvent, s: PenSample) -> PenEvent {
         PenEvent::Move(_) => PenEvent::Move(s),
         PenEvent::Up(_) => PenEvent::Up(s),
     }
+}
+
+/// Where dropped objects go: the slide point `start` (where the drag
+/// began, under the pointer then) lands on the target slide's point
+/// `target` (under the pointer at the release), and everything keeps its
+/// size on screen (`k`: the source's screen pixels per slide unit over
+/// the target's).
+pub fn drop_mapping(start: [f32; 2], target: [f32; 2], k: f32) -> crate::canvas::affine::Affine {
+    use crate::canvas::affine::Affine;
+    Affine::translate([-start[0], -start[1]]).then(Affine::scale_about([0.0, 0.0], k, k)).then(Affine::translate(target))
 }
 
 /// The tools the window can use; with any other a drag pans.
@@ -124,7 +153,70 @@ impl WindowEdit {
             pen: None,
             mouse: None,
             mouse_was_down: false,
+            notice: None,
         }
+    }
+
+    /// What the window has to tell the user, once.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
+    }
+
+    /// Objects dropped here from the canvas: select them, on slide `idx`.
+    pub fn select_dropped(&mut self, placed: crate::canvas::hit::Selection, idx: usize, canvas: &Canvas) {
+        self.tool.select.sel = placed;
+        self.tool.select.gesture = None;
+        self.tool.select.rebind(idx, canvas);
+    }
+
+    /// A selection is being moved here right now (the Select tool's move,
+    /// not a resize, turn or rubber band); where its drag began, slide
+    /// units.
+    fn moving_from(&self) -> Option<[f32; 2]> {
+        match (self.tool.kind, self.tool.select.gesture) {
+            (ToolKind::Select, Some(crate::tools::select_tool::Gesture::Move { start, .. })) => Some(start),
+            _ => None,
+        }
+    }
+
+    /// A selection being moved here was let go at `screen` (physical
+    /// pixels): over the canvas, it moves to the canvas's slide, landing
+    /// under the pointer at the same size on screen, selected there.
+    /// True when it was, so the release is not the Select tool's.
+    #[allow(clippy::too_many_arguments)]
+    fn drop_on_canvas(&mut self, screen: [f32; 2], manager: &mut CanvasManager, view: View, ppp: f32, input: &Input, main_tool: &mut ActiveTool) -> bool {
+        let (Some(start), Some(main)) = (self.moving_from(), input.main) else { return false };
+        if self.tool.select.sel.is_empty() || crate::platform::top_level_window_at(screen[0] as i32, screen[1] as i32) != main.hwnd {
+            return false;
+        }
+        let to = manager.active_index();
+        let Some(dst) = manager.slide(to) else { return false };
+        if manager.is_locked(to) {
+            self.notice = Some(format!("Slide {} is locked — unlock it to move objects there", to + 1));
+            self.tool.select.gesture = None;
+            return true;
+        }
+        let local = [(screen[0] - main.origin_px[0]) / main.ppp, (screen[1] - main.origin_px[1]) / main.ppp];
+        let target = [(local[0] - dst.pan[0]) / dst.zoom, (local[1] - dst.pan[1]) / dst.zoom];
+        let k = (view.zoom * ppp) / (dst.zoom * main.ppp).max(1e-6);
+        let m = drop_mapping(start, target, k);
+        let sel = std::mem::take(&mut self.tool.select.sel);
+        self.tool.select.gesture = None;
+        let li = manager.slide(view.slide).map_or(0, |c| c.active_layer);
+        match manager.drop_objects(view.slide, to, li, &sel.strokes, &sel.shapes, &m) {
+            Some(placed) => {
+                let n = placed.strokes.len() + placed.shapes.len();
+                main_tool.select.sel = placed;
+                main_tool.select.gesture = None;
+                main_tool.select.rebind(to, manager.active());
+                if view.slide != to {
+                    let what = if n == 1 { "1 object".to_string() } else { format!("{n} objects") };
+                    self.notice = Some(format!("Moved {what} to slide {}", to + 1));
+                }
+            }
+            None => self.tool.select.sel = sel,
+        }
+        true
     }
 
     /// Take the toolbar's choices: kind, colour, size, style, smoothing.
@@ -196,6 +288,7 @@ impl WindowEdit {
         editable: bool,
         input: &Input,
         hwnd: isize,
+        main_tool: &mut ActiveTool,
     ) {
         let pans = self.drag_pans(editable, input, ctx);
         let (ctrl, shift) = ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
@@ -209,6 +302,7 @@ impl WindowEdit {
         let ppp = ctx.pixels_per_point();
         for ev in std::mem::take(&mut self.pen_queue) {
             let Some(o) = origin else { break };
+            let screen = sample_of(&ev).pos;
             let s = sample_of(&ev);
             let s = PenSample { pos: [(s.pos[0] - o[0]) / ppp, (s.pos[1] - o[1]) / ppp], ..s };
             let ev = with_sample(ev, s);
@@ -220,7 +314,10 @@ impl WindowEdit {
                 }
                 PenEvent::Move(_) => self.pen = self.drag(self.pen, ev, manager, view, pan),
                 PenEvent::Up(_) => {
-                    self.apply(self.pen, ev, manager, view);
+                    let dropped = self.pen == Some(Gesture::Tool) && self.drop_on_canvas(screen, manager, view, ppp, input, main_tool);
+                    if !dropped {
+                        self.apply(self.pen, ev, manager, view);
+                    }
                     self.pen = None;
                 }
             }
@@ -244,7 +341,13 @@ impl WindowEdit {
                 }
                 (true, true) => self.apply(self.mouse, PenEvent::Move(sample), manager, view),
                 (false, true) => {
-                    self.apply(self.mouse, PenEvent::Up(sample), manager, view);
+                    // Let go outside the window, maybe over the canvas.
+                    let screen = origin.map(|o| [o[0] + pos[0] * ppp, o[1] + pos[1] * ppp]);
+                    let dropped = self.mouse == Some(Gesture::Tool)
+                        && screen.is_some_and(|s| self.drop_on_canvas(s, manager, view, ppp, input, main_tool));
+                    if !dropped {
+                        self.apply(self.mouse, PenEvent::Up(sample), manager, view);
+                    }
                     self.mouse = None;
                 }
                 _ => {}
@@ -441,6 +544,32 @@ mod tests {
         };
         let _ = ctx.run(input, |ctx| e.keys(ctx, &mut m, view(), true, &mut main, &keys));
         assert_eq!(m.slide(1).unwrap().layers[0].strokes.len(), 1, "undone on the window's slide");
+    }
+
+    #[test]
+    fn a_drop_lands_under_the_pointer_at_the_same_size_on_screen() {
+        // Grabbed at slide point (10, 20), let go over target point
+        // (100, 50); the target shows things twice as big per unit.
+        let m = drop_mapping([10.0, 20.0], [100.0, 50.0], 0.5);
+        assert_eq!(m.apply([10.0, 20.0]), [100.0, 50.0], "the grabbed point is under the pointer");
+        let p = m.apply([30.0, 20.0]);
+        assert!((p[0] - 110.0).abs() < 1e-4 && (p[1] - 50.0).abs() < 1e-4, "20 units away become 10: {p:?}");
+    }
+
+    #[test]
+    fn a_drop_on_the_same_slide_moves_in_place() {
+        let mut m = manager();
+        let mut e = WindowEdit::new(&AppConfig::default());
+        e.tool.kind = ToolKind::Pen;
+        draw(&mut e, &mut m, Gesture::Tool, [300.0, 250.0], [380.0, 270.0]);
+        let undo = m.slide(1).unwrap().edit_stamp().0;
+        let shift = crate::canvas::affine::Affine::translate([40.0, 0.0]);
+        let placed = m.drop_objects(1, 1, 0, &[0], &[], &shift).expect("moved");
+        assert_eq!(placed.strokes, [0], "still the same object");
+        let b = m.slide(1).unwrap();
+        assert_eq!(b.layers[0].strokes.len(), 1);
+        assert!((b.layers[0].strokes[0].samples[0].pos[0] - 140.0).abs() < 2.0, "moved 40 units");
+        assert_eq!(b.edit_stamp().0, undo + 1, "one undo step");
     }
 
     #[test]

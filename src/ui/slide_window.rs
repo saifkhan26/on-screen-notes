@@ -70,6 +70,10 @@ pub struct SlideWindow {
     find_tries: u32,
     /// The window's own copy of the tool and its gestures in flight.
     edit: crate::ui::slide_edit::WindowEdit,
+    /// The canvas area last frame, window points, and the window's points
+    /// per pixel: where a drop from the canvas lands (`canvas_at`).
+    last_rect: egui::Rect,
+    last_ppp: f32,
 }
 
 /// How the main window looks this frame, for the slide window to match.
@@ -107,7 +111,38 @@ impl SlideWindow {
             hwnd: 0,
             find_tries: 0,
             edit: crate::ui::slide_edit::WindowEdit::new(cfg),
+            last_rect: egui::Rect::NOTHING,
+            last_ppp: 1.0,
         }
+    }
+
+    /// The slide shown, and its point under screen point `screen`
+    /// (physical pixels), with the screen pixels per slide unit there:
+    /// where something dropped from the canvas lands. `None` in Pins mode
+    /// or before the window is placed.
+    pub fn canvas_at(&self, screen: [f32; 2]) -> Option<(usize, [f32; 2], f32)> {
+        if self.pins || !self.last_rect.is_positive() {
+            return None;
+        }
+        let (l, t, _, _) = crate::platform::client_rect(self.hwnd)?;
+        let local = [(screen[0] - l as f32) / self.last_ppp, (screen[1] - t as f32) / self.last_ppp];
+        let p = [
+            (local[0] - self.last_rect.min.x - self.pan[0]) / self.zoom,
+            (local[1] - self.last_rect.min.y - self.pan[1]) / self.zoom,
+        ];
+        Some((self.slide, p, self.zoom * self.last_ppp))
+    }
+
+    /// Objects dropped here from the canvas: select them.
+    pub fn select_dropped(&mut self, placed: crate::canvas::hit::Selection, manager: &CanvasManager) {
+        if let Some(c) = manager.slide(self.slide) {
+            self.edit.select_dropped(placed, self.slide, c);
+        }
+    }
+
+    /// What the window has to tell the user, once.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.edit.take_notice()
     }
 
     /// Take the pen gestures that start over this window out of the
@@ -479,10 +514,12 @@ fn canvas_area(
             resize_edges(ui, rect);
             return;
         }
+        win.last_rect = rect;
+        win.last_ppp = ctx.pixels_per_point();
         let editable = !manager.is_locked(win.slide);
         let view = crate::ui::slide_edit::View { slide: win.slide, rect, pan: win.pan, zoom: win.zoom };
         win.edit.keys(ctx, manager, view, editable, main_tool, input.keys);
-        win.edit.pointer(ctx, &response, manager, view, &mut win.pan, editable, input, win.hwnd);
+        win.edit.pointer(ctx, &response, manager, view, &mut win.pan, editable, input, win.hwnd, main_tool);
         let drag_pans = win.edit.drag_pans(editable, input, ctx);
         if navigate(ctx, win, rect, &response, drag_pans) {
             if let Some(slide) = manager.slide(win.slide) {
@@ -542,6 +579,18 @@ fn canvas_area(
                 };
                 painter.circle_stroke(p, r, egui::Stroke::new(1.2, colour));
             }
+        }
+        // A selection dragged on the canvas is over this window: say
+        // letting go drops it here.
+        if input.drop_hover {
+            let accent = Color32::from_rgb(86, 160, 255);
+            painter.rect_stroke(rect.shrink(3.0), Rounding::same(10.0), egui::Stroke::new(3.0, accent));
+            let text = if editable { format!("Drop to move to slide {}", win.slide + 1) } else { format!("Slide {} is locked", win.slide + 1) };
+            let at = egui::pos2(rect.center().x, rect.max.y - 28.0);
+            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(14.0), theme::TEXT_PRIMARY);
+            let pill = egui::Rect::from_center_size(at, galley.size() + Vec2::new(20.0, 10.0));
+            painter.rect_filled(pill, Rounding::same(8.0), theme::GLASS_FILL);
+            painter.galley(pill.center() - galley.size() * 0.5, galley, theme::TEXT_PRIMARY);
         }
         resize_edges(ui, rect);
     });
