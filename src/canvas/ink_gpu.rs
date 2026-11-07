@@ -200,6 +200,7 @@ fn stroke_key(s: &Stroke) -> u64 {
     h = mix(h, s.style as u64);
     h = mix(h, s.filled as u64);
     h = mix(h, s.base_width.to_bits() as u64);
+    h = mix(h, s.px.to_bits() as u64);
     h = mix(h, s.samples.len() as u64);
     if let Some(p) = s.samples.first() {
         h = mix(h, p.pos[0].to_bits() as u64 | (p.pos[1].to_bits() as u64) << 32);

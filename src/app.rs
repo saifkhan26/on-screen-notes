@@ -3387,6 +3387,7 @@ impl eframe::App for OnScreenNotesApp {
                             cursor_screen,
                             ctrl,
                             shift,
+                            space_held,
                             &mut self.tool,
                             &mut self.canvases,
                             &mut self.config.bg_opacity,

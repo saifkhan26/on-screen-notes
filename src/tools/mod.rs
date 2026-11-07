@@ -236,10 +236,38 @@ impl ActiveTool {
         }
     }
 
+    /// Canvas units per screen pixel for what this tool draws or rubs
+    /// out. The pen and the eraser work at their size as it looks on
+    /// screen, whatever the zoom (`Stroke::px`); the freehand arrow and
+    /// the laser keep their size in canvas units.
+    fn px(&self, canvas: &Canvas) -> f32 {
+        match self.kind {
+            ToolKind::Pen | ToolKind::Eraser => 1.0 / canvas.zoom.max(1e-3),
+            _ => 1.0,
+        }
+    }
+
+    /// How far from its centre the eraser rubs out ink at `zoom`, in
+    /// canvas units: `size` screen pixels.
+    pub fn eraser_radius(&self, zoom: f32) -> f32 {
+        self.size / zoom.max(1e-3)
+    }
+
+    /// Radius, in screen points, of the ring that previews the tool at
+    /// the pointer: the widest line a pen-down would draw, or how far
+    /// the eraser reaches.
+    pub fn cursor_radius(&self, zoom: f32) -> f32 {
+        match self.kind {
+            ToolKind::Pen => (self.size * 0.5).max(2.0),
+            ToolKind::Eraser => self.size.max(2.0),
+            _ => (self.size * 0.5).max(2.0) * zoom,
+        }
+    }
+
     /// Pen-down at `sample`. Begins a stroke or shape depending on tool.
-    /// Only the Select tool uses `canvas` here: to find out what the pen
-    /// landed on, and to switch the active layer when that is on
-    /// another one.
+    /// The Select tool uses `canvas` to find out what the pen landed on
+    /// (and to switch the active layer when that is on another one); the
+    /// pen and eraser read its zoom.
     pub fn begin(&mut self, sample: PenSample, canvas: &mut Canvas) {
         match self.kind {
             ToolKind::Select => self.select.begin(sample.pos, canvas),
@@ -248,18 +276,16 @@ impl ActiveTool {
                 // (Default / Pencil / Marker / Airbrush) AND the
                 // current smoothing options so the user's choice locks
                 // in at pen-down.
-                // The pen and pencil draw at the size as it looks on
-                // screen (`StrokeStyle::sizes_on_screen`); once drawn the
-                // width is fixed, so the line scales with the view like
-                // everything else.
-                let width = if self.kind == ToolKind::Pen && self.style.sizes_on_screen() {
-                    self.size / canvas.zoom.max(1e-3)
-                } else {
-                    self.size
-                };
+                // Every pen style draws at the size as it looks on
+                // screen (`Stroke::px`), so zooming in to add detail
+                // gives finer lines and brush strokes, not bigger ones.
+                // Once drawn the width is fixed, so the line scales with
+                // the view like everything else.
+                let px = self.px(canvas);
                 let mut s = Stroke::with_style_and_smoothing(
-                    self.color, width, self.style, self.smoothing,
+                    self.color, self.size * px, self.style, self.smoothing,
                 );
+                s.px = px;
                 s.push(sample);
                 self.in_progress_stroke = Some(s);
             }
@@ -274,10 +300,13 @@ impl ActiveTool {
             ToolKind::Eraser => {
                 // Eraser keeps the plain ribbon look for its visible
                 // trail — pencil styling would make the trail confusingly
-                // faint.
+                // faint. The trail is as wide as what the eraser reaches
+                // (`eraser_radius` either side), so it shows what goes.
+                let px = self.px(canvas);
                 let mut s = Stroke::with_style_and_smoothing(
-                    self.color, self.size, StrokeStyle::Default, self.smoothing,
+                    self.color, 2.0 * self.size * px, StrokeStyle::Default, self.smoothing,
                 );
+                s.px = px;
                 s.push(sample);
                 self.in_progress_stroke = Some(s);
             }
@@ -354,7 +383,8 @@ impl ActiveTool {
                 }
                 // Eraser radius scales with `size`. Real-time delete keeps
                 // the UX responsive — user sees ink disappear under the tip.
-                canvas.erase_at(sample.pos, self.size);
+                let r = self.eraser_radius(canvas.zoom);
+                canvas.erase_at(sample.pos, r);
             }
             ToolKind::Rect | ToolKind::Ellipse | ToolKind::Line | ToolKind::Arrow => {
                 if let Some((_, end)) = self.in_progress_shape.as_mut() {
@@ -587,12 +617,63 @@ mod tests {
     }
 
     #[test]
-    fn pen_and_pencil_draw_the_size_seen_on_screen() {
+    fn every_pen_style_draws_the_size_seen_on_screen() {
         assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Default, 1.0), 8.0);
         assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Default, 4.0), 2.0, "zoomed in, finer on the canvas");
         assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Pencil, 0.5), 16.0, "zoomed out, wider on the canvas");
-        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Marker, 4.0), 8.0, "the marker keeps canvas units");
+        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Marker, 4.0), 2.0, "the marker too");
+        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Airbrush, 0.25), 32.0, "and the airbrush");
         assert_eq!(width_drawn(ToolKind::FreehandArrow, StrokeStyle::Default, 4.0), 8.0);
+    }
+
+    /// Zoomed in 4×, an 8 px eraser reaches 2 canvas units: what it
+    /// covers on screen. The ring at the pointer is that size too, and
+    /// the pen's ring is the line it would draw, at any zoom.
+    #[test]
+    fn the_eraser_and_the_rings_keep_their_size_on_screen() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.size = 2.0;
+        let mut canvas = Canvas { zoom: 4.0, ..Canvas::default() };
+        for y in [0.0, 20.0] {
+            tool.begin(PenSample::from_pos([0.0, y]), &mut canvas);
+            for i in 1..10 {
+                tool.update(PenSample::from_pos([i as f32 * 10.0, y]), &mut canvas);
+            }
+            tool.end(PenSample::from_pos([100.0, y]), &mut canvas);
+        }
+        let strokes = |c: &Canvas| c.layers[c.active_layer].strokes.len();
+        assert_eq!(strokes(&canvas), 2);
+
+        tool.kind = ToolKind::Eraser;
+        tool.size = 8.0;
+        assert_eq!(tool.eraser_radius(canvas.zoom), 2.0);
+        tool.begin(PenSample::from_pos([50.0, 1.5]), &mut canvas);
+        tool.update(PenSample::from_pos([50.0, 1.5]), &mut canvas);
+        assert_eq!(strokes(&canvas), 1, "6 px from the first line: within reach");
+        tool.update(PenSample::from_pos([50.0, 17.0]), &mut canvas);
+        tool.end(PenSample::from_pos([50.0, 17.0]), &mut canvas);
+        assert_eq!(strokes(&canvas), 1, "12 px from the second line: out of reach");
+
+        assert_eq!(tool.cursor_radius(4.0), 8.0, "the eraser ring shows its reach");
+        tool.kind = ToolKind::Pen;
+        assert_eq!(tool.cursor_radius(4.0), 4.0, "an 8 px line, whatever the zoom");
+        assert_eq!(tool.cursor_radius(0.5), 4.0);
+        tool.kind = ToolKind::FreehandArrow;
+        assert_eq!(tool.cursor_radius(4.0), 16.0, "the arrow keeps canvas units");
+    }
+
+    /// A brush stroke drawn zoomed in remembers the pixel size, so its
+    /// thinnest mark and stamp spacing are screen pixels too.
+    #[test]
+    fn a_stroke_remembers_the_pixel_size_it_was_drawn_at() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.style = StrokeStyle::Airbrush;
+        let mut canvas = Canvas { zoom: 4.0, ..Canvas::default() };
+        tool.begin(PenSample::from_pos([10.0, 10.0]), &mut canvas);
+        assert_eq!(tool.in_progress_stroke.as_ref().unwrap().px, 0.25);
+        tool.kind = ToolKind::FreehandArrow;
+        tool.begin(PenSample::from_pos([10.0, 10.0]), &mut canvas);
+        assert_eq!(tool.in_progress_stroke.as_ref().unwrap().px, 1.0, "the arrow keeps canvas units");
     }
 
     #[test]

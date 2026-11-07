@@ -762,8 +762,9 @@ pub fn show(
                                 tool.color[0], tool.color[1], tool.color[2], 220,
                             )
                         };
-                        let zoom = manager.active().zoom;
-                        let r = (tool.size * 0.5).max(2.0) * zoom;
+                        // The pen and eraser work at their size on
+                        // screen, so their ring keeps its size at any zoom.
+                        let r = tool.cursor_radius(manager.active().zoom);
                         ui.painter().circle_stroke(p, r, egui::Stroke::new(1.2, color));
                     }
                 }

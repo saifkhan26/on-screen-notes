@@ -161,12 +161,15 @@ the binary on first launch.
 | Insert picture / video / GIF | toolbar film button, or drag & drop | See [Videos & GIFs](#videos--gifs) |
 | Open a PureRef board | toolbar film button, or drag & drop a `.pur` | Opens as a new slide; see [PureRef boards](#pureref-boards) |
 
-The pen and pencil draw at the chosen size as it looks on screen,
-whatever the zoom: zoomed in 4×, a new line is a quarter as wide on the
-canvas, so detail work gets fine lines. A line keeps its width once
-drawn and scales with the view like everything else; the size slider
-re-widths selected pen and pencil lines the same way. Marker, airbrush,
-eraser and shapes keep their size in canvas units.
+The pen, pencil, marker, airbrush and eraser work at the chosen size as
+it looks on screen, whatever the zoom: zoomed in 4×, a new line is a
+quarter as wide on the canvas, so you can sketch zoomed out and zoom in
+for fine detail. Thin lines, airbrush density and smoothing feel the
+same at every zoom too, and the ring at the pointer always shows the
+line you are about to draw (for the eraser, how far it reaches). A line
+keeps its width once drawn and scales with the view like everything
+else; the size slider re-widths selected lines the same way. Freehand
+arrows, the laser and shapes keep their size in canvas units.
 
 ### Dashed border
 
@@ -384,6 +387,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Freeze frame → layer | `Ctrl+Shift+F` |
 | Click-through (passthrough) | hold `Alt` |
 | Pan canvas | hold `Space` + drag |
+| Zoom canvas (any tool, the pen too) | hold `Space` + scroll |
 | Pan active layer | hold `Shift+Space` + drag |
 | Zoom active layer | hold `Shift+Space` + scroll |
 | Active layer opacity — absolute | `1`=10 % … `9`=90 %, `0`=0 % |
@@ -516,6 +520,7 @@ Modifier-key gestures stay hard-coded (they are not shortcuts):
 | Pen / Pencil / Marker / Airbrush / Eraser | scroll | Adjust brush size |
 | Spotlight active | scroll | Resize spotlight square |
 | Any other tool | scroll | Canvas zoom |
+| Any tool | `Space` + scroll | Canvas zoom (about the cursor) |
 | Any tool | `Shift` + scroll | Active layer opacity |
 | Any tool | `Shift+Space` + scroll | Active layer zoom (about the cursor) |
 

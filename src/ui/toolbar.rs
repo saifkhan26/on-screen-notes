@@ -669,7 +669,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
         ("View & input", vec![
             ("Hide / show UI",              k(c.toggle_ui)),
             ("Pan",                         s("Space+drag / middle drag")),
-            ("Zoom",                        s("Scroll")),
+            ("Zoom",                        s("Scroll / Space+Scroll")),
             ("  pen tools, fill, spotlight: size", s("Scroll")),
             ("Reset zoom + pan",            k(c.reset_view)),
             ("Background opacity",          s("Ctrl+Scroll")),

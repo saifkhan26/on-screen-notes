@@ -443,7 +443,7 @@ fn stroke_vertex_cost(stroke: &Stroke, zoom: f32) -> usize {
         let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
         arc += len;
         if k > 0.0 {
-            stamps += len / (0.5 * (cache.widths[i] + cache.widths[i + 1]) * k).max(0.5);
+            stamps += len / (0.5 * (cache.widths[i] + cache.widths[i + 1]) * k).max(0.5 * stroke.px);
         }
     }
     let fill = if stroke.filled { n * 3 } else { 0 };
@@ -1175,7 +1175,7 @@ pub(crate) fn emit_stroke(
     if stroke.samples.len() == 1 {
         let s = stroke.samples[0];
         let pressure = if matches!(stroke.style, StrokeStyle::Marker) { 1.0 } else { s.pressure.max(0.1) };
-        sink.disc(s.pos, (stroke.base_width * 0.5 * pressure).max(0.4), DiscRule::Plain, paint_color);
+        sink.disc(s.pos, (stroke.base_width * 0.5 * pressure).max(0.4 * stroke.px), DiscRule::Plain, paint_color);
         return;
     }
 
@@ -1184,7 +1184,7 @@ pub(crate) fn emit_stroke(
         Some(cache) => cache,
         None => {
             let position_passes = stroke.smoothing.cache_passes(position_passes);
-            live = crate::canvas::stroke::build_spine(&stroke.samples, stroke.base_width, position_passes);
+            live = crate::canvas::stroke::build_spine(&stroke.samples, stroke.base_width, stroke.px, position_passes);
             &live
         }
     };
@@ -1220,7 +1220,7 @@ pub(crate) fn emit_stroke(
     } else {
         (&cache.points, widths_for_paint)
     };
-    emit_polyline(sink, pts, ws, paint_color, stroke.style);
+    emit_polyline(sink, pts, ws, paint_color, stroke.style, stroke.px);
 }
 
 /// A variable-width centerline as a **single triangle-strip ribbon
@@ -1244,6 +1244,7 @@ fn emit_polyline(
     widths: &[f32],
     color: egui::Color32,
     style: StrokeStyle,
+    px: f32,
 ) {
     let n = points.len();
     if n == 0 { return; }
@@ -1267,11 +1268,11 @@ fn emit_polyline(
     // from the per-stamp width jitter is what gives the graphite
     // texture.
     if let StrokeStyle::Pencil = style {
-        emit_pencil_stamps(sink, points, widths, color);
+        emit_pencil_stamps(sink, points, widths, color, px);
         return;
     }
     if let StrokeStyle::Airbrush = style {
-        emit_airbrush_stamps(sink, points, widths, color);
+        emit_airbrush_stamps(sink, points, widths, color, px);
         return;
     }
 
@@ -1494,6 +1495,7 @@ fn emit_airbrush_stamps(
     points: &[[f32; 2]],
     widths: &[f32],
     color: egui::Color32,
+    px: f32,
 ) {
     let n = points.len();
     if n == 0 { return; }
@@ -1516,7 +1518,7 @@ fn emit_airbrush_stamps(
         // 7 % per-stamp alpha that composites to ≈ 1 - 0.93^10 ≈
         // 52 % cover on a single pass; doubling back over the same
         // path takes it toward solid.
-        let spacing = (avg_w * 0.10).max(0.5);
+        let spacing = (avg_w * 0.10).max(0.5 * px);
         let mut d = spacing - residual;
         while d < seg_len {
             let t   = d / seg_len;
@@ -1537,6 +1539,7 @@ fn emit_pencil_stamps(
     points: &[[f32; 2]],
     widths: &[f32],
     color: egui::Color32,
+    px: f32,
 ) {
     let n = points.len();
     if n == 0 { return; }
@@ -1583,7 +1586,7 @@ fn emit_pencil_stamps(
         // pixel is hit by ~5 stamps, giving a continuous line with
         // visible per-stamp jitter at the edges. Floor at 0.5 px so a
         // hairline stroke still emits enough stamps to overlap.
-        let spacing = (avg_w * 0.20).max(0.5);
+        let spacing = (avg_w * 0.20).max(0.5 * px);
         // 85 % of nominal spacing is the rejection threshold. Lower
         // than the spacing itself so jitter between consecutive stamps
         // does not accidentally trip the guard on a perfectly straight
@@ -2140,6 +2143,8 @@ fn draw_stroke(pixmap: &mut PixmapMut<'_>, stroke: &Stroke, t: Transform) {
         return;
     }
     let paint = rgba_paint(stroke.color);
+    // Thinnest mark, in screen pixels at the zoom the stroke was drawn at.
+    let min_r = 0.4 * stroke.px;
 
     // Prefer the cached subdivided polyline (built once at commit time and
     // re-used by both the live egui paint and the screenshot path). Without
@@ -2149,7 +2154,7 @@ fn draw_stroke(pixmap: &mut PixmapMut<'_>, stroke: &Stroke, t: Transform) {
     if let Some(cache) = &stroke.cache {
         if cache.points.is_empty() { return; }
         if cache.points.len() == 1 {
-            let r = (cache.widths[0] * 0.5).max(0.4);
+            let r = (cache.widths[0] * 0.5).max(min_r);
             stamp_circle(pixmap, cache.points[0], r, &paint, t);
             return;
         }
@@ -2161,7 +2166,7 @@ fn draw_stroke(pixmap: &mut PixmapMut<'_>, stroke: &Stroke, t: Transform) {
         let pts = &cache.points;
         let ws  = &cache.widths;
         let n   = pts.len();
-        let r0 = (ws[0] * 0.5).max(0.4);
+        let r0 = (ws[0] * 0.5).max(min_r);
         stamp_circle(pixmap, pts[0], r0, &paint, t);
         for i in 1..n {
             let prev = pts[i - 1];
@@ -2180,7 +2185,7 @@ fn draw_stroke(pixmap: &mut PixmapMut<'_>, stroke: &Stroke, t: Transform) {
                 let u = s as f32 / steps as f32;
                 let pos = [prev[0] + dx * u, prev[1] + dy * u];
                 let w   = w0 + (w1 - w0) * u;
-                stamp_circle(pixmap, pos, (w * 0.5).max(0.4), &paint, t);
+                stamp_circle(pixmap, pos, (w * 0.5).max(min_r), &paint, t);
             }
         }
         return;
@@ -2192,7 +2197,7 @@ fn draw_stroke(pixmap: &mut PixmapMut<'_>, stroke: &Stroke, t: Transform) {
     // between them. The screenshot pipeline always sees committed strokes
     // (which carry a cache), so this is exercised rarely.
     let mut prev = stroke.samples[0];
-    stamp_circle(pixmap, prev.pos, half_width(prev.pressure, stroke.base_width), &paint, t);
+    stamp_circle(pixmap, prev.pos, half_width(prev.pressure, stroke.base_width, min_r), &paint, t);
     for &cur in stroke.samples.iter().skip(1) {
         let dx = cur.pos[0] - prev.pos[0];
         let dy = cur.pos[1] - prev.pos[1];
@@ -2202,18 +2207,19 @@ fn draw_stroke(pixmap: &mut PixmapMut<'_>, stroke: &Stroke, t: Transform) {
             let t_ = i as f32 / steps as f32;
             let pos  = [prev.pos[0] + dx * t_, prev.pos[1] + dy * t_];
             let pres = prev.pressure + (cur.pressure - prev.pressure) * t_;
-            stamp_circle(pixmap, pos, half_width(pres, stroke.base_width), &paint, t);
+            stamp_circle(pixmap, pos, half_width(pres, stroke.base_width, min_r), &paint, t);
         }
         prev = cur;
     }
 }
 
 #[inline]
-fn half_width(pressure: f32, base: f32) -> f32 {
-    // Clamp to [0.4, base/2]: even at "zero pressure" we still want a hair-thin
-    // mark so the user sees their input. The 0.4 floor avoids invisible dots.
+fn half_width(pressure: f32, base: f32, min_r: f32) -> f32 {
+    // Clamp to [min_r, base/2]: even at "zero pressure" we still want a
+    // hair-thin mark so the user sees their input. The floor avoids
+    // invisible dots.
     let p = pressure.clamp(0.0, 1.0);
-    (base * 0.5 * p).max(0.4)
+    (base * 0.5 * p).max(min_r)
 }
 
 fn stamp_circle(

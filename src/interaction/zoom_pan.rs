@@ -6,6 +6,9 @@
 //!   * Pen-style tool     → adjust pen size.
 //!   * Any other tool     → zoom the canvas around the cursor.
 //!
+//! Holding Space (the pan key) makes the wheel zoom whatever the tool,
+//! so the pen and brushes can pan and zoom without switching tools.
+//!
 //! A locked slide, or one still opening, takes no edits: there Shift +
 //! wheel does nothing and a pen-style tool zooms like any other.
 //!
@@ -45,6 +48,7 @@ pub fn handle_scroll(
     cursor_screen: [f32; 2],
     ctrl_held: bool,
     shift_held: bool,
+    space_held: bool,
     tool: &mut ActiveTool,
     canvases: &mut CanvasManager,
     bg_opacity: &mut f32,
@@ -82,7 +86,11 @@ pub fn handle_scroll(
         return;
     }
 
-    if matches!(tool.kind, ToolKind::Spotlight) {
+    if space_held {
+        // Space pans, so with it held the wheel is view navigation too.
+        let (pan, zoom) = canvases.active_view_mut();
+        zoom_about_cursor(pan, zoom, raw_delta_y, cursor_screen);
+    } else if matches!(tool.kind, ToolKind::Spotlight) {
         if notches == 0 { return; }
         const STEP: f32 = 5.0;
         tool.spotlight_size = (tool.spotlight_size + n_f * STEP).clamp(20.0, 800.0);
@@ -138,10 +146,10 @@ mod tests {
         canvas.dirty = false;
         let mut m = CanvasManager::for_tests(vec![canvas]);
         let mut bg = 0.5;
-        handle_scroll(1, 1.0, [100.0, 100.0], false, false, &mut tool, &mut m, &mut bg);
+        handle_scroll(1, 1.0, [100.0, 100.0], false, false, false, &mut tool, &mut m, &mut bg);
         assert!(m.active().zoom > 1.0);
         assert!(!m.active().dirty, "zooming must not trigger a slide save");
-        handle_scroll(1, 1.0, [100.0, 100.0], false, true, &mut tool, &mut m, &mut bg);
+        handle_scroll(1, 1.0, [100.0, 100.0], false, true, false, &mut tool, &mut m, &mut bg);
         assert!(m.active().dirty, "a layer-opacity change must be saved");
     }
 
@@ -155,12 +163,32 @@ mod tests {
         let mut m = CanvasManager::for_tests(vec![canvas]);
         m.set_locked(0, true);
         let mut bg = 0.5;
-        handle_scroll(1, 1.0, [100.0, 100.0], false, false, &mut tool, &mut m, &mut bg);
+        handle_scroll(1, 1.0, [100.0, 100.0], false, false, false, &mut tool, &mut m, &mut bg);
         assert!(m.active().zoom > 1.0, "the pen's wheel zooms instead");
         assert_eq!(tool.size, size);
-        handle_scroll(1, 1.0, [100.0, 100.0], false, true, &mut tool, &mut m, &mut bg);
+        handle_scroll(1, 1.0, [100.0, 100.0], false, true, false, &mut tool, &mut m, &mut bg);
         assert_eq!(m.active().layers[0].opacity, 1.0);
         assert!(!m.active().dirty);
+    }
+
+    /// The wheel sizes the pen, but with Space (the pan key) held it
+    /// zooms, so the pen and brushes never need a tool switch to zoom.
+    #[test]
+    fn space_and_the_wheel_zoom_while_the_pen_is_out() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = ToolKind::Pen;
+        let size = tool.size;
+        let mut m = CanvasManager::for_tests(vec![Canvas::default()]);
+        let mut bg = 0.5;
+        handle_scroll(1, 1.0, [100.0, 100.0], false, false, false, &mut tool, &mut m, &mut bg);
+        assert_eq!(tool.size, size + 1.0, "without Space the wheel sizes the pen");
+        assert_eq!(m.active().zoom, 1.0);
+        handle_scroll(1, 1.0, [100.0, 100.0], false, false, true, &mut tool, &mut m, &mut bg);
+        assert!(m.active().zoom > 1.0, "with Space it zooms in");
+        handle_scroll(-1, -1.0, [100.0, 100.0], false, false, true, &mut tool, &mut m, &mut bg);
+        handle_scroll(-1, -1.0, [100.0, 100.0], false, false, true, &mut tool, &mut m, &mut bg);
+        assert!(m.active().zoom < 1.0, "and out");
+        assert_eq!(tool.size, size + 1.0, "leaving the size alone");
     }
 
     #[test]
