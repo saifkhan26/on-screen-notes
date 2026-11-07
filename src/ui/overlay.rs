@@ -647,54 +647,8 @@ pub fn show(
             // something apart from the slide; frame and handles on the
             // selected one.
             if (pin_marks.outlines || pin_marks.selected.is_some()) && show_selection {
-                let painter = ui.painter();
-                let at = |q: [f32; 2]| rect.min + egui::vec2(q[0], q[1]);
-                let line = egui::Color32::from_rgb(86, 160, 255);
-                let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
-                for p in &pinned {
-                    let frame = p.frame();
-                    let corners: Vec<egui::Pos2> = frame.corners().iter().map(|c| at(*c)).collect();
-                    if pin_marks.selected == Some(p.pin.id) {
-                        painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(3.0, under)));
-                        painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(1.4, line)));
-                        let (top, knob) = crate::canvas::pins::rotate_knob(&frame);
-                        painter.line_segment([at(top), at(knob)], egui::Stroke::new(3.0, under));
-                        painter.line_segment([at(top), at(knob)], egui::Stroke::new(1.4, line));
-                        for (h, kind) in crate::canvas::pins::handles(&frame) {
-                            let h = at(h);
-                            match kind {
-                                crate::canvas::pins::PinHandle::Rotate => {
-                                    painter.circle_filled(h, 6.5, under);
-                                    painter.circle_filled(h, 5.0, egui::Color32::WHITE);
-                                    painter.circle_stroke(h, 5.0, egui::Stroke::new(1.4, line));
-                                }
-                                crate::canvas::pins::PinHandle::Corner { .. } => {
-                                    let outer = egui::Rect::from_center_size(h, egui::vec2(11.0, 11.0));
-                                    let inner = egui::Rect::from_center_size(h, egui::vec2(8.0, 8.0));
-                                    painter.rect_filled(outer, egui::Rounding::same(2.0), under);
-                                    painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
-                                    painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
-                                }
-                            }
-                        }
-                    } else if pin_marks.outlines {
-                        let mut ring = corners.clone();
-                        ring.push(corners[0]);
-                        let faint = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 150));
-                        painter.extend(egui::Shape::dashed_line(&ring, faint, 6.0, 4.0));
-                    }
-                    if pin_marks.outlines {
-                        // Badge on the top-right corner, turned with the pin
-                        // but kept upright.
-                        let c = at(frame.corners()[1]);
-                        painter.circle_filled(c, 9.0, egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220));
-                        let icon = egui::Rect::from_center_size(c, egui::vec2(11.0, 11.0));
-                        egui::Image::new(egui::include_image!("../../assets/icons/pin.svg"))
-                            .tint(line)
-                            .fit_to_exact_size(icon.size())
-                            .paint_at(ui, icon);
-                    }
-                }
+                let painter = ui.painter().clone();
+                paint_pin_marks(ui, &painter, rect.min, &pinned, pin_marks);
             }
 
             // Magnifier loupe — captured desktop image painted into
@@ -785,6 +739,59 @@ pub fn show(
             }
         });
     canvas_rect
+}
+
+/// Pins: a faint outline and a badge on each, so they read as something
+/// apart from the slide; frame and handles on the selected one. A pin's
+/// screen point `q` shows at `origin + q`.
+pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos2, pinned: &[crate::canvas::pins::Pinned], marks: PinMarks) {
+    let at = |q: [f32; 2]| origin + egui::vec2(q[0], q[1]);
+    let line = egui::Color32::from_rgb(86, 160, 255);
+    let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+    for p in pinned {
+        let frame = p.frame();
+        let corners: Vec<egui::Pos2> = frame.corners().iter().map(|c| at(*c)).collect();
+        if marks.selected == Some(p.pin.id) {
+            painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(3.0, under)));
+            painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(1.4, line)));
+            let (top, knob) = crate::canvas::pins::rotate_knob(&frame);
+            painter.line_segment([at(top), at(knob)], egui::Stroke::new(3.0, under));
+            painter.line_segment([at(top), at(knob)], egui::Stroke::new(1.4, line));
+            for (h, kind) in crate::canvas::pins::handles(&frame) {
+                let h = at(h);
+                match kind {
+                    crate::canvas::pins::PinHandle::Rotate => {
+                        painter.circle_filled(h, 6.5, under);
+                        painter.circle_filled(h, 5.0, egui::Color32::WHITE);
+                        painter.circle_stroke(h, 5.0, egui::Stroke::new(1.4, line));
+                    }
+                    crate::canvas::pins::PinHandle::Corner { .. } => {
+                        let outer = egui::Rect::from_center_size(h, egui::vec2(11.0, 11.0));
+                        let inner = egui::Rect::from_center_size(h, egui::vec2(8.0, 8.0));
+                        painter.rect_filled(outer, egui::Rounding::same(2.0), under);
+                        painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
+                        painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
+                    }
+                }
+            }
+        } else if marks.outlines {
+            let mut ring = corners.clone();
+            ring.push(corners[0]);
+            let faint = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 150));
+            painter.extend(egui::Shape::dashed_line(&ring, faint, 6.0, 4.0));
+        }
+        if marks.outlines {
+            // Badge on the top-right corner, turned with the pin but kept
+            // upright.
+            let c = at(frame.corners()[1]);
+            painter.circle_filled(c, 9.0, egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220));
+            let icon = egui::Rect::from_center_size(c, egui::vec2(11.0, 11.0));
+            egui::Image::new(egui::include_image!("../../assets/icons/pin.svg"))
+                .tint(line)
+                .fit_to_exact_size(icon.size())
+                .paint_at(ui, icon);
+        }
+    }
 }
 
 /// The Select tool's frame, handles, rotate knob and rubber-band box, for

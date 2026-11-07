@@ -1314,7 +1314,9 @@ impl OnScreenNotesApp {
     /// moved into the middle of the canvas area (`area` across). The zoom
     /// stays as it was.
     fn open_pin_slide(&mut self, id: u64, area: egui::Vec2) {
-        let found = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| (p.slide, p.members.to_vec(), p.anchor()));
+        // A global pin may be away in the slide window, out of `pinned`.
+        let find = |pins: Vec<crate::canvas::pins::Pinned>| pins.iter().find(|p| p.pin.id == id).map(|p| (p.slide, p.members.to_vec(), p.anchor()));
+        let found = find(self.canvases.pinned()).or_else(|| find(self.canvases.global_pins()));
         let Some((slide, members, anchor)) = found else { return };
         self.canvases.go_to(slide);
         self.pin_tool.clear();
@@ -3777,6 +3779,10 @@ impl eframe::App for OnScreenNotesApp {
                 keys: &self.hotkeys_cfg,
                 main,
                 drop_hover,
+                main_area: {
+                    let s = self.overlay_cache.canvas_rect(ctx).size();
+                    [s.x, s.y]
+                },
             };
             let open = ui::slide_window::show(
                 ctx,
@@ -3791,6 +3797,10 @@ impl eframe::App for OnScreenNotesApp {
             );
             if let Some(msg) = win.take_notice() {
                 self.toast = Some((msg, Instant::now()));
+            }
+            if let Some(id) = win.take_open_pin() {
+                let area = self.overlay_cache.canvas_rect(ctx).size();
+                self.open_pin_slide(id, area);
             }
             if !open {
                 self.slide_window = None;
@@ -3929,7 +3939,7 @@ fn resize_cursor(direction: f32) -> egui::CursorIcon {
 /// Cursor for the Select tool over pins: what a press at `q` (points
 /// from the canvas area's top-left) would grab, or what the pin gesture
 /// in flight is doing. `None` when the pointer is over no pin.
-fn pin_cursor(
+pub(crate) fn pin_cursor(
     tool: &crate::canvas::pins::PinTool,
     q: [f32; 2],
     pins: &[crate::canvas::pins::Pinned],

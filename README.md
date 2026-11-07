@@ -229,7 +229,9 @@ Every action is one undo step. Things worth knowing:
   Select; Ctrl+Z on that slide); middle-drag or Space+drag pans. Drag a
   selection from the canvas into the window, or back, to move it to the
   other slide, landing where you let go. Its **Pins** toggle shows the
-  pins on every slide there instead of on the canvas.
+  pins on every slide there instead of on the canvas; with Select they
+  move, resize and turn there as on the canvas (Delete unpins,
+  double-click goes to the pin's slide).
 - The **funnel** button highlights pictures, GIFs and/or videos on the
   slide (each type outlined in its own colour, the rest dimmed), and
   "Select these" selects them, ready to arrange or copy.

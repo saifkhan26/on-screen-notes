@@ -11,7 +11,9 @@
 //! The toolbar's tool works here too, on the slide shown (see
 //! `slide_edit`): draw, erase (Ctrl), shapes, laser, select. Wheel zooms;
 //! middle-drag or Space+drag pans, and a plain drag pans on a locked
-//! slide, in Pins mode, or with a tool the window cannot use yet. The
+//! slide or with a tool the window cannot use yet. In Pins mode the
+//! Select tool moves, resizes and turns the pins (Delete unpins,
+//! double-click goes to a pin's slide) and any other drag pans. The
 //! window has its own pan and zoom, so looking around here never moves
 //! that slide's view on the canvas.
 //!
@@ -147,11 +149,13 @@ impl SlideWindow {
 
     /// Take the pen gestures that start over this window out of the
     /// canvas's `events`, to replay here (see `WindowEdit::claim_pen`).
-    /// None in Pins mode, where the pen only pans.
     pub fn claim_pen(&mut self, events: &mut Vec<crate::input::pen::PenEvent>, client_origin: [i32; 2]) {
-        if !self.pins {
-            self.edit.claim_pen(events, client_origin, self.hwnd);
-        }
+        self.edit.claim_pen(events, client_origin, self.hwnd);
+    }
+
+    /// A pin double-clicked here, for the app to go to its slide.
+    pub fn take_open_pin(&mut self) -> Option<u64> {
+        self.edit.take_open_pin()
     }
 
     /// A pen or mouse gesture is drawing or moving something here.
@@ -239,7 +243,7 @@ pub fn show(
         let mut open = !ctx.input(|i| i.viewport().close_requested());
         let top = if look.chrome { CARD_INSET } else { 0.0 };
         if win.pins {
-            pins_area(ctx, win, cache, manager, position_passes, media, look.background, top);
+            pins_area(ctx, win, cache, manager, position_passes, media, look, top, main_tool, input);
         } else {
             canvas_area(ctx, win, cache, manager, position_passes, media, look.background, top, main_tool, input);
         }
@@ -401,6 +405,7 @@ fn card(ctx: &egui::Context, win: &mut SlideWindow, manager: &CanvasManager) -> 
                     };
                     if text_btn(ui, "Pins", tip, win.pins) {
                         win.pins = !win.pins;
+                        win.edit.drop_pin_selection();
                         win.fit_pending = true;
                     }
                     ui.add_space(8.0);
@@ -597,35 +602,48 @@ fn canvas_area(
 }
 
 /// The global pins alone, laid out as they are on the canvas, under the
-/// window's own pan and zoom (`fit` gathers them into view).
+/// window's own pan and zoom (`fit` gathers them into view). With the
+/// Select tool they move, resize and turn here as on the canvas.
 #[allow(clippy::too_many_arguments)]
 fn pins_area(
     ctx: &egui::Context,
     win: &mut SlideWindow,
     cache: &mut OverlayCache,
-    manager: &CanvasManager,
+    manager: &mut CanvasManager,
     position_passes: usize,
     media: &crate::media::MediaHub,
-    background: Color32,
+    look: &Look,
     top: f32,
+    main_tool: &mut crate::tools::ActiveTool,
+    input: &crate::ui::slide_edit::Input,
 ) {
-    egui::CentralPanel::default().frame(egui::Frame::none().fill(background)).show(ctx, |ui| {
+    egui::CentralPanel::default().frame(egui::Frame::none().fill(look.background)).show(ctx, |ui| {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        win.last_rect = rect;
+        win.last_ppp = ctx.pixels_per_point();
+        // With the Select tool the pins move, resize and turn here as on
+        // the canvas (see `WindowEdit::pins_pointer`); any other press
+        // pans, so a plain drag is not `navigate`'s.
+        win.edit.pins_keys(ctx, manager, main_tool, input.keys);
+        let origin = rect.min + Vec2::new(win.pan[0], win.pan[1]);
+        win.edit.pins_pointer(ctx, &response, manager, origin, win.zoom, &mut win.pan, input, win.hwnd);
+        if navigate(ctx, win, rect, &response, false) {
+            let bounds = manager
+                .global_pins()
+                .iter()
+                .map(|p| p.frame().aabb())
+                .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
+            if let Some(b) = bounds {
+                // No bigger than on the canvas: they were sized there.
+                fit_bounds(win, b, rect.size(), top, 1.0);
+            }
+        }
+
         let pins = manager.global_pins();
         if pins.is_empty() {
             let text = if manager.pins_hidden() { "Pins are hidden — Shift+P shows them" } else { "No pins on every slide yet — Ctrl+P pins a selection" };
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(14.0), theme::TEXT_MUTED);
         } else {
-            if navigate(ctx, win, rect, &response, true) {
-                let bounds = pins
-                    .iter()
-                    .map(|p| p.frame().aabb())
-                    .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
-                if let Some(b) = bounds {
-                    // No bigger than on the canvas: they were sized there.
-                    fit_bounds(win, b, rect.size(), top, 1.0);
-                }
-            }
             let origin = rect.min + Vec2::new(win.pan[0], win.pan[1]);
             let textures = cache.pin_textures(ctx, &pins, rect, origin, win.zoom, media, false);
             let painter = ui.painter_at(rect);
@@ -634,6 +652,16 @@ fn pins_area(
                 // and place (`rigid`) are the canvas's, so the layout
                 // is kept.
                 render::paint_pinned(&painter, origin, p.canvas, p.members, p.pin.rigid(p.anchor()), p.pin.scale * win.zoom, position_passes, textures);
+            }
+            // Outlines, badges and the selected pin's handles, as on the
+            // canvas with the Select tool, drawn on the pins as the window
+            // shows them so the handles keep their size on screen.
+            if look.chrome && win.edit.tool().kind == crate::tools::ToolKind::Select {
+                let o = [origin.x, origin.y];
+                let shown: Vec<crate::canvas::pins::Pin> = pins.iter().map(|p| p.pin.viewed(o, win.zoom)).collect();
+                let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: s, ..*p }).collect();
+                let marks = crate::ui::overlay::PinMarks { selected: win.edit.selected_pin(), outlines: true };
+                crate::ui::overlay::paint_pin_marks(ui, &painter, egui::Pos2::ZERO, &view, marks);
             }
         }
         resize_edges(ui, rect);

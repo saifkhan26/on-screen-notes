@@ -54,6 +54,11 @@ pub struct WindowEdit {
     /// Something to tell the user (a drop done or refused), for the app's
     /// toast.
     notice: Option<String>,
+    /// Pins mode: which global pin is selected here, and the move /
+    /// resize / turn in flight. The canvas has its own.
+    pin_tool: crate::canvas::pins::PinTool,
+    /// A pin was double-clicked: the app goes to its slide.
+    open_pin: Option<u64>,
 }
 
 /// Where the window's slide sits: the canvas area, and the window's pan
@@ -86,6 +91,9 @@ pub struct Input<'a> {
     /// Where the canvas is, for a selection dragged out of the window and
     /// let go over it.
     pub main: Option<MainCanvas>,
+    /// The canvas area's size, points: a pin moved in the window is kept
+    /// on it, so it can be reached there again.
+    pub main_area: [f32; 2],
     /// A selection is being dragged on the canvas and the pointer is over
     /// this window: letting go drops it here.
     pub drop_hover: bool,
@@ -154,6 +162,230 @@ impl WindowEdit {
             mouse: None,
             mouse_was_down: false,
             notice: None,
+            pin_tool: crate::canvas::pins::PinTool::default(),
+            open_pin: None,
+        }
+    }
+
+    /// A pin double-clicked in the window, for the app to go to its slide.
+    pub fn take_open_pin(&mut self) -> Option<u64> {
+        self.open_pin.take()
+    }
+
+    /// The pin selected in the window.
+    pub fn selected_pin(&self) -> Option<u64> {
+        self.pin_tool.selected
+    }
+
+    /// Let go of the selected pin (Pins mode turned off).
+    pub fn drop_pin_selection(&mut self) {
+        self.pin_tool.clear();
+    }
+
+    /// The pen events taken for this window, in its own points (`hwnd` is
+    /// the window's), each with its screen position in pixels.
+    fn drain_pen(&mut self, ctx: &egui::Context, hwnd: isize) -> Vec<(PenEvent, [f32; 2])> {
+        let queue = std::mem::take(&mut self.pen_queue);
+        let Some((l, t, _, _)) = crate::platform::client_rect(hwnd) else { return Vec::new() };
+        let ppp = ctx.pixels_per_point();
+        queue
+            .into_iter()
+            .map(|ev| {
+                let s = sample_of(&ev);
+                let local = PenSample { pos: [(s.pos[0] - l as f32) / ppp, (s.pos[1] - t as f32) / ppp], ..s };
+                (with_sample(ev, local), s.pos)
+            })
+            .collect()
+    }
+
+    /// Pins mode: with the Select tool a press on a pin selects it, and a
+    /// drag moves, resizes or turns it, as on the canvas; a double-click
+    /// goes to its slide. Any other press pans. `origin` is where a pin's
+    /// screen point 0 shows (canvas area corner plus pan), `zoom` the
+    /// window's. The pins keep their places as the canvas has them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pins_pointer(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        manager: &mut CanvasManager,
+        origin: egui::Pos2,
+        zoom: f32,
+        pan: &mut [f32; 2],
+        input: &Input,
+        hwnd: isize,
+    ) {
+        let select = self.tool.kind == ToolKind::Select;
+        let ids: Vec<u64> = manager.global_pins().iter().map(|p| p.pin.id).collect();
+        if !select || self.pin_tool.selected.is_some_and(|id| !ids.contains(&id)) {
+            self.pin_tool.clear();
+        }
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let o = [origin.x, origin.y];
+
+        // The pen first; the mouse only while the pen is not the one
+        // moving the pointer (the tablet driver copies its presses).
+        for (ev, _) in self.drain_pen(ctx, hwnd) {
+            let g = self.pen;
+            self.pen = self.pin_event(ev, g, ctx, manager, o, zoom, pan, select, shift, input.main_area);
+        }
+        let down = ctx.input(|i| i.pointer.primary_down());
+        if !input.pen_owns_pointer && self.pen.is_none() {
+            if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                let s = PenSample::from_pos([p.x, p.y]);
+                let ev = match (down, self.mouse_was_down) {
+                    (true, false) if response.is_pointer_button_down_on() => Some(PenEvent::Down(s)),
+                    (true, true) if self.mouse.is_some() => Some(PenEvent::Move(s)),
+                    (false, true) if self.mouse.is_some() => Some(PenEvent::Up(s)),
+                    _ => None,
+                };
+                if let Some(ev) = ev {
+                    let g = self.mouse;
+                    self.mouse = self.pin_event(ev, g, ctx, manager, o, zoom, pan, select, shift, input.main_area);
+                }
+            }
+        }
+        self.mouse_was_down = down;
+
+        // The cursor says what a press would do.
+        if let Some(p) = response.hover_pos() {
+            let w = [p.x, p.y];
+            let cursor = if select {
+                let pins = manager.global_pins();
+                let shown: Vec<crate::canvas::pins::Pin> = pins.iter().map(|p| p.pin.viewed(o, zoom)).collect();
+                let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: s, ..*p }).collect();
+                crate::app::pin_cursor(&self.pin_tool, w, &view)
+            } else {
+                None
+            };
+            let panning = matches!(self.pen, Some(Gesture::Pan(_))) || matches!(self.mouse, Some(Gesture::Pan(_)));
+            ctx.set_cursor_icon(cursor.unwrap_or(if panning { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab }));
+        }
+    }
+
+    /// One pen or mouse event in Pins mode, given the gesture it belongs
+    /// to; returns that gesture as it goes on (`None` once it ended).
+    #[allow(clippy::too_many_arguments)]
+    fn pin_event(
+        &mut self,
+        ev: PenEvent,
+        g: Option<Gesture>,
+        ctx: &egui::Context,
+        manager: &mut CanvasManager,
+        o: [f32; 2],
+        zoom: f32,
+        pan: &mut [f32; 2],
+        select: bool,
+        snap: bool,
+        area: [f32; 2],
+    ) -> Option<Gesture> {
+        let w = sample_of(&ev).pos;
+        match ev {
+            PenEvent::Down(_) => {
+                let on_ui = ctx.layer_id_at(egui::pos2(w[0], w[1])).is_some_and(|l| l.order > egui::Order::Background);
+                Some(if on_ui {
+                    Gesture::Ui
+                } else if select {
+                    match self.press_pin(w, manager, o, zoom) {
+                        crate::canvas::pins::Press::Took => Gesture::Tool,
+                        crate::canvas::pins::Press::Open(id) => {
+                            self.open_pin = Some(id);
+                            Gesture::Ui
+                        }
+                        crate::canvas::pins::Press::Missed => Gesture::Pan(w),
+                    }
+                } else {
+                    Gesture::Pan(w)
+                })
+            }
+            PenEvent::Move(_) | PenEvent::Up(_) => {
+                let up = matches!(ev, PenEvent::Up(_));
+                let next = match g {
+                    Some(Gesture::Tool) => {
+                        self.move_pin(w, snap, up, manager, o, zoom, area);
+                        g
+                    }
+                    Some(Gesture::Pan(last)) => {
+                        pan[0] += w[0] - last[0];
+                        pan[1] += w[1] - last[1];
+                        Some(Gesture::Pan(w))
+                    }
+                    g => g,
+                };
+                if up { None } else { next }
+            }
+        }
+    }
+
+    /// A press at window point `w` on the global pins.
+    fn press_pin(&mut self, w: [f32; 2], manager: &mut CanvasManager, o: [f32; 2], zoom: f32) -> crate::canvas::pins::Press {
+        let press = {
+            let pins = manager.global_pins();
+            let shown: Vec<crate::canvas::pins::Pin> = pins.iter().map(|p| p.pin.viewed(o, zoom)).collect();
+            let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: s, ..*p }).collect();
+            self.pin_tool.press(w, &view)
+        };
+        if press == crate::canvas::pins::Press::Took {
+            if let Some(id) = self.pin_tool.selected {
+                manager.pin_board().raise(id);
+            }
+        }
+        press
+    }
+
+    /// Carry the pin gesture to window point `w` (`up`: let go), working
+    /// on the pins as the window shows them and writing the result back
+    /// as the canvas places them, kept on the canvas area (`area`).
+    #[allow(clippy::too_many_arguments)]
+    fn move_pin(&mut self, w: [f32; 2], snap: bool, up: bool, manager: &mut CanvasManager, o: [f32; 2], zoom: f32, area: [f32; 2]) {
+        let shown: Vec<crate::canvas::pins::Pin> = manager.global_pins().iter().map(|p| p.pin.viewed(o, zoom)).collect();
+        let mut scratch = crate::canvas::pins::PinBoard::scratch(shown);
+        if up {
+            self.pin_tool.release(w, snap, &mut scratch);
+        } else {
+            self.pin_tool.drag(w, snap, &mut scratch);
+        }
+        let Some(id) = self.pin_tool.selected else { return };
+        let Some(moved) = scratch.get_mut(id).map(|p| p.unviewed(o, zoom)) else { return };
+        if let Some(pin) = manager.pin_board().get_mut(id) {
+            pin.center = moved.center;
+            pin.scale = moved.scale;
+            pin.angle = moved.angle;
+            if up {
+                pin.center = [pin.center[0].clamp(0.0, area[0].max(0.0)), pin.center[1].clamp(0.0, area[1].max(0.0))];
+            }
+        }
+    }
+
+    /// Pins mode keys: Delete unpins the selected pin (its objects stay
+    /// on their slide), Esc lets go of it, the tool keys pick the tool.
+    pub fn pins_keys(&mut self, ctx: &egui::Context, manager: &mut CanvasManager, main: &mut ActiveTool, keys: &ParsedHotkeys) {
+        let events: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (key, mods) in events {
+            if matches!(key, egui::Key::Delete | egui::Key::Backspace) {
+                if let Some(id) = self.pin_tool.selected {
+                    let slide = manager.pin_board().members(id).map(|(s, _)| s);
+                    self.pin_tool.clear();
+                    if manager.unpin(id) {
+                        self.notice = Some(match slide {
+                            Some(s) => format!("Unpinned — the objects stay on slide {}", s + 1),
+                            None => "Unpinned".to_string(),
+                        });
+                    }
+                }
+            } else if key == egui::Key::Escape {
+                self.pin_tool.clear();
+            } else if !mods.ctrl && !mods.command && !mods.alt {
+                crate::interaction::react_tool_shortcut(key, mods, main, keys);
+            }
         }
     }
 
@@ -570,6 +802,45 @@ mod tests {
         assert_eq!(b.layers[0].strokes.len(), 1);
         assert!((b.layers[0].strokes[0].samples[0].pos[0] - 140.0).abs() < 2.0, "moved 40 units");
         assert_eq!(b.edit_stamp().0, undo + 1, "one undo step");
+    }
+
+    #[test]
+    fn a_pin_moves_in_the_window_and_keeps_its_canvas_place() {
+        let mut slide = Canvas { dirty: false, ..Canvas::default() };
+        slide.layers[0].shapes.push(crate::canvas::shape::Shape::Line {
+            a: [0.0, 0.0],
+            b: [100.0, 0.0],
+            color: [255; 4],
+            stroke_width: 4.0,
+            border: Default::default(),
+            pin: 0,
+        });
+        let mut m = CanvasManager::for_tests(vec![slide]);
+        let id = m.pin_objects(0, &[], &[0], [0.0, 0.0], false).expect("pinned");
+        let before = m.global_pins()[0].pin.center;
+        assert_eq!(before, [50.0, 0.0], "over the line, as the canvas shows it");
+
+        // The window shows the pins at half size, 100 / 50 points in.
+        let (o, zoom) = ([100.0, 50.0], 0.5);
+        let mut e = WindowEdit::new(&AppConfig::default());
+        e.tool.kind = ToolKind::Select;
+        let at = [o[0] + before[0] * zoom, o[1] + before[1] * zoom];
+        let stamp = m.slide(0).unwrap().edit_stamp();
+        assert_eq!(e.press_pin(at, &mut m, o, zoom), crate::canvas::pins::Press::Took);
+        assert_eq!(e.selected_pin(), Some(id));
+        e.move_pin([at[0] + 20.0, at[1] + 10.0], false, true, &mut m, o, zoom, [2000.0, 2000.0]);
+        let after = m.global_pins()[0].pin.center;
+        assert!((after[0] - 90.0).abs() < 1e-3 && (after[1] - 20.0).abs() < 1e-3, "20 / 10 window points are 40 / 20 on the canvas: {after:?}");
+        assert_eq!(m.slide(0).unwrap().edit_stamp(), stamp, "moving a pin edits no slide");
+    }
+
+    #[test]
+    fn a_pin_seen_in_the_window_maps_back() {
+        let pin = crate::canvas::pins::Pin { id: 1, center: [300.0, 200.0], scale: 2.0, angle: 0.5, local: false };
+        let v = pin.viewed([40.0, -10.0], 0.25);
+        assert_eq!((v.center, v.scale, v.angle), ([115.0, 40.0], 0.5, 0.5));
+        let back = v.unviewed([40.0, -10.0], 0.25);
+        assert!((back.center[0] - 300.0).abs() < 1e-3 && (back.center[1] - 200.0).abs() < 1e-3 && (back.scale - 2.0).abs() < 1e-5);
     }
 
     #[test]

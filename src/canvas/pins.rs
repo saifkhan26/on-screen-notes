@@ -99,6 +99,28 @@ impl Pin {
         Obb { center: self.center, half: [half(bounds[0], bounds[2]), half(bounds[1], bounds[3])], angle: self.angle }
     }
 
+    /// This pin as seen through a view that shows its screen point `q` at
+    /// `origin + q · zoom` (the slide window's): its handles, grab areas
+    /// and smallest frame then keep their size on screen there, as on the
+    /// canvas. `unviewed` turns a place found there back into the pin's.
+    pub fn viewed(&self, origin: [f32; 2], zoom: f32) -> Pin {
+        Pin {
+            center: [origin[0] + self.center[0] * zoom, origin[1] + self.center[1] * zoom],
+            scale: self.scale * zoom,
+            ..*self
+        }
+    }
+
+    /// The inverse of `viewed`.
+    pub fn unviewed(&self, origin: [f32; 2], zoom: f32) -> Pin {
+        let zoom = zoom.max(1e-6);
+        Pin {
+            center: [(self.center[0] - origin[0]) / zoom, (self.center[1] - origin[1]) / zoom],
+            scale: (self.scale / zoom).clamp(MIN_SCALE, MAX_SCALE),
+            ..*self
+        }
+    }
+
     /// A pin over objects of `canvas` whose box is `bounds`, placed
     /// exactly where they show on that slide now. Global, as every pin
     /// whose place could be lost was before local pins.
@@ -283,6 +305,13 @@ impl PinBoard {
             .filter(|p| p.id != 0 && seen.insert(p.id) && usable(p))
             .collect();
         Self { saved: Some(pins.clone()), pins, ..Self::default() }
+    }
+
+    /// A board holding just these places, unchecked, for `PinTool` to move
+    /// pins on in another space (`Pin::viewed`); read the result back with
+    /// `get_mut`.
+    pub fn scratch(pins: Vec<Pin>) -> Self {
+        Self { pins, ..Self::default() }
     }
 
     /// Look through the slides that changed since the last call (or
