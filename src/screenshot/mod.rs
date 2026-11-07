@@ -1,6 +1,6 @@
 //! Screenshot pipeline: capture screen → rasterise annotations → composite → save.
 //!
-//! Triggered by the global hotkey (default Ctrl+Shift+S). Saved files land
+//! Triggered by the global hotkey (default Ctrl+Alt+Shift+S). Saved files land
 //! in the configured directory or in `<pictures>/on-screen-notes/`.
 
 pub mod compositor;

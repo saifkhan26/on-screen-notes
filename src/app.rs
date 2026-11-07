@@ -38,7 +38,7 @@ pub struct OnScreenNotesApp {
     overlay_cache: ui::overlay::OverlayCache,
 
     /// Whether the main overlay is shown. Toggled by the global hotkey
-    /// (default Ctrl+Shift+N).
+    /// (default Ctrl+Alt+Shift+N).
     overlay_visible: bool,
     /// Whether mouse left-button was down on the previous frame; used to
     /// synthesise pen events from mouse for the no-tablet fallback.
@@ -126,9 +126,13 @@ pub struct OnScreenNotesApp {
     osn_hwnd: isize,
 
     /// Screen-recording state machine. Idle by default; toggled on /
-    /// off via `Ctrl+Shift+R`. While capturing we hide the floating UI
-    /// so it doesn't end up in the saved GIF.
+    /// off via the global hotkey (default `Ctrl+Alt+Shift+R`). While
+    /// capturing we hide the floating UI so it doesn't end up in the
+    /// saved GIF.
     recorder: crate::recording::Recorder,
+    /// That hotkey as the REC badge shows it, e.g. "Ctrl+Shift+Alt+R";
+    /// `None` when the binding does not parse.
+    record_hotkey: Option<String>,
 
     /// Saved `ui_visible` value at the moment recording started, so we
     /// can restore the user's chrome state after the recording
@@ -482,6 +486,8 @@ impl OnScreenNotesApp {
         // cached on the App for the in-overlay dispatcher.
         let hotkeys_file = crate::input::hotkeys_config::HotkeysConfig::load_or_default();
         let hotkeys_cfg = hotkeys_file.parsed();
+        let record_hotkey = crate::input::hotkeys_config::parse(&hotkeys_file.global.start_record)
+            .map(|b| b.label());
 
         let hotkeys = match Hotkeys::register(&hotkeys_file.global) {
             Ok(h) => Some(h),
@@ -544,6 +550,7 @@ impl OnScreenNotesApp {
             ui_visible: true,
             osn_hwnd,
             recorder: crate::recording::Recorder::default(),
+            record_hotkey,
             ui_visible_before_record: true,
             toast: None,
             pending_screenshot: None,
@@ -3580,7 +3587,10 @@ impl eframe::App for OnScreenNotesApp {
                                     4.5,
                                     egui::Color32::from_rgba_unmultiplied(232, 71, 71, pulse),
                                 );
-                                ui.label(format!("REC  {elapsed:02}s  · Ctrl+Shift+R stop"));
+                                ui.label(match &self.record_hotkey {
+                                    Some(k) => format!("REC  {elapsed:02}s  · {k} stop"),
+                                    None => format!("REC  {elapsed:02}s"),
+                                });
                             });
                         });
                 });

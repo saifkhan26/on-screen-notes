@@ -351,14 +351,21 @@ change does not retro-apply.
 
 ## Global hotkeys
 
-Work even when overlay is unfocused.
+Work even when overlay is unfocused. While the app runs, Windows hands
+these combos to it alone — the app in focus never sees them — so the
+defaults use `Ctrl+Alt+Shift`, which other apps leave alone.
 
 | Action | Default |
 |---|---|
-| Toggle overlay visibility | `Ctrl+Shift+N` |
-| Screenshot (bg + ink) | `Ctrl+Shift+S` |
-| Start / stop recording | `Ctrl+Shift+R` |
-| Pause / resume recording | `Ctrl+Shift+P` |
+| Toggle overlay visibility | `Ctrl+Alt+Shift+N` |
+| Screenshot (bg + ink) | `Ctrl+Alt+Shift+S` |
+| Start / stop recording | `Ctrl+Alt+Shift+R` |
+| Pause / resume recording | `Ctrl+Alt+Shift+P` |
+
+They used to be `Ctrl+Shift+N/S/R/P`, which took Save As, VS Code's
+command palette and the browser's hard reload away from other apps. An
+existing `hotkeys.toml` is upgraded once on launch: each global still on
+its old default moves to the new one, and bindings you changed are kept.
 
 All hotkeys (globals + in-overlay shortcuts) are configurable via
 `hotkeys.toml`. See [Customising hotkeys](#customising-hotkeys).
@@ -434,11 +441,13 @@ one shortcut goes dead, the rest still work. Look at `RUST_LOG=warn`
 output for the offending line.
 
 ```toml
+version = 2
+
 [global]
-toggle_overlay = "ctrl+shift+n"
-screenshot     = "ctrl+shift+s"
-start_record   = "ctrl+shift+r"
-pause_record   = "ctrl+shift+p"
+toggle_overlay = "ctrl+alt+shift+n"
+screenshot     = "ctrl+alt+shift+s"
+start_record   = "ctrl+alt+shift+r"
+pause_record   = "ctrl+alt+shift+p"
 
 [tool]
 pen        = "p"
@@ -684,8 +693,8 @@ and always exit with the app.
 
 ## Recording
 
-`Ctrl+Shift+R` starts a screen capture of the area under the overlay;
-press again to stop. `Ctrl+Shift+P` pauses / resumes mid-record.
+`Ctrl+Alt+Shift+R` starts a screen capture of the area under the overlay;
+press again to stop. `Ctrl+Alt+Shift+P` pauses / resumes mid-record.
 
 Output format toggle in settings:
 

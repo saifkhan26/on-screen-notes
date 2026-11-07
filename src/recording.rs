@@ -1,6 +1,6 @@
 //! Screen-recording pipeline.
 //!
-//! The user toggles recording via `Ctrl+Shift+R` (or a toolbar button
+//! The user toggles recording via `Ctrl+Alt+Shift+R` (or a toolbar button
 //! that fires the same event). A dedicated worker thread spawned at
 //! `start()` does the heavy lifting: each tick it captures the screen
 //! under the OSN window with `xcap` (from whichever monitors the window

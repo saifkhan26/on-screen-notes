@@ -10,10 +10,11 @@
 //!   3. Built-in defaults                  — first run, no file anywhere.
 //!
 //! On the very first run we also write the defaults to the binary-
-//! adjacent path so the user has something concrete to edit.
+//! adjacent path so the user has something concrete to edit. A file
+//! from an older format is upgraded in place on load (`upgrade_text`).
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ============================================================================
 // Binding — one parsed hotkey (modifiers + key).
@@ -192,10 +193,37 @@ impl Default for GlobalSection {
     }
 }
 
-fn default_toggle_overlay() -> String { "ctrl+shift+n".into() }
-fn default_screenshot()     -> String { "ctrl+shift+s".into() }
-fn default_start_record()   -> String { "ctrl+shift+r".into() }
-fn default_pause_record()   -> String { "ctrl+shift+p".into() }
+// A global hotkey is taken from every other app while OSN runs, so the
+// defaults use Ctrl+Alt+Shift, which apps leave alone. They were
+// Ctrl+Shift+N/S/R/P, which ate Save As, VS Code's command palette and
+// the browser's hard reload; `upgrade_text` moves files still on those.
+fn default_toggle_overlay() -> String { "ctrl+alt+shift+n".into() }
+fn default_screenshot()     -> String { "ctrl+alt+shift+s".into() }
+fn default_start_record()   -> String { "ctrl+alt+shift+r".into() }
+fn default_pause_record()   -> String { "ctrl+alt+shift+p".into() }
+
+type DefaultFn = fn() -> String;
+
+/// Each `[global]` key with its default before format 2 and its default now.
+const OLD_GLOBAL_DEFAULTS: [(&str, &str, DefaultFn); 4] = [
+    ("toggle_overlay", "ctrl+shift+n", default_toggle_overlay),
+    ("screenshot",     "ctrl+shift+s", default_screenshot),
+    ("start_record",   "ctrl+shift+r", default_start_record),
+    ("pause_record",   "ctrl+shift+p", default_pause_record),
+];
+
+/// True when two global-hotkey strings name the same combo, whatever
+/// the case or the order of the modifiers.
+fn same_global_combo(a: &str, b: &str) -> bool {
+    let tokens = |s: &str| {
+        to_global_hotkey_format(s).map(|f| {
+            let mut t: Vec<String> = f.split('+').map(str::to_owned).collect();
+            t.sort();
+            t
+        })
+    };
+    matches!((tokens(a), tokens(b)), (Some(x), Some(y)) if x == y)
+}
 
 /// Translate our `"ctrl+shift+n"` style into the format the
 /// `global-hotkey` crate expects (`"ctrl+shift+KeyN"`, `"shift+Digit0"`,
@@ -463,12 +491,30 @@ fn d_media_play_pause() -> String { "k".into() }
 fn d_media_prev_frame() -> String { "comma".into() }
 fn d_media_next_frame() -> String { "period".into() }
 
+/// Current file format. 2 moved the global defaults off Ctrl+Shift.
+const FORMAT: u32 = 2;
+
 /// Top-level hotkeys file shape.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeysConfig {
+    /// Format the file was written in. Files from before it was
+    /// recorded read as 0 and get `upgrade_text` once; after that a
+    /// binding set back to an old default stays.
+    #[serde(default)] pub version: u32,
     #[serde(default)] pub global: GlobalSection,
     #[serde(default)] pub tool:   ToolSection,
     #[serde(default)] pub canvas: CanvasSection,
+}
+
+impl Default for HotkeysConfig {
+    fn default() -> Self {
+        Self {
+            version: FORMAT,
+            global: GlobalSection::default(),
+            tool: ToolSection::default(),
+            canvas: CanvasSection::default(),
+        }
+    }
 }
 
 // ============================================================================
@@ -669,28 +715,11 @@ impl HotkeysConfig {
     /// fresh installs writes the defaults to the exe-adjacent path so
     /// the user has something concrete to edit.
     pub fn load_or_default() -> Self {
-        let exe_p = exe_path();
-        if let Ok(s) = std::fs::read_to_string(&exe_p) {
-            match toml::from_str::<HotkeysConfig>(&s) {
-                Ok(c) => {
-                    log::info!("hotkeys loaded from {}", exe_p.display());
-                    return c;
-                }
-                Err(e) => log::warn!("hotkeys.toml at {} failed to parse: {e}", exe_p.display()),
-            }
+        if let Some(c) = Self::load(&exe_path()) {
+            return c;
         }
-        if let Some(user_p) = user_config_path() {
-            if let Ok(s) = std::fs::read_to_string(&user_p) {
-                match toml::from_str::<HotkeysConfig>(&s) {
-                    Ok(c) => {
-                        log::info!("hotkeys loaded from {}", user_p.display());
-                        return c;
-                    }
-                    Err(e) => log::warn!(
-                        "hotkeys.toml at {} failed to parse: {e}", user_p.display()
-                    ),
-                }
-            }
+        if let Some(c) = user_config_path().and_then(|p| Self::load(&p)) {
+            return c;
         }
         let defaults = Self::default();
         // Write defaults so user has a template — best-effort, swallow errors.
@@ -714,6 +743,111 @@ impl HotkeysConfig {
         let full = format!("{header}{toml_str}");
         std::fs::write(&p, full)
     }
+
+    /// Read and parse the file at `path`, bringing one from an older
+    /// format up to date and writing it back. `None` when there is no
+    /// file there or it does not parse.
+    fn load(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let cfg = match toml::from_str::<Self>(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("hotkeys.toml at {} failed to parse: {e}", path.display());
+                return None;
+            }
+        };
+        log::info!("hotkeys loaded from {}", path.display());
+        if cfg.version >= FORMAT {
+            return Some(cfg);
+        }
+        let upgraded = upgrade_text(&text);
+        match toml::from_str::<Self>(&upgraded) {
+            Ok(c) => {
+                // Unwritable (a read-only install dir): the upgrade
+                // still applies, it just runs again next launch.
+                match std::fs::write(path, &upgraded) {
+                    Ok(()) => log::info!("hotkeys.toml at {} upgraded to format {FORMAT}", path.display()),
+                    Err(e) => log::warn!("could not write upgraded hotkeys.toml at {}: {e}", path.display()),
+                }
+                Some(c)
+            }
+            Err(e) => {
+                log::warn!("upgraded hotkeys.toml did not parse ({e}); using it as written");
+                Some(cfg)
+            }
+        }
+    }
+}
+
+/// Bring the text of a hotkeys file from before `FORMAT` up to date:
+/// each `[global]` binding still on its old default moves to the new
+/// one, and the format is recorded so this happens once. Comments,
+/// layout and the user's own bindings are kept as written.
+fn upgrade_text(text: &str) -> String {
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let version_line = format!("version = {FORMAT}");
+    let mut out = String::with_capacity(text.len() + 32);
+    // Empty at the top level, before the first table.
+    let mut section = String::new();
+    let mut version_written = false;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[body.len()..];
+        let trimmed = body.trim();
+        if trimmed.starts_with('[') {
+            if !version_written {
+                out.push_str(&format!("{version_line}{nl}{nl}"));
+                version_written = true;
+            }
+            section = trimmed.trim_matches(['[', ']']).trim().to_owned();
+            out.push_str(line);
+            continue;
+        }
+        let key = trimmed.split_once('=').map(|(k, _)| k.trim().trim_matches('"'));
+        if section.is_empty() && key == Some("version") {
+            out.push_str(&version_line);
+            out.push_str(ending);
+            version_written = true;
+            continue;
+        }
+        if section == "global" {
+            if let Some(new) = upgrade_global_line(body) {
+                out.push_str(&new);
+                out.push_str(ending);
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    if !version_written {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(nl);
+        }
+        out.push_str(&version_line);
+        out.push_str(nl);
+    }
+    out
+}
+
+/// `line` (in `[global]`, without its line ending) with its value moved
+/// to the new default, when it binds one of `OLD_GLOBAL_DEFAULTS` to
+/// that key's old default. Anything else around the value — spacing, a
+/// trailing comment — is kept.
+fn upgrade_global_line(line: &str) -> Option<String> {
+    let (key, rest) = line.split_once('=')?;
+    let (_, old, new) = OLD_GLOBAL_DEFAULTS
+        .iter()
+        .find(|(k, _, _)| *k == key.trim().trim_matches('"'))?;
+    let open = rest.find(['"', '\''])?;
+    let quote = &rest[open..open + 1];
+    let len = rest[open + 1..].find(quote)?;
+    let value = &rest[open + 1..open + 1 + len];
+    if !same_global_combo(value, old) {
+        return None;
+    }
+    let before = &rest[..open];
+    let after = &rest[open + 1 + len + 1..];
+    Some(format!("{key}={before}{quote}{}{quote}{after}", new()))
 }
 
 #[cfg(test)]
@@ -740,8 +874,8 @@ mod tests {
         assert_eq!(b(c.last_slide), Some((egui::Key::End, false, false)));
         assert_eq!(b(c.rename_slide), Some((egui::Key::F2, false, false)));
         assert_eq!(b(c.lock_slide), Some((egui::Key::R, true, false)));
-        // Ctrl+R is not the rectangle tool (plain R), nor is the
-        // recording hotkey (Ctrl+Shift+R) the lock.
+        // Ctrl+R is not the rectangle tool (plain R), nor is Ctrl+Shift+R
+        // (the recording hotkey before format 2) the lock.
         let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
         let tools = HotkeysConfig::default().parsed().tool;
         assert!(!tools.rect.unwrap().matches(egui::Key::R, ctrl));
@@ -789,5 +923,70 @@ mod tests {
     fn files_without_media_keys_get_the_defaults() {
         let cfg: HotkeysConfig = toml::from_str("[canvas]\nundo = \"ctrl+z\"\n").unwrap();
         assert_eq!(cfg.canvas.media_play_pause, "k");
+    }
+
+    #[test]
+    fn written_defaults_read_back_current() {
+        let text = toml::to_string_pretty(&HotkeysConfig::default()).unwrap();
+        let cfg: HotkeysConfig = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.version, FORMAT);
+        assert_eq!(cfg.global.screenshot, "ctrl+alt+shift+s");
+    }
+
+    #[test]
+    fn upgrade_moves_only_untouched_global_defaults() {
+        let old = "# On-Screen Notes — hotkeys.toml\n\n\
+                   [global]\n\
+                   toggle_overlay = \"ctrl+shift+n\"\n\
+                   screenshot = \"F9\"\n\
+                   start_record   = 'Shift+Ctrl+R'  # mine\n\
+                   pause_record = \"ctrl+alt+p\"\n\
+                   [tool]\n\
+                   pen = \"ctrl+shift+n\"\n";
+        let cfg: HotkeysConfig = toml::from_str(old).unwrap();
+        assert_eq!(cfg.version, 0);
+
+        let new = upgrade_text(old);
+        assert_eq!(
+            new,
+            "# On-Screen Notes — hotkeys.toml\n\n\
+             version = 2\n\n\
+             [global]\n\
+             toggle_overlay = \"ctrl+alt+shift+n\"\n\
+             screenshot = \"F9\"\n\
+             start_record   = 'ctrl+alt+shift+r'  # mine\n\
+             pause_record = \"ctrl+alt+p\"\n\
+             [tool]\n\
+             pen = \"ctrl+shift+n\"\n"
+        );
+        let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
+        assert_eq!(cfg.version, FORMAT);
+        assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
+        assert_eq!(cfg.global.screenshot, "F9");
+        assert_eq!(cfg.global.start_record, "ctrl+alt+shift+r");
+        assert_eq!(cfg.global.pause_record, "ctrl+alt+p");
+        assert_eq!(cfg.tool.pen, "ctrl+shift+n");
+    }
+
+    #[test]
+    fn upgrade_without_a_global_section_records_the_format() {
+        let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 2\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
+        assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
+
+        let new = upgrade_text("version = 1");
+        assert_eq!(new, "version = 2");
+        assert_eq!(upgrade_text(""), "version = 2\n");
+    }
+
+    #[test]
+    fn old_and_new_global_defaults_are_different_combos() {
+        for (_, old, new) in OLD_GLOBAL_DEFAULTS {
+            assert!(!same_global_combo(old, &new()));
+            assert!(same_global_combo(old, &old.to_uppercase()));
+        }
+        // `cmd` is the Windows key to the global-hotkey crate, not Ctrl.
+        assert!(!same_global_combo("cmd+shift+n", "ctrl+shift+n"));
     }
 }
