@@ -219,6 +219,14 @@ Every action is one undo step. Things worth knowing:
 - **Copy to a new slide** (`Ctrl+Shift+D`, any selection) adds a slide
   after the last one holding copies of the selected objects, in the same
   spot and view, and goes there with them selected.
+- **Move to slide…** (the bar's arrow-into-box button) lists the other
+  slides; the selection leaves this slide and lands on the one picked,
+  where it shows now on screen through that slide's own view. One undo
+  step on each slide; moved objects leave their pin.
+- **Slide window** — right-click a slide in the slide panel and pick
+  "Open in a window" to see it in a second window (pan, zoom, fit), or
+  turn on its **Pins** toggle to show the pins on every slide there
+  instead of on the canvas.
 - The **funnel** button highlights pictures, GIFs and/or videos on the
   slide (each type outlined in its own colour, the rest dimmed), and
   "Select these" selects them, ready to arrange or copy.

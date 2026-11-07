@@ -1,10 +1,11 @@
 //! Arrange bar: shown under the toolbar while objects are selected.
 //! Packs, groups by type, aligns and distributes the selection (see
 //! `tools::arrange`) when there are two or more, copies it to a new
-//! slide, and pins it (see `canvas::pins`). A selected pin gets a bar
+//! slide, moves it to another slide, and pins it (see `canvas::pins`). A selected pin gets a bar
 //! of its own in the same place, which also shows it on one slide or
 //! every slide.
 
+use crate::canvas::CanvasManager;
 use crate::tools::arrange::{Align, Arrange};
 use crate::ui::theme;
 use egui::{Color32, Rounding, Vec2};
@@ -15,6 +16,8 @@ const BTN: f32 = 28.0;
 pub enum BarAction {
     Arrange(Arrange),
     CopyToNewSlide,
+    /// Move the selection to this slide (an index).
+    MoveToSlide(usize),
     /// Pin the selection to every slide, or unpin it if all of it is.
     TogglePin,
 }
@@ -35,9 +38,9 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 }
 
 /// Draw the bar for a selection of `count` objects; `pinned` when every
-/// one of them is in a pin. Returns what was clicked this frame, if
-/// anything.
-pub fn show(ctx: &egui::Context, count: usize, pinned: bool) -> Option<BarAction> {
+/// one of them is in a pin; `slides` for the list "Move to slide" opens.
+/// Returns what was clicked this frame, if anything.
+pub fn show(ctx: &egui::Context, count: usize, pinned: bool, slides: &CanvasManager) -> Option<BarAction> {
     let pos = bar_pos(ctx);
     let mut picked = None;
     egui::Area::new(egui::Id::new("osn_arrange_bar"))
@@ -58,6 +61,9 @@ pub fn show(ctx: &egui::Context, count: usize, pinned: bool) -> Option<BarAction
                         "Copy to a new slide — Ctrl+Shift+D  (added after the last slide)")
                     {
                         picked = Some(BarAction::CopyToNewSlide);
+                    }
+                    if let Some(to) = move_btn(ui, slides) {
+                        picked = Some(BarAction::MoveToSlide(to));
                     }
                     let tip = if pinned {
                         "Unpin — stop showing these as a pin — Ctrl+P"
@@ -106,6 +112,58 @@ pub fn show_pin(ctx: &egui::Context, slide: usize, here: bool, local: bool) -> O
                 });
             });
         });
+    picked
+}
+
+/// "Move to slide": a button opening the list of the other slides, drawn
+/// like the slide window's picker. The slide picked, if one was.
+fn move_btn(ui: &mut egui::Ui, slides: &CanvasManager) -> Option<usize> {
+    let popup = ui.make_persistent_id("osn_move_to_slide");
+    let open = ui.memory(|m| m.is_popup_open(popup));
+    let others = slides.count() > 1;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
+    let bg = if open {
+        theme::ACCENT
+    } else if others && response.hovered() {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(7.0), bg);
+    let tint = if others { theme::TEXT_PRIMARY } else { Color32::from_white_alpha(60) };
+    let icon = rect.shrink(rect.width() * 0.22);
+    egui::Image::new(egui::include_image!("../../assets/icons/move-to-slide.svg"))
+        .tint(tint)
+        .fit_to_exact_size(icon.size())
+        .paint_at(ui, icon);
+    let tip = if others {
+        "Move to slide… — the objects leave this slide and land on the one you pick, where they show now"
+    } else {
+        "Move to slide… — there is no other slide yet"
+    };
+    let response = response.on_hover_text(tip);
+    if others && response.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup));
+    }
+
+    let mut picked = None;
+    let active = slides.active_index();
+    let room = (ui.ctx().screen_rect().max.y - rect.max.y - 24.0).max(72.0);
+    egui::popup_below_widget(ui, popup, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+        ui.set_min_width(crate::ui::slide_window::PICKER_W);
+        ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+        ui.label(egui::RichText::new("Move to slide").small().color(theme::TEXT_MUTED));
+        egui::ScrollArea::vertical().max_height(room.min(360.0)).show(ui, |ui| {
+            for i in (0..slides.count()).filter(|&i| i != active) {
+                if crate::ui::slide_window::slide_row(ui, slides, i, false) {
+                    picked = Some(i);
+                }
+            }
+        });
+    });
+    if picked.is_some() {
+        ui.memory_mut(|m| m.close_popup());
+    }
     picked
 }
 

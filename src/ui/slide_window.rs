@@ -212,7 +212,7 @@ fn slide_label(manager: &CanvasManager, idx: usize) -> String {
 }
 
 /// Width of the slide picker's button and list.
-const PICKER_W: f32 = 170.0;
+pub(crate) const PICKER_W: f32 = 170.0;
 const ROW_H: f32 = 24.0;
 /// Width of the slide-number column, as in the slide panel.
 const NUM_W: f32 = 26.0;
@@ -259,7 +259,7 @@ fn slide_picker(ui: &mut egui::Ui, current: usize, manager: &CanvasManager) -> O
 }
 
 /// One slide in the picker's list: number, then name; lit when shown.
-fn slide_row(ui: &mut egui::Ui, manager: &CanvasManager, i: usize, current: bool) -> bool {
+pub(crate) fn slide_row(ui: &mut egui::Ui, manager: &CanvasManager, i: usize, current: bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(PICKER_W, ROW_H), egui::Sense::click());
     let bg = if current {
         theme::ACCENT

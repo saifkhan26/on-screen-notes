@@ -784,6 +784,52 @@ impl CanvasManager {
         self.pins.pinned(&self.canvases, self.active)
     }
 
+    /// Move the chosen objects of the active slide's layer `li` to slide
+    /// `to`, onto its active layer, where they show now: through `to`'s
+    /// own pan and zoom they land on the same spot of the screen, at the
+    /// same size. One undo step on each slide. Moved objects leave their
+    /// pin, like copies (a pin shows objects of one slide). Returns how
+    /// many moved: none to the slide itself, a slide that does not
+    /// exist, or a locked one, and none from a locked slide.
+    pub fn move_objects_to(&mut self, to: usize, li: usize, strokes: &[usize], shapes: &[usize]) -> usize {
+        let from = self.active;
+        if to == from || to >= self.canvases.len() || self.is_locked(to) || self.is_locked(from) {
+            return 0;
+        }
+        self.ensure_loaded(from);
+        self.ensure_loaded(to);
+        let (Some(src), Some(dst)) = (self.canvases[from].as_ref(), self.canvases[to].as_ref()) else { return 0 };
+        let Some(layer) = src.layers.get(li) else { return 0 };
+        let mut moved_strokes: Vec<stroke::Stroke> = strokes.iter().filter_map(|&i| layer.strokes.get(i).cloned()).collect();
+        let mut moved_shapes: Vec<shape::Shape> = shapes.iter().filter_map(|&i| layer.shapes.get(i).cloned()).collect();
+        let count = moved_strokes.len() + moved_shapes.len();
+        if count == 0 {
+            return 0;
+        }
+        // Slide `from` point p shows at pan_f + p·zoom_f; slide `to`
+        // shows the point (pan_f − pan_t + p·zoom_f) / zoom_t there.
+        let k = src.zoom / dst.zoom.max(1e-6);
+        let d = [(src.pan[0] - dst.pan[0]) / dst.zoom.max(1e-6), (src.pan[1] - dst.pan[1]) / dst.zoom.max(1e-6)];
+        let m = affine::Affine::scale_about([0.0, 0.0], k, k).then(affine::Affine::translate(d));
+        for s in &mut moved_strokes {
+            s.apply_affine(&m);
+            s.pin = 0;
+        }
+        for s in &mut moved_shapes {
+            s.apply_affine(&m);
+            s.set_pin(0);
+        }
+        if let Some(c) = self.canvases[from].as_mut() {
+            c.delete_objects(li, strokes, shapes);
+        }
+        if let Some(c) = self.canvases[to].as_mut() {
+            let target = c.active_layer;
+            c.insert_objects(target, moved_strokes, moved_shapes);
+        }
+        self.refresh_pins();
+        count
+    }
+
     /// The global pins, for the slide window to show in place of the
     /// canvas (see `set_globals_away`).
     pub fn global_pins(&self) -> Vec<pins::Pinned<'_>> {
@@ -1666,6 +1712,40 @@ mod pin_tests {
         m.active_mut().redo();
         m.refresh_pins();
         assert_eq!(m.pinned()[0].pin.center, [500.0, 500.0]);
+    }
+
+    #[test]
+    fn moving_objects_to_another_slide_keeps_them_on_the_same_spot() {
+        let mut a = slide();
+        a.pan = [100.0, 50.0];
+        a.zoom = 2.0;
+        let mut b = slide();
+        b.pan = [-40.0, 10.0];
+        b.zoom = 0.5;
+        let mut m = CanvasManager::for_tests(vec![a, b]);
+        m.pin_objects(0, &[0], &[1], [0.0, 0.0], false).expect("pinned");
+        let screen = |c: &Canvas, p: [f32; 2]| [c.pan[0] + p[0] * c.zoom, c.pan[1] + p[1] * c.zoom];
+        let Shape::Line { a: start, .. } = m.active().layers[0].shapes[1] else { panic!("a line") };
+        let before = screen(m.active(), start);
+        let undo_a = m.active().edit_stamp().0;
+
+        assert_eq!(m.move_objects_to(1, 0, &[0], &[1]), 2);
+        let a = m.slide(0).unwrap();
+        assert_eq!((a.layers[0].strokes.len(), a.layers[0].shapes.len()), (0, 1), "gone from slide 1");
+        assert_eq!(a.edit_stamp().0, undo_a + 1, "one undo step there");
+        let b = m.slide(1).unwrap();
+        assert_eq!((b.layers[0].strokes.len(), b.layers[0].shapes.len()), (2, 3), "added to slide 2");
+        let moved = &b.layers[0].shapes[2];
+        let Shape::Line { a: start, .. } = moved else { panic!("a line") };
+        let after = screen(b, *start);
+        assert!((before[0] - after[0]).abs() < 1e-3 && (before[1] - after[1]).abs() < 1e-3, "same spot on screen");
+        assert_eq!(moved.pin(), 0, "out of its pin");
+        assert!(b.dirty);
+
+        // Not onto itself, nor to or from a locked slide.
+        assert_eq!(m.move_objects_to(0, 0, &[], &[0]), 0);
+        m.set_locked(1, true);
+        assert_eq!(m.move_objects_to(1, 0, &[], &[0]), 0);
     }
 
     #[test]

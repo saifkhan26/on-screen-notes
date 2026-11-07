@@ -1147,6 +1147,29 @@ impl OnScreenNotesApp {
         self.toast = Some((format!("Copied {what} to new slide {}", idx + 1), Instant::now()));
     }
 
+    /// Move the selected objects to slide `to`, where they show now (see
+    /// `CanvasManager::move_objects_to`), and say so. The selection goes
+    /// with them: nothing is left here to select.
+    fn move_selection_to(&mut self, to: usize) {
+        if !self.may_edit() {
+            return;
+        }
+        if self.canvases.is_locked(to) {
+            self.toast = Some((format!("Slide {} is locked — unlock it to move objects there", to + 1), Instant::now()));
+            return;
+        }
+        let li = self.canvases.active().active_layer;
+        let sel = std::mem::take(&mut self.tool.select.sel);
+        self.tool.select.gesture = None;
+        let count = self.canvases.move_objects_to(to, li, &sel.strokes, &sel.shapes);
+        if count == 0 {
+            self.tool.select.sel = sel;
+            return;
+        }
+        let what = if count == 1 { "1 object".to_string() } else { format!("{count} objects") };
+        self.toast = Some((format!("Moved {what} to slide {}", to + 1), Instant::now()));
+    }
+
     /// Pack, group, align or distribute the selection, as one undo step.
     fn arrange_selection(&mut self, op: crate::tools::arrange::Arrange) {
         let c = self.canvases.active();
@@ -2403,9 +2426,10 @@ impl eframe::App for OnScreenNotesApp {
                 && selected_count >= 1
                 && self.tool.select.gesture.is_none()
             {
-                match ui::arrange_bar::show(ctx, selected_count, self.selection_pinned()) {
+                match ui::arrange_bar::show(ctx, selected_count, self.selection_pinned(), &self.canvases) {
                     Some(ui::arrange_bar::BarAction::Arrange(op)) => self.arrange_selection(op),
                     Some(ui::arrange_bar::BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
+                    Some(ui::arrange_bar::BarAction::MoveToSlide(to)) => self.move_selection_to(to),
                     Some(ui::arrange_bar::BarAction::TogglePin) => self.toggle_pin_selection(),
                     None => {}
                 }
