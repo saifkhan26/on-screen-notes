@@ -2013,16 +2013,11 @@ impl eframe::App for OnScreenNotesApp {
     /// We want *clear color* to be fully transparent so the window stays
     /// see-through. eframe queries this once per frame.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Alpha drives the window's see-through level: 0 = fully
-        // transparent, 1 = fully opaque. RGB comes from `config.bg_color`
-        // so the user can tint the overlay (e.g. paper-cream for a
-        // notebook feel, deep navy for low-light work). Pre-multiply RGB
-        // by alpha — wgpu's clear path expects pre-multiplied output.
-        let a = self.config.bg_opacity.clamp(0.0, 1.0);
-        let r = self.config.bg_color[0] as f32 / 255.0 * a;
-        let g = self.config.bg_color[1] as f32 / 255.0 * a;
-        let b = self.config.bg_color[2] as f32 / 255.0 * a;
-        [r, g, b, a]
+        // Fully clear: the overlay's tint (`config.bg_color` at
+        // `bg_opacity`) is painted in `update` as a rectangle with
+        // Windows 11's rounded corners, which a clear colour cannot have
+        // (`theme::paint_window`). Corners outside it stay see-through.
+        [0.0; 4]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2057,6 +2052,17 @@ impl eframe::App for OnScreenNotesApp {
                 fill * 100.0,
             )
         });
+        // ---- Window background ------------------------------------------
+        // The tint lets the desktop show through: 0 opacity is clear, 1
+        // opaque; its colour can be paper-cream, deep navy… Painted with
+        // Windows 11's rounded corners (square while maximized), under
+        // everything else drawn this frame.
+        {
+            let square = ctx.input(|i| i.viewport().maximized == Some(true) || i.viewport().fullscreen == Some(true));
+            let tint = ui::slide_window::Look::background(self.config.bg_color, self.config.bg_opacity);
+            ui::theme::paint_window(&ctx.layer_painter(egui::LayerId::background()), ctx.screen_rect(), tint, square);
+        }
+
         // ---- First-frame init -------------------------------------------
         // On startup, explicitly tell the OS: "we want input by default".
         // Only pin-picking makes the window pass clicks through, and only
@@ -2068,6 +2074,9 @@ impl eframe::App for OnScreenNotesApp {
             // on the toolbar or a popup never focused it; a press on the
             // canvas still reclaims the foreground from another app.)
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            // Rounded corners, like any Windows 11 window (DWM squares
+            // a window without a title bar unless asked).
+            crate::platform::round_corners(self.osn_hwnd);
             self.idle_frame = refresh_period(self.osn_hwnd);
             self.first_frame = false;
             log::info!("on-screen-notes started: overlay visible, input enabled");

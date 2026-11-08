@@ -188,6 +188,42 @@ pub fn own_window_titled(prefix: &str, except: isize) -> isize {
     search.found
 }
 
+/// Ready `hwnd` for the rounded corners the app draws itself.
+///
+/// Windows 11 does not round a see-through window, and winit makes ours
+/// see-through with DWM blur-behind, so asking for rounded corners
+/// (`DWMWA_WINDOW_CORNER_PREFERENCE`) changes nothing. The app instead
+/// paints its background as a rounded rectangle (`theme::paint_window`).
+/// DWM would still draw its 1-pixel window border square around that,
+/// so the border is turned off; the app draws a rounded one. The corner
+/// preference is still set, for the day the window is not see-through.
+/// On Windows 10 both calls fail and nothing changes.
+pub fn round_corners(hwnd_raw: isize) {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
+    if hwnd_raw == 0 {
+        return;
+    }
+    let pref = DWMWCP_ROUND;
+    // DWMWA_COLOR_NONE: no border at all.
+    let no_border: u32 = 0xFFFF_FFFE;
+    // SAFETY: each value is live for its call, and its size is passed
+    // with it.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            HWND(hwnd_raw),
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&pref) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            HWND(hwnd_raw),
+            DWMWA_BORDER_COLOR,
+            &no_border as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of_val(&no_border) as u32,
+        );
+    }
+}
+
 /// Make `owner` own the top-level window `hwnd`: Windows then keeps
 /// `hwnd` above `owner` and hides it with it, without making it
 /// always-on-top.

@@ -260,6 +260,8 @@ pub fn show(
         win.hwnd = crate::platform::own_window_titled("Slide ", look.owner);
         if win.hwnd != 0 {
             crate::platform::set_owner(win.hwnd, look.owner);
+            // Rounded corners, like the overlay and any Windows 11 window.
+            crate::platform::round_corners(win.hwnd);
         }
     }
     open
@@ -489,6 +491,12 @@ fn close_btn(ui: &mut egui::Ui) -> bool {
     response.on_hover_text("Close this window").clicked()
 }
 
+/// The window is maximized or full screen, where Windows draws windows
+/// with square corners.
+fn square_corners(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.viewport().maximized == Some(true) || i.viewport().fullscreen == Some(true))
+}
+
 fn zoom_label(zoom: f32) -> String {
     let pct = zoom * 100.0;
     if pct < 10.0 { format!("{pct:.1}%") } else { format!("{pct:.0}%") }
@@ -510,8 +518,9 @@ fn canvas_area(
     main_tool: &mut crate::tools::ActiveTool,
     input: &crate::ui::slide_edit::Input,
 ) {
-    egui::CentralPanel::default().frame(egui::Frame::none().fill(background)).show(ctx, |ui| {
+    egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        theme::paint_window(ui.painter(), ctx.screen_rect(), background, square_corners(ctx));
         if manager.slide(win.slide).is_none() {
             // Still being read; the main window keeps frames coming
             // while slides load.
@@ -617,8 +626,9 @@ fn pins_area(
     main_tool: &mut crate::tools::ActiveTool,
     input: &crate::ui::slide_edit::Input,
 ) {
-    egui::CentralPanel::default().frame(egui::Frame::none().fill(look.background)).show(ctx, |ui| {
+    egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        theme::paint_window(ui.painter(), ctx.screen_rect(), look.background, square_corners(ctx));
         win.last_rect = rect;
         win.last_ppp = ctx.pixels_per_point();
         // With the Select tool the pins move, resize and turn here as on

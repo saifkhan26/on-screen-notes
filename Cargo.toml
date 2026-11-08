@@ -95,6 +95,9 @@ windows     = { version = "0.56", features = [
     # exits, even by crash (`panic = "abort"` skips every `Drop`).
     "Win32_System_JobObjects",
     "Win32_Security",
+    # DwmSetWindowAttribute: Windows 11's rounded corners for our
+    # borderless windows, which DWM leaves square unless asked.
+    "Win32_Graphics_Dwm",
 ] }
 
 # tiny-skia = a small, pure-Rust 2D rasteriser. We use it to draw our
