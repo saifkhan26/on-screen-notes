@@ -669,7 +669,7 @@ fn pins_area(
             if look.chrome && win.edit.tool().kind == crate::tools::ToolKind::Select {
                 let o = [origin.x, origin.y];
                 let shown: Vec<crate::canvas::pins::Pin> = pins.iter().map(|p| p.pin.viewed(o, win.zoom)).collect();
-                let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: s, ..*p }).collect();
+                let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: *s, ..*p }).collect();
                 let marks = crate::ui::overlay::PinMarks { selected: win.edit.selected_pin(), outlines: true };
                 crate::ui::overlay::paint_pin_marks(ui, &painter, egui::Pos2::ZERO, &view, marks);
             }

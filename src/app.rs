@@ -2094,6 +2094,9 @@ impl eframe::App for OnScreenNotesApp {
         // The global pins are on the canvas, or in the slide window when
         // its "Pins" toggle is on; never both.
         self.canvases.set_globals_away(self.slide_window.as_ref().is_some_and(|w| w.shows_pins()));
+        // Every pin shows wholly on the canvas area, whatever its size now.
+        let area = self.overlay_cache.canvas_rect(ctx).size();
+        self.canvases.set_pin_area([area.x, area.y]);
         let errs = self.canvases.take_load_errors();
         if !errs.is_empty() {
             let msg = match errs.len() {

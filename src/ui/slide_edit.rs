@@ -253,7 +253,7 @@ impl WindowEdit {
             let cursor = if select {
                 let pins = manager.global_pins();
                 let shown: Vec<crate::canvas::pins::Pin> = pins.iter().map(|p| p.pin.viewed(o, zoom)).collect();
-                let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: s, ..*p }).collect();
+                let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: *s, ..*p }).collect();
                 crate::app::pin_cursor(&self.pin_tool, w, &view)
             } else {
                 None
@@ -322,7 +322,7 @@ impl WindowEdit {
         let press = {
             let pins = manager.global_pins();
             let shown: Vec<crate::canvas::pins::Pin> = pins.iter().map(|p| p.pin.viewed(o, zoom)).collect();
-            let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: s, ..*p }).collect();
+            let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: *s, ..*p }).collect();
             self.pin_tool.press(w, &view)
         };
         if press == crate::canvas::pins::Press::Took {

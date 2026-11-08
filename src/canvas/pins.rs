@@ -231,10 +231,12 @@ fn tag_of(c: &Canvas, m: PinMember) -> Option<u64> {
     }
 }
 
-/// A pin with objects to show, for drawing and hit-testing.
+/// A pin with objects to show, for drawing and hit-testing. `pin` is its
+/// place as shown: the stored one, nudged to keep the pin on the canvas
+/// area (see `PinBoard::set_area`).
 #[derive(Clone, Copy)]
 pub struct Pinned<'a> {
-    pub pin: &'a Pin,
+    pub pin: Pin,
     /// Index of the slide its objects live on.
     pub slide: usize,
     pub canvas: &'a Canvas,
@@ -295,6 +297,25 @@ pub struct PinBoard {
     /// The global pins show in the slide window instead of on the
     /// canvas (its "Pins" toggle). Not saved: the slide window is not.
     globals_away: bool,
+    /// Size of the canvas area, points: pins are shown inside it.
+    area: Option<[f32; 2]>,
+}
+
+/// `pin` moved, if need be, so that its frame around objects whose box is
+/// `bounds` lies inside `area` (from the canvas area's top-left). One too
+/// big to fit shows from its top-left corner.
+fn kept_in(pin: Pin, bounds: [f32; 4], area: [f32; 2]) -> Pin {
+    let [x0, y0, x1, y1] = pin.frame(bounds).aabb();
+    let shift = |lo: f32, hi: f32, room: f32| {
+        if lo < 0.0 || hi - lo > room {
+            -lo
+        } else if hi > room {
+            room - hi
+        } else {
+            0.0
+        }
+    };
+    Pin { center: [pin.center[0] + shift(x0, x1, area[0]), pin.center[1] + shift(y0, y1, area[1])], ..pin }
 }
 
 impl PinBoard {
@@ -388,7 +409,12 @@ impl PinBoard {
                 if !keep(pin, slide) { return None; }
                 let canvas = canvases.get(slide)?.as_ref()?;
                 let f = self.scans.get(slide)?.as_ref()?.found.get(k)?;
-                Some(Pinned { pin, slide, canvas, members: &f.members, bounds: f.bounds? })
+                let bounds = f.bounds?;
+                let pin = match self.area {
+                    Some(area) => kept_in(*pin, bounds, area),
+                    None => *pin,
+                };
+                Some(Pinned { pin, slide, canvas, members: &f.members, bounds })
             })
             .collect()
     }
@@ -397,6 +423,15 @@ impl PinBoard {
     /// or back on the canvas.
     pub fn set_globals_away(&mut self, away: bool) {
         self.globals_away = away;
+    }
+
+    /// The canvas area is `area` points across: every pin shows wholly
+    /// inside it, moved in from an edge if its place would put part of it
+    /// outside (a smaller window, a pin grown or turned past the edge).
+    /// Only where it shows: the place kept for it stays, so a window that
+    /// is small for a moment does not push the pins about for good.
+    pub fn set_area(&mut self, area: [f32; 2]) {
+        self.area = (area[0] > 1.0 && area[1] > 1.0).then_some(area);
     }
 
     /// Some pin has objects to show on slide `active` (hidden or not).
@@ -607,7 +642,7 @@ impl PinTool {
     pub fn press(&mut self, q: [f32; 2], pins: &[Pinned]) -> Press {
         self.gesture = None;
         if let Some((id, h, frame)) = self.handle_at(q, pins) {
-            let pin = pins.iter().find(|p| p.pin.id == id).map(|p| *p.pin);
+            let pin = pins.iter().find(|p| p.pin.id == id).map(|p| p.pin);
             let Some(pin) = pin else { return Press::Missed };
             self.gesture = Some(match h {
                 PinHandle::Corner { x, y } => Gesture::Resize { id, x, y, frame, scale: pin.scale },

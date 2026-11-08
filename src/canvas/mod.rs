@@ -892,6 +892,12 @@ impl CanvasManager {
         self.pins.set_globals_away(away);
     }
 
+    /// The canvas area is `area` points across: pins show wholly inside
+    /// it (see `PinBoard::set_area`). Their kept places do not change.
+    pub fn set_pin_area(&mut self, area: [f32; 2]) {
+        self.pins.set_area(area);
+    }
+
     /// Some pin has objects to show on the active slide, whether or not
     /// pins are hidden.
     pub fn has_pins(&self) -> bool {
@@ -1796,6 +1802,29 @@ mod pin_tests {
         assert_eq!(m.move_objects_to(0, 0, &[], &[0]), 0);
         m.set_locked(1, true);
         assert_eq!(m.move_objects_to(1, 0, &[], &[0]), 0);
+    }
+
+    #[test]
+    fn pins_show_inside_the_canvas_area_without_losing_their_place() {
+        let mut m = CanvasManager::for_tests(vec![slide()]);
+        let id = m.pin_objects(0, &[0], &[], [0.0, 0.0], false).expect("pinned");
+        // Put it half past the right edge of an 800 × 600 area.
+        m.pin_board().get_mut(id).unwrap().center = [790.0, 300.0];
+        m.set_pin_area([800.0, 600.0]);
+        let shown = m.pinned()[0];
+        let [x0, y0, x1, y1] = shown.frame().aabb();
+        assert!(x0 >= -1e-3 && y0 >= -1e-3 && x1 <= 800.0 + 1e-3 && y1 <= 600.0 + 1e-3, "wholly inside: {:?}", [x0, y0, x1, y1]);
+        assert_eq!(m.pin_board().get_mut(id).unwrap().center, [790.0, 300.0], "its own place is kept");
+
+        // A bigger window shows it where it was put.
+        m.set_pin_area([2000.0, 1200.0]);
+        assert_eq!(m.pinned()[0].pin.center, [790.0, 300.0]);
+
+        // Too big for the area: its top-left corner shows.
+        m.pin_board().get_mut(id).unwrap().scale = 100.0;
+        m.set_pin_area([300.0, 200.0]);
+        let [x0, y0, _, _] = m.pinned()[0].frame().aabb();
+        assert!(x0.abs() < 1e-3 && y0.abs() < 1e-3, "from its top-left: {:?}", [x0, y0]);
     }
 
     #[test]
