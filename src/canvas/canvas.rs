@@ -976,6 +976,29 @@ impl Canvas {
         )
     }
 
+    /// Transform each chosen object by its own `Affine`, all in one undo
+    /// step — what Arrange's size matching does. Laid out like
+    /// `move_objects_each`; identity transforms are left out of the
+    /// step, and it returns false when nothing changed.
+    pub fn transform_objects_each(&mut self, li: usize, strokes: &[(usize, Affine)], shapes: &[(usize, Affine)]) -> bool {
+        let changed = |list: &[(usize, Affine)]| -> Vec<(usize, Affine)> {
+            list.iter().copied().filter(|(_, m)| !m.is_identity()).collect()
+        };
+        let (strokes, shapes) = (changed(strokes), changed(shapes));
+        let transform = |list: &[(usize, Affine)], i: usize| {
+            list.binary_search_by_key(&i, |e| e.0).map_or(Affine::IDENTITY, |k| list[k].1)
+        };
+        let stroke_ix: Vec<usize> = strokes.iter().map(|e| e.0).collect();
+        let shape_ix: Vec<usize> = shapes.iter().map(|e| e.0).collect();
+        self.edit_objects(
+            li,
+            &stroke_ix,
+            &shape_ix,
+            |i, s| s.apply_affine(&transform(&strokes, i)),
+            |i, s| s.apply_affine(&transform(&shapes, i)),
+        )
+    }
+
     /// Put the chosen objects in pin `id`, or take them out of any pin
     /// with `id = 0` (see `canvas::pins`). One undo step; objects that
     /// already are so are left out of it. Returns false when nothing

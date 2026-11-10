@@ -166,9 +166,16 @@ pub struct AppConfig {
     /// slide panel.
     #[serde(default)]
     pub slide_tab_order: SlideTabOrder,
+
+    /// The arrange bar's "keep apart" switch: aligning slides objects
+    /// until they touch instead of piling them on top of each other.
+    #[serde(default = "default_arrange_apart")]
+    pub arrange_apart: bool,
 }
 
 fn default_slide_panel_open() -> bool { true }
+
+fn default_arrange_apart() -> bool { true }
 
 fn default_pressure_curve() -> f32 { 1.0 }
 
@@ -213,6 +220,7 @@ impl Default for AppConfig {
             ffmpeg_path: None,
             slide_panel_open: true,
             slide_tab_order: SlideTabOrder::default(),
+            arrange_apart: true,
         }
     }
 }

@@ -1,11 +1,14 @@
 //! Arrange: tidy a selection. Pack it into a compact block, line it up
-//! along an edge or centre, space it evenly, or sort it into clusters by
-//! media type.
+//! along an edge or centre (overlapping or not), space it evenly, sort it
+//! into clusters by media type, or give it one width or height.
 //!
 //! Pure geometry: each operation takes the objects' boxes and returns
-//! how far to move each one. The app applies the moves as one undo step
-//! (`Canvas::move_objects_each`). Nothing is resized or rotated.
+//! how far to move each one (`offsets`) or how much to scale it
+//! (`scales`). The app applies the result as one undo step
+//! (`Canvas::move_objects_each` / `Canvas::transform_objects_each`).
+//! Nothing is rotated.
 
+use crate::canvas::affine::Affine;
 use crate::canvas::canvas::{shape_bounds, Layer};
 use crate::canvas::hit::Selection;
 use crate::canvas::shape::MediaType;
@@ -16,6 +19,9 @@ pub type Bounds = [f32; 4];
 /// Per-object moves: `(index, offset)`, ascending by index.
 pub type Moves = Vec<(usize, [f32; 2])>;
 
+/// Per-object transforms: `(index, transform)`, ascending by index.
+pub type Transforms = Vec<(usize, Affine)>;
+
 /// The moves `op` makes of the selected strokes and shapes on `layer`.
 /// Pictures, GIFs and videos move one by one, each carrying the ink
 /// drawn on it; other ink and shapes move in touching clusters.
@@ -23,6 +29,30 @@ pub type Moves = Vec<(usize, [f32; 2])>;
 /// divided by `zoom`.
 pub fn plan(layer: &Layer, sel: &Selection, op: Arrange, zoom: f32) -> (Moves, Moves) {
     let zoom = zoom.max(1e-3);
+    let (units, owners) = gather(layer, sel, zoom);
+    let items: Vec<Item> = units.iter().map(|u| u.item).collect();
+    let offsets = offsets(&items, op, 1.0 / zoom);
+    per_object(&units, &owners, &offsets)
+}
+
+/// The transforms that give the selected strokes and shapes on `layer`
+/// the size `m` picks. Each unit (see `plan`) scales as a whole, by the
+/// same factor across and down, so pictures keep their proportions; its
+/// top-left corner stays put.
+pub fn plan_sizes(layer: &Layer, sel: &Selection, m: Match, zoom: f32) -> (Transforms, Transforms) {
+    let (units, owners) = gather(layer, sel, zoom.max(1e-3));
+    let items: Vec<Item> = units.iter().map(|u| u.item).collect();
+    let transforms: Vec<Affine> = items
+        .iter()
+        .zip(scales(&items, m))
+        .map(|(it, s)| Affine::scale_about([it.bounds[0], it.bounds[1]], s, s))
+        .collect();
+    per_object(&units, &owners, &transforms)
+}
+
+/// The selected objects gathered into units, and which stroke (`true`)
+/// or shape each object `units` refers to is.
+fn gather(layer: &Layer, sel: &Selection, zoom: f32) -> (Vec<Unit>, Vec<(bool, usize)>) {
     // Every selected object as (box, media group), plus which it is.
     let mut objects: Vec<(Bounds, Option<u8>)> = Vec::new();
     let mut owners: Vec<(bool, usize)> = Vec::new();
@@ -42,15 +72,18 @@ pub fn plan(layer: &Layer, sel: &Selection, op: Arrange, zoom: f32) -> (Moves, M
         objects.push((shape_bounds(s), group));
         owners.push((false, i));
     }
-    let units = units(&objects, 8.0 / zoom);
-    let items: Vec<Item> = units.iter().map(|u| u.item).collect();
-    let offsets = offsets(&items, op, 40.0 / zoom);
+    (units(&objects, 8.0 / zoom), owners)
+}
+
+/// Hand each unit's value to every object in it, split into strokes and
+/// shapes, each ascending by index.
+fn per_object<T: Copy>(units: &[Unit], owners: &[(bool, usize)], values: &[T]) -> (Vec<(usize, T)>, Vec<(usize, T)>) {
     let (mut strokes, mut shapes) = (Vec::new(), Vec::new());
-    for (u, d) in units.iter().zip(offsets) {
+    for (u, &v) in units.iter().zip(values) {
         for &m in &u.members {
             match owners[m] {
-                (true, i) => strokes.push((i, d)),
-                (false, i) => shapes.push((i, d)),
+                (true, i) => strokes.push((i, v)),
+                (false, i) => shapes.push((i, v)),
             }
         }
     }
@@ -77,10 +110,49 @@ pub enum Arrange {
     GroupByType,
     /// Line every object up with the selection's edge or centre.
     Align(Align),
+    /// Slide every object toward the selection's edge or centre until
+    /// it gets there or bumps into another one: objects that would
+    /// overlap end up edge to edge instead. Each keeps its place on the
+    /// other axis, so a row aligned left stays a row. Objects only a
+    /// hair into each other's row pass (see `in_way`).
+    Slide(Align),
     /// Equal gaps left to right; the outermost two stay put.
     DistributeX,
     /// Equal gaps top to bottom; the outermost two stay put.
     DistributeY,
+}
+
+/// The width or height every object takes from the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Match {
+    /// The narrowest object's width.
+    NarrowestWidth,
+    /// The shortest object's height.
+    ShortestHeight,
+    /// The widest object's width.
+    WidestWidth,
+    /// The tallest object's height.
+    TallestHeight,
+}
+
+/// Each item's scale factor for `m`, in `items` order. Items with no
+/// extent on that axis (a straight line along the other one) keep their
+/// size and set none.
+pub fn scales(items: &[Item], m: Match) -> Vec<f32> {
+    let ax = match m {
+        Match::NarrowestWidth | Match::WidestWidth => 0,
+        Match::ShortestHeight | Match::TallestHeight => 1,
+    };
+    let len = |it: &Item| it.bounds[ax + 2] - it.bounds[ax];
+    let lens = items.iter().map(len).filter(|&l| l > EPS);
+    let target = match m {
+        Match::NarrowestWidth | Match::ShortestHeight => lens.fold(f32::INFINITY, f32::min),
+        Match::WidestWidth | Match::TallestHeight => lens.fold(0.0, f32::max),
+    };
+    if items.len() < 2 || !target.is_finite() || target <= EPS {
+        return vec![1.0; items.len()];
+    }
+    items.iter().map(|it| if len(it) > EPS { target / len(it) } else { 1.0 }).collect()
 }
 
 impl Arrange {
@@ -175,11 +247,14 @@ pub fn units(objects: &[(Bounds, Option<u8>)], tol: f32) -> Vec<Unit> {
     out
 }
 
-/// How far to move each item, in `items` order. `gap` is the space
-/// left between clusters by `GroupByType`.
-pub fn offsets(items: &[Item], op: Arrange, gap: f32) -> Vec<[f32; 2]> {
+/// How far to move each item, in `items` order. `px` is one screen
+/// pixel in canvas units: it sizes the space `GroupByType` leaves
+/// between clusters, and how far into each other two boxes must reach
+/// for `Slide` to count them as in each other's way (see `in_way`).
+pub fn offsets(items: &[Item], op: Arrange, px: f32) -> Vec<[f32; 2]> {
     let mut out = vec![[0.0, 0.0]; items.len()];
     if items.len() < op.min_items() { return out; }
+    let gap = 40.0 * px;
     let all = union(items.iter().map(|it| it.bounds));
     match op {
         Arrange::Pack => {
@@ -216,6 +291,54 @@ pub fn offsets(items: &[Item], op: Arrange, gap: f32) -> Vec<[f32; 2]> {
                 };
             }
         }
+        Arrange::Slide(a) => {
+            // Along axis `ax`; boxes are in each other's way when they
+            // share some of the other axis `oth`.
+            let (ax, oth) = match a {
+                Align::Left | Align::CenterX | Align::Right => (0, 1),
+                Align::Top | Align::CenterY | Align::Bottom => (1, 0),
+            };
+            let line = match a {
+                Align::Left | Align::Top => all[ax],
+                Align::Right | Align::Bottom => all[ax + 2],
+                Align::CenterX | Align::CenterY => (all[ax] + all[ax + 2]) * 0.5,
+            };
+            let len = |b: Bounds| b[ax + 2] - b[ax];
+            // Where a box's near edge goes with nothing in the way, and
+            // whether getting there is a move up the axis.
+            let goal = |b: Bounds| match a {
+                Align::Left | Align::Top => line,
+                Align::Right | Align::Bottom => line - len(b),
+                Align::CenterX | Align::CenterY => line - len(b) * 0.5,
+            };
+            let rising = |b: Bounds| match a {
+                Align::Left | Align::Top => false,
+                Align::Right | Align::Bottom => true,
+                Align::CenterX | Align::CenterY => b[ax] + b[ax + 2] < 2.0 * line,
+            };
+            // Nearest the line first: it gets there, and the rest pile
+            // up behind it.
+            let mut order: Vec<usize> = (0..items.len()).collect();
+            let dist = |i: usize| (goal(items[i].bounds) - items[i].bounds[ax]).abs();
+            order.sort_by(|&p, &q| dist(p).total_cmp(&dist(q)));
+            let mut placed: Vec<Bounds> = Vec::with_capacity(items.len());
+            for i in order {
+                let b = items[i].bounds;
+                let ahead = placed.iter().filter(|p| in_way(**p, b, oth, px));
+                // Stop short of every placed box in the way, which also
+                // pushes a box out of one it already overlapped.
+                let at = if rising(b) {
+                    ahead.fold(goal(b) + len(b), |end, p| end.min(p[ax])) - len(b)
+                } else {
+                    ahead.fold(goal(b), |start, p| start.max(p[ax + 2]))
+                };
+                out[i][ax] = at - b[ax];
+                let mut now = b;
+                now[ax] = at;
+                now[ax + 2] = at + len(b);
+                placed.push(now);
+            }
+        }
         Arrange::DistributeX | Arrange::DistributeY => {
             let ax = if op == Arrange::DistributeX { 0 } else { 1 };
             let b = |i: usize| items[i].bounds;
@@ -234,6 +357,18 @@ pub fn offsets(items: &[Item], op: Arrange, gap: f32) -> Vec<[f32; 2]> {
         }
     }
     out
+}
+
+/// Whether boxes `a` and `b` block each other when one slides along the
+/// axis other than `oth`: they share more of axis `oth` than a hair.
+/// A hair is four screen pixels (`px` is one) or 4% of the smaller box
+/// on that axis, whichever is more — boards laid out edge to edge, such
+/// as PureRef's, overlap their neighbours by that much — but never over
+/// a quarter of it, so a thin line still blocks.
+fn in_way(a: Bounds, b: Bounds, oth: usize, px: f32) -> bool {
+    let shared = a[oth + 2].min(b[oth + 2]) - a[oth].max(b[oth]);
+    let small = (a[oth + 2] - a[oth]).min(b[oth + 2] - b[oth]);
+    shared > (4.0 * px).max(0.04 * small).min(0.25 * small)
 }
 
 fn union(boxes: impl Iterator<Item = Bounds>) -> Bounds {
@@ -380,7 +515,7 @@ mod tests {
         let items: Vec<Item> = sizes.iter().enumerate()
             .map(|(i, &(w, h))| item(i as f32 * 700.0, (i % 3) as f32 * 900.0, w, h, 0))
             .collect();
-        let after = moved(&items, &offsets(&items, Arrange::Pack, 0.0));
+        let after = moved(&items, &offsets(&items, Arrange::Pack, 1.0));
         for i in 0..after.len() {
             for j in i + 1..after.len() {
                 assert!(!overlap(after[i], after[j]), "{i} and {j} overlap");
@@ -402,7 +537,7 @@ mod tests {
             item(900.0, 300.0, 100.0, 100.0, 2),
             item(50.0, 600.0, 100.0, 100.0, 1),
         ];
-        let after = moved(&items, &offsets(&items, Arrange::GroupByType, 40.0));
+        let after = moved(&items, &offsets(&items, Arrange::GroupByType, 1.0));
         // Group 0 leftmost, then 1, then 2, a gap between each.
         assert_eq!(after[1][0], 0.0);
         assert_eq!(after[3][0], 140.0);
@@ -469,15 +604,96 @@ mod tests {
         }
     }
 
+    /// Keep-apart aligning and size matching on a whole real slide, set
+    /// up like `arrange_a_real_slide`: slide `OSN_TEST_SLIDE` is read and
+    /// each result is written back as one of the next five slides, then
+    /// the slide as it was as the sixth, each viewed whole in a
+    /// 1200 × 800 window (what a fresh `OSN_DATA_DIR` opens).
+    #[test]
+    #[ignore]
+    fn slide_and_match_a_real_slide() {
+        assert!(
+            std::env::var_os("OSN_DATA_DIR").is_some_and(|d| !d.is_empty()),
+            "set OSN_DATA_DIR to a copy of the data folder; this test overwrites slides"
+        );
+        let index: usize = std::env::var("OSN_TEST_SLIDE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let crate::persistence::LoadOutcome::Loaded(canvas) = crate::persistence::load_canvas(index, 0, &Default::default()) else {
+            panic!("could not load slide {index}")
+        };
+        let li = canvas.active_layer;
+        let layer = &canvas.layers[li];
+        let sel = Selection { strokes: (0..layer.strokes.len()).collect(), shapes: (0..layer.shapes.len()).collect() };
+        for (i, l) in canvas.layers.iter().enumerate() {
+            let mark = if i == li { " (arranged)" } else { "" };
+            println!("layer {i}{mark}: {} strokes, {} shapes", l.strokes.len(), l.shapes.len());
+        }
+        let media = |c: &crate::canvas::canvas::Canvas| -> Vec<Bounds> {
+            c.layers[li].shapes.iter().filter(|s| s.media_type().is_some()).map(shape_bounds).collect()
+        };
+        let fit = |c: &mut crate::canvas::canvas::Canvas| {
+            let l = &c.layers[li];
+            let all = Selection { strokes: (0..l.strokes.len()).collect(), shapes: (0..l.shapes.len()).collect() };
+            let b = union(gather(l, &all, c.zoom).0.iter().map(|u| u.item.bounds));
+            // Below the toolbar, clear of the slide panel.
+            let (x0, y0, x1, y1) = (220.0, 70.0, 1180.0, 790.0);
+            c.zoom = ((x1 - x0) / (b[2] - b[0])).min((y1 - y0) / (b[3] - b[1]));
+            c.pan = [(x0 + x1) * 0.5 - (b[0] + b[2]) * 0.5 * c.zoom, (y0 + y1) * 0.5 - (b[1] + b[3]) * 0.5 * c.zoom];
+        };
+        let mut before = canvas.clone();
+        fit(&mut before);
+        crate::persistence::save_canvas(index + 6, &before).expect("save");
+        let ops = [Ok(Align::Left), Ok(Align::Top), Ok(Align::CenterX), Err(Match::TallestHeight), Err(Match::NarrowestWidth)];
+        for (k, op) in ops.into_iter().enumerate() {
+            let mut out = canvas.clone();
+            match op {
+                Ok(a) => {
+                    let (strokes, shapes) = plan(layer, &sel, Arrange::Slide(a), canvas.zoom);
+                    out.move_objects_each(li, &strokes, &shapes);
+                    // Boxes a hair into each other only touch (see
+                    // `in_way`); f32 rounding at canvas coordinates
+                    // leaves edges ~0.001 px into each other.
+                    let oth = if matches!(a, Align::Left | Align::CenterX | Align::Right) { 1 } else { 0 };
+                    let shrink = |b: Bounds| [b[0] + 0.01, b[1] + 0.01, b[2] - 0.01, b[3] - 0.01];
+                    let after = media(&out);
+                    for i in 0..after.len() {
+                        for j in i + 1..after.len() {
+                            let (p, q) = (after[i], after[j]);
+                            assert!(
+                                !(overlap(shrink(p), shrink(q)) && in_way(p, q, oth, 1.0 / canvas.zoom)),
+                                "{a:?}: media {i} {p:?} and {j} {q:?} overlap"
+                            );
+                        }
+                    }
+                }
+                Err(m) => {
+                    let (units, _) = gather(layer, &sel, canvas.zoom);
+                    let items: Vec<Item> = units.iter().map(|u| u.item).collect();
+                    let ax = if matches!(m, Match::NarrowestWidth | Match::WidestWidth) { 0 } else { 1 };
+                    let len = |b: Bounds| b[ax + 2] - b[ax];
+                    let target = items.iter().zip(scales(&items, m)).map(|(it, s)| len(it.bounds) * s).find(|&l| l > EPS).expect("something to size");
+                    let (strokes, shapes) = plan_sizes(layer, &sel, m, canvas.zoom);
+                    out.transform_objects_each(li, &strokes, &shapes);
+                    for (before, after) in media(&canvas).into_iter().zip(media(&out)) {
+                        assert!((len(after) - target).abs() < target * 1e-3, "{m:?}: {after:?} is not {target}");
+                        assert!((after[0] - before[0]).abs() < 0.05 && (after[1] - before[1]).abs() < 0.05, "{m:?}: top-left moved");
+                    }
+                    println!("{m:?}: every picture {target:.1} px");
+                }
+            }
+            fit(&mut out);
+            crate::persistence::save_canvas(index + 1 + k, &out).expect("save");
+        }
+    }
+
     #[test]
     fn align_lines_up_edges_and_centres() {
         let items = [item(10.0, 0.0, 100.0, 50.0, 0), item(200.0, 80.0, 40.0, 20.0, 0)];
-        let left = moved(&items, &offsets(&items, Arrange::Align(Align::Left), 0.0));
+        let left = moved(&items, &offsets(&items, Arrange::Align(Align::Left), 1.0));
         assert_eq!((left[0][0], left[1][0]), (10.0, 10.0));
         assert_eq!(left[1][1], 80.0, "aligning left leaves y alone");
-        let right = moved(&items, &offsets(&items, Arrange::Align(Align::Right), 0.0));
+        let right = moved(&items, &offsets(&items, Arrange::Align(Align::Right), 1.0));
         assert_eq!((right[0][2], right[1][2]), (240.0, 240.0));
-        let mid = moved(&items, &offsets(&items, Arrange::Align(Align::CenterY), 0.0));
+        let mid = moved(&items, &offsets(&items, Arrange::Align(Align::CenterY), 1.0));
         assert_eq!(mid[0][1] + mid[0][3], mid[1][1] + mid[1][3]);
     }
 
@@ -488,13 +704,130 @@ mod tests {
             item(110.0, 0.0, 50.0, 10.0, 0),
             item(400.0, 0.0, 100.0, 10.0, 0),
         ];
-        let after = moved(&items, &offsets(&items, Arrange::DistributeX, 0.0));
+        let after = moved(&items, &offsets(&items, Arrange::DistributeX, 1.0));
         assert_eq!(after[0][0], 0.0);
         assert_eq!(after[2][2], 500.0);
         let g1 = after[1][0] - after[0][2];
         let g2 = after[2][0] - after[1][2];
         assert!((g1 - g2).abs() < 1e-3 && (g1 - 125.0).abs() < 1e-3);
         // Two objects: nothing to distribute.
-        assert_eq!(offsets(&items[..2], Arrange::DistributeX, 0.0), vec![[0.0, 0.0]; 2]);
+        assert_eq!(offsets(&items[..2], Arrange::DistributeX, 1.0), vec![[0.0, 0.0]; 2]);
+    }
+
+    fn slid(items: &[Item], a: Align) -> Vec<Bounds> {
+        moved(items, &offsets(items, Arrange::Slide(a), 1.0))
+    }
+
+    #[test]
+    fn slide_left_keeps_a_row_a_row() {
+        let items = [
+            item(0.0, 0.0, 30.0, 20.0, 0),
+            item(180.0, 5.0, 20.0, 20.0, 0),
+            item(80.0, 0.0, 50.0, 20.0, 0),
+            // Another row, with nothing in its way.
+            item(150.0, 100.0, 40.0, 20.0, 0),
+        ];
+        let after = slid(&items, Align::Left);
+        let xs: Vec<[f32; 2]> = after.iter().map(|b| [b[0], b[2]]).collect();
+        assert_eq!(xs, vec![[0.0, 30.0], [80.0, 100.0], [30.0, 80.0], [0.0, 40.0]]);
+        for (b, a) in items.iter().zip(&after) {
+            assert_eq!((b.bounds[1], b.bounds[3]), (a[1], a[3]), "sliding left leaves y alone");
+        }
+    }
+
+    #[test]
+    fn slide_right_and_down_pile_up_against_the_far_edge() {
+        let items = [item(0.0, 0.0, 30.0, 20.0, 0), item(100.0, 0.0, 50.0, 20.0, 0)];
+        let right = slid(&items, Align::Right);
+        assert_eq!((right[0][0], right[0][2]), (70.0, 100.0));
+        assert_eq!((right[1][0], right[1][2]), (100.0, 150.0));
+        // A column, sliding down.
+        let items = [item(0.0, 0.0, 30.0, 20.0, 0), item(10.0, 50.0, 30.0, 40.0, 0)];
+        let down = slid(&items, Align::Bottom);
+        assert_eq!((down[0][1], down[0][3]), (30.0, 50.0));
+        assert_eq!((down[1][1], down[1][3]), (50.0, 90.0));
+    }
+
+    #[test]
+    fn slide_to_the_centre_gathers_round_the_nearest() {
+        let items = [item(0.0, 0.0, 20.0, 10.0, 0), item(100.0, 0.0, 40.0, 10.0, 0), item(300.0, 0.0, 20.0, 10.0, 0)];
+        let after = slid(&items, Align::CenterX);
+        // The middle one is nearest the centre (160) and lands on it;
+        // the others close up on either side.
+        assert_eq!((after[1][0], after[1][2]), (140.0, 180.0));
+        assert_eq!((after[0][0], after[0][2]), (120.0, 140.0));
+        assert_eq!((after[2][0], after[2][2]), (180.0, 200.0));
+    }
+
+    #[test]
+    fn slide_pushes_overlapping_objects_apart_but_not_touching_rows() {
+        let items = [item(0.0, 0.0, 100.0, 50.0, 0), item(20.0, 10.0, 100.0, 50.0, 0)];
+        let after = slid(&items, Align::Left);
+        assert_eq!((after[1][0], after[1][2]), (100.0, 200.0));
+        // Rows edge to edge, a hair into each other, don't block.
+        let items = [item(50.0, 0.0, 20.0, 20.0, 0), item(100.0, 19.9, 20.0, 20.0, 0)];
+        let after = slid(&items, Align::Left);
+        assert_eq!(after[1][0], 50.0);
+        // Nor do a PureRef block's, two canvas pixels into each other at
+        // 200 %; a real row, a fifth into the next one, does.
+        let items = [
+            item(0.0, 0.0, 100.0, 100.0, 0),
+            item(300.0, 98.0, 100.0, 100.0, 0),
+            item(600.0, 80.0, 100.0, 100.0, 0),
+        ];
+        let after = moved(&items, &offsets(&items, Arrange::Slide(Align::Left), 0.5));
+        assert_eq!(after[1][0], 0.0);
+        assert_eq!(after[2][0], 100.0);
+        // A thin line in a picture's row is in its way.
+        let items = [item(0.0, 0.0, 100.0, 100.0, 0), item(300.0, 50.0, 60.0, 2.0, 0)];
+        assert_eq!(slid(&items, Align::Left)[1][0], 100.0);
+    }
+
+    #[test]
+    fn slide_never_overlaps_anything() {
+        let sizes = [(300.0, 200.0), (120.0, 400.0), (500.0, 280.0), (90.0, 90.0), (260.0, 180.0),
+                     (200.0, 340.0), (150.0, 100.0), (400.0, 220.0), (80.0, 160.0), (330.0, 330.0)];
+        // Scattered, some on top of each other.
+        let items: Vec<Item> = sizes.iter().enumerate()
+            .map(|(i, &(w, h))| item((i * 7 % 10) as f32 * 230.0, (i * 3 % 10) as f32 * 170.0, w, h, 0))
+            .collect();
+        for a in [Align::Left, Align::CenterX, Align::Right, Align::Top, Align::CenterY, Align::Bottom] {
+            let after = slid(&items, a);
+            let oth = if matches!(a, Align::Left | Align::CenterX | Align::Right) { 1 } else { 0 };
+            for i in 0..after.len() {
+                for j in i + 1..after.len() {
+                    assert!(!(overlap(after[i], after[j]) && in_way(after[i], after[j], oth, 1.0)), "{a:?}: {i} and {j} overlap");
+                }
+            }
+            for (b, a) in items.iter().zip(&after) {
+                assert_eq!((b.bounds[oth], b.bounds[oth + 2]), (a[oth], a[oth + 2]));
+            }
+        }
+    }
+
+    #[test]
+    fn match_sizes_scales_whole_objects_from_their_top_left() {
+        let items = [
+            item(0.0, 0.0, 100.0, 50.0, 0),
+            item(200.0, 10.0, 50.0, 80.0, 0),
+            item(400.0, 0.0, 200.0, 20.0, 0),
+            item(700.0, 0.0, 0.0, 30.0, 0), // a vertical line: no width
+        ];
+        assert_eq!(scales(&items, Match::NarrowestWidth), vec![0.5, 1.0, 0.25, 1.0]);
+        assert_eq!(scales(&items, Match::WidestWidth), vec![2.0, 4.0, 1.0, 1.0]);
+        assert_eq!(scales(&items, Match::ShortestHeight), vec![0.4, 0.25, 1.0, 20.0 / 30.0]);
+        assert_eq!(scales(&items, Match::TallestHeight), vec![1.6, 1.0, 4.0, 80.0 / 30.0]);
+        // As `plan_sizes` applies them.
+        let s = scales(&items, Match::WidestWidth);
+        for (it, s) in items.iter().zip(s).take(3) {
+            let b = it.bounds;
+            let m = Affine::scale_about([b[0], b[1]], s, s);
+            let (p, q) = (m.apply([b[0], b[1]]), m.apply([b[2], b[3]]));
+            assert_eq!(p, [b[0], b[1]], "top-left stays");
+            assert!((q[0] - p[0] - 200.0).abs() < 1e-3);
+            assert!(((q[1] - p[1]) / (q[0] - p[0]) - (b[3] - b[1]) / (b[2] - b[0])).abs() < 1e-5, "proportions kept");
+        }
+        // One object: nothing to match.
+        assert_eq!(scales(&items[..1], Match::WidestWidth), vec![1.0]);
     }
 }

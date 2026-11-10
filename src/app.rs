@@ -1224,6 +1224,17 @@ impl OnScreenNotesApp {
         }
     }
 
+    /// Give the selection one width or height, as one undo step.
+    fn match_selection_size(&mut self, m: crate::tools::arrange::Match) {
+        let c = self.canvases.active();
+        let li = c.active_layer;
+        let Some(layer) = c.layers.get(li) else { return };
+        let (strokes, shapes) = crate::tools::arrange::plan_sizes(layer, &self.tool.select.sel, m, c.zoom);
+        if !self.canvases.active_mut().transform_objects_each(li, &strokes, &shapes) {
+            self.toast = Some(("Already that size".to_string(), std::time::Instant::now()));
+        }
+    }
+
     /// Every selected object is in a pin.
     fn selection_pinned(&self) -> bool {
         let c = self.canvases.active();
@@ -2488,8 +2499,10 @@ impl eframe::App for OnScreenNotesApp {
                 && selected_count >= 1
                 && self.tool.select.gesture.is_none()
             {
-                match ui::arrange_bar::show(ctx, selected_count, self.selection_pinned(), &self.canvases) {
+                let pinned = self.selection_pinned();
+                match ui::arrange_bar::show(ctx, selected_count, pinned, &self.canvases, &mut self.config.arrange_apart) {
                     Some(ui::arrange_bar::BarAction::Arrange(op)) => self.arrange_selection(op),
+                    Some(ui::arrange_bar::BarAction::Match(m)) => self.match_selection_size(m),
                     Some(ui::arrange_bar::BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
                     Some(ui::arrange_bar::BarAction::MoveToSlide(to)) => self.move_selection_to(to),
                     Some(ui::arrange_bar::BarAction::TogglePin) => self.toggle_pin_selection(),
