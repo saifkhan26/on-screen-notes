@@ -321,6 +321,116 @@ pub fn load_locks() -> Vec<bool> {
     })
 }
 
+/// A reorder of the slides whose files are being renamed into place.
+///
+/// Slide files are named by position (`canvas_N.ron`), so moving a slide
+/// renames files rather than rewriting them: a 1 GB slide moves as fast
+/// as an empty one, and no slide's contents are touched. This record is
+/// `canvases/moving.ron` while the renames run, written before the first
+/// one and removed after the last, so a crash in between is finished on
+/// the next start (`finish_slide_move`) instead of leaving slides out of
+/// order or out of sight.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SlideMove {
+    /// `order[j]` is the slot whose file becomes `canvas_j.ron`.
+    pub order: Vec<usize>,
+    /// The names, locks and views in the new order, written last.
+    pub names: Vec<String>,
+    pub locks: Vec<bool>,
+    pub views: Vec<SlideView>,
+    /// Every file that moves has left its old name: only putting them
+    /// under their new names is left.
+    #[serde(default)]
+    pub placing: bool,
+}
+
+const MOVE_RECORD: &str = "moving.ron";
+
+/// Rename the slide files into `mv.order` and write the names, locks and
+/// views that go with it (see `SlideMove`). A move left unfinished by an
+/// earlier failed attempt is finished instead — the caller retries the
+/// same move until it goes through.
+pub fn move_slide_files(mv: &SlideMove) -> Result<()> {
+    move_slide_files_in(&paths::canvases_dir()?, mv)
+}
+
+pub(crate) fn move_slide_files_in(dir: &Path, mv: &SlideMove) -> Result<()> {
+    if dir.join(MOVE_RECORD).exists() {
+        return finish_slide_move_in(dir);
+    }
+    write_move_record(dir, mv)?;
+    run_slide_move(dir, mv.clone())
+}
+
+/// Finish a slide reorder a crash cut short, before any slide is read.
+/// Logged, never fatal: without it the slides still open, some of them
+/// out of order.
+pub fn finish_slide_move() {
+    let Ok(dir) = paths::canvases_dir() else { return };
+    if let Err(e) = finish_slide_move_in(&dir) {
+        log::warn!("could not finish reordering the slides: {e:#}");
+    }
+}
+
+pub(crate) fn finish_slide_move_in(dir: &Path) -> Result<()> {
+    let path = dir.join(MOVE_RECORD);
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path:?}"))?;
+    let mv: SlideMove = ron::from_str(&text).with_context(|| format!("reading {path:?}"))?;
+    log::warn!("finishing a slide reorder that was cut short");
+    run_slide_move(dir, mv)
+}
+
+fn write_move_record(dir: &Path, mv: &SlideMove) -> Result<()> {
+    atomic_write(&dir.join(MOVE_RECORD), ron::ser::to_string(mv)?.as_bytes())
+}
+
+/// The renames, in two steps so no file is ever renamed onto another:
+/// every file that moves first goes to `canvas_<new>.ron.moving`, then
+/// each of those to `canvas_<new>.ron`. Both steps can be run again
+/// after a crash: the first only moves files still under their old name,
+/// the second only files still parked.
+fn run_slide_move(dir: &Path, mut mv: SlideMove) -> Result<()> {
+    let moved: Vec<usize> = (0..mv.order.len()).filter(|&j| mv.order[j] != j).collect();
+    let file = |i: usize| dir.join(format!("canvas_{i}.ron"));
+    let parked = |j: usize| dir.join(format!("canvas_{j}.ron.moving"));
+    if !mv.placing {
+        for &j in &moved {
+            let (src, tmp) = (file(mv.order[j]), parked(j));
+            // A slide never saved (a new one) has no file to move.
+            if !tmp.exists() && src.exists() {
+                std::fs::rename(&src, &tmp).with_context(|| format!("moving {src:?} aside"))?;
+            }
+        }
+        mv.placing = true;
+        write_move_record(dir, &mv)?;
+    }
+    for &j in &moved {
+        let (tmp, dst) = (parked(j), file(j));
+        if !tmp.exists() {
+            continue;
+        }
+        if dst.exists() {
+            // Only the autosave writes a slide file, and only with that
+            // slide's newest state: the parked file is an older copy of
+            // the same slide. Kept beside it all the same.
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let aside = dir.join(format!("canvas_{j}.ron.replaced-{stamp}"));
+            log::warn!("{dst:?} was written before the reorder finished; the older copy is kept as {aside:?}");
+            std::fs::rename(&tmp, &aside).with_context(|| format!("keeping {tmp:?} aside"))?;
+            continue;
+        }
+        std::fs::rename(&tmp, &dst).with_context(|| format!("putting {tmp:?} in place"))?;
+    }
+    atomic_write(&dir.join("names.ron"), ron::ser::to_string(&mv.names)?.as_bytes())?;
+    atomic_write(&dir.join("locks.ron"), ron::ser::to_string(&mv.locks)?.as_bytes())?;
+    atomic_write(&dir.join("views.ron"), ron::ser::to_string(&mv.views)?.as_bytes())?;
+    std::fs::remove_file(dir.join(MOVE_RECORD)).context("removing the reorder record")?;
+    Ok(())
+}
+
 /// Atomic write helper: we write to `<path>.tmp` and rename onto `path`.
 ///
 /// Why: `std::fs::write` is not atomic — if the program crashes mid-write
@@ -543,5 +653,106 @@ mod tests {
                 assert!(serialize_canvas(&fast).unwrap() == serialize_canvas(&plain).unwrap(), "{name}: the fast path read something else");
             }
         }
+    }
+    /// A scratch canvases folder holding `canvas_N.ron` = "slide <tag>".
+    fn move_dir(name: &str, slides: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("osn-move-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, tag) in slides.iter().enumerate() {
+            std::fs::write(dir.join(format!("canvas_{i}.ron")), format!("slide {tag}")).unwrap();
+        }
+        dir
+    }
+
+    fn slides_in(dir: &Path, n: usize) -> Vec<String> {
+        (0..n).map(|i| std::fs::read_to_string(dir.join(format!("canvas_{i}.ron"))).unwrap_or_default()).collect()
+    }
+
+    fn a_move(order: Vec<usize>) -> SlideMove {
+        let n = order.len();
+        SlideMove {
+            names: order.iter().map(|i| format!("name {i}")).collect(),
+            locks: order.iter().map(|i| *i == 0).collect(),
+            views: (0..n).map(|i| SlideView { pan: [i as f32, 0.0], zoom: 1.0 }).collect(),
+            order,
+            placing: false,
+        }
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".moving") || n == MOVE_RECORD)
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn moving_a_slide_renames_the_files_and_writes_the_lists_in_the_new_order() {
+        let dir = move_dir("plain", &["a", "b", "c", "d"]);
+        // Slide 1 to the end: b c d a.
+        move_slide_files_in(&dir, &a_move(vec![1, 2, 3, 0])).unwrap();
+        assert_eq!(slides_in(&dir, 4), ["slide b", "slide c", "slide d", "slide a"]);
+        assert_eq!(std::fs::read_to_string(dir.join("names.ron")).unwrap(), r#"["name 1","name 2","name 3","name 0"]"#);
+        assert!(std::fs::read_to_string(dir.join("locks.ron")).unwrap().starts_with("[false,false,false,true]"));
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reorder_cut_short_while_moving_files_aside_is_finished_next_start() {
+        let dir = move_dir("step1", &["a", "b", "c"]);
+        // c a b: the record is written and one file parked, then a crash.
+        let mv = a_move(vec![2, 0, 1]);
+        write_move_record(&dir, &mv).unwrap();
+        std::fs::rename(dir.join("canvas_2.ron"), dir.join("canvas_0.ron.moving")).unwrap();
+        finish_slide_move_in(&dir).unwrap();
+        assert_eq!(slides_in(&dir, 3), ["slide c", "slide a", "slide b"]);
+        assert!(leftovers(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reorder_cut_short_while_placing_files_is_finished_next_start() {
+        let dir = move_dir("step2", &["a", "b", "c"]);
+        // b a c: both files parked, one put back, then a crash.
+        let mut mv = a_move(vec![1, 0, 2]);
+        std::fs::rename(dir.join("canvas_1.ron"), dir.join("canvas_0.ron.moving")).unwrap();
+        std::fs::rename(dir.join("canvas_0.ron"), dir.join("canvas_1.ron.moving")).unwrap();
+        mv.placing = true;
+        write_move_record(&dir, &mv).unwrap();
+        std::fs::rename(dir.join("canvas_0.ron.moving"), dir.join("canvas_0.ron")).unwrap();
+        // A retry this run goes the same way as a finish at startup.
+        move_slide_files_in(&dir, &mv).unwrap();
+        assert_eq!(slides_in(&dir, 3), ["slide b", "slide a", "slide c"]);
+        assert!(leftovers(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_slide_never_saved_moves_without_a_file_and_nothing_is_overwritten() {
+        // Slot 2 has no file yet (a new slide); it goes first.
+        let dir = move_dir("unsaved", &["a", "b"]);
+        move_slide_files_in(&dir, &a_move(vec![2, 0, 1])).unwrap();
+        assert!(!dir.join("canvas_0.ron").exists(), "the new slide is written by the autosave");
+        assert_eq!(slides_in(&dir, 3)[1..], ["slide a", "slide b"]);
+
+        // The autosave wrote a slide before its parked file was put back:
+        // the newer file stays and the older is kept beside it.
+        let dir = move_dir("written", &["a", "b"]);
+        let mut mv = a_move(vec![1, 0]);
+        std::fs::rename(dir.join("canvas_1.ron"), dir.join("canvas_0.ron.moving")).unwrap();
+        std::fs::rename(dir.join("canvas_0.ron"), dir.join("canvas_1.ron.moving")).unwrap();
+        mv.placing = true;
+        write_move_record(&dir, &mv).unwrap();
+        std::fs::write(dir.join("canvas_0.ron"), "slide b, newer").unwrap();
+        finish_slide_move_in(&dir).unwrap();
+        assert_eq!(slides_in(&dir, 2), ["slide b, newer", "slide a"]);
+        let kept = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().starts_with("canvas_0.ron.replaced-"));
+        assert!(kept, "the older copy is kept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

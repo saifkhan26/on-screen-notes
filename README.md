@@ -53,7 +53,13 @@ layers.
 - **Slide panel** — every slide listed in the bottom-left corner by number
   and name: click one to go there, double-click (or `F2`) to name it,
   `+` to add a slide, the arrow-to-line button (or `End`) for the last
-  one. `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle through the slides by
+  one. **Drag a row** to move the slide (a line shows where it lands), or
+  right-click it for Move to the top / up / down / to the bottom (keys
+  for the slide shown: `move_slide_up` / `move_slide_down` in
+  `hotkeys.toml`, unbound until set). Its name, lock, view, undo
+  history and pins go with it. Moving renames the slide files rather
+  than rewriting them, so a huge slide moves as fast as an empty one; a
+  crash part way is finished on the next start. `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle through the slides by
   number; the clock button switches them to *recently used* order, like
   `Alt+Tab` — a tap flips back to the slide you were on before, holding
   `Ctrl` and tapping again goes further back. The `‹` button folds the
@@ -411,6 +417,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | First / last slide | `Home` / `End` |
 | Name the active slide (in the slide panel) | `F2` |
 | Lock / unlock the active slide (pan and zoom only) | `Ctrl+R` |
+| Move the active slide one place up / down (or drag it in the slide panel) | unbound; set `move_slide_up` / `move_slide_down` |
 | Previous / next layer | `↓` / `↑` |
 | Hide / show the active layer | `H` |
 | Reset pan + zoom | `Ctrl+0` |
@@ -468,7 +475,7 @@ one shortcut goes dead, the rest still work. Look at `RUST_LOG=warn`
 output for the offending line.
 
 ```toml
-version = 5
+version = 6
 
 [global]
 toggle_overlay = "ctrl+alt+shift+n"

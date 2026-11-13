@@ -651,6 +651,8 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
         ])),
         ("Panels & pins", bound(vec![
             ("New slide",                c.new_slide),
+            ("Move the slide up",        c.move_slide_up),
+            ("Move the slide down",      c.move_slide_down),
             ("Fold / unfold slide panel", c.toggle_slide_panel),
             ("Ctrl+Tab: in order / recent", c.toggle_slide_order),
             ("Slide window open / close", c.slide_window),

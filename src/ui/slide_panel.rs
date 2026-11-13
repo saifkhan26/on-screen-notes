@@ -2,7 +2,9 @@
 //! slide.
 //!
 //! One row per slide: its number and name. A click goes to the slide; a
-//! double-click (or F2, for the active slide) names it. The header
+//! double-click (or F2, for the active slide) names it. Dragging a row
+//! moves the slide (a line shows where it lands), and so do the row's
+//! right-click menu and the move-slide keys. The header
 //! switches what Ctrl+Tab steps through (slide order or recently used),
 //! jumps to the last slide, adds a slide after it, and folds the panel
 //! down to a small "n/N" tab.
@@ -29,6 +31,8 @@ pub struct SlidePanel {
     /// The active slide when the panel last drew, so a slide reached
     /// another way (a key) is scrolled into view once.
     shown_active: Option<usize>,
+    /// The slide whose row is being dragged to a new place.
+    dragging: Option<usize>,
 }
 
 pub enum SlideAction {
@@ -38,6 +42,8 @@ pub enum SlideAction {
     Add,
     /// Show the slide in the slide window (`ui::slide_window`).
     OpenWindow(usize),
+    /// Move slide `.0` to place `.1`, the slides between shifting along.
+    Move(usize, usize),
 }
 
 #[derive(Default)]
@@ -73,6 +79,9 @@ pub fn show(ctx: &egui::Context, state: &mut SlidePanel, cfg: &mut AppConfig, to
         state.renaming = None;
     }
     let typing = state.renaming.is_some();
+    if state.dragging.is_some_and(|i| i >= count) {
+        state.dragging = None;
+    }
     let mut action = None;
     let open = &mut cfg.slide_panel_open;
     let tab_order = &mut cfg.slide_tab_order;
@@ -148,10 +157,16 @@ pub fn show(ctx: &egui::Context, state: &mut SlidePanel, cfg: &mut AppConfig, to
                     .min_scrolled_height(list_h)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
+                        let mut rows = Vec::with_capacity(count);
                         for i in 0..count {
-                            if let Some(a) = slide_row(ui, state, manager, i, active) {
+                            let (a, rect) = slide_row(ui, state, manager, i, active);
+                            if let Some(a) = a {
                                 action = Some(a);
                             }
+                            rows.push(rect);
+                        }
+                        if let Some(m) = drag_rows(ui, state, &rows) {
+                            action = Some(m);
                         }
                     });
             });
@@ -163,12 +178,54 @@ pub fn show(ctx: &egui::Context, state: &mut SlidePanel, cfg: &mut AppConfig, to
     Shown { action, hovered, typing }
 }
 
+/// A row being dragged: the line where it would land, the list scrolling
+/// when the pointer nears its top or bottom, and on letting go the move
+/// (none when it lands where it was). Esc puts it back.
+fn drag_rows(ui: &mut egui::Ui, state: &mut SlidePanel, rows: &[egui::Rect]) -> Option<SlideAction> {
+    let from = state.dragging?;
+    if rows.is_empty() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.dragging = None;
+        return None;
+    }
+    let pointer = ui.ctx().pointer_latest_pos()?;
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    // The gap the pointer is nearest: before row `gap`.
+    let gap = rows.iter().filter(|r| r.center().y < pointer.y).count();
+    let lands = if gap > from { gap - 1 } else { gap };
+    if lands != from {
+        let y = match gap {
+            0 => rows[0].top(),
+            g if g == rows.len() => rows[g - 1].bottom(),
+            g => (rows[g - 1].bottom() + rows[g].top()) * 0.5,
+        };
+        let x = rows[0].x_range();
+        ui.painter().line_segment([egui::pos2(x.min + 4.0, y), egui::pos2(x.max - 4.0, y)], egui::Stroke::new(2.0, theme::ACCENT));
+        ui.painter().circle_filled(egui::pos2(x.min + 4.0, y), 3.0, theme::ACCENT);
+    }
+    let clip = ui.clip_rect();
+    let step = if pointer.y < clip.top() + 18.0 { 6.0 } else if pointer.y > clip.bottom() - 18.0 { -6.0 } else { 0.0 };
+    if step != 0.0 {
+        ui.scroll_with_delta(Vec2::new(0.0, step));
+        ui.ctx().request_repaint();
+    }
+    if ui.input(|i| !i.pointer.any_down()) {
+        state.dragging = None;
+        return (lands != from).then_some(SlideAction::Move(from, lands));
+    }
+    None
+}
+
 /// One row: the slide's number, then its name — or the name field while
-/// it is being named.
-fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager, i: usize, active: usize) -> Option<SlideAction> {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(WIDTH, ROW_H), egui::Sense::click());
+/// it is being named. Also returns where the row is, for dragging.
+fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager, i: usize, active: usize) -> (Option<SlideAction>, egui::Rect) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(WIDTH, ROW_H), egui::Sense::click_and_drag());
+    if response.drag_started() && state.renaming.is_none() {
+        state.dragging = Some(i);
+    }
     let is_active = i == active;
-    let bg = if is_active {
+    let bg = if state.dragging == Some(i) {
+        Color32::from_white_alpha(34)
+    } else if is_active {
         theme::ACCENT
     } else if response.hovered() {
         Color32::from_white_alpha(14)
@@ -224,7 +281,7 @@ fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager,
             }
             state.renaming = None;
         }
-        return action;
+        return (action, rect);
     }
 
     let name = manager.name(i);
@@ -238,14 +295,27 @@ fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager,
     ui.painter().galley(pos, galley, colour);
 
     let mut tip = if name.is_empty() { "Double-click to name".to_string() } else { format!("{name}\nDouble-click to rename") };
-    tip.push_str("\nRight-click to open in a window");
+    tip.push_str("\nDrag to move it\nRight-click to open in a window or move it");
     if locked {
         tip.push_str("\nLocked: pans and zooms, takes no edits");
     }
+    let last = manager.count().saturating_sub(1);
     response.context_menu(|ui| {
         if ui.button("Open in a window").clicked() {
             action = Some(SlideAction::OpenWindow(i));
             ui.close_menu();
+        }
+        ui.separator();
+        for (label, to, enabled) in [
+            ("Move to the top", 0, i > 0),
+            ("Move up", i.saturating_sub(1), i > 0),
+            ("Move down", (i + 1).min(last), i < last),
+            ("Move to the bottom", last, i < last),
+        ] {
+            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                action = Some(SlideAction::Move(i, to));
+                ui.close_menu();
+            }
         }
     });
     let response = response.on_hover_text(tip);
@@ -254,7 +324,7 @@ fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager,
     } else if response.clicked() && !is_active {
         action = Some(SlideAction::GoTo(i));
     }
-    action
+    (action, rect)
 }
 
 /// The folded panel: "n/N" and an unfold arrow.

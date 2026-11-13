@@ -186,6 +186,12 @@ impl SlideWindow {
         }
     }
 
+    /// Slides were moved: keep showing the same slide, `map` giving its
+    /// new number.
+    pub fn renumber(&mut self, map: impl Fn(usize) -> usize) {
+        self.slide = map(self.slide);
+    }
+
     /// Slide `idx` was deleted: keep showing the same slide under its new
     /// number. False when it was the one shown, so the window should go.
     pub fn slide_removed(&mut self, idx: usize) -> bool {

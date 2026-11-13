@@ -99,6 +99,14 @@ pub struct CanvasManager {
     /// The running save deletes unused media. Until it ends no picture is
     /// stored or swapped in, as one could name a file about to go.
     deleting_media: bool,
+    /// Slides were reordered and their files are yet to follow:
+    /// `pending_move[j]` is the slot whose file holds the slide now at
+    /// `j`. The renames run before the next save writes anything
+    /// (`apply_pending_move`), never alongside one.
+    pending_move: Option<Vec<usize>>,
+    /// The last try at those renames failed; until one goes through,
+    /// no further reorder is taken (it would no longer match the files).
+    move_stuck: bool,
 }
 
 /// Stand-in for a slot whose file is missing or unreadable. It keeps
@@ -231,6 +239,8 @@ impl CanvasManager {
     /// `start_loading` with `workers` loader threads. With none, slides
     /// are only read when visited or by `finish_loading`.
     fn start_loading_with(cfg: &AppConfig, workers: usize) -> Self {
+        // A reorder a crash cut short is finished before anything is read.
+        crate::persistence::finish_slide_move();
         let passes = cfg.smoothing_level.position_passes();
         let mut m = Self {
             canvases: Vec::new(),
@@ -254,6 +264,8 @@ impl CanvasManager {
             opening: placeholder_canvas(),
             pictures: picture_store::PictureStore::new(crate::persistence::paths::media_dir().ok()),
             deleting_media: false,
+            pending_move: None,
+            move_stuck: false,
         };
         // Every slot up to the highest file on disk gets an entry. A gap
         // or an unreadable file becomes a blank placeholder instead of
@@ -333,6 +345,8 @@ impl CanvasManager {
             pins: pins::PinBoard::default(),
             pictures: picture_store::PictureStore::new(None),
             deleting_media: false,
+            pending_move: None,
+            move_stuck: false,
         }
     }
 
@@ -781,6 +795,90 @@ impl CanvasManager {
         }
     }
 
+    /// Move slide `from` to place `to`, the slides between shifting one
+    /// place to make room; the slide shown stays shown. Its name, lock,
+    /// view, undo history and pins go with it. Not an edit of any slide:
+    /// on disk only files are renamed (see `persistence::SlideMove`), at
+    /// the next save. Refused, with the reason, while that cannot be
+    /// done safely.
+    pub fn move_slide(&mut self, from: usize, to: usize) -> Result<(), &'static str> {
+        let n = self.canvases.len();
+        if from >= n || to >= n || from == to {
+            return Ok(());
+        }
+        if self.loading.is_some() {
+            return Err("The slides are still opening — move it in a moment");
+        }
+        if !self.protected.is_empty() {
+            return Err("A slide that could not be read is kept in place, so slides can't be moved");
+        }
+        if self.prune_orphans {
+            return Err("Still saving after the deleted slide — move it in a moment");
+        }
+        if self.move_stuck {
+            return Err("The last move is still being written — try again in a moment");
+        }
+        let map = |i: usize| moved_index(from, to, i);
+        // Where each slide now is came from: `order[j]` is the old place
+        // of the slide now at `j`.
+        let mut order: Vec<usize> = (0..n).collect();
+        let o = order.remove(from);
+        order.insert(to, o);
+        let slide = self.canvases.remove(from);
+        self.canvases.insert(to, slide);
+        let name = self.names.remove(from);
+        self.names.insert(to, name);
+        let lock = self.locks.remove(from);
+        self.locks.insert(to, lock);
+        self.active = map(self.active);
+        for i in &mut self.recent {
+            *i = map(*i);
+        }
+        self.recent_walk = None;
+        // Pins find their slide by number.
+        self.pins.forget_scans();
+        // Fold into a move whose renames are still to run: the files are
+        // where that one found them.
+        let disk: Vec<usize> = match self.pending_move.take() {
+            Some(mut pending) => {
+                pending.extend(pending.len()..n);
+                order.iter().map(|&i| pending[i]).collect()
+            }
+            None => order,
+        };
+        self.pending_move = disk.iter().enumerate().any(|(j, &i)| i != j).then_some(disk);
+        Ok(())
+    }
+
+    /// Run the renames a reorder is waiting on (`move_slide`), with the
+    /// names, locks and views in the new order. False when they failed:
+    /// nothing else should be written then, and the next call tries again.
+    fn apply_pending_move(&mut self) -> bool {
+        let Some(order) = self.pending_move.clone() else { return true };
+        // Never on the real slides from a test.
+        #[cfg(test)]
+        assert!(std::env::var_os("OSN_DATA_DIR").is_some(), "a test renamed slide files without OSN_DATA_DIR");
+        let views: Vec<SlideView> = self.canvases.iter().flatten().map(view_of).collect();
+        let mv = crate::persistence::SlideMove { order, names: self.names.clone(), locks: self.locks.clone(), views: views.clone(), placing: false };
+        let t = Instant::now();
+        match crate::persistence::move_slide_files(&mv) {
+            Ok(()) => {
+                crate::perf::line(format!("slides reordered on disk in {:.1} ms", crate::perf::ms(t.elapsed())));
+                self.pending_move = None;
+                self.move_stuck = false;
+                self.saved_names = mv.names;
+                self.saved_locks = mv.locks;
+                self.saved_views = views.into_iter().map(Some).collect();
+                true
+            }
+            Err(e) => {
+                log::warn!("could not reorder the slide files yet: {e:#}");
+                self.move_stuck = true;
+                false
+            }
+        }
+    }
+
     /// Slide `idx`'s name; empty when it has none.
     pub fn name(&self, idx: usize) -> &str {
         self.names.get(idx).map_or("", String::as_str)
@@ -1070,6 +1168,11 @@ impl CanvasManager {
         if self.saving.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
+        // Files first follow a reorder, so what is written next lands
+        // in the right place.
+        if !self.apply_pending_move() {
+            return;
+        }
         if let Some(views) = self.take_changed_views() {
             std::thread::spawn(move || {
                 if let Err(e) = crate::persistence::save_views(&views) {
@@ -1186,6 +1289,10 @@ impl CanvasManager {
         while self.saving.load(std::sync::atomic::Ordering::Acquire) {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        // Should the renames fail, their record finishes them at the next
+        // start; the slides below are written all the same, and a file
+        // written meanwhile wins over the older copy it parked.
+        self.apply_pending_move();
         if let Some(views) = self.take_changed_views() {
             if let Err(e) = crate::persistence::save_views(&views) {
                 log::warn!("failed to save slide views: {e}");
@@ -1235,6 +1342,19 @@ struct SaveDone(std::sync::Arc<std::sync::atomic::AtomicBool>);
 impl Drop for SaveDone {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Where the slide at `i` ends up when the slide at `from` moves to `to`.
+pub fn moved_index(from: usize, to: usize, i: usize) -> usize {
+    if i == from {
+        to
+    } else if from < to && (from + 1..=to).contains(&i) {
+        i - 1
+    } else if to < from && (to..from).contains(&i) {
+        i + 1
+    } else {
+        i
     }
 }
 
@@ -1580,6 +1700,70 @@ mod view_tests {
         one.delete_active();
         assert_eq!((one.count(), one.name(0)), (1, ""));
     }
+
+    /// Slides told apart by their pan.
+    fn tagged(n: usize) -> CanvasManager {
+        let mut m = CanvasManager::for_tests((0..n).map(|i| {
+            let mut c = clean();
+            c.pan = [i as f32, 0.0];
+            c
+        }).collect());
+        for i in 0..n {
+            m.rename(i, &format!("s{i}"));
+        }
+        m.take_changed_names();
+        m
+    }
+
+    fn tags(m: &CanvasManager) -> Vec<usize> {
+        m.canvases.iter().flatten().map(|c| c.pan[0] as usize).collect()
+    }
+
+    #[test]
+    fn a_moved_slide_takes_its_name_and_lock_and_the_one_shown_stays_shown() {
+        let mut m = tagged(5);
+        m.set_locked(1, true);
+        m.go_to(3);
+        m.note_visit();
+        m.go_to(1);
+        m.note_visit();
+        // Slide 2 (index 1) to the end, then the last to the front.
+        m.move_slide(1, 4).unwrap();
+        assert_eq!(tags(&m), [0, 2, 3, 4, 1]);
+        assert_eq!((m.name(4), m.is_locked(4), m.is_locked(1)), ("s1", true, false));
+        assert_eq!(m.active_index(), 4, "still showing the slide it showed");
+        assert_eq!(m.recent[..2], [4, 2], "recently used follows the slides");
+        assert!(m.canvases.iter().flatten().all(|c| !c.dirty), "moving is not an edit of any slide");
+        m.move_slide(4, 0).unwrap();
+        assert_eq!(tags(&m), [1, 0, 2, 3, 4]);
+        assert_eq!(m.active_index(), 0);
+        // The files: one rename list from where they were, not two.
+        assert_eq!(m.pending_move, Some(vec![1, 0, 2, 3, 4]));
+        // Moving it back leaves nothing to rename.
+        m.move_slide(0, 1).unwrap();
+        assert_eq!(tags(&m), [0, 1, 2, 3, 4]);
+        assert_eq!(m.pending_move, None);
+    }
+
+    #[test]
+    fn slides_added_after_a_move_fold_into_it_and_a_fresh_delete_holds_moves_back() {
+        let mut m = tagged(3);
+        m.move_slide(0, 2).unwrap();
+        m.push_canvas(clean());
+        m.move_slide(3, 0).unwrap();
+        // The new slide (no file yet, slot 3) first, then 1 2 0.
+        assert_eq!(m.pending_move, Some(vec![3, 1, 2, 0]));
+        assert_eq!(moved_index(1, 3, 0), 0);
+        assert_eq!(moved_index(1, 3, 1), 3);
+        assert_eq!(moved_index(1, 3, 3), 2);
+        assert_eq!(moved_index(3, 1, 1), 2);
+
+        let mut m = tagged(3);
+        m.go_to(1);
+        m.delete_active();
+        assert!(m.move_slide(0, 1).is_err(), "the delete is not on disk yet");
+        assert_eq!(tags(&m), [0, 2]);
+    }
 }
 
 #[cfg(test)]
@@ -1637,6 +1821,7 @@ mod loader_tests {
         assert!(m.is_locked(0) && !m.is_locked(3), "locks come back with their slides");
 
         slides_still_loading_are_never_written(&dir);
+        moved_slides_are_renamed_not_rewritten(&dir);
 
         std::env::remove_var("OSN_DATA_DIR");
         let _ = std::fs::remove_dir_all(&root);
@@ -1651,6 +1836,40 @@ mod loader_tests {
             m.poll_loads();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// Moving a slide renames the files at the next save and rewrites
+    /// none; the order, names and views are there on the next start. Runs
+    /// inside the test above, which owns `OSN_DATA_DIR`.
+    fn moved_slides_are_renamed_not_rewritten(dir: &std::path::Path) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            std::fs::remove_file(e.unwrap().path()).unwrap();
+        }
+        for i in 0..3 {
+            let mut c = Canvas::default();
+            c.pan = [i as f32, 0.0];
+            std::fs::write(dir.join(format!("canvas_{i}.ron")), crate::persistence::serialize_canvas(&c).unwrap()).unwrap();
+        }
+        let modified = |i: usize| std::fs::metadata(dir.join(format!("canvas_{i}.ron"))).unwrap().modified().unwrap();
+        let before: Vec<_> = (0..3).map(modified).collect();
+
+        let mut m = CanvasManager::load_or_default(&AppConfig::default());
+        m.rename(0, "First");
+        m.move_slide(0, 2).unwrap();
+        m.save_all(Some(&HashSet::new()));
+        while m.saving.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(m.pending_move.is_none());
+        let pan = |i: usize| crate::persistence::parse_canvas(&std::fs::read_to_string(dir.join(format!("canvas_{i}.ron"))).unwrap(), 3).unwrap().pan[0];
+        assert_eq!((pan(0), pan(1), pan(2)), (1.0, 2.0, 0.0));
+        // Renamed, not rewritten: each file is the one it was.
+        assert_eq!([modified(0), modified(1), modified(2)], [before[1], before[2], before[0]]);
+        assert!(!dir.join("moving.ron").exists());
+
+        let m = CanvasManager::load_or_default(&AppConfig::default());
+        assert_eq!((m.name(0), m.name(2)), ("", "First"));
+        assert_eq!(m.slide(2).unwrap().pan, [0.0, 0.0]);
     }
 
     /// A slide the background loader has not read yet is never written,

@@ -1823,7 +1823,46 @@ impl OnScreenNotesApp {
                 let msg = if self.tool.text_box { "Text in a box: on" } else { "Text in a box: off" };
                 say(self, msg.to_string());
             }
+            K::MoveSlide(step) => {
+                let from = self.canvases.active_index();
+                if let Some(to) = from.checked_add_signed(isize::from(step)).filter(|&to| to < self.canvases.count()) {
+                    self.move_slide(from, to);
+                }
+            }
         }
+    }
+
+    /// Move slide `from` to place `to` (`CanvasManager::move_slide`), and
+    /// everything here that knows slides by number along with it; or say
+    /// why it can't move yet.
+    fn move_slide(&mut self, from: usize, to: usize) {
+        if let Err(why) = self.canvases.move_slide(from, to) {
+            self.toast = Some((why.to_string(), Instant::now()));
+            return;
+        }
+        let map = |i: usize| crate::canvas::moved_index(from, to, i);
+        if let Some(w) = self.slide_window.as_mut() {
+            w.renumber(map);
+        }
+        self.overlay_cache.slides_moved(map);
+        if let Some(g) = self.view_glide.as_mut() {
+            g.slide = map(g.slide);
+        }
+        if let Some(p) = self.peek.as_mut() {
+            p.slide = map(p.slide);
+        }
+        if let Some(p) = self.picture_colours.as_mut() {
+            p.at.0 = map(p.at.0);
+        }
+        if let Some(c) = self.confirm_delete.as_mut() {
+            *c = map(*c);
+        }
+        // Their undo entries are where they were; only the run's slide
+        // number is out of date.
+        self.restyle_run = None;
+        self.nudge_run = None;
+        // The selection is on the slide still shown, now numbered anew.
+        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
     /// Move the selection `px` screen pixels: real ones, so a 1 px nudge
@@ -4239,6 +4278,7 @@ impl eframe::App for OnScreenNotesApp {
                 Some(ui::slide_panel::SlideAction::Add) => {
                     self.canvases.push_canvas(crate::canvas::canvas::Canvas::default());
                 }
+                Some(ui::slide_panel::SlideAction::Move(from, to)) => self.move_slide(from, to),
                 Some(ui::slide_panel::SlideAction::OpenWindow(i)) => match self.slide_window.as_mut() {
                     // One slide window: asking again shows the slide there.
                     Some(win) => {

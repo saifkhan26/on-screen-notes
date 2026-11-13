@@ -54,6 +54,8 @@ pub enum KeyAction {
     PictureColours,
     /// Text labels in a box, or not.
     TextBox,
+    /// Move the active slide one place toward the first (−1) or last (+1).
+    MoveSlide(i8),
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -107,6 +109,8 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (t.text_box, KeyAction::TextBox),
         (c.zoom_to_fit, KeyAction::ZoomToFit),
         (c.zoom_to_selection, KeyAction::ZoomToSelection),
+        (c.move_slide_up, KeyAction::MoveSlide(-1)),
+        (c.move_slide_down, KeyAction::MoveSlide(1)),
         (c.new_slide, KeyAction::NewSlide),
         (c.toggle_slide_panel, KeyAction::ToggleSlidePanel),
         (c.toggle_slide_order, KeyAction::ToggleSlideOrder),
@@ -175,6 +179,10 @@ mod tests {
         assert_eq!(press(&keys, egui::Key::Num1, ctrl), vec![KeyAction::ZoomToFit]);
         assert_eq!(press(&keys, egui::Key::Num2, ctrl), vec![KeyAction::ZoomToSelection]);
         assert_eq!(press(&keys, egui::Key::Num1, egui::Modifiers::NONE), vec![], "1 alone is the opacity key");
+        let cfg: HotkeysConfig = toml::from_str("[canvas]\nmove_slide_up = \"alt+pageup\"\nmove_slide_down = \"alt+pagedown\"\n").unwrap();
+        let keys = cfg.parsed();
+        assert_eq!(press(&keys, egui::Key::PageUp, egui::Modifiers::ALT), vec![KeyAction::MoveSlide(-1)]);
+        assert_eq!(press(&keys, egui::Key::PageDown, egui::Modifiers::ALT), vec![KeyAction::MoveSlide(1)]);
     }
 
     #[test]

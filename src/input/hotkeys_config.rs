@@ -387,6 +387,10 @@ pub struct CanvasSection {
     /// Lock the active slide against edits (it still pans and zooms), or
     /// unlock it.
     #[serde(default = "d_lock_slide")]    pub lock_slide: String,
+    /// Move the active slide one place toward the first / the last, as
+    /// the slide panel's menu does. Unbound until set.
+    #[serde(default)] pub move_slide_up: String,
+    #[serde(default)] pub move_slide_down: String,
     #[serde(default = "d_prev_layer")]    pub prev_layer: String,
     #[serde(default = "d_next_layer")]    pub next_layer: String,
     #[serde(default = "d_toggle_ui")]     pub toggle_ui: String,
@@ -555,6 +559,7 @@ impl Default for CanvasSection {
             first_slide: d_first_slide(), last_slide: d_last_slide(),
             rename_slide: d_rename_slide(),
             lock_slide: d_lock_slide(),
+            move_slide_up: String::new(), move_slide_down: String::new(),
             prev_layer: d_prev_layer(), next_layer: d_next_layer(),
             toggle_ui: d_toggle_ui(),
             opacity_0: d_op_0(), opacity_1: d_op_1(),
@@ -618,6 +623,7 @@ fn d_first_slide()   -> String { "home".into() }
 fn d_last_slide()    -> String { "end".into() }
 fn d_rename_slide()  -> String { "f2".into() }
 fn d_lock_slide()    -> String { "ctrl+r".into() }
+
 fn d_prev_layer()    -> String { "arrowdown".into() }
 fn d_next_layer()    -> String { "arrowup".into() }
 fn d_toggle_ui()     -> String { "tab".into() }
@@ -657,8 +663,9 @@ fn d_media_next_frame() -> String { "period".into() }
 /// Current file format. 2 moved the global defaults off Ctrl+Shift; 3
 /// made every button bindable and lists each binding in the file; 4
 /// added the nudge keys; 5 zoom to fit / to the selection (and the held
-/// peek), flipping, the text box and a picture's colours.
-const FORMAT: u32 = 5;
+/// peek), flipping, the text box and a picture's colours; 6 moving
+/// slides.
+const FORMAT: u32 = 6;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -775,6 +782,8 @@ pub struct CanvasBindings {
     pub last_slide: Option<Binding>,
     pub rename_slide: Option<Binding>,
     pub lock_slide: Option<Binding>,
+    pub move_slide_up: Option<Binding>,
+    pub move_slide_down: Option<Binding>,
     pub prev_layer: Option<Binding>,
     pub next_layer: Option<Binding>,
     pub toggle_ui: Option<Binding>,
@@ -943,6 +952,8 @@ impl HotkeysConfig {
                 last_slide:    p("canvas.last_slide",    &self.canvas.last_slide),
                 rename_slide:  p("canvas.rename_slide",  &self.canvas.rename_slide),
                 lock_slide:    p("canvas.lock_slide",    &self.canvas.lock_slide),
+                move_slide_up:   p("canvas.move_slide_up",   &cv.move_slide_up),
+                move_slide_down: p("canvas.move_slide_down", &cv.move_slide_down),
                 prev_layer:    p("canvas.prev_layer",    &self.canvas.prev_layer),
                 next_layer:    p("canvas.next_layer",    &self.canvas.next_layer),
                 toggle_ui:     p("canvas.toggle_ui",     &self.canvas.toggle_ui),
@@ -1288,6 +1299,8 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "last_slide")           => "Last slide",
         ("canvas", "rename_slide")         => "Name the slide",
         ("canvas", "lock_slide")           => "Lock / unlock the slide against edits",
+        ("canvas", "move_slide_up")        => "Move the slide one place toward the first",
+        ("canvas", "move_slide_down")      => "Move the slide one place toward the last",
         ("canvas", "prev_layer")           => "Layer below",
         ("canvas", "next_layer")           => "Layer above",
         ("canvas", "toggle_ui")            => "Hide / show the toolbar and panels",
@@ -1566,7 +1579,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 5"));
+        assert!(up.contains("version = 6"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1575,7 +1588,7 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 5\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 6\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
         assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
@@ -1612,7 +1625,7 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 5\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 6\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
@@ -1715,7 +1728,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 5\n\n\
+             version = 6\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1736,13 +1749,13 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 5\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 6\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 5");
-        assert_eq!(upgrade_text("", 0), "version = 5\n");
+        assert_eq!(new, "version = 6");
+        assert_eq!(upgrade_text("", 0), "version = 6\n");
     }
 
     #[test]

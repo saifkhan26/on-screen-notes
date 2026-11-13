@@ -61,6 +61,14 @@ const KEEP_SHOWS: u64 = 600;
 impl OverlayCache {
     pub fn new() -> Self { Self::default() }
 
+    /// Slides were moved: each texture follows its slide to the number
+    /// `map` gives it. None is dropped — dropping mid-frame could free a
+    /// texture made this frame, which egui-wgpu does not survive.
+    pub fn slides_moved(&mut self, map: impl Fn(usize) -> usize) {
+        self.images = std::mem::take(&mut self.images).into_iter().map(|((c, l), v)| ((map(c), l), v)).collect();
+        self.layer_thumbs = std::mem::take(&mut self.layer_thumbs).into_iter().map(|((c, l), v)| ((map(c), l), v)).collect();
+    }
+
     /// Drop the textures of frozen frames that have not been drawn for a
     /// while. Runs before anything is drawn in a frame, so a
     /// texture is never made and freed in the same frame (egui-wgpu
