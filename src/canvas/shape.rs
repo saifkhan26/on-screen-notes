@@ -237,6 +237,20 @@ pub fn text_extent(content: &str, font_size: f32) -> [f32; 2] {
     ]
 }
 
+/// Space between a text label and the edge of its box, `[across, down]`,
+/// for text `font_size` tall.
+pub fn text_box_pad(font_size: f32) -> [f32; 2] {
+    [font_size * 0.35, font_size * 0.18]
+}
+
+/// Box colour that keeps text of colour `text` readable: a dark box
+/// behind light text, a light one behind dark text.
+pub fn auto_text_box(text: [u8; 4]) -> [u8; 4] {
+    let [r, g, b, _] = text.map(|c| f32::from(c) / 255.0);
+    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if luma > 0.5 { [24, 24, 28, 215] } else { [250, 250, 247, 230] }
+}
+
 /// All shape variants live in one enum so a Canvas can store them in a single
 /// `Vec<Shape>` without trait objects (which complicate serde).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +343,11 @@ pub enum Shape {
         /// Same as `Rect::pin`.
         #[serde(default, skip_serializing_if = "is_unpinned")]
         pin: u64,
+        /// Colour of the rounded box drawn behind the text, if it has
+        /// one (`text_box_pad` around it). Not written when unset, so a
+        /// plain label keeps its old on-disk form.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<[u8; 4]>,
     },
     /// Raster sticker — a PNG-backed image dropped at `pos` with
     /// canvas-local `size`. Produced by the flood-fill tool (which
@@ -354,6 +373,14 @@ pub enum Shape {
         /// Turn about the image's centre; see `Rect::rotation`.
         #[serde(default, skip_serializing_if = "is_zero")]
         rotation: f32,
+        /// Shown mirrored left to right in its own frame (before
+        /// `rotation`); a top-to-bottom flip is this plus a half turn.
+        /// Applied as it is drawn — texture coordinates on screen, a
+        /// mirrored transform off screen — so flipping makes no new
+        /// pixels and works for videos and GIFs alike. On top of any
+        /// `PictureRef::mirror`, which is part of what the file shows.
+        #[serde(default, skip_serializing_if = "is_false")]
+        flip: bool,
         /// Fill sticker or picture. Defaults to `Fill`, which is what
         /// every raster saved before this field existed is.
         #[serde(default, skip_serializing_if = "is_fill")]
@@ -526,8 +553,16 @@ impl Shape {
                 if let Some(new) = color { *c = new; }
                 if let Some(w) = width { *stroke_width = w; }
             }
-            Shape::Text { color: c, font_size, .. } => {
-                if let Some(new) = color { *c = new; }
+            Shape::Text { color: c, font_size, background, .. } => {
+                if let Some(new) = color {
+                    // A box picked to go with the old colour follows the
+                    // new one, so the text stays readable; a box of any
+                    // other colour (a PureRef note's) is left as it is.
+                    if *background == Some(auto_text_box(*c)) {
+                        *background = Some(auto_text_box(new));
+                    }
+                    *c = new;
+                }
                 if let Some(w) = width { *font_size = (w.max(6.0) * 3.0).clamp(12.0, 240.0); }
             }
             Shape::Raster { .. } => {}
@@ -554,9 +589,12 @@ impl Shape {
                 half: [size[0].abs() * 0.5, size[1].abs() * 0.5],
                 angle: *rotation,
             },
-            Shape::Text { pos, content, font_size, rotation, .. } => {
+            Shape::Text { pos, content, font_size, rotation, background, .. } => {
                 let [w, h] = text_extent(content, *font_size);
                 let (s, c) = rotation.sin_cos();
+                // A box reaches past the text by the same amount on
+                // every side, so it widens the frame about one centre.
+                let pad = if background.is_some() { text_box_pad(*font_size) } else { [0.0, 0.0] };
                 // The label turns about `pos`, so its centre swings
                 // around that corner.
                 Obb {
@@ -564,7 +602,7 @@ impl Shape {
                         pos[0] + c * w * 0.5 - s * h * 0.5,
                         pos[1] + s * w * 0.5 + c * h * 0.5,
                     ],
-                    half: [w * 0.5, h * 0.5],
+                    half: [w * 0.5 + pad[0], h * 0.5 + pad[1]],
                     angle: *rotation,
                 }
             }
@@ -579,16 +617,28 @@ impl Shape {
     /// exact for every transform the Select tool produces — a rotation,
     /// a uniform scale, or a stretch along the box's own sides.
     ///
+    /// A mirroring transform (a flip) cannot turn a box into a box by
+    /// rotation alone. A rectangle or ellipse looks the same either way
+    /// round, so it takes the turn that reads closest to upright; a
+    /// picture toggles `flip`; a text label keeps reading left to right
+    /// and only its box is mirrored into place.
+    ///
     /// Stroke widths and font sizes scale by `Affine::linear_scale`.
     pub fn apply_affine(&mut self, m: &Affine) {
         let s = m.linear_scale();
+        let mirrored = m.a * m.d - m.b * m.c < 0.0;
         let len = |v: [f32; 2]| (v[0] * v[0] + v[1] * v[1]).sqrt();
+        // Of the box's mapped x-axis `u` and its opposite, the turn that
+        // points more to the right — for a box that looks the same
+        // either way round.
+        let upright = |u: [f32; 2]| if u[0] >= 0.0 { u[1].atan2(u[0]) } else { (-u[1]).atan2(-u[0]) };
         // Maps a box given as (centre, half-extents, rotation).
         let map_box = |center: [f32; 2], half: [f32; 2], rotation: f32| {
             let (sin, cos) = rotation.sin_cos();
             let u = m.apply_vec([cos, sin]);
             let v = m.apply_vec([-sin, cos]);
-            (m.apply(center), [half[0] * len(u), half[1] * len(v)], u[1].atan2(u[0]))
+            let turn = if mirrored { upright(u) } else { u[1].atan2(u[0]) };
+            (m.apply(center), [half[0] * len(u), half[1] * len(v)], turn)
         };
         match self {
             Shape::Line { a, b, stroke_width, .. } | Shape::Arrow { a, b, stroke_width, .. } => {
@@ -606,13 +656,36 @@ impl Shape {
                 *rotation = r;
                 *stroke_width *= s;
             }
-            Shape::Raster { pos, size, rotation, .. } => {
+            Shape::Raster { pos, size, rotation, flip, .. } => {
                 let center = [pos[0] + size[0] * 0.5, pos[1] + size[1] * 0.5];
                 let half = [size[0].abs() * 0.5, size[1].abs() * 0.5];
-                let (c, h, r) = map_box(center, half, *rotation);
+                let (c, h, _) = map_box(center, half, *rotation);
+                let (sin, cos) = rotation.sin_cos();
+                let u = m.apply_vec([cos, sin]);
+                // Mirrored, the picture's own x-axis (flipped once more)
+                // now runs along -u.
+                *rotation = if mirrored { (-u[1]).atan2(-u[0]) } else { u[1].atan2(u[0]) };
+                *flip ^= mirrored;
                 *pos = [c[0] - h[0], c[1] - h[1]];
                 *size = [h[0] * 2.0, h[1] * 2.0];
-                *rotation = r;
+            }
+            Shape::Text { .. } if mirrored => {
+                // Text never reads backwards: the label's box lands where
+                // the mirror puts it, turned the way that still reads
+                // left to right.
+                let center = m.apply(self.obb().center);
+                let Shape::Text { pos, content, font_size, rotation, .. } = self else { unreachable!() };
+                let (sin, cos) = rotation.sin_cos();
+                let u = m.apply_vec([cos, sin]);
+                let v = m.apply_vec([-sin, cos]);
+                *rotation = upright(u);
+                *font_size *= len(v);
+                let [w, h] = text_extent(content, *font_size);
+                let (rs, rc) = rotation.sin_cos();
+                *pos = [
+                    center[0] - rc * w * 0.5 + rs * h * 0.5,
+                    center[1] - rs * w * 0.5 - rc * h * 0.5,
+                ];
             }
             Shape::Text { pos, font_size, rotation, .. } => {
                 let (sin, cos) = rotation.sin_cos();
@@ -668,6 +741,7 @@ mod tests {
             color: [0; 4], rotation: 0.0, kind: RasterKind::Fill, media: None,
             picture: None,
             pin: 0,
+            flip: false,
         };
         let text = ron::to_string(&raster).unwrap();
         assert!(!text.contains("rotation") && !text.contains("kind") && !text.contains("media"), "{text}");
@@ -680,6 +754,7 @@ mod tests {
             color: [0; 4], rotation: 0.5, kind: RasterKind::Image, media: None,
             picture: None,
             pin: 0,
+            flip: false,
         };
         let back: Shape = ron::from_str(&ron::to_string(&raster).unwrap()).unwrap();
         assert!(matches!(back, Shape::Raster { rotation, kind: RasterKind::Image, .. } if (rotation - 0.5).abs() < 1e-6));
@@ -698,6 +773,7 @@ mod tests {
             })),
             picture: None,
             pin: 0,
+            flip: false,
         }
     }
 
@@ -745,6 +821,7 @@ mod tests {
             color: [0; 4], rotation: 0.0, kind: RasterKind::Image, media: None,
             picture: Some(Box::new(PictureRef { file: "0123456789abcdef.jpg".into(), size: [400, 300], crop, mirror })),
             pin: 0,
+            flip: false,
         }
     }
 
@@ -840,9 +917,84 @@ mod tests {
 
     #[test]
     fn text_turns_about_its_anchor() {
-        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0, pin: 0 };
+        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0, pin: 0, background: None };
         t.apply_affine(&Affine::rotate_about([10.0, 10.0], 0.3).then(Affine::scale_about([10.0, 10.0], 2.0, 2.0)));
         assert!(matches!(t, Shape::Text { pos, font_size, rotation, .. }
             if (pos[0] - 10.0).abs() < 1e-3 && (font_size - 40.0).abs() < 1e-2 && (rotation - 0.3).abs() < 1e-4));
+    }
+
+    fn near(a: [f32; 2], b: [f32; 2]) -> bool {
+        (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3
+    }
+
+    /// Where the picture's own top-left pixel ends up on the canvas.
+    fn first_pixel(s: &Shape) -> [f32; 2] {
+        let Shape::Raster { flip, .. } = s else { panic!() };
+        let o = s.obb();
+        o.from_local([if *flip { o.half[0] } else { -o.half[0] }, -o.half[1]])
+    }
+
+    #[test]
+    fn flipping_a_picture_mirrors_what_it_shows_in_place() {
+        let mut p = stored_picture(None, false);
+        let mid = p.obb().center;
+        // Left to right: same box, the first pixel now top-right.
+        p.apply_affine(&Affine::scale_about(mid, -1.0, 1.0));
+        let Shape::Raster { pos, size, rotation, flip, .. } = &p else { panic!() };
+        assert!(*flip && rotation.abs() < 1e-5, "{rotation}");
+        assert!(near(*pos, [3.0, 4.0]) && near(*size, [10.0, 6.0]));
+        assert!(near(first_pixel(&p), [13.0, 4.0]));
+        // Back again is where it started.
+        p.apply_affine(&Affine::scale_about(mid, -1.0, 1.0));
+        assert!(matches!(p, Shape::Raster { flip: false, .. }));
+        assert!(near(first_pixel(&p), [3.0, 4.0]));
+        // Top to bottom: a left-to-right flip turned half round, the
+        // first pixel bottom-left.
+        p.apply_affine(&Affine::scale_about(mid, 1.0, -1.0));
+        let Shape::Raster { rotation, flip, .. } = &p else { panic!() };
+        assert!(*flip && (rotation.abs() - std::f32::consts::PI).abs() < 1e-5, "{rotation}");
+        assert!(near(first_pixel(&p), [3.0, 10.0]), "{:?}", first_pixel(&p));
+        let back: Shape = ron::from_str(&ron::to_string(&p).unwrap()).unwrap();
+        assert!(matches!(back, Shape::Raster { flip: true, .. }), "flip is saved");
+        let plain = ron::to_string(&stored_picture(None, false)).unwrap();
+        assert!(!plain.contains("flip"), "an unflipped picture keeps its old form: {plain}");
+    }
+
+    #[test]
+    fn flipping_a_turned_box_keeps_it_upright_and_text_reading_forwards() {
+        let mut r = rect([0.0, 0.0], [40.0, 20.0]);
+        if let Shape::Rect { rotation, .. } = &mut r { *rotation = 0.2; }
+        r.apply_affine(&Affine::scale_about([20.0, 10.0], -1.0, 1.0));
+        let Shape::Rect { rotation, a, b, .. } = &r else { panic!() };
+        assert!((rotation + 0.2).abs() < 1e-4, "mirrored turn, not half a turn off: {rotation}");
+        assert!(near(*a, [0.0, 0.0]) && near(*b, [40.0, 20.0]));
+
+        let mut t = Shape::Text { pos: [100.0, 50.0], content: "abc".into(), font_size: 20.0, color: [0; 4], rotation: 0.1, pin: 0, background: None };
+        let centre = t.obb().center;
+        t.apply_affine(&Affine::scale_about([0.0, 0.0], 1.0, -1.0));
+        let Shape::Text { rotation, font_size, .. } = &t else { panic!() };
+        assert!((rotation + 0.1).abs() < 1e-4 && (font_size - 20.0).abs() < 1e-4, "{rotation} {font_size}");
+        assert!(near(t.obb().center, [centre[0], -centre[1]]), "the label lands where the mirror puts it");
+    }
+
+    #[test]
+    fn a_text_box_widens_the_frame_and_follows_a_recolour() {
+        let plain = Shape::Text { pos: [0.0, 0.0], content: "ab".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None };
+        let mut boxed = plain.clone();
+        if let Shape::Text { background, .. } = &mut boxed { *background = Some(auto_text_box([255; 4])); }
+        let (a, b) = (plain.obb(), boxed.obb());
+        assert!(near(a.center, b.center));
+        let pad = text_box_pad(20.0);
+        assert!(near([b.half[0] - a.half[0], b.half[1] - a.half[1]], pad));
+        // Light text sits on a dark box; recoloured dark, the box turns light.
+        assert!(auto_text_box([255; 4])[0] < 64);
+        boxed.restyle(Some([0, 0, 0, 255]), None);
+        assert!(matches!(boxed, Shape::Text { background: Some(bg), .. } if bg == auto_text_box([0, 0, 0, 255]) && bg[0] > 200));
+        // A box of its own colour stays.
+        let mut own = boxed.clone();
+        if let Shape::Text { background, .. } = &mut own { *background = Some([1, 2, 3, 200]); }
+        own.restyle(Some([255; 4]), None);
+        assert!(matches!(own, Shape::Text { background: Some([1, 2, 3, 200]), .. }));
+        assert!(!ron::to_string(&plain).unwrap().contains("background"));
     }
 }

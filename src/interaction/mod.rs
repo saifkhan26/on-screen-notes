@@ -269,6 +269,7 @@ pub fn route_text_input(
                     color: t.color,
                     rotation: 0.0,
                     pin: 0,
+                    background: tool.text_box.then(|| crate::canvas::shape::auto_text_box(t.color)),
                 });
             }
         }

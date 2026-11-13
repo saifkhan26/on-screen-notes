@@ -161,7 +161,7 @@ mod tests {
                     1 => Shape::Ellipse { a, b, color, stroke_width, border, rotation, pin: 0 },
                     2 => Shape::Line { a, b, color, stroke_width, border, pin: 0 },
                     3 => Shape::Arrow { a, b, color, stroke_width, border, pin: 0 },
-                    _ => Shape::Text { pos: a, content: format!("label {i}\nsecond line"), font_size: rng.range(14.0, 48.0), color, rotation, pin: 0 },
+                    _ => Shape::Text { pos: a, content: format!("label {i}\nsecond line"), font_size: rng.range(14.0, 48.0), color, rotation, pin: 0, background: None },
                 }
             })
             .collect()
@@ -193,6 +193,7 @@ mod tests {
                     media: None,
                     picture: None,
                     pin: 0,
+                    flip: false,
                 }
             })
             .collect()

@@ -284,11 +284,13 @@ pub fn raster_solid_at(png: &[u8], u: f32, v: f32, may_decode: bool) -> bool {
 /// for videos and GIFs, whose `png` is only the first frame — a GIF
 /// that starts transparent would otherwise be unclickable there.
 fn shape_solid_at(shape: &Shape, p: [f32; 2], may_decode: bool) -> bool {
-    let Shape::Raster { png, media: None, .. } = shape else { return true };
+    let Shape::Raster { png, media: None, flip, .. } = shape else { return true };
     let o = shape.obb();
     let q = o.to_local(p);
     let (hw, hh) = (o.half[0].max(1e-3), o.half[1].max(1e-3));
-    raster_solid_at(png, (q[0] + hw) / (2.0 * hw), (q[1] + hh) / (2.0 * hh), may_decode)
+    let u = (q[0] + hw) / (2.0 * hw);
+    let u = if *flip { 1.0 - u } else { u };
+    raster_solid_at(png, u, (q[1] + hh) / (2.0 * hh), may_decode)
 }
 
 /// Something under the pointer, on any layer.
@@ -417,6 +419,7 @@ mod tests {
             rotation: 0.0, kind: crate::canvas::shape::RasterKind::Image, media: None,
             picture: None,
             pin: 0,
+            flip: false,
         }
     }
 

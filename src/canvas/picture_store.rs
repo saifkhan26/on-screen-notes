@@ -340,6 +340,7 @@ mod tests {
             media: None,
             picture: None,
             pin: 7,
+            flip: false,
         }
     }
 

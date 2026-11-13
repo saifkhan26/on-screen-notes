@@ -38,6 +38,8 @@ pub fn show(
     // Whether pins are hidden; `None` when there are no pins, which
     // hides the button.
     pins_hidden: Option<&mut bool>,
+    // Text labels are selected: the text-box switch shows for them.
+    text_selected: bool,
     // The hotkeys as bound, for the help panel.
     keys: &ParsedHotkeys,
 ) -> bool {
@@ -64,6 +66,11 @@ pub fn show(
                     interacted |= tool_btn(ui, tool, ToolKind::Fill,          "Fill — F");
                     interacted |= tool_btn(ui, tool, ToolKind::Laser,         "Laser pointer — L  (fades after pen-up)");
                     interacted |= tool_btn(ui, tool, ToolKind::Text,          "Text — T  (click to place, Enter to commit, Shift+Enter newline)");
+                    // Contextual, like the dashed-border switch: with the
+                    // Text tool, or with labels selected.
+                    if tool.kind == ToolKind::Text || text_selected {
+                        interacted |= text_box_btn(ui, tool, keys.toolbar.text_box);
+                    }
                     interacted |= tool_btn(ui, tool, ToolKind::Spotlight,     "Spotlight — S  (dim everything except a square around the cursor; wheel resizes)");
                     interacted |= tool_btn(ui, tool, ToolKind::LassoErase,    "Lasso erase — X  (draw a closed loop, or click corner by corner for a polygon and close it on the first corner, with a double click or Enter; ink whose centroid lands inside is removed)");
                     interacted |= tool_btn(ui, tool, ToolKind::LassoSelect,   "Lasso capture — Shift+X  (draw a closed loop, or click corner by corner for a polygon and close it on the first corner, with a double click or Enter; the screen pixels inside become an image on the active layer)");
@@ -619,6 +626,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Background opacity up",    tb.background_up),
             ("Background opacity down",  tb.background_down),
             ("Black background",         tb.reset_background),
+            ("Text in a box on / off",   tb.text_box),
         ])),
         ("Arrange (2+ selected)", bound(vec![
             ("Pack",                     a.pack),
@@ -637,6 +645,9 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Height of the shortest",   a.match_shortest_height),
             ("Height of the tallest",    a.match_tallest_height),
             ("Move to slide…",           a.move_to_slide),
+            ("Flip left to right",       a.flip_horizontal),
+            ("Flip top to bottom",       a.flip_vertical),
+            ("A picture's colours",      a.picture_colours),
         ])),
         ("Panels & pins", bound(vec![
             ("New slide",                c.new_slide),
@@ -721,7 +732,7 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Copy to a new slide",         k(c.copy_to_new_slide)),
             ("Pin to every slide / unpin",  k(c.pin_selection)),
             ("Hide / show all pins",        k(c.toggle_pins)),
-            ("Arrange (2+ selected)",       s("bar under the toolbar")),
+            ("Arrange, flip, a picture's colours", s("bar under the toolbar")),
             ("Recolour / resize",           s("palette / size slider")),
         ]),
         ("Pictures, videos & GIFs", vec![
@@ -737,7 +748,8 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Name the slide",              k(c.rename_slide)),
             ("Lock / unlock",               k(c.lock_slide)),
             ("Undo / redo",                 k2(c.undo, c.redo)),
-            ("Delete the slide",            k(c.delete_canvas)),
+            ("Delete the slide (asks first)", k(c.delete_canvas)),
+            ("Zoom to fit / selection / while held", format!("{} / hold {}", k2(c.zoom_to_fit, c.zoom_to_selection), k(c.hold_zoom_to_selection))),
         ]),
         ("Layers (the active one)", vec![
             ("Previous / next layer",       k2(c.prev_layer, c.next_layer)),
@@ -871,6 +883,42 @@ fn dash_toggle_btn(ui: &mut egui::Ui, tool: &mut ActiveTool) -> bool {
             BorderStyle::Solid          => BorderStyle::DashedAnimated,
             BorderStyle::DashedAnimated => BorderStyle::Solid,
         };
+        return true;
+    }
+    response.hovered() || response.is_pointer_button_down_on()
+}
+
+/// Text-in-a-box switch: flips `tool.text_box`, which the Text tool
+/// reads when it places a label (and the app applies to selected
+/// labels).
+fn text_box_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, key: Option<Binding>) -> bool {
+    let on = tool.text_box;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
+    let bg = if on {
+        theme::ACCENT
+    } else if response.hovered() {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+    let icon = rect.shrink(rect.width() * 0.22);
+    egui::Image::new(egui::include_image!("../../assets/icons/text-box.svg"))
+        .tint(theme::TEXT_PRIMARY)
+        .fit_to_exact_size(icon.size())
+        .paint_at(ui, icon);
+    let tip = if on {
+        "Text in a box ON — labels get a box that keeps them readable (click for plain text; applies to selected labels too)"
+    } else {
+        "Text in a box OFF — click to put labels in a box that keeps them readable (applies to selected labels too)"
+    };
+    let tip = match key {
+        Some(b) => format!("{tip} — {}", b.label()),
+        None => tip.to_string(),
+    };
+    let response = response.on_hover_text(tip);
+    if response.clicked() {
+        tool.text_box = !tool.text_box;
         return true;
     }
     response.hovered() || response.is_pointer_button_down_on()

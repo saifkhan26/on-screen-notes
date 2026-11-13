@@ -1,10 +1,11 @@
 //! Arrange bar: shown under the toolbar while objects are selected.
 //! Packs, groups by type, aligns (piled up or kept apart), distributes
 //! and evens out the sizes of the selection (see `tools::arrange`) when
-//! there are two or more, copies it to a new
-//! slide, moves it to another slide, and pins it (see `canvas::pins`). A selected pin gets a bar
-//! of its own in the same place, which also shows it on one slide or
-//! every slide.
+//! there are two or more; flips it and zooms to it; shows a lone
+//! picture's colours (`tools::picture_colours`) in a row of its own;
+//! copies it to a new slide, moves it to another slide, and pins it
+//! (see `canvas::pins`). A selected pin gets a bar of its own in the
+//! same place, which also shows it on one slide or every slide.
 
 use crate::canvas::CanvasManager;
 use crate::input::hotkeys_config::{Binding, ParsedHotkeys};
@@ -32,6 +33,25 @@ pub enum BarAction {
     MoveToSlide(usize),
     /// Pin the selection to every slide, or unpin it if all of it is.
     TogglePin,
+    /// Mirror the selection left to right (`false`) or top to bottom.
+    Flip(bool),
+    ZoomToSelection,
+    /// Show the selected picture's colours, or hide them.
+    PictureColours,
+    /// Draw with this colour.
+    UseColour([u8; 4]),
+    /// The picture's colours become the toolbar's palette.
+    KeepColours,
+    /// The palette from before `KeepColours` comes back.
+    RestorePalette,
+}
+
+/// The palette button's part, for a selection that is one picture.
+pub struct ColourRow<'a> {
+    /// Its colours, when they are showing.
+    pub shown: Option<&'a [[u8; 4]]>,
+    /// A palette replaced by `KeepColours` can come back.
+    pub can_restore: bool,
 }
 
 /// What a click on a selected pin's bar asks for.
@@ -54,8 +74,10 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 /// `apart` is the "keep apart" switch: on, the align buttons slide
 /// objects until they touch rather than piling them up; the bar flips
 /// it when clicked. `keys` label the buttons' tooltips; `open_move`
-/// opens "Move to slide…" as its key asks. Returns what was clicked this
-/// frame, if anything.
+/// opens "Move to slide…" as its key asks; `picture` is set when the
+/// selection is one picture, for its palette button. Returns what was
+/// clicked this frame, if anything.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
     count: usize,
@@ -64,6 +86,7 @@ pub fn show(
     apart: &mut bool,
     keys: &ParsedHotkeys,
     open_move: bool,
+    picture: Option<ColourRow<'_>>,
 ) -> Option<BarAction> {
     let pos = bar_pos(ctx);
     let mut picked = None;
@@ -73,6 +96,7 @@ pub fn show(
         .order(egui::Order::Middle)
         .show(ctx, |ui| {
             theme::card_frame().inner_margin(egui::Margin::symmetric(8.0, 4.0)).show(ui, |ui| {
+                ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     ui.label(egui::RichText::new(format!("{count} selected")).small().color(theme::TEXT_MUTED));
@@ -81,6 +105,26 @@ pub fn show(
                         arrange_buttons(ui, count, apart, keys, &mut picked);
                         divider(ui);
                     }
+                    let k = &keys.arrange;
+                    let tip = with_key("Flip left to right — about the selection's middle", k.flip_horizontal);
+                    if icon_btn(ui, egui::include_image!("../../assets/icons/flip-horizontal.svg"), true, &tip) {
+                        picked = Some(BarAction::Flip(false));
+                    }
+                    let tip = with_key("Flip top to bottom — about the selection's middle", k.flip_vertical);
+                    if icon_btn(ui, egui::include_image!("../../assets/icons/flip-vertical.svg"), true, &tip) {
+                        picked = Some(BarAction::Flip(true));
+                    }
+                    let tip = with_key("Zoom to the selection", keys.canvas.zoom_to_selection);
+                    if icon_btn(ui, egui::include_image!("../../assets/icons/zoom-selection.svg"), true, &tip) {
+                        picked = Some(BarAction::ZoomToSelection);
+                    }
+                    if let Some(row) = &picture {
+                        let tip = with_key("Colours in this picture — draw with one, or keep them all as the palette", k.picture_colours);
+                        if toggle_btn(ui, egui::include_image!("../../assets/icons/palette.svg"), row.shown.is_some(), &tip) {
+                            picked = Some(BarAction::PictureColours);
+                        }
+                    }
+                    divider(ui);
                     let tip = with_key("Copy to a new slide (added after the last slide)", keys.canvas.copy_to_new_slide);
                     if icon_btn(ui, egui::include_image!("../../assets/icons/copy-to-slide.svg"), true, &tip) {
                         picked = Some(BarAction::CopyToNewSlide);
@@ -98,9 +142,47 @@ pub fn show(
                         picked = Some(BarAction::TogglePin);
                     }
                 });
+                if let Some(row) = &picture {
+                    if let Some(colours) = row.shown {
+                        colour_row(ui, colours, row.can_restore, &mut picked);
+                    }
+                }
+                });
             });
         });
     picked
+}
+
+/// The picture's colours under the bar's buttons: click one to draw
+/// with it; keep them all as the palette, or bring the old one back.
+fn colour_row(ui: &mut egui::Ui, colours: &[[u8; 4]], can_restore: bool, picked: &mut Option<BarAction>) {
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if colours.is_empty() {
+            ui.label(egui::RichText::new("No colours: the picture is see-through").small().color(theme::TEXT_MUTED));
+            return;
+        }
+        ui.label(egui::RichText::new("Its colours").small().color(theme::TEXT_MUTED));
+        for &c in colours {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::click());
+            let fill = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 255);
+            let body = if resp.hovered() { rect.shrink(1.0) } else { rect.shrink(2.5) };
+            ui.painter().rect_filled(body, Rounding::same(5.0), fill);
+            ui.painter().rect_stroke(body, Rounding::same(5.0), egui::Stroke::new(1.0, Color32::from_white_alpha(40)));
+            let tip = format!("#{:02X}{:02X}{:02X} — click to draw with it", c[0], c[1], c[2]);
+            if resp.on_hover_text(tip).clicked() {
+                *picked = Some(BarAction::UseColour(c));
+            }
+        }
+        divider(ui);
+        if ui.button("Use as palette").on_hover_text("These colours replace the toolbar's swatches").clicked() {
+            *picked = Some(BarAction::KeepColours);
+        }
+        if can_restore && ui.button("Restore palette").on_hover_text("Bring back the swatches from before").clicked() {
+            *picked = Some(BarAction::RestorePalette);
+        }
+    });
 }
 
 /// The bar for a selected pin whose objects are on slide `slide` (an

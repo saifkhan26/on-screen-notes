@@ -675,14 +675,19 @@ fn paint_shape(
             }
         }
         // `Painter::image` only takes an axis-aligned rect, so a turned
-        // image goes out as its own two-triangle textured quad.
-        Shape::Raster { rotation, .. } if *rotation != 0.0 => {
+        // image goes out as its own two-triangle textured quad. So does a
+        // flipped one: its texture coordinates run right to left.
+        Shape::Raster { rotation, flip, .. } if *rotation != 0.0 || *flip => {
             if let Some(tex_id) = raster_tex {
                 let tint = egui::Color32::from_rgba_unmultiplied(
                     255, 255, 255,
                     (layer_opacity * 255.0).clamp(0.0, 255.0) as u8,
                 );
-                let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                let uvs = if *flip {
+                    [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+                } else {
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+                };
                 let mut mesh = egui::Mesh::with_texture(tex_id);
                 for (p, uv) in shape.obb().corners().into_iter().zip(uvs) {
                     mesh.vertices.push(egui::epaint::Vertex {
@@ -713,7 +718,7 @@ fn paint_shape(
                 );
             }
         }
-        Shape::Text { pos, content, font_size, color, rotation, .. } => {
+        Shape::Text { pos, content, font_size, color, rotation, background, .. } => {
             let c = col(*color, layer_opacity);
             // The shape's `font_size` is in canvas-local logical px;
             // multiply by zoom so the on-screen height honours the
@@ -737,6 +742,14 @@ fn paint_shape(
             let reach = longest * size + content.split('\n').count() as f32 * line_h;
             if !painter.clip_rect().expand(reach).contains(top_left) {
                 return;
+            }
+            if let Some(bg) = background {
+                let widest = content
+                    .split('\n')
+                    .map(|l| text_line_width(painter, l, size, &family))
+                    .fold(0.0_f32, f32::max);
+                let lines = content.split('\n').count();
+                paint_text_box(painter, top_left, [widest, line_h * lines as f32], size, *rotation, col(*bg, layer_opacity));
             }
             // Each line is its own galley turned about its top-left,
             // stepped down the label's turned "down" direction so the
@@ -798,6 +811,43 @@ mod glyph_tests {
         assert!(seen.len() <= 15, "{} sizes", seen.len());
         assert_eq!(glyph_px(5000.0), MAX_GLYPH_PX);
     }
+}
+
+/// How wide one line of a text label `size` logical px tall is drawn,
+/// in logical px — the width `paint_text_line` gives it.
+fn text_line_width(painter: &egui::Painter, line: &str, size: f32, family: &egui::FontFamily) -> f32 {
+    let ppp = painter.ctx().pixels_per_point();
+    let px = size * ppp;
+    let glyph = glyph_px(px);
+    let drawn = if glyph == px { size } else { glyph / ppp };
+    let galley = painter.layout_no_wrap(line.to_string(), egui::FontId::new(drawn, family.clone()), egui::Color32::WHITE);
+    galley.size().x * size / drawn
+}
+
+/// The rounded box behind a text label: `text` is the size of its lines
+/// (`[widest, all lines' height]`, screen points) from `top_left`, the
+/// corner the label turns about by `angle`; `size` is its text height,
+/// which sets the padding and the corner radius.
+pub(crate) fn paint_text_box(
+    painter: &egui::Painter,
+    top_left: egui::Pos2,
+    text: [f32; 2],
+    size: f32,
+    angle: f32,
+    fill: egui::Color32,
+) {
+    let pad = crate::canvas::shape::text_box_pad(size);
+    let half = [text[0] * 0.5 + pad[0], text[1] * 0.5 + pad[1]];
+    let centre = [text[0] * 0.5, text[1] * 0.5];
+    let (s, c) = angle.sin_cos();
+    let pts: Vec<egui::Pos2> = rounded_box_outline(half, size * 0.3)
+        .into_iter()
+        .map(|q| {
+            let (x, y) = (centre[0] + q[0], centre[1] + q[1]);
+            egui::pos2(top_left.x + c * x - s * y, top_left.y + s * x + c * y)
+        })
+        .collect();
+    painter.add(egui::Shape::convex_polygon(pts, fill, egui::Stroke::NONE));
 }
 
 /// One line of a text label, `size` logical px tall, its top-left at
@@ -1874,6 +1924,26 @@ fn rgba_paint(color: [u8; 4]) -> Paint<'static> {
     p
 }
 
+/// A rectangle with corners rounded by `r`, as a tiny-skia path.
+fn rounded_rect_path(rect: tiny_skia::Rect, r: f32) -> Option<tiny_skia::Path> {
+    let (x0, y0, x1, y1) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let r = r.max(0.0).min(rect.width() * 0.5).min(rect.height() * 0.5);
+    // Cubic quarter circles: control points k·r along each side.
+    let k = r * 0.552_284_8;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x0 + r, y0);
+    pb.line_to(x1 - r, y0);
+    pb.cubic_to(x1 - r + k, y0, x1, y0 + r - k, x1, y0 + r);
+    pb.line_to(x1, y1 - r);
+    pb.cubic_to(x1, y1 - r + k, x1 - r + k, y1, x1 - r, y1);
+    pb.line_to(x0 + r, y1);
+    pb.cubic_to(x0 + r - k, y1, x0, y1 - r + k, x0, y1 - r);
+    pb.line_to(x0, y0 + r);
+    pb.cubic_to(x0, y0 + r - k, x0 + r - k, y0, x0 + r, y0);
+    pb.close();
+    pb.finish()
+}
+
 /// `t` with a turn of `rotation` radians about canvas point `(cx, cy)`
 /// applied first. Returns `t` untouched for an unrotated shape, so those
 /// rasterise exactly as they did before shapes could turn.
@@ -2049,7 +2119,7 @@ fn draw_shape(
             draw_line(pixmap, *b, [b[0] + h1x, b[1] + h1y], *color, *stroke_width, t);
             draw_line(pixmap, *b, [b[0] + h2x, b[1] + h2y], *color, *stroke_width, t);
         }
-        Shape::Raster { pos, size, png, rotation, kind, media, picture, .. } => {
+        Shape::Raster { pos, size, png, rotation, kind, media, picture, flip, .. } => {
             let t = turned(t, *rotation, pos[0] + size[0] * 0.5, pos[1] + size[1] * 0.5);
             let opacity = match kind {
                 crate::canvas::shape::RasterKind::Image => image_opacity.clamp(0.0, 1.0),
@@ -2077,9 +2147,13 @@ fn draw_shape(
                 let (iw, ih) = (src.width(), src.height());
                 let sx = size[0] / iw as f32;
                 let sy = size[1] / ih as f32;
-                let draw_t = Transform::from_scale(sx, sy)
-                    .post_translate(pos[0], pos[1])
-                    .post_concat(t);
+                // Flipped: the image's left edge lands on the box's right.
+                let draw_t = if *flip {
+                    Transform::from_row(-sx, 0.0, 0.0, sy, pos[0] + size[0], pos[1])
+                } else {
+                    Transform::from_scale(sx, sy).post_translate(pos[0], pos[1])
+                }
+                .post_concat(t);
                 let opts = tiny_skia::PixmapPaint {
                     opacity,
                     blend_mode: tiny_skia::BlendMode::SourceOver,
@@ -2088,8 +2162,21 @@ fn draw_shape(
                 pixmap.draw_pixmap(0, 0, src.as_ref(), &opts, draw_t, None);
             }
         }
-        Shape::Text { pos, content, font_size, color, rotation, .. } => {
+        Shape::Text { pos, content, font_size, color, rotation, background, .. } => {
             let t = turned(t, *rotation, pos[0], pos[1]);
+            // The box, at the coarse size hit-testing uses: there is no
+            // font here to measure the lines with.
+            if let Some(bg) = background {
+                let [w, h] = crate::canvas::shape::text_extent(content, *font_size);
+                let pad = crate::canvas::shape::text_box_pad(*font_size);
+                let r = (*font_size * 0.3).min(w * 0.5 + pad[0]).min(h * 0.5 + pad[1]);
+                if let Some(rect) = tiny_skia::Rect::from_xywh(pos[0] - pad[0], pos[1] - pad[1], w + 2.0 * pad[0], h + 2.0 * pad[1]) {
+                    let path = rounded_rect_path(rect, r);
+                    if let Some(path) = path {
+                        pixmap.fill_path(&path, &rgba_paint(*bg), FillRule::Winding, t, None);
+                    }
+                }
+            }
             // tiny-skia has no built-in font rasteriser, so the
             // screenshot pipeline can't show glyphs yet. We paint a
             // coloured underline at the top-left of each line and a
@@ -2267,6 +2354,7 @@ mod rotation_tests {
             color: [0; 4], rotation: std::f32::consts::FRAC_PI_2, kind: RasterKind::Image, media: None,
             picture: None,
             pin: 0,
+            flip: false,
         };
         // Where `Obb` says the red (left) and blue (right) halves went.
         let o = shape.obb();

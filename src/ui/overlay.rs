@@ -502,11 +502,22 @@ pub fn show(
                     * size * 0.55)
                     .max(size * 0.6);
                 let guide_h = line_h * lines.len().max(1) as f32;
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(top_left, egui::vec2(guide_w, guide_h)),
-                    egui::Rounding::same(2.0),
-                    guide_color,
-                );
+                if tool.text_box {
+                    // The box the label will have, already.
+                    let widest = lines
+                        .iter()
+                        .map(|l| ui.painter().layout_no_wrap(l.to_string(), font_id.clone(), color).size().x)
+                        .fold(size * 0.6, f32::max);
+                    let fill = crate::canvas::shape::auto_text_box(text_edit.color);
+                    let fill = egui::Color32::from_rgba_unmultiplied(fill[0], fill[1], fill[2], fill[3]);
+                    crate::canvas::render::paint_text_box(ui.painter(), top_left, [widest, guide_h], size, 0.0, fill);
+                } else {
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(top_left, egui::vec2(guide_w, guide_h)),
+                        egui::Rounding::same(2.0),
+                        guide_color,
+                    );
+                }
 
                 // Paint the typed lines.
                 for (i, line) in lines.iter().enumerate() {

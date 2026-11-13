@@ -31,13 +31,24 @@ layers.
   polygon; the screen pixels inside become an image on the active layer
 - **Select** — pick objects, then move / resize / rotate them with
   handles; multi-select, duplicate, copy / paste, recolour, re-order
-- **Text labels** — click to place, type, Enter to commit
+- **Text labels** — click to place, type, Enter to commit; the box
+  button beside the Text tool puts labels in a rounded box that keeps
+  them readable over anything
 - **Videos, GIFs & pictures** — drop a video, animated GIF or picture
   onto the canvas (or use the film button); videos and GIFs play /
   pause, scrub, and step frame by frame forward and back. See
   [Videos & GIFs](#videos--gifs)
 - **PureRef boards** — drop a `.pur` file (PureRef 1.x or 2.x) to open it
   as a new slide. See [PureRef boards](#pureref-boards)
+- **Zoom to fit / zoom to the selection** — `Ctrl+1` shows everything on
+  the slide, `Ctrl+2` the selection; hold `C` to look at the selection
+  (or the whole slide) and let go to glide back. The view glides there
+  rather than jumping
+- **Flip** the selection left to right or top to bottom, pictures,
+  videos and GIFs included (text moves but keeps reading forwards)
+- **A picture's colours** — select one picture and the palette button on
+  the bar under the toolbar shows the colours that sum it up: click one
+  to draw with it, or keep them all as the toolbar's palette
 - **Multiple canvases**, persistent on disk via RON
 - **Slide panel** — every slide listed in the bottom-left corner by number
   and name: click one to go there, double-click (or `F2`) to name it,
@@ -144,7 +155,7 @@ the binary on first launch.
 | Airbrush | `G` | Soft disc spray; hold still to build density |
 | Fill | `F` | Click → flood-fills enclosed region |
 | Laser pointer | `L` | Strokes fade after pen-up |
-| Text | `T` | Click anywhere, type, Enter commits |
+| Text | `T` | Click anywhere, type, Enter commits. The box button beside it puts labels in a box (for selected labels too) |
 | Spotlight | `S` | Press again to exit |
 | Lasso erase | `X` | Draw closed loop, or click corners for a polygon (closes like Lasso capture's) |
 | Lasso capture | `Shift+X` | Draw closed loop → image object on the active layer. Or click corners for a polygon: click the first corner, double-click or `Enter` to close, `Backspace` takes back a corner |
@@ -199,6 +210,9 @@ layer makes that layer the active one.
 | `Ctrl+V` with an image on the clipboard | Paste it as an image object |
 | `Ctrl+↑` / `Ctrl+↓` | Bring to front / send to back |
 | Pick a palette colour, move the size slider | Recolour / change line width of the selection |
+| Flip buttons on the bar | Mirror the selection left to right / top to bottom, about its middle |
+| Magnifier-in-a-frame button on the bar, or `Ctrl+2` | Zoom to the selection; hold `C` to look and come back |
+| Palette button on the bar (one picture selected) | Show its colours: click one to draw with it, **Use as palette** keeps them all (**Restore palette** brings the old one back) |
 | `Esc` | Cancel the drag in progress, then deselect |
 
 Every action is one undo step. Things worth knowing:
@@ -391,7 +405,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Eraser (modifier) | hold `Ctrl` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Shift+Z` |
 | Clear active layer | `Ctrl+Delete` |
-| Delete active canvas | `Ctrl+Shift+Backspace` |
+| Delete active canvas (asks first unless it is empty; `Enter` deletes, `Esc` keeps it) | `Ctrl+Shift+Backspace` |
 | Previous / next canvas | `←` / `→` |
 | Previous / next slide, wrapping round (never adds a slide) — or, with the slide panel's clock button on, back / forward through recently used slides | `Ctrl+Shift+Tab` / `Ctrl+Tab` |
 | First / last slide | `Home` / `End` |
@@ -400,6 +414,9 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Previous / next layer | `↓` / `↑` |
 | Hide / show the active layer | `H` |
 | Reset pan + zoom | `Ctrl+0` |
+| Zoom to fit everything on the slide | `Ctrl+1` |
+| Zoom to the selection (nothing selected: the whole slide) | `Ctrl+2` |
+| Look at the selection while held, back when let go (a quick tap stays) | hold `C` |
 | Reset active layer position | `Ctrl+Shift+0` |
 | Reset active layer zoom | `Ctrl+Shift+9` |
 | Freeze frame → layer | `Ctrl+Shift+F` |
@@ -451,7 +468,7 @@ one shortcut goes dead, the rest still work. Look at `RUST_LOG=warn`
 output for the offending line.
 
 ```toml
-version = 2
+version = 5
 
 [global]
 toggle_overlay = "ctrl+alt+shift+n"
@@ -483,6 +500,9 @@ redo          = "ctrl+shift+z"
 clear_layer   = "ctrl+delete"
 delete_canvas = "ctrl+shift+backspace"
 reset_view    = "ctrl+0"
+zoom_to_fit   = "ctrl+1"
+zoom_to_selection = "ctrl+2"
+hold_zoom_to_selection = "c"
 reset_layer_pos = "ctrl+shift+0"
 reset_layer_zoom = "ctrl+shift+9"
 freeze_frame  = "ctrl+shift+f"
@@ -649,8 +669,9 @@ by PureRef 2 (including 2's "save as legacy") both work.
   (paused until you start them), unless the board crops or mirrors
   them: those come in as a still of the first frame.
 - **Notes** become text labels with their colour and rotation, wrapped
-  to the note's width when it has a fixed one. Their background box and
-  rich-text styling are dropped.
+  to the note's width when it has a fixed one. A note's background
+  becomes the label's box, in the note's colour; rich-text styling is
+  dropped.
 - **Not brought over:** pictures that are only linked from disk rather
   than stored in the board, formats the app cannot decode (such as PSD,
   TIFF or EXR in PureRef 2 boards), and drawings. The toast says how

@@ -355,6 +355,13 @@ pub struct CanvasSection {
     #[serde(default = "d_clear_layer")]   pub clear_layer: String,
     #[serde(default = "d_delete_canvas")] pub delete_canvas: String,
     #[serde(default = "d_reset_view")]    pub reset_view: String,
+    /// Glide the view so everything on the slide shows.
+    #[serde(default = "d_zoom_to_fit")]   pub zoom_to_fit: String,
+    /// Glide the view so the selection fills it (the Select tool's).
+    #[serde(default = "d_zoom_to_selection")] pub zoom_to_selection: String,
+    /// Held: the view goes to the selection (the whole slide with
+    /// nothing selected), and back when let go. A quick tap stays.
+    #[serde(default = "d_hold_zoom_to_selection")] pub hold_zoom_to_selection: String,
     /// Undoes every per-layer pan applied to the active layer. Must be
     /// a strict superset of `reset_view`'s modifiers (it is checked
     /// first) or `reset_view` swallows it — see the dispatch site.
@@ -498,6 +505,9 @@ pub struct ToolbarSection {
     pub background_down: String,
     /// Back to a black background.
     pub reset_background: String,
+    /// Text labels in a box: new ones from the Text tool, and the
+    /// selected ones.
+    pub text_box: String,
 }
 
 /// The arrange bar's buttons, for the Select tool's selection. Unbound
@@ -523,6 +533,11 @@ pub struct ArrangeSection {
     pub match_tallest_height: String,
     /// Open "Move to slide…".
     pub move_to_slide: String,
+    /// Mirror the selection left to right / top to bottom.
+    pub flip_horizontal: String,
+    pub flip_vertical: String,
+    /// The selected picture's colours, to draw with or keep as the palette.
+    pub picture_colours: String,
 }
 
 impl Default for CanvasSection {
@@ -531,6 +546,8 @@ impl Default for CanvasSection {
             undo: d_undo(), redo: d_redo(),
             clear_layer: d_clear_layer(), delete_canvas: d_delete_canvas(),
             reset_view: d_reset_view(), reset_layer_pos: d_reset_layer_pos(),
+            zoom_to_fit: d_zoom_to_fit(), zoom_to_selection: d_zoom_to_selection(),
+            hold_zoom_to_selection: d_hold_zoom_to_selection(),
             reset_layer_zoom: d_reset_layer_zoom(),
             freeze_frame: d_freeze_frame(),
             prev_canvas: d_prev_canvas(), next_canvas: d_next_canvas(),
@@ -587,6 +604,9 @@ fn d_redo()          -> String { "ctrl+shift+z".into() }
 fn d_clear_layer()   -> String { "ctrl+delete".into() }
 fn d_delete_canvas() -> String { "ctrl+shift+backspace".into() }
 fn d_reset_view()    -> String { "ctrl+0".into() }
+fn d_zoom_to_fit()   -> String { "ctrl+1".into() }
+fn d_zoom_to_selection() -> String { "ctrl+2".into() }
+fn d_hold_zoom_to_selection() -> String { "c".into() }
 fn d_reset_layer_pos() -> String { "ctrl+shift+0".into() }
 fn d_reset_layer_zoom() -> String { "ctrl+shift+9".into() }
 fn d_freeze_frame()  -> String { "ctrl+shift+f".into() }
@@ -636,8 +656,9 @@ fn d_media_next_frame() -> String { "period".into() }
 
 /// Current file format. 2 moved the global defaults off Ctrl+Shift; 3
 /// made every button bindable and lists each binding in the file; 4
-/// added the nudge keys.
-const FORMAT: u32 = 4;
+/// added the nudge keys; 5 zoom to fit / to the selection (and the held
+/// peek), flipping, the text box and a picture's colours.
+const FORMAT: u32 = 5;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -707,6 +728,7 @@ pub struct ToolbarBindings {
     pub background_up: Option<Binding>,
     pub background_down: Option<Binding>,
     pub reset_background: Option<Binding>,
+    pub text_box: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -727,6 +749,9 @@ pub struct ArrangeBindings {
     pub match_shortest_height: Option<Binding>,
     pub match_tallest_height: Option<Binding>,
     pub move_to_slide: Option<Binding>,
+    pub flip_horizontal: Option<Binding>,
+    pub flip_vertical: Option<Binding>,
+    pub picture_colours: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -736,6 +761,9 @@ pub struct CanvasBindings {
     pub clear_layer: Option<Binding>,
     pub delete_canvas: Option<Binding>,
     pub reset_view: Option<Binding>,
+    pub zoom_to_fit: Option<Binding>,
+    pub zoom_to_selection: Option<Binding>,
+    pub hold_zoom_to_selection: Option<Binding>,
     pub reset_layer_pos: Option<Binding>,
     pub reset_layer_zoom: Option<Binding>,
     pub freeze_frame: Option<Binding>,
@@ -872,6 +900,7 @@ impl HotkeysConfig {
                 background_up:      p("toolbar.background_up",      &tb.background_up),
                 background_down:    p("toolbar.background_down",    &tb.background_down),
                 reset_background:   p("toolbar.reset_background",   &tb.reset_background),
+                text_box:           p("toolbar.text_box",           &tb.text_box),
             },
             arrange: ArrangeBindings {
                 pack:           p("arrange.pack",           &ar.pack),
@@ -890,6 +919,9 @@ impl HotkeysConfig {
                 match_shortest_height: p("arrange.match_shortest_height", &ar.match_shortest_height),
                 match_tallest_height:  p("arrange.match_tallest_height",  &ar.match_tallest_height),
                 move_to_slide:  p("arrange.move_to_slide",  &ar.move_to_slide),
+                flip_horizontal: p("arrange.flip_horizontal", &ar.flip_horizontal),
+                flip_vertical:   p("arrange.flip_vertical",   &ar.flip_vertical),
+                picture_colours: p("arrange.picture_colours", &ar.picture_colours),
             },
             canvas: CanvasBindings {
                 undo:          p("canvas.undo",          &self.canvas.undo),
@@ -897,6 +929,9 @@ impl HotkeysConfig {
                 clear_layer:   p("canvas.clear_layer",   &self.canvas.clear_layer),
                 delete_canvas: p("canvas.delete_canvas", &self.canvas.delete_canvas),
                 reset_view:    p("canvas.reset_view",    &self.canvas.reset_view),
+                zoom_to_fit:   p("canvas.zoom_to_fit",   &cv.zoom_to_fit),
+                zoom_to_selection: p("canvas.zoom_to_selection", &cv.zoom_to_selection),
+                hold_zoom_to_selection: p("canvas.hold_zoom_to_selection", &cv.hold_zoom_to_selection),
                 reset_layer_pos: p("canvas.reset_layer_pos", &self.canvas.reset_layer_pos),
                 reset_layer_zoom: p("canvas.reset_layer_zoom", &self.canvas.reset_layer_zoom),
                 freeze_frame:  p("canvas.freeze_frame",  &self.canvas.freeze_frame),
@@ -1212,6 +1247,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("toolbar", "background_up")      => "Background opacity +10 %",
         ("toolbar", "background_down")    => "Background opacity -10 %",
         ("toolbar", "reset_background")   => "Black background",
+        ("toolbar", "text_box")           => "Text in a box: new labels, and the selected ones",
 
         ("arrange", "pack")                  => "Pack the selection into a tight block, sizes kept",
         ("arrange", "group_by_type")         => "Group the selection: pictures, GIFs, videos, the rest",
@@ -1229,12 +1265,18 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("arrange", "match_shortest_height") => "Every selected object as tall as the shortest",
         ("arrange", "match_tallest_height")  => "Every selected object as tall as the tallest",
         ("arrange", "move_to_slide")         => "Open \"Move to slide...\" for the selection",
+        ("arrange", "flip_horizontal")       => "Mirror the selection left to right",
+        ("arrange", "flip_vertical")         => "Mirror the selection top to bottom",
+        ("arrange", "picture_colours")       => "The selected picture's colours, to draw with or keep as the palette",
 
         ("canvas", "undo")                 => "Undo",
         ("canvas", "redo")                 => "Redo",
         ("canvas", "clear_layer")          => "Clear the active layer",
         ("canvas", "delete_canvas")        => "Delete the slide",
         ("canvas", "reset_view")           => "Reset zoom and pan",
+        ("canvas", "zoom_to_fit")          => "Zoom to fit everything on the slide",
+        ("canvas", "zoom_to_selection")    => "Zoom to the selection",
+        ("canvas", "hold_zoom_to_selection") => "Hold: look at the selection (or the whole slide), back when let go",
         ("canvas", "reset_layer_pos")      => "Undo the active layer's moves",
         ("canvas", "reset_layer_zoom")     => "Undo the active layer's zooms",
         ("canvas", "freeze_frame")         => "Freeze the screen into a new layer",
@@ -1524,7 +1566,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 4"));
+        assert!(up.contains("version = 5"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1533,7 +1575,7 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 4\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 5\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
         assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
@@ -1570,7 +1612,7 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 4\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 5\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
@@ -1673,7 +1715,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 4\n\n\
+             version = 5\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1694,13 +1736,13 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 4\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 5\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 4");
-        assert_eq!(upgrade_text("", 0), "version = 4\n");
+        assert_eq!(new, "version = 5");
+        assert_eq!(upgrade_text("", 0), "version = 5\n");
     }
 
     #[test]

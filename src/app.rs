@@ -13,6 +13,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::canvas::shape::Shape;
 use crate::canvas::CanvasManager;
 use crate::config::AppConfig;
 use crate::input::{
@@ -187,6 +188,21 @@ pub struct OnScreenNotesApp {
     /// The arrange bar's "Move to slide…" list opens next frame: its
     /// key was pressed after the bar was drawn.
     move_picker_pending: bool,
+    /// Slide waiting on "Delete this slide?" — the delete key was
+    /// pressed on a slide with something on it. Keys go to the dialog
+    /// alone while it is up.
+    confirm_delete: Option<usize>,
+    /// Zoom to fit / to selection in progress: the view glides there
+    /// over a few frames instead of jumping.
+    view_glide: Option<interaction::zoom_pan::ViewGlide>,
+    /// The peek key is held: the view went to the selection (or the
+    /// whole slide) and goes back here when the key is let go.
+    peek: Option<Peek>,
+    /// The selected picture's colours, while the arrange bar shows them.
+    picture_colours: Option<PictureColours>,
+    /// The palette from before "Use as palette", for "Restore palette".
+    /// Kept until the app closes.
+    palette_before: Option<Vec<[u8; 4]>>,
     /// Last rect applied via `ViewportCommand` so we can skip the
     /// re-emit when the target window hasn't moved.
     pinned_last_rect: Option<(i32, i32, i32, i32)>,
@@ -283,6 +299,25 @@ fn refresh_period(hwnd: isize) -> Duration {
 /// Text put on the OS clipboard by an in-app copy. Seeing it come back
 /// in a paste means the newest thing the user copied is `obj_clipboard`.
 const CLIP_MARKER: &str = "on-screen-notes:selection";
+
+/// The view the peek key goes back to (`OnScreenNotesApp::update_peek`).
+struct Peek {
+    slide: usize,
+    back: ([f32; 2], f32),
+    since: Instant,
+}
+
+/// Colours found in a picture, for the arrange bar.
+struct PictureColours {
+    /// `(slide, layer, shape)` of the picture.
+    at: (usize, usize, usize),
+    colours: Vec<[u8; 4]>,
+}
+
+/// The box `[x0, y0, x1, y1]` around two others.
+fn union_box(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
 
 /// A Select-tool command picked out of this frame's key events, run
 /// after egui's input lock is released.
@@ -567,6 +602,11 @@ impl OnScreenNotesApp {
             pin_picking: false,
             pin_prev_lmb: false,
             move_picker_pending: false,
+            confirm_delete: None,
+            view_glide: None,
+            peek: None,
+            picture_colours: None,
+            palette_before: None,
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),
             obj_clipboard: (Vec::new(), Vec::new()),
@@ -1053,6 +1093,7 @@ impl OnScreenNotesApp {
                     media: None,
                     picture: None,
                     pin: 0,
+                    flip: false,
                 };
                 let c = self.canvases.active_mut();
                 c.add_shape(shape);
@@ -1233,6 +1274,367 @@ impl OnScreenNotesApp {
         }
     }
 
+    /// Canvas box around the Select tool's selection, if there is one.
+    fn selection_bounds(&self) -> Option<[f32; 4]> {
+        if self.tool.kind != crate::tools::ToolKind::Select || self.tool.select.sel.is_empty() {
+            return None;
+        }
+        let c = self.canvases.active();
+        let layer = c.layers.get(c.active_layer)?;
+        let sel = &self.tool.select.sel;
+        sel.strokes
+            .iter()
+            .filter_map(|&i| layer.strokes.get(i)?.bounds())
+            .chain(sel.shapes.iter().filter_map(|&i| layer.shapes.get(i).map(crate::canvas::canvas::shape_bounds)))
+            .reduce(union_box)
+    }
+
+    /// Canvas box around everything on the active slide's shown layers.
+    fn slide_bounds(&self) -> Option<[f32; 4]> {
+        let c = self.canvases.active();
+        c.layers.iter().filter(|l| l.visible).filter_map(|l| l.content_bounds()).reduce(union_box)
+    }
+
+    /// Where on screen a fitted view goes, `[x, y, width, height]` from
+    /// the canvas's top-left: the canvas less a margin, and below the
+    /// toolbar and the bar under it while they show.
+    fn fit_area(&self, ctx: &egui::Context) -> [f32; 4] {
+        const MARGIN: f32 = 32.0;
+        let r = self.overlay_cache.canvas_rect(ctx);
+        let top = if self.ui_visible {
+            ["osn_toolbar", "osn_arrange_bar", "osn_pin_bar"]
+                .into_iter()
+                .filter_map(|id| {
+                    let id = egui::Id::new(id);
+                    // A bar hidden now still has its old place on record.
+                    let shown = ctx.memory(|m| m.areas().visible_last_frame(&egui::LayerId::new(egui::Order::Middle, id)));
+                    shown.then(|| ctx.memory(|m| m.area_rect(id))).flatten()
+                })
+                .filter(|a| a.top() < r.top() + 200.0)
+                .map(|a| a.bottom() - r.top())
+                .fold(0.0_f32, f32::max)
+        } else {
+            0.0
+        };
+        [MARGIN, top + MARGIN, (r.width() - 2.0 * MARGIN).max(1.0), (r.height() - top - 2.0 * MARGIN).max(1.0)]
+    }
+
+    /// Glide the view to `to` over a few frames.
+    fn glide_view(&mut self, to: ([f32; 2], f32), ctx: &egui::Context) {
+        let area = self.fit_area(ctx);
+        let c = self.canvases.active();
+        let about = [area[0] + area[2] * 0.5, area[1] + area[3] * 0.5];
+        let glide = interaction::zoom_pan::ViewGlide::new(self.canvases.active_index(), (c.pan, c.zoom), to, about);
+        self.view_glide = Some(glide);
+        ctx.request_repaint();
+    }
+
+    /// The view that shows canvas box `bounds` whole, at most `max_zoom`.
+    fn view_fitting(&self, bounds: [f32; 4], max_zoom: f32, ctx: &egui::Context) -> ([f32; 2], f32) {
+        interaction::zoom_pan::fit_view(bounds, self.fit_area(ctx), max_zoom)
+    }
+
+    /// Glide the view to show everything on the slide.
+    fn zoom_to_fit(&mut self, ctx: &egui::Context) {
+        match self.slide_bounds() {
+            Some(b) => {
+                let to = self.view_fitting(b, interaction::zoom_pan::FIT_MAX_ZOOM, ctx);
+                self.glide_view(to, ctx);
+            }
+            None => self.toast = Some(("Nothing on this slide to zoom to".to_string(), Instant::now())),
+        }
+    }
+
+    /// Glide the view to show the selection; with nothing selected, the
+    /// whole slide.
+    fn zoom_to_selection(&mut self, ctx: &egui::Context) {
+        match self.selection_bounds() {
+            Some(b) => {
+                let to = self.view_fitting(b, interaction::zoom_pan::FIT_SELECTION_MAX_ZOOM, ctx);
+                self.glide_view(to, ctx);
+            }
+            None => {
+                if self.slide_bounds().is_some() {
+                    self.toast = Some(("Nothing selected: showing the whole slide".to_string(), Instant::now()));
+                }
+                self.zoom_to_fit(ctx);
+            }
+        }
+    }
+
+    /// One frame of a glide in progress.
+    fn step_view_glide(&mut self, ctx: &egui::Context) {
+        let Some(g) = self.view_glide.as_mut() else { return };
+        if g.slide != self.canvases.active_index() {
+            self.view_glide = None;
+            return;
+        }
+        let (pan, zoom) = self.canvases.active_view_mut();
+        if g.step(pan, zoom, Instant::now()) {
+            ctx.request_repaint();
+        } else {
+            self.view_glide = None;
+        }
+    }
+
+    /// The peek key (`canvas.hold_zoom_to_selection`): pressed, the view
+    /// glides to the selection (the whole slide with nothing selected);
+    /// held a moment and let go, it glides back. A quick tap stays.
+    fn update_peek(&mut self, ctx: &egui::Context) {
+        /// Shorter than this is a tap, which keeps the new view.
+        const TAP: std::time::Duration = std::time::Duration::from_millis(300);
+        let Some(b) = self.hotkeys_cfg.canvas.hold_zoom_to_selection else { return };
+        let typing = self.tool.in_progress_text.is_some()
+            || self.slide_panel.is_renaming()
+            || self.confirm_delete.is_some()
+            || ctx.wants_keyboard_input();
+        let held = ctx.input(|i| {
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            // Once going, only the key itself matters.
+            i.key_down(b.key)
+                && (self.peek.is_some() || (b.ctrl == ctrl && b.shift == i.modifiers.shift && b.alt == i.modifiers.alt))
+        });
+        match (&self.peek, held) {
+            (None, true) if !typing => {
+                let target = match self.selection_bounds() {
+                    Some(sel) => Some((sel, interaction::zoom_pan::FIT_SELECTION_MAX_ZOOM)),
+                    None => self.slide_bounds().map(|all| (all, interaction::zoom_pan::FIT_MAX_ZOOM)),
+                };
+                if let Some((bounds, max_zoom)) = target {
+                    let c = self.canvases.active();
+                    self.peek = Some(Peek { slide: self.canvases.active_index(), back: (c.pan, c.zoom), since: Instant::now() });
+                    let to = self.view_fitting(bounds, max_zoom, ctx);
+                    self.glide_view(to, ctx);
+                }
+            }
+            (Some(p), false) => {
+                if p.slide == self.canvases.active_index() && p.since.elapsed() >= TAP {
+                    let back = p.back;
+                    self.glide_view(back, ctx);
+                }
+                self.peek = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Mirror the selection left to right, or top to bottom, about the
+    /// middle of its box: one undo step. Pictures flip as they are drawn;
+    /// text moves but keeps reading left to right.
+    fn flip_selection(&mut self, vertical: bool) {
+        let Some(b) = self.selection_bounds() else { return };
+        if !self.may_edit() { return; }
+        let mid = [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5];
+        let m = if vertical {
+            crate::canvas::affine::Affine::scale_about(mid, 1.0, -1.0)
+        } else {
+            crate::canvas::affine::Affine::scale_about(mid, -1.0, 1.0)
+        };
+        let sel = self.tool.select.sel.clone();
+        let c = self.canvases.active_mut();
+        let li = c.active_layer;
+        c.transform_objects(li, &sel.strokes, &sel.shapes, &m);
+    }
+
+    /// Selected text labels, with the Select tool.
+    fn selected_text(&self) -> Vec<usize> {
+        if self.tool.kind != crate::tools::ToolKind::Select {
+            return Vec::new();
+        }
+        let c = self.canvases.active();
+        let Some(layer) = c.layers.get(c.active_layer) else { return Vec::new() };
+        self.tool.select.sel.shapes.iter().copied().filter(|&i| matches!(layer.shapes.get(i), Some(Shape::Text { .. }))).collect()
+    }
+
+    /// The text-box switch was flipped: the selected labels follow it.
+    fn apply_text_box_to_selection(&mut self) {
+        let texts = self.selected_text();
+        if texts.is_empty() || !self.may_edit() { return; }
+        let on = self.tool.text_box;
+        let c = self.canvases.active_mut();
+        let li = c.active_layer;
+        c.set_text_box(li, &texts, on);
+    }
+
+    /// `(slide, layer, shape)` of the selected picture, when the
+    /// selection is one picture (or video, or GIF) and nothing else.
+    fn selected_picture(&self) -> Option<(usize, usize, usize)> {
+        let sel = &self.tool.select.sel;
+        if self.tool.kind != crate::tools::ToolKind::Select || !sel.strokes.is_empty() || sel.shapes.len() != 1 {
+            return None;
+        }
+        let c = self.canvases.active();
+        let i = sel.shapes[0];
+        let picture = matches!(
+            c.layers.get(c.active_layer)?.shapes.get(i)?,
+            Shape::Raster { kind: crate::canvas::shape::RasterKind::Image, .. }
+        );
+        picture.then_some((self.canvases.active_index(), c.active_layer, i))
+    }
+
+    /// Show the selected picture's colours in the arrange bar, or hide
+    /// them. A video or GIF gives the colours of the frame it shows.
+    fn toggle_picture_colours(&mut self) {
+        let Some(at) = self.selected_picture() else { return };
+        if self.picture_colours.as_ref().is_some_and(|p| p.at == at) {
+            self.picture_colours = None;
+            return;
+        }
+        let c = self.canvases.active();
+        let Some(Shape::Raster { png, media, .. }) = c.layers.get(at.1).and_then(|l| l.shapes.get(at.2)) else { return };
+        let frame = media.as_ref().and_then(|m| self.media.current_frames().get(&m.id).cloned());
+        let img = match frame {
+            Some(f) => {
+                let bytes: Vec<u8> = f.pixels.iter().flat_map(|p| p.to_srgba_unmultiplied()).collect();
+                image::RgbaImage::from_raw(f.size[0] as u32, f.size[1] as u32, bytes)
+            }
+            None => image::load_from_memory(png).ok().map(|i| i.to_rgba8()),
+        };
+        let Some(img) = img else {
+            self.toast = Some(("Couldn't read this picture's colours".to_string(), Instant::now()));
+            return;
+        };
+        let k = self.config.palette.len().max(1);
+        let colours = crate::tools::picture_colours::picture_colours(&img, k);
+        self.picture_colours = Some(PictureColours { at, colours });
+    }
+
+    /// The picture's colours become the toolbar's palette, the same
+    /// number of swatches as before (so the colour keys keep their
+    /// places); the old palette can come back with "Restore palette".
+    fn keep_picture_colours(&mut self) {
+        let Some(p) = &self.picture_colours else { return };
+        if p.colours.is_empty() { return; }
+        // Fewer colours than swatches: the rest keep what they had.
+        let new: Vec<[u8; 4]> = if self.config.palette.is_empty() {
+            p.colours.clone()
+        } else {
+            self.config.palette.iter().enumerate().map(|(i, old)| p.colours.get(i).copied().unwrap_or(*old)).collect()
+        };
+        let before = std::mem::replace(&mut self.config.palette, new);
+        if self.palette_before.is_none() {
+            self.palette_before = Some(before);
+        }
+        self.toast = Some(("These colours are the palette now".to_string(), Instant::now()));
+    }
+
+    fn restore_palette(&mut self) {
+        if let Some(before) = self.palette_before.take() {
+            self.config.palette = before;
+            self.toast = Some(("Palette restored".to_string(), Instant::now()));
+        }
+    }
+
+    /// The delete-slide key: ask first, unless the slide has nothing on
+    /// it to lose.
+    fn request_slide_delete(&mut self) {
+        let idx = self.canvases.active_index();
+        let empty = self.canvases.slide(idx).is_some_and(|c| {
+            c.layers.iter().all(|l| l.strokes.is_empty() && l.shapes.is_empty() && l.image.is_none())
+        });
+        if empty {
+            self.delete_slide(idx);
+        } else {
+            self.confirm_delete = Some(idx);
+        }
+    }
+
+    /// Delete slide `idx` (the only slide is emptied instead).
+    fn delete_slide(&mut self, idx: usize) {
+        if idx >= self.canvases.count() { return; }
+        if self.canvases.active_index() != idx {
+            self.canvases.go_to(idx);
+        }
+        let before = self.canvases.count();
+        self.canvases.delete_active();
+        self.view_glide = None;
+        self.peek = None;
+        // The slide window follows its slide to its new number, or
+        // closes with it.
+        if self.canvases.count() < before && self.slide_window.as_mut().is_some_and(|w| !w.slide_removed(idx)) {
+            self.slide_window = None;
+        }
+    }
+
+    /// "Delete this slide?", while one is waiting on it. Enter (or the
+    /// delete key again) deletes, Esc keeps it.
+    fn show_delete_confirm(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.confirm_delete else { return };
+        if idx >= self.canvases.count() {
+            self.confirm_delete = None;
+            return;
+        }
+        let only = self.canvases.count() == 1;
+        let name = self.canvases.name(idx);
+        let which = if name.is_empty() { format!("Slide {}", idx + 1) } else { format!("Slide {} \u{201c}{name}\u{201d}", idx + 1) };
+        let holds = match self.canvases.slide(idx) {
+            Some(c) => {
+                let objects: usize = c.layers.iter().map(|l| l.strokes.len() + l.shapes.len() + usize::from(l.image.is_some())).sum();
+                let pictures: usize = c
+                    .layers
+                    .iter()
+                    .map(|l| {
+                        usize::from(l.image.is_some())
+                            + l.shapes.iter().filter(|s| matches!(s, Shape::Raster { kind: crate::canvas::shape::RasterKind::Image, .. })).count()
+                    })
+                    .sum();
+                let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+                match pictures {
+                    0 => format!("It holds {}.", plural(objects, "object", "objects")),
+                    p => format!("It holds {}, {} of them {}.", plural(objects, "object", "objects"), p, if p == 1 { "a picture" } else { "pictures" }),
+                }
+            }
+            None => "It is still opening.".to_string(),
+        };
+        let mut decision: Option<bool> = None;
+        let delete_key = self.hotkeys_cfg.canvas.delete_canvas;
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                decision = Some(false);
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                || delete_key.is_some_and(|b| i.consume_shortcut(&egui::KeyboardShortcut::new(b.to_modifiers(), b.key)))
+            {
+                decision = Some(true);
+            }
+        });
+        egui::Window::new(if only { "Empty this slide?" } else { "Delete this slide?" })
+            .id(egui::Id::new("osn_delete_slide"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_max_width(340.0);
+                ui.label(format!("{which}. {holds}"));
+                let after = if only {
+                    "It is the only slide, so it is emptied instead. This can't be undone."
+                } else {
+                    "This can't be undone."
+                };
+                ui.label(egui::RichText::new(after).small().color(ui::theme::TEXT_MUTED));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let label = egui::RichText::new(if only { "Empty slide" } else { "Delete slide" }).color(egui::Color32::WHITE);
+                    if ui.add(egui::Button::new(label).fill(egui::Color32::from_rgb(190, 52, 52))).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Keep it").clicked() {
+                        decision = Some(false);
+                    }
+                });
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new("Enter deletes · Esc keeps it").small().color(ui::theme::TEXT_MUTED));
+            });
+        match decision {
+            Some(true) => {
+                self.confirm_delete = None;
+                self.delete_slide(idx);
+            }
+            Some(false) => self.confirm_delete = None,
+            None => {}
+        }
+    }
+
     /// Give the selection one width or height, as one undo step.
     fn match_selection_size(&mut self, m: crate::tools::arrange::Match) {
         let c = self.canvases.active();
@@ -1402,6 +1804,24 @@ impl OnScreenNotesApp {
                 if selecting && self.may_edit() {
                     self.nudge_selection(px, ctx.pixels_per_point());
                 }
+            }
+            K::ZoomToFit => self.zoom_to_fit(ctx),
+            K::ZoomToSelection => self.zoom_to_selection(ctx),
+            K::Flip(vertical) => {
+                if selecting {
+                    self.flip_selection(vertical);
+                }
+            }
+            K::PictureColours => {
+                if selecting {
+                    self.toggle_picture_colours();
+                }
+            }
+            K::TextBox => {
+                self.tool.text_box = !self.tool.text_box;
+                self.apply_text_box_to_selection();
+                let msg = if self.tool.text_box { "Text in a box: on" } else { "Text in a box: off" };
+                say(self, msg.to_string());
             }
         }
     }
@@ -1761,6 +2181,7 @@ impl OnScreenNotesApp {
             media: None,
             picture: None,
             pin: 0,
+            flip: false,
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
@@ -2003,6 +2424,7 @@ impl OnScreenNotesApp {
             media: imported.media.map(Box::new),
             picture: None,
             pin: 0,
+            flip: false,
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
     }
@@ -2600,6 +3022,10 @@ impl eframe::App for OnScreenNotesApp {
             }
         }
 
+        // ---- Zoom to fit / selection: glide and peek ----------------------
+        self.update_peek(ctx);
+        self.step_view_glide(ctx);
+
         // ---- Space-hold pan check ---------------------------------------
         // We treat Space as a *modal* pan key: while it is held, all pen +
         // mouse drags pan the active canvas instead of drawing. This is the
@@ -2633,6 +3059,8 @@ impl eframe::App for OnScreenNotesApp {
                 }
             }
             let (prev_color, prev_size) = (self.tool.color, self.tool.size);
+            let prev_text_box = self.tool.text_box;
+            let text_selected = !self.selected_text().is_empty();
             let mut insert_media = false;
             let mut select_filtered = false;
             let media_counts = ui::media_filter::counts(self.canvases.active());
@@ -2655,12 +3083,16 @@ impl eframe::App for OnScreenNotesApp {
                     media_counts,
                     &mut select_filtered,
                     has_pins.then_some(&mut pins_hidden),
+                    text_selected,
                     &self.hotkeys_cfg,
                 )
             } else {
                 false
             };
             self.set_pins_hidden(pins_hidden);
+            if self.tool.text_box != prev_text_box {
+                self.apply_text_box_to_selection();
+            }
             // Recently-used slide history: the active slide counts as
             // visited, and letting go of Ctrl ends a Ctrl+Tab walk.
             if !ctx.input(|i| interaction::slide_walk_held(i.modifiers, &self.hotkeys_cfg)) {
@@ -2684,20 +3116,40 @@ impl eframe::App for OnScreenNotesApp {
             // for a single object); hidden mid-gesture so it doesn't
             // flicker over a drag. A selected pin gets its own bar there.
             let selected_count = self.tool.select.sel.strokes.len() + self.tool.select.sel.shapes.len();
+            // A picture's colours belong to that picture: another
+            // selection puts them away.
+            let picture = self.selected_picture();
+            if self.picture_colours.as_ref().is_some_and(|p| Some(p.at) != picture) {
+                self.picture_colours = None;
+            }
+            let mut use_colour = None;
             if self.ui_visible
                 && self.tool.kind == crate::tools::ToolKind::Select
                 && selected_count >= 1
                 && self.tool.select.gesture.is_none()
             {
+                use ui::arrange_bar::BarAction;
                 let pinned = self.selection_pinned();
                 let open_move = std::mem::take(&mut self.move_picker_pending);
                 let keys = &self.hotkeys_cfg;
-                match ui::arrange_bar::show(ctx, selected_count, pinned, &self.canvases, &mut self.config.arrange_apart, keys, open_move) {
-                    Some(ui::arrange_bar::BarAction::Arrange(op)) => self.arrange_selection(op),
-                    Some(ui::arrange_bar::BarAction::Match(m)) => self.match_selection_size(m),
-                    Some(ui::arrange_bar::BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
-                    Some(ui::arrange_bar::BarAction::MoveToSlide(to)) => self.move_selection_to(to),
-                    Some(ui::arrange_bar::BarAction::TogglePin) => self.toggle_pin_selection(),
+                let row = picture.map(|_| ui::arrange_bar::ColourRow {
+                    shown: self.picture_colours.as_ref().map(|p| p.colours.as_slice()),
+                    can_restore: self.palette_before.is_some(),
+                });
+                match ui::arrange_bar::show(ctx, selected_count, pinned, &self.canvases, &mut self.config.arrange_apart, keys, open_move, row) {
+                    Some(BarAction::Arrange(op)) => self.arrange_selection(op),
+                    Some(BarAction::Match(m)) => self.match_selection_size(m),
+                    Some(BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
+                    Some(BarAction::MoveToSlide(to)) => self.move_selection_to(to),
+                    Some(BarAction::TogglePin) => self.toggle_pin_selection(),
+                    Some(BarAction::Flip(vertical)) => self.flip_selection(vertical),
+                    Some(BarAction::ZoomToSelection) => self.zoom_to_selection(ctx),
+                    Some(BarAction::PictureColours) => self.toggle_picture_colours(),
+                    // Set after the restyle below, so the picture is
+                    // not "recoloured" into an empty undo step.
+                    Some(BarAction::UseColour(c)) => use_colour = Some(c),
+                    Some(BarAction::KeepColours) => self.keep_picture_colours(),
+                    Some(BarAction::RestorePalette) => self.restore_palette(),
                     None => {}
                 }
             }
@@ -2708,6 +3160,10 @@ impl eframe::App for OnScreenNotesApp {
             // A colour or size picked in the toolbar while objects are
             // selected restyles those objects.
             self.restyle_selection(prev_color, prev_size);
+            if let Some(c) = use_colour {
+                self.tool.color = c;
+                self.toast = Some((format!("Drawing colour #{:02X}{:02X}{:02X}", c[0], c[1], c[2]), Instant::now()));
+            }
             // If the user switched smoothing levels via the toolbar, push
             // the new value through the input filter, the tool's pass
             // budget, and rebuild every stroke cache so existing strokes
@@ -2797,6 +3253,7 @@ impl eframe::App for OnScreenNotesApp {
                 self.media_ui.show(ctx, &self.media, &media_objs, media_selected, canvas_rect, show_media_bars);
             self.media_ui.ffmpeg_window(ctx, self.osn_hwnd, &mut media_out);
             self.apply_media_out(media_out);
+            self.show_delete_confirm(ctx);
 
             // ---- Screenshot region selection --------------------------------
             // Draws the dimmed rubber-band over the canvas and, on release,
@@ -3450,6 +3907,8 @@ impl eframe::App for OnScreenNotesApp {
             let mut rename_slide = false;
             // Ctrl+R (lock or unlock it), likewise.
             let mut toggle_lock = false;
+            // Ctrl+Shift+Backspace (delete it, once confirmed), likewise.
+            let mut delete_slide = false;
             // Keys bound to buttons (`interaction::action_keys`), likewise.
             let mut key_actions: Vec<interaction::action_keys::KeyAction> = Vec::new();
             // With objects selected a nudge key moves them and does
@@ -3468,7 +3927,8 @@ impl eframe::App for OnScreenNotesApp {
                 // takes raw bools (not Modifiers).
                 let ctrl  = mods.ctrl || mods.command;
                 let shift = mods.shift;
-                if text_consumed {
+                // "Delete this slide?" takes the keys while it is up.
+                if text_consumed || self.confirm_delete.is_some() {
                     // Still allow scroll-wheel events (handled below
                     // outside this for-loop) but drop key events.
                     // Falling through to the wheel block below means
@@ -3602,18 +4062,8 @@ impl eframe::App for OnScreenNotesApp {
                         if let Some(b) = keys.canvas.clear_layer {
                             if b.matches(*key, mods) { self.canvases.active_mut().clear(); }
                         }
-                        if let Some(b) = keys.canvas.delete_canvas {
-                            if b.matches(*key, mods) {
-                                let (gone, before) = (self.canvases.active_index(), self.canvases.count());
-                                self.canvases.delete_active();
-                                // The slide window follows its slide to
-                                // its new number, or closes with it.
-                                if self.canvases.count() < before
-                                    && self.slide_window.as_mut().is_some_and(|w| !w.slide_removed(gone))
-                                {
-                                    self.slide_window = None;
-                                }
-                            }
+                        if keys.canvas.delete_canvas.is_some_and(|b| b.matches(*key, mods)) {
+                            delete_slide = true;
                         }
                         // Layer opacity: 1..9 set absolute N·10 %,
                         // 0 sets 0 %. `-` / `=` step ±10 %. All
@@ -3770,6 +4220,9 @@ impl eframe::App for OnScreenNotesApp {
             }
             for action in key_actions {
                 self.apply_key_action(action, ctx);
+            }
+            if delete_slide {
+                self.request_slide_delete();
             }
             if toggle_lock {
                 self.toggle_lock();

@@ -1317,6 +1317,7 @@ mod media_cleanup_tests {
             })),
             picture: None,
             pin: 0,
+            flip: false,
         }
     }
 
@@ -1943,6 +1944,7 @@ mod pin_tests {
         c.layers[0].shapes.push(Shape::Raster {
             pos: [0.0, 0.0], size: [20.0, 20.0], png: std::sync::Arc::new(png.into_inner()), px_size: [4, 4],
             color: [0; 4], rotation: 0.0, kind: RasterKind::Image, media: None, picture: None, pin: 0,
+            flip: false,
         });
         c.layers[0].opacity = 0.25;
         let mut m = CanvasManager::for_tests(vec![c]);

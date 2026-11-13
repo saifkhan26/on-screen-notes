@@ -14,6 +14,7 @@ pub mod arrow_tool;
 pub mod eraser_tool;
 pub mod lasso_tool;
 pub mod pen_tool;
+pub mod picture_colours;
 pub mod select_tool;
 pub mod shape_tool;
 
@@ -167,6 +168,10 @@ pub struct ActiveTool {
     /// is `Solid`, and any previously-committed dashed shape carries
     /// its own `border` field independently.
     pub border_style: BorderStyle,
+    /// Text labels go in a box (`Shape::Text::background`), in a colour
+    /// that keeps them readable. The toolbar's toggle beside the Text
+    /// tool; for the labels placed from now on.
+    pub text_box: bool,
     /// Active text-tool caret buffer, if any. Created when the user
     /// activates the Text tool (and either clicks or presses `T`),
     /// mutated by keyboard input in `interaction::route_text_input`,
@@ -225,6 +230,7 @@ impl ActiveTool {
             position_passes: cfg.smoothing_level.position_passes(),
             laser_strokes:   Vec::new(),
             border_style:    BorderStyle::Solid,
+            text_box:        false,
             in_progress_text: None,
             eyedropper_pending: false,
             pending_fill_at: None,
@@ -475,6 +481,7 @@ impl ActiveTool {
                             color: prev.color,
                             rotation: 0.0,
                             pin: 0,
+                            background: self.text_box.then(|| crate::canvas::shape::auto_text_box(prev.color)),
                         });
                     }
                 }

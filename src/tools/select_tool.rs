@@ -608,6 +608,7 @@ mod tests {
             rotation: 0.0, kind: RasterKind::Image, media: None,
             picture: None,
             pin: 0,
+            flip: false,
         }
     }
 
@@ -824,6 +825,7 @@ mod tests {
         c.layers[0].shapes.push(Shape::Text {
             pos: [0.0, 50.0], content: "hi".into(), font_size: 20.0, color: [0; 4], rotation: 0.0,
             pin: 0,
+            background: None,
         });
         let mut t = tool(&c);
         t.sel = Selection { strokes: vec![0], shapes: vec![0] };

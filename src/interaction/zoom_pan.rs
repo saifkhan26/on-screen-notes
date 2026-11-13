@@ -137,6 +137,88 @@ fn zoom_about_cursor(pan: &mut [f32; 2], zoom: &mut f32, raw_delta_y: f32, curso
     pan[1] = cursor_screen[1] - cy * z_new;
 }
 
+/// Most a zoom to fit enlarges the whole slide: a slide holding one
+/// small note should not fill the screen with it.
+pub const FIT_MAX_ZOOM: f32 = 4.0;
+/// Most a zoom to the selection enlarges: one handwritten word comes up
+/// to read comfortably, not to a blur.
+pub const FIT_SELECTION_MAX_ZOOM: f32 = 8.0;
+
+/// The view (`pan`, `zoom`) that shows the canvas box `[x0, y0, x1, y1]`
+/// whole and centred in `area` — `[x, y, width, height]` in the same
+/// screen space as `pan` (relative to the canvas origin) — zoomed in no
+/// further than `max_zoom`.
+pub fn fit_view([x0, y0, x1, y1]: [f32; 4], area: [f32; 4], max_zoom: f32) -> ([f32; 2], f32) {
+    let (w, h) = ((x1 - x0).max(1e-3), (y1 - y0).max(1e-3));
+    let (aw, ah) = (area[2].max(1.0), area[3].max(1.0));
+    let zoom = (aw / w).min(ah / h).min(max_zoom).clamp(MIN_ZOOM, MAX_ZOOM);
+    let centre = [area[0] + aw * 0.5, area[1] + ah * 0.5];
+    let pan = [centre[0] - (x0 + x1) * 0.5 * zoom, centre[1] - (y0 + y1) * 0.5 * zoom];
+    (pan, zoom)
+}
+
+/// A view gliding to a new pan and zoom over a few frames (zoom to fit,
+/// zoom to the selection), so the eye can follow where it went.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewGlide {
+    /// Slide it belongs to: going to another slide ends it.
+    pub slide: usize,
+    from: ([f32; 2], f32),
+    to: ([f32; 2], f32),
+    /// Screen point (relative to the canvas origin) the glide is
+    /// measured about: the middle of the area being fitted.
+    about: [f32; 2],
+    start: std::time::Instant,
+    /// The view this glide last set. Anything else found there means the
+    /// user panned or zoomed meanwhile, which ends the glide.
+    last: ([f32; 2], f32),
+}
+
+/// How long a glide takes.
+const GLIDE: std::time::Duration = std::time::Duration::from_millis(240);
+
+impl ViewGlide {
+    pub fn new(slide: usize, from: ([f32; 2], f32), to: ([f32; 2], f32), about: [f32; 2]) -> Self {
+        ViewGlide { slide, from, to, about, start: std::time::Instant::now(), last: from }
+    }
+
+    /// Move the view one frame along. Returns `false` once the glide is
+    /// over — arrived, or given up because the view was changed by
+    /// something else — and the caller should drop it.
+    pub fn step(&mut self, pan: &mut [f32; 2], zoom: &mut f32, now: std::time::Instant) -> bool {
+        if *pan != self.last.0 || *zoom != self.last.1 {
+            return false;
+        }
+        let t = (now.saturating_duration_since(self.start).as_secs_f32() / GLIDE.as_secs_f32()).min(1.0);
+        let (p, z) = glide_view(self.from, self.to, self.about, ease_out(t));
+        *pan = p;
+        *zoom = z;
+        self.last = (p, z);
+        t < 1.0
+    }
+}
+
+/// Fast at first, settling gently.
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// The view `k` (0..1) of the way from `from` to `to`. Zoom moves
+/// evenly in scale (halving and doubling take the same time), and the
+/// canvas point under `about` slides straight from where it was to
+/// where it ends up, so the view neither swings away nor overshoots.
+fn glide_view(from: ([f32; 2], f32), to: ([f32; 2], f32), about: [f32; 2], k: f32) -> ([f32; 2], f32) {
+    if k >= 1.0 {
+        return to;
+    }
+    let (z0, z1) = (from.1.max(MIN_ZOOM), to.1.max(MIN_ZOOM));
+    let z = (z0.ln() + (z1.ln() - z0.ln()) * k).exp();
+    let q0 = [(about[0] - from.0[0]) / z0, (about[1] - from.0[1]) / z0];
+    let q1 = [(about[0] - to.0[0]) / z1, (about[1] - to.0[1]) / z1];
+    let q = [q0[0] + (q1[0] - q0[0]) * k, q0[1] + (q1[1] - q0[1]) * k];
+    ([about[0] - q[0] * z, about[1] - q[1] * z], z)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +299,56 @@ mod tests {
         wheel(5, 1.0, &mut canvas);
         let after = [(100.0 - canvas.pan[0]) / canvas.zoom, (100.0 - canvas.pan[1]) / canvas.zoom];
         assert!((under[0] - after[0]).abs() < 1e-2 * under[0].abs().max(1.0), "{under:?} vs {after:?}");
+    }
+
+    fn on_screen(view: ([f32; 2], f32), p: [f32; 2]) -> [f32; 2] {
+        [view.0[0] + p[0] * view.1, view.0[1] + p[1] * view.1]
+    }
+
+    #[test]
+    fn fitting_shows_the_box_whole_and_centred_in_the_area() {
+        // A wide box in a squarish area: width decides the zoom.
+        let area = [20.0, 60.0, 400.0, 300.0];
+        let view = fit_view([100.0, 100.0, 900.0, 300.0], area, 100.0);
+        assert!((view.1 - 0.5).abs() < 1e-6);
+        let (a, b) = (on_screen(view, [100.0, 100.0]), on_screen(view, [900.0, 300.0]));
+        assert!((a[0] - 20.0).abs() < 1e-3 && (b[0] - 420.0).abs() < 1e-3, "edge to edge across: {a:?} {b:?}");
+        let mid = (a[1] + b[1]) * 0.5;
+        assert!((mid - 210.0).abs() < 1e-3, "centred down: {mid}");
+        // A tiny box stops at the zoom limit, still centred.
+        let view = fit_view([0.0, 0.0, 2.0, 2.0], area, FIT_MAX_ZOOM);
+        assert_eq!(view.1, FIT_MAX_ZOOM);
+        let c = on_screen(view, [1.0, 1.0]);
+        assert!((c[0] - 220.0).abs() < 1e-3 && (c[1] - 210.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_glide_starts_where_it_was_ends_where_it_goes_and_zooms_evenly() {
+        let from = ([0.0, 0.0], 1.0);
+        let to = ([-300.0, 50.0], 4.0);
+        let about = [200.0, 150.0];
+        assert_eq!(glide_view(from, to, about, 0.0), from);
+        assert_eq!(glide_view(from, to, about, 1.0), to);
+        // Halfway in time is halfway in scale: 2×, not 2.5×.
+        assert!((glide_view(from, to, about, 0.5).1 - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_glide_gives_way_to_the_user() {
+        let start = std::time::Instant::now();
+        let mut g = ViewGlide::new(0, ([0.0, 0.0], 1.0), ([10.0, 10.0], 2.0), [100.0, 100.0]);
+        let (mut pan, mut zoom) = ([0.0, 0.0], 1.0);
+        assert!(g.step(&mut pan, &mut zoom, start + std::time::Duration::from_millis(60)));
+        assert!(zoom > 1.0 && zoom < 2.0);
+        // The wheel moved the view: the glide stops and leaves it be.
+        zoom *= 1.1;
+        let mine = (pan, zoom);
+        assert!(!g.step(&mut pan, &mut zoom, start + std::time::Duration::from_millis(120)));
+        assert_eq!((pan, zoom), mine);
+        // Left alone, one runs to its end.
+        let mut g = ViewGlide::new(0, ([0.0, 0.0], 1.0), ([10.0, 10.0], 2.0), [100.0, 100.0]);
+        let (mut pan, mut zoom) = ([0.0, 0.0], 1.0);
+        assert!(!g.step(&mut pan, &mut zoom, start + std::time::Duration::from_secs(1)));
+        assert_eq!((pan, zoom), ([10.0, 10.0], 2.0));
     }
 }

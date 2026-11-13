@@ -213,5 +213,6 @@ pub fn flood_fill_active(
         media: None,
         picture: None,
         pin: 0,
+        flip: false,
     })
 }

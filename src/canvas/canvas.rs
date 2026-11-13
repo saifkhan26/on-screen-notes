@@ -1010,6 +1010,25 @@ impl Canvas {
         self.edit_objects(li, &strokes, &shapes, |_, s| s.pin = id, |_, s| s.set_pin(id))
     }
 
+    /// Put the chosen text labels in a box that keeps them readable
+    /// (`shape::auto_text_box`), or take them out of any box. One undo
+    /// step; other shapes, and labels already so, are left out of it.
+    /// Returns false when nothing changed.
+    pub fn set_text_box(&mut self, li: usize, shapes: &[usize], on: bool) -> bool {
+        let Some(layer) = self.layers.get(li) else { return false };
+        let shapes: Vec<usize> = shapes
+            .iter()
+            .copied()
+            .filter(|&i| matches!(layer.shapes.get(i), Some(Shape::Text { background, .. }) if background.is_some() != on))
+            .collect();
+        let boxed = |_: usize, s: &mut Shape| {
+            if let Shape::Text { background, color, .. } = s {
+                *background = on.then(|| crate::canvas::shape::auto_text_box(*color));
+            }
+        };
+        self.edit_objects(li, &[], &shapes, |_, _| {}, boxed)
+    }
+
     /// Recolour and / or re-width the chosen objects.
     ///
     /// `merge_into_last` folds this change into the undo entry on top of
@@ -1431,6 +1450,7 @@ fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
         media: None,
         picture: None,
         pin: 0,
+        flip: false,
     });
     layer.rev += 1;
     Some(img.capture_zoom)
@@ -1712,6 +1732,7 @@ fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutco
         picture: None,
         // What is left of a pinned fill stays in its pin.
         pin: shape.pin(),
+        flip: false,
     })
 }
 
@@ -1755,6 +1776,20 @@ mod layer_xform_tests {
 
     fn dot(c: &Canvas) -> [f32; 2] { c.layers[0].strokes[0].samples[0].pos }
     fn width(c: &Canvas) -> f32 { c.layers[0].strokes[0].base_width }
+
+    #[test]
+    fn boxing_labels_is_one_undo_step_and_skips_other_shapes() {
+        let mut c = Canvas::default();
+        c.add_shape(Shape::Text { pos: [0.0, 0.0], content: "a".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None });
+        c.add_shape(Shape::Rect { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border: crate::canvas::shape::BorderStyle::Solid, rotation: 0.0, pin: 0 });
+        let steps = c.undo_log.len();
+        assert!(c.set_text_box(0, &[0, 1], true));
+        assert_eq!(c.undo_log.len(), steps + 1);
+        assert!(matches!(c.layers[0].shapes[0], Shape::Text { background: Some(_), .. }));
+        assert!(!c.set_text_box(0, &[0, 1], true), "already boxed: nothing to do");
+        c.undo();
+        assert!(matches!(c.layers[0].shapes[0], Shape::Text { background: None, .. }));
+    }
 
     #[test]
     fn scale_about_pivot_pins_the_pivot_and_scales_width() {
@@ -1840,6 +1875,7 @@ mod object_edit_tests {
             color: [0; 4], rotation: 0.0, kind, media: None,
             picture: None,
             pin: 0,
+            flip: false,
         }
     }
 

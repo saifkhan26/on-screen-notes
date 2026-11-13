@@ -44,6 +44,16 @@ pub enum KeyAction {
     PinThisSlideOnly,
     /// Move the Select tool's selection by this many screen pixels.
     Nudge([f32; 2]),
+    /// Glide the view to show the whole slide.
+    ZoomToFit,
+    /// Glide the view to show the selection.
+    ZoomToSelection,
+    /// Mirror the selection left to right (`false`) or top to bottom.
+    Flip(bool),
+    /// Show the selected picture's colours.
+    PictureColours,
+    /// Text labels in a box, or not.
+    TextBox,
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -70,6 +80,9 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (a.match_shortest_height, KeyAction::Match(Match::ShortestHeight)),
         (a.match_tallest_height, KeyAction::Match(Match::TallestHeight)),
         (a.move_to_slide, KeyAction::MoveToSlide),
+        (a.flip_horizontal, KeyAction::Flip(false)),
+        (a.flip_vertical, KeyAction::Flip(true)),
+        (a.picture_colours, KeyAction::PictureColours),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));
     for (i, b) in t.colour.iter().enumerate() {
@@ -91,6 +104,9 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (t.background_up, KeyAction::Background(1)),
         (t.background_down, KeyAction::Background(-1)),
         (t.reset_background, KeyAction::ResetBackground),
+        (t.text_box, KeyAction::TextBox),
+        (c.zoom_to_fit, KeyAction::ZoomToFit),
+        (c.zoom_to_selection, KeyAction::ZoomToSelection),
         (c.new_slide, KeyAction::NewSlide),
         (c.toggle_slide_panel, KeyAction::ToggleSlidePanel),
         (c.toggle_slide_order, KeyAction::ToggleSlideOrder),
@@ -150,6 +166,15 @@ mod tests {
         assert_eq!(press(&keys, egui::Key::G, alt), vec![KeyAction::Highlight(MediaType::Gif)]);
         assert_eq!(press(&keys, egui::Key::OpenBracket, egui::Modifiers::NONE), vec![KeyAction::Size(-1)]);
         assert_eq!(press(&keys, egui::Key::ArrowDown, alt), vec![KeyAction::MoveLayer(-1)]);
+    }
+
+    #[test]
+    fn zoom_keys_are_bound_by_default() {
+        let keys = HotkeysConfig::default().parsed();
+        let ctrl = egui::Modifiers::CTRL;
+        assert_eq!(press(&keys, egui::Key::Num1, ctrl), vec![KeyAction::ZoomToFit]);
+        assert_eq!(press(&keys, egui::Key::Num2, ctrl), vec![KeyAction::ZoomToSelection]);
+        assert_eq!(press(&keys, egui::Key::Num1, egui::Modifiers::NONE), vec![], "1 alone is the opacity key");
     }
 
     #[test]

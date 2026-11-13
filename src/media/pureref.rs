@@ -11,7 +11,8 @@
 //! The layouts are reverse-engineered (FyorDev/PureRef-format and
 //! wolfexplode/obsidian-excalidraw-pureref). Only what is needed to place
 //! pictures and notes is read; groups only contribute their transforms,
-//! and drawings, opacity and note backgrounds are left out.
+//! and drawings and opacity are left out. A note's background becomes
+//! its label's box (`Shape::Text::background`).
 //!
 //! Boards can be gigabytes, so nothing holds the whole file: 1.x
 //! pictures are read one at a time from their byte ranges, and a 2.x
@@ -91,6 +92,9 @@ pub enum BoardItem {
         font_size: f64,
         color: [u8; 4],
         rotation: f64,
+        /// The note's box colour; `None` when it has none (or it is
+        /// fully clear).
+        background: Option<[u8; 4]>,
     },
 }
 
@@ -271,15 +275,17 @@ pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &s
                     media: media.map(Box::new),
                     picture: picture.map(Box::new),
                     pin: 0,
+                    flip: false,
                 }
             }
-            BoardItem::Note { text, pos, font_size, color, rotation } => Shape::Text {
+            BoardItem::Note { text, pos, font_size, color, rotation, background } => Shape::Text {
                 pos: map(pos),
                 content: text,
                 font_size: (font_size * s) as f32,
                 color,
                 rotation: rotation as f32,
                 pin: 0,
+                background,
             },
         })
         .collect();
@@ -406,6 +412,8 @@ struct RawNote {
     to_scene: Xf,
     font_px: f64,
     color: [u8; 4],
+    /// Box colour, if the note has a visible one.
+    background: Option<[u8; 4]>,
     /// 2.x places a note's centre at its origin, 1.x its top-left.
     centred: bool,
     /// Width the note's text wraps at, in note space, when it was given
@@ -776,7 +784,7 @@ fn read_v1_item(
             r.u32()?; // id
             let z = r.f64()?;
             let fg = r.qcolor()?;
-            r.qcolor()?; // background, not imported
+            let background = r.qcolor()?.filter(|c| c[3] > 0);
             let children = r.u32()?;
             let to_scene = item.then(parent);
             let mut order = parent_order.to_vec();
@@ -787,6 +795,7 @@ fn read_v1_item(
                     to_scene,
                     font_px: html_font_px(&text).unwrap_or(NOTE_FONT_PX),
                     color: html_color(&text).or(fg).unwrap_or(NOTE_COLOR),
+                    background,
                     centred: false,
                     width: None,
                     order: order.clone(),
@@ -1064,6 +1073,7 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
         let id_col = stmt.column_index("id")?;
         let text_col = stmt.column_index("text").ok();
         let color_col = stmt.column_index("text_color").ok();
+        let background_col = stmt.column_index("background_color").ok();
         let size_col = stmt.column_index("fixed_size").ok();
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -1091,6 +1101,7 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
                 to_scene,
                 font_px: html_font_px(&html).unwrap_or(NOTE_FONT_PX),
                 color: html_color(&html).or_else(|| hex_color(string(color_col).ok()?.trim())).unwrap_or(NOTE_COLOR),
+                background: string(background_col).ok().and_then(|s| hex_color(s.trim())).filter(|c| c[3] > 0),
                 centred: true,
                 width,
                 order: order_of(id),
@@ -1686,7 +1697,7 @@ fn place_note(n: &RawNote) -> Option<BoardItem> {
     if !(pos.iter().all(|v| v.is_finite()) && font_size > 0.0 && font_size.is_finite()) {
         return None;
     }
-    Some(BoardItem::Note { text, pos, font_size, color: n.color, rotation: u[1].atan2(u[0]) })
+    Some(BoardItem::Note { text, pos, font_size, color: n.color, rotation: u[1].atan2(u[0]), background: n.background })
 }
 
 /// Word-wrap `text` to lines about `width` note units long at
@@ -1849,7 +1860,7 @@ mod tests {
 
     fn note(item: &BoardItem) -> (&str, [f64; 2], f64, [u8; 4], f64) {
         match item {
-            BoardItem::Note { text, pos, font_size, color, rotation } => (text, *pos, *font_size, *color, *rotation),
+            BoardItem::Note { text, pos, font_size, color, rotation, .. } => (text, *pos, *font_size, *color, *rotation),
             BoardItem::Picture { .. } => panic!("expected a note"),
         }
     }
@@ -2204,6 +2215,8 @@ mod tests {
         assert_eq!(text, "Hi & bye\n\nline 3");
         assert!(close(font_size, 30.0));
         assert_eq!(color, [0, 255, 0, 255]);
+        // Its background (#AARRGGBB) becomes the label's box.
+        assert!(matches!(board.items[1], BoardItem::Note { background: Some([255, 255, 255, 0xd9]), .. }));
         // A 2.x note is centred on its origin.
         let [w, h] = text_extent(text, 30.0).map(f64::from);
         assert_close(pos, [-w / 2.0, -h / 2.0]);
