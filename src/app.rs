@@ -184,6 +184,9 @@ pub struct OnScreenNotesApp {
     /// LMB state on the previous frame — used to detect the rising
     /// edge of a click during pin-picking.
     pin_prev_lmb: bool,
+    /// The arrange bar's "Move to slide…" list opens next frame: its
+    /// key was pressed after the bar was drawn.
+    move_picker_pending: bool,
     /// Last rect applied via `ViewportCommand` so we can skip the
     /// re-emit when the target window hasn't moved.
     pinned_last_rect: Option<(i32, i32, i32, i32)>,
@@ -205,6 +208,10 @@ pub struct OnScreenNotesApp {
     /// tick is folded into that same undo entry — a slider drag is one
     /// Ctrl+Z, not hundreds.
     restyle_run: Option<(usize, usize)>,
+    /// `(canvas index, undo-log length, when)` right after the last
+    /// nudge, likewise: a nudge soon after it on the same objects joins
+    /// its undo entry, so a held arrow key is one Ctrl+Z.
+    nudge_run: Option<(usize, usize, Instant)>,
     /// Ctrl+V state on the previous frame, for edge detection — see
     /// `platform::paste_chord_down`.
     paste_chord_prev: bool,
@@ -559,11 +566,13 @@ impl OnScreenNotesApp {
             pinned_hwnd: None,
             pin_picking: false,
             pin_prev_lmb: false,
+            move_picker_pending: false,
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),
             obj_clipboard: (Vec::new(), Vec::new()),
             paste_count: 0,
             restyle_run: None,
+            nudge_run: None,
             paste_chord_prev: false,
             mouse_gesture: false,
             media: crate::media::MediaHub::new(),
@@ -1232,6 +1241,187 @@ impl OnScreenNotesApp {
         let (strokes, shapes) = crate::tools::arrange::plan_sizes(layer, &self.tool.select.sel, m, c.zoom);
         if !self.canvases.active_mut().transform_objects_each(li, &strokes, &shapes) {
             self.toast = Some(("Already that size".to_string(), std::time::Instant::now()));
+        }
+    }
+
+    /// The Open dialog for pictures, videos, GIFs and PureRef boards,
+    /// unless it is open already.
+    fn open_media_dialog(&mut self) {
+        if self.media_dialog.is_some() { return; }
+        let mut exts = vec!["gif"];
+        exts.extend_from_slice(crate::media::import::VIDEO_EXTS);
+        exts.extend_from_slice(crate::media::import::IMAGE_EXTS);
+        exts.push("pur");
+        self.media_dialog = Some(ui::media_controls::pick_files(
+            self.osn_hwnd,
+            "Insert picture, video, GIF or PureRef board",
+            &[("Pictures, videos, GIFs and PureRef boards", &exts), ("PureRef boards", &["pur"])],
+            true,
+        ));
+    }
+
+    /// Press the button a key is bound to (`interaction::action_keys`),
+    /// as a click on it would. The arrange bar's and the pin bar's keys
+    /// do something only while their bar would show.
+    fn apply_key_action(&mut self, action: interaction::action_keys::KeyAction, ctx: &egui::Context) {
+        use crate::tools::arrange::Arrange;
+        use interaction::action_keys::KeyAction as K;
+        let say = |app: &mut Self, msg: String| app.toast = Some((msg, Instant::now()));
+        let selecting = self.tool.kind == crate::tools::ToolKind::Select
+            && !self.tool.select.sel.is_empty()
+            && self.tool.select.gesture.is_none();
+        match action {
+            K::Arrange(op) => {
+                if selecting && self.may_edit() {
+                    self.arrange_selection(op);
+                }
+            }
+            K::Align(a) => {
+                if selecting && self.may_edit() {
+                    self.arrange_selection(if self.config.arrange_apart { Arrange::Slide(a) } else { Arrange::Align(a) });
+                }
+            }
+            K::Match(m) => {
+                if selecting && self.may_edit() {
+                    self.match_selection_size(m);
+                }
+            }
+            K::KeepApart => {
+                self.config.arrange_apart = !self.config.arrange_apart;
+                let msg = if self.config.arrange_apart {
+                    "Keep apart on: aligning slides objects until they touch"
+                } else {
+                    "Keep apart off: aligning lines objects up, even on top of each other"
+                };
+                say(self, msg.to_string());
+            }
+            K::MoveToSlide => {
+                if selecting {
+                    self.move_picker_pending = true;
+                }
+            }
+            K::Colour(i) => {
+                if let Some(&c) = self.config.palette.get(i) {
+                    let (color, size) = (self.tool.color, self.tool.size);
+                    self.tool.color = c;
+                    self.restyle_selection(color, size);
+                }
+            }
+            K::Size(n) => {
+                let (color, size) = (self.tool.color, self.tool.size);
+                interaction::zoom_pan::nudge_size(&mut self.tool, f32::from(n));
+                self.restyle_selection(color, size);
+            }
+            K::InsertMedia => self.open_media_dialog(),
+            K::Highlight(t) => {
+                let on = self.media_filter.flag(t);
+                *on = !*on;
+            }
+            K::SelectHighlighted => {
+                if self.may_edit() {
+                    self.select_media_matches();
+                }
+            }
+            K::PinToWindow => {
+                if self.pinned_hwnd.is_some() {
+                    self.pinned_hwnd = None;
+                } else if self.pin_picking {
+                    self.pin_picking = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+                } else {
+                    self.pin_picking = true;
+                }
+            }
+            K::Background(n) => {
+                self.config.bg_opacity = (self.config.bg_opacity + 0.1 * f32::from(n)).clamp(0.0, 1.0);
+            }
+            K::ResetBackground => self.config.bg_color = [0, 0, 0],
+            K::NewSlide => {
+                self.canvases.push_canvas(crate::canvas::canvas::Canvas::default());
+                say(self, format!("Slide {} added at the end", self.canvases.count()));
+            }
+            K::ToggleSlidePanel => {
+                self.config.slide_panel_open = !self.config.slide_panel_open;
+                if self.config.slide_panel_open {
+                    self.ui_visible = true;
+                }
+            }
+            K::ToggleSlideOrder => {
+                use crate::config::SlideTabOrder;
+                let recent = self.config.slide_tab_order == SlideTabOrder::RecentlyUsed;
+                self.config.slide_tab_order = if recent { SlideTabOrder::Sequential } else { SlideTabOrder::RecentlyUsed };
+                let msg = if recent { "Ctrl+Tab goes through slides in order" } else { "Ctrl+Tab goes to recently used slides" };
+                say(self, msg.to_string());
+            }
+            K::SlideWindow => {
+                if self.slide_window.is_some() {
+                    self.slide_window = None;
+                } else {
+                    self.slide_window = Some(ui::slide_window::SlideWindow::new(self.canvases.active_index(), &self.config));
+                }
+            }
+            K::NewLayer => {
+                if self.may_edit() {
+                    self.canvases.active_mut().add_layer();
+                }
+            }
+            K::DeleteLayer => {
+                if self.may_edit() {
+                    let c = self.canvases.active_mut();
+                    let (li, n) = (c.active_layer, c.layers.len());
+                    c.delete_layer(li);
+                    // Not undoable, as the layer panel's button is not:
+                    // say so, since an empty layer shows no change.
+                    let msg = if n > 1 { format!("Layer {} deleted", li + 1) } else { "The last layer stays".to_string() };
+                    say(self, msg);
+                }
+            }
+            K::MoveLayer(n) => {
+                if self.may_edit() {
+                    let c = self.canvases.active_mut();
+                    let li = c.active_layer;
+                    if let Some(to) = li.checked_add_signed(isize::from(n)).filter(|&to| to < c.layers.len()) {
+                        c.move_layer(li, to);
+                    }
+                }
+            }
+            K::PinGoToSlide => {
+                if let Some(id) = self.pin_tool.selected {
+                    let area = self.overlay_cache.canvas_rect(ctx).size();
+                    self.open_pin_slide(id, area);
+                }
+            }
+            K::PinThisSlideOnly => {
+                if let Some(id) = self.pin_tool.selected {
+                    if let Some(local) = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| p.pin.local) {
+                        self.set_pin_local(id, !local);
+                    }
+                }
+            }
+            K::Nudge(px) => {
+                if selecting && self.may_edit() {
+                    self.nudge_selection(px, ctx.pixels_per_point());
+                }
+            }
+        }
+    }
+
+    /// Move the selection `px` screen pixels: real ones, so a 1 px nudge
+    /// is the smallest step the screen shows, at any zoom. Nudges less
+    /// than a second apart on the same objects are one undo step.
+    fn nudge_selection(&mut self, px: [f32; 2], pixels_per_point: f32) {
+        const RUN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+        let idx = self.canvases.active_index();
+        let sel = self.tool.select.sel.clone();
+        let c = self.canvases.active_mut();
+        let li = c.active_layer;
+        let per_px = 1.0 / (c.zoom.max(1e-3) * pixels_per_point.max(1e-3));
+        let now = Instant::now();
+        let merge = self
+            .nudge_run
+            .is_some_and(|(i, len, at)| i == idx && len == c.undo_log.len() && now - at < RUN_GAP);
+        if c.nudge_objects(li, &sel.strokes, &sel.shapes, [px[0] * per_px, px[1] * per_px], merge) {
+            self.nudge_run = Some((idx, c.undo_log.len(), now));
         }
     }
 
@@ -2500,7 +2690,9 @@ impl eframe::App for OnScreenNotesApp {
                 && self.tool.select.gesture.is_none()
             {
                 let pinned = self.selection_pinned();
-                match ui::arrange_bar::show(ctx, selected_count, pinned, &self.canvases, &mut self.config.arrange_apart) {
+                let open_move = std::mem::take(&mut self.move_picker_pending);
+                let keys = &self.hotkeys_cfg;
+                match ui::arrange_bar::show(ctx, selected_count, pinned, &self.canvases, &mut self.config.arrange_apart, keys, open_move) {
                     Some(ui::arrange_bar::BarAction::Arrange(op)) => self.arrange_selection(op),
                     Some(ui::arrange_bar::BarAction::Match(m)) => self.match_selection_size(m),
                     Some(ui::arrange_bar::BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
@@ -2510,17 +2702,8 @@ impl eframe::App for OnScreenNotesApp {
                 }
             }
             self.show_pin_bar(ctx);
-            if insert_media && self.media_dialog.is_none() {
-                let mut exts = vec!["gif"];
-                exts.extend_from_slice(crate::media::import::VIDEO_EXTS);
-                exts.extend_from_slice(crate::media::import::IMAGE_EXTS);
-                exts.push("pur");
-                self.media_dialog = Some(ui::media_controls::pick_files(
-                    self.osn_hwnd,
-                    "Insert picture, video, GIF or PureRef board",
-                    &[("Pictures, videos, GIFs and PureRef boards", &exts), ("PureRef boards", &["pur"])],
-                    true,
-                ));
+            if insert_media {
+                self.open_media_dialog();
             }
             // A colour or size picked in the toolbar while objects are
             // selected restyles those objects.
@@ -3267,6 +3450,14 @@ impl eframe::App for OnScreenNotesApp {
             let mut rename_slide = false;
             // Ctrl+R (lock or unlock it), likewise.
             let mut toggle_lock = false;
+            // Keys bound to buttons (`interaction::action_keys`), likewise.
+            let mut key_actions: Vec<interaction::action_keys::KeyAction> = Vec::new();
+            // With objects selected a nudge key moves them and does
+            // nothing else, even when it is a slide or layer key too (the
+            // arrows are, by default).
+            let nudge_live = self.tool.kind == crate::tools::ToolKind::Select
+                && !self.tool.select.sel.is_empty()
+                && self.tool.select.gesture.is_none();
             // An edit key on a slide that takes no edits, to say why
             // nothing happened.
             let mut refused = false;
@@ -3330,6 +3521,8 @@ impl eframe::App for OnScreenNotesApp {
                                     media_keys.push(crate::media::Cmd::Step(-1));
                                 } else if hit(c.media_next_frame) {
                                     media_keys.push(crate::media::Cmd::Step(1));
+                                } else if hit(c.media_loop) {
+                                    media_keys.push(crate::media::Cmd::ToggleLoop);
                                 }
                             }
                         }
@@ -3338,6 +3531,12 @@ impl eframe::App for OnScreenNotesApp {
                     if let egui::Event::Key { key, pressed: true, .. } = ev {
                         // Tool switch shortcuts.
                         interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
+                        let collected = key_actions.len();
+                        interaction::action_keys::collect(*key, mods, keys, &mut key_actions);
+                        let nudged = nudge_live
+                            && key_actions[collected..]
+                                .iter()
+                                .any(|a| matches!(a, interaction::action_keys::KeyAction::Nudge(_)));
                         // Every key passes through here: only an edit may
                         // flag the slide for the autosave. Checked per key:
                         // the one before may have gone to another slide.
@@ -3347,9 +3546,11 @@ impl eframe::App for OnScreenNotesApp {
                         }
                         // Canvas + layer navigation. A slide's active layer is
                         // part of it, so it stays put on a locked slide.
-                        interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys, self.config.slide_tab_order);
-                        if editable {
-                            interaction::react_layer_nav(*key, mods, &mut self.canvases, keys);
+                        if !nudged {
+                            interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys, self.config.slide_tab_order);
+                            if editable {
+                                interaction::react_layer_nav(*key, mods, &mut self.canvases, keys);
+                            }
                         }
                         // Toggle floating UI chrome.
                         if let Some(b) = keys.canvas.toggle_ui {
@@ -3385,15 +3586,17 @@ impl eframe::App for OnScreenNotesApp {
                         if let Some(b) = keys.canvas.undo {
                             if b.matches(*key, mods) {
                                 self.canvases.active_mut().undo();
-                                // The entry a size-slider run was being
-                                // folded into may be gone now.
+                                // The entry a size-slider run or a run of
+                                // nudges was being folded into may be gone now.
                                 self.restyle_run = None;
+                                self.nudge_run = None;
                             }
                         }
                         if let Some(b) = keys.canvas.redo {
                             if b.matches(*key, mods) {
                                 self.canvases.active_mut().redo();
                                 self.restyle_run = None;
+                                self.nudge_run = None;
                             }
                         }
                         if let Some(b) = keys.canvas.clear_layer {
@@ -3564,6 +3767,9 @@ impl eframe::App for OnScreenNotesApp {
                     }
                     self.apply_sel_action(action, canvas_rect, ppp);
                 }
+            }
+            for action in key_actions {
+                self.apply_key_action(action, ctx);
             }
             if toggle_lock {
                 self.toggle_lock();

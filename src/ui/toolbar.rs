@@ -73,7 +73,8 @@ pub fn show(
                     // Group 2: shape tools
                     interacted |= tool_btn(ui, tool, ToolKind::Rect,          "Rectangle — R");
                     interacted |= tool_btn(ui, tool, ToolKind::Ellipse,       "Ellipse — O");
-                    interacted |= tool_btn(ui, tool, ToolKind::Line,          "Line — straight line (toolbar only)");
+                    let line_tip = keys.tool.line.map_or_else(|| "Line — straight line".to_string(), |b| format!("Line — {}", b.label()));
+                    interacted |= tool_btn(ui, tool, ToolKind::Line,          &line_tip);
                     interacted |= tool_btn(ui, tool, ToolKind::Arrow,         "Arrow — A");
                     interacted |= tool_btn(ui, tool, ToolKind::FreehandArrow, "Freehand arrow — Shift+A");
                     // Contextual dashed-border toggle — visible only
@@ -581,7 +582,7 @@ fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
     });
     ui.add_space(6.0);
     ui.label(
-        egui::RichText::new("Keys can be changed in hotkeys.toml.")
+        egui::RichText::new("Keys can be changed in hotkeys.toml, where every button can be given one too.")
             .small()
             .color(theme::TEXT_MUTED),
     );
@@ -589,10 +590,94 @@ fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
 
 /// Every hotkey as bound (a rebound key shows its new combo, an unbound
 /// or unreadable one a dash) and the fixed mouse / modifier gestures.
+/// The buttons' own keys, unbound until set, are listed once they are.
 fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
+    let mut sections = fixed_help_sections(keys);
+    let (t, tb, a, c) = (&keys.tool, &keys.toolbar, &keys.arrange, &keys.canvas);
+    let bound = |rows: Vec<(&'static str, Option<Binding>)>| -> Vec<(&'static str, String)> {
+        rows.into_iter().filter_map(|(name, b)| b.map(|b| (name, b.label()))).collect()
+    };
+    let mut more = [
+        ("Toolbar buttons", bound(vec![
+            ("Dashed / solid border",    t.dashed_border),
+            ("Colour 1",                 tb.colour[0]),
+            ("Colour 2",                 tb.colour[1]),
+            ("Colour 3",                 tb.colour[2]),
+            ("Colour 4",                 tb.colour[3]),
+            ("Colour 5",                 tb.colour[4]),
+            ("Colour 6",                 tb.colour[5]),
+            ("Colour 7",                 tb.colour[6]),
+            ("Colour 8",                 tb.colour[7]),
+            ("Size up",                  tb.size_up),
+            ("Size down",                tb.size_down),
+            ("Insert picture / video / GIF", tb.insert_media),
+            ("Highlight pictures",       tb.highlight[0]),
+            ("Highlight GIFs",           tb.highlight[1]),
+            ("Highlight videos",         tb.highlight[2]),
+            ("Select the highlighted",   tb.select_highlighted),
+            ("Pin to a window / unpin",  tb.pin_to_window),
+            ("Background opacity up",    tb.background_up),
+            ("Background opacity down",  tb.background_down),
+            ("Black background",         tb.reset_background),
+        ])),
+        ("Arrange (2+ selected)", bound(vec![
+            ("Pack",                     a.pack),
+            ("Group by type",            a.group_by_type),
+            ("Keep apart on / off",      a.keep_apart),
+            ("Align left",               a.align_left),
+            ("Align centres across",     a.align_center_x),
+            ("Align right",              a.align_right),
+            ("Align top",                a.align_top),
+            ("Align centres down",       a.align_center_y),
+            ("Align bottom",             a.align_bottom),
+            ("Distribute across",        a.distribute_x),
+            ("Distribute down",          a.distribute_y),
+            ("Width of the narrowest",   a.match_narrowest_width),
+            ("Width of the widest",      a.match_widest_width),
+            ("Height of the shortest",   a.match_shortest_height),
+            ("Height of the tallest",    a.match_tallest_height),
+            ("Move to slide…",           a.move_to_slide),
+        ])),
+        ("Panels & pins", bound(vec![
+            ("New slide",                c.new_slide),
+            ("Fold / unfold slide panel", c.toggle_slide_panel),
+            ("Ctrl+Tab: in order / recent", c.toggle_slide_order),
+            ("Slide window open / close", c.slide_window),
+            ("New layer",                c.new_layer),
+            ("Delete layer (no undo)",   c.delete_layer),
+            ("Pin: go to its slide",     c.pin_go_to_slide),
+            ("Pin: this slide only / every slide", c.pin_this_slide_only),
+            ("Loop video / GIF",         c.media_loop),
+        ])),
+    ];
+    // Both layer moves on one row, when either is bound.
+    if c.move_layer_up.is_some() || c.move_layer_down.is_some() {
+        let label = |b: Option<Binding>| b.map_or_else(|| "—".to_owned(), |b| b.label());
+        more[2].1.push(("Move layer up / down", format!("{} / {}", label(c.move_layer_up), label(c.move_layer_down))));
+    }
+    sections.extend(more.into_iter().filter(|(_, rows)| !rows.is_empty()));
+    sections
+}
+
+/// `help_sections`' rows that always show.
+fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
     let k = |b: Option<Binding>| b.map_or_else(|| "—".to_owned(), |b| b.label());
     let k2 = |a: Option<Binding>, b: Option<Binding>| format!("{} / {}", k(a), k(b));
     let s = |text: &str| text.to_owned();
+    // One key per direction, a modifier they share said once:
+    // "Shift+← → ↑ ↓".
+    let k4 = |bs: [Option<Binding>; 4]| {
+        let mods = |b: Binding| (b.ctrl, b.shift, b.alt);
+        let bare = |b: Binding| Binding { ctrl: false, shift: false, alt: false, ..b }.label();
+        match bs {
+            [Some(first), ..] if bs.iter().all(|b| b.is_some_and(|b| mods(b) == mods(first))) => {
+                let full = first.label();
+                let prefix = &full[..full.len() - bare(first).len()];
+                format!("{prefix}{}", bs.map(|b| b.map_or_else(String::new, bare)).join(" "))
+            }
+            _ => bs.map(|b| k(b)).join(" "),
+        }
+    };
     let (t, c, g) = (&keys.tool, &keys.canvas, &keys.global);
     vec![
         ("Tools", vec![
@@ -606,7 +691,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Text",                        k(t.text)),
             ("Rectangle",                   k(t.rect)),
             ("Ellipse",                     k(t.ellipse)),
-            ("Line",                        s("toolbar only")),
+            ("Line",                        t.line.map_or_else(|| s("toolbar (or bind tool.line)"), |b| b.label())),
             ("Straight arrow",              k(t.arrow)),
             ("Freehand arrow",              k(t.freehand_arrow)),
             ("Lasso erase",                 k(t.lasso)),
@@ -626,6 +711,8 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Add / remove",                s("Shift+click")),
             ("Box select",                  s("drag on empty space")),
             ("Move / resize / rotate",      s("drag / handles / knob")),
+            ("Nudge 1 px",                  k4(c.nudge_1px)),
+            ("Nudge 10 px",                 k4(c.nudge_10px)),
             ("Rotate in 15° steps",         s("hold Shift")),
             ("Delete",                      format!("{} / Backspace", k(c.delete_selection))),
             ("Duplicate",                   k(c.duplicate)),

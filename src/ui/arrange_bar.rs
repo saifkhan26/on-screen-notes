@@ -7,11 +7,20 @@
 //! every slide.
 
 use crate::canvas::CanvasManager;
+use crate::input::hotkeys_config::{Binding, ParsedHotkeys};
 use crate::tools::arrange::{Align, Arrange, Match};
 use crate::ui::theme;
 use egui::{Color32, Rounding, Vec2};
 
 const BTN: f32 = 28.0;
+
+/// `tip`, followed by the keys that press the button when it has any.
+fn with_key(tip: &str, key: Option<Binding>) -> String {
+    match key {
+        Some(b) => format!("{tip} — {}", b.label()),
+        None => tip.to_string(),
+    }
+}
 
 /// What a click on the bar asks for.
 pub enum BarAction {
@@ -44,8 +53,18 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 /// one of them is in a pin; `slides` for the list "Move to slide" opens.
 /// `apart` is the "keep apart" switch: on, the align buttons slide
 /// objects until they touch rather than piling them up; the bar flips
-/// it when clicked. Returns what was clicked this frame, if anything.
-pub fn show(ctx: &egui::Context, count: usize, pinned: bool, slides: &CanvasManager, apart: &mut bool) -> Option<BarAction> {
+/// it when clicked. `keys` label the buttons' tooltips; `open_move`
+/// opens "Move to slide…" as its key asks. Returns what was clicked this
+/// frame, if anything.
+pub fn show(
+    ctx: &egui::Context,
+    count: usize,
+    pinned: bool,
+    slides: &CanvasManager,
+    apart: &mut bool,
+    keys: &ParsedHotkeys,
+    open_move: bool,
+) -> Option<BarAction> {
     let pos = bar_pos(ctx);
     let mut picked = None;
     egui::Area::new(egui::Id::new("osn_arrange_bar"))
@@ -59,23 +78,23 @@ pub fn show(ctx: &egui::Context, count: usize, pinned: bool, slides: &CanvasMana
                     ui.label(egui::RichText::new(format!("{count} selected")).small().color(theme::TEXT_MUTED));
                     ui.add_space(6.0);
                     if count >= 2 {
-                        arrange_buttons(ui, count, apart, &mut picked);
+                        arrange_buttons(ui, count, apart, keys, &mut picked);
                         divider(ui);
                     }
-                    if icon_btn(ui, egui::include_image!("../../assets/icons/copy-to-slide.svg"), true,
-                        "Copy to a new slide — Ctrl+Shift+D  (added after the last slide)")
-                    {
+                    let tip = with_key("Copy to a new slide (added after the last slide)", keys.canvas.copy_to_new_slide);
+                    if icon_btn(ui, egui::include_image!("../../assets/icons/copy-to-slide.svg"), true, &tip) {
                         picked = Some(BarAction::CopyToNewSlide);
                     }
-                    if let Some(to) = move_btn(ui, slides) {
+                    if let Some(to) = move_btn(ui, slides, keys.arrange.move_to_slide, open_move) {
                         picked = Some(BarAction::MoveToSlide(to));
                     }
                     let tip = if pinned {
-                        "Unpin — stop showing these as a pin — Ctrl+P"
+                        "Unpin — stop showing these as a pin"
                     } else {
-                        "Pin to every slide — the objects stay here, and a pin you can move and resize shows them on every slide; its bar can keep it to this slide — Ctrl+P"
+                        "Pin to every slide — the objects stay here, and a pin you can move and resize shows them on every slide; its bar can keep it to this slide"
                     };
-                    if toggle_btn(ui, egui::include_image!("../../assets/icons/pin.svg"), pinned, tip) {
+                    let tip = with_key(tip, keys.canvas.pin_selection);
+                    if toggle_btn(ui, egui::include_image!("../../assets/icons/pin.svg"), pinned, &tip) {
                         picked = Some(BarAction::TogglePin);
                     }
                 });
@@ -121,11 +140,15 @@ pub fn show_pin(ctx: &egui::Context, slide: usize, here: bool, local: bool) -> O
 }
 
 /// "Move to slide": a button opening the list of the other slides, drawn
-/// like the slide window's picker. The slide picked, if one was.
-fn move_btn(ui: &mut egui::Ui, slides: &CanvasManager) -> Option<usize> {
+/// like the slide window's picker; `key` presses it, and `open_now` is
+/// it pressed. The slide picked, if one was.
+fn move_btn(ui: &mut egui::Ui, slides: &CanvasManager, key: Option<Binding>, open_now: bool) -> Option<usize> {
     let popup = ui.make_persistent_id("osn_move_to_slide");
-    let open = ui.memory(|m| m.is_popup_open(popup));
     let others = slides.count() > 1;
+    if open_now && others {
+        ui.memory_mut(|m| m.open_popup(popup));
+    }
+    let open = ui.memory(|m| m.is_popup_open(popup));
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if open {
         theme::ACCENT
@@ -142,9 +165,9 @@ fn move_btn(ui: &mut egui::Ui, slides: &CanvasManager) -> Option<usize> {
         .fit_to_exact_size(icon.size())
         .paint_at(ui, icon);
     let tip = if others {
-        "Move to slide… — the objects leave this slide and land on the one you pick, where they show now"
+        with_key("Move to slide… — the objects leave this slide and land on the one you pick, where they show now", key)
     } else {
-        "Move to slide… — there is no other slide yet"
+        "Move to slide… — there is no other slide yet".to_string()
     };
     let response = response.on_hover_text(tip);
     if others && response.clicked() {
@@ -174,23 +197,24 @@ fn move_btn(ui: &mut egui::Ui, slides: &CanvasManager) -> Option<usize> {
 
 /// Pack, group, align, distribute and match sizes, for two or more
 /// objects.
-fn arrange_buttons(ui: &mut egui::Ui, count: usize, apart: &mut bool, picked: &mut Option<BarAction>) {
-    let mut btn = |ui: &mut egui::Ui, op: Arrange, img: egui::ImageSource<'static>, tip: &str| {
-        if icon_btn(ui, img, count >= op.min_items(), tip) {
+fn arrange_buttons(ui: &mut egui::Ui, count: usize, apart: &mut bool, keys: &ParsedHotkeys, picked: &mut Option<BarAction>) {
+    let k = &keys.arrange;
+    let mut btn = |ui: &mut egui::Ui, op: Arrange, img: egui::ImageSource<'static>, tip: &str, key: Option<Binding>| {
+        if icon_btn(ui, img, count >= op.min_items(), &with_key(tip, key)) {
             *picked = Some(BarAction::Arrange(op));
         }
     };
     btn(ui, Arrange::Pack, egui::include_image!("../../assets/icons/pack.svg"),
-        "Pack — fit the selection into a tight block, sizes kept");
+        "Pack — fit the selection into a tight block, sizes kept", k.pack);
     btn(ui, Arrange::GroupByType, egui::include_image!("../../assets/icons/group-by-type.svg"),
-        "Group by type — pictures, GIFs, videos and other objects each packed into their own cluster");
+        "Group by type — pictures, GIFs, videos and other objects each packed into their own cluster", k.group_by_type);
     divider(ui);
     let tip = if *apart {
         "Keep apart: on — aligning slides each object until it reaches the edge or bumps into another, so nothing ends up on top of anything. Click to let aligning pile objects up"
     } else {
         "Keep apart: off — aligning lines objects up exactly, even on top of each other. Click to have them slide until they touch instead"
     };
-    if toggle_btn(ui, egui::include_image!("../../assets/icons/keep-apart.svg"), *apart, tip) {
+    if toggle_btn(ui, egui::include_image!("../../assets/icons/keep-apart.svg"), *apart, &with_key(tip, k.keep_apart)) {
         *apart = !*apart;
     }
     let align = |a: Align| if *apart { Arrange::Slide(a) } else { Arrange::Align(a) };
@@ -199,31 +223,31 @@ fn arrange_buttons(ui: &mut egui::Ui, count: usize, apart: &mut bool, picked: &m
     } else {
         ("line up edges", "line up centres")
     };
-    btn(ui, align(Align::Left), egui::include_image!("../../assets/icons/align-left.svg"), &format!("Align left — {edge}"));
-    btn(ui, align(Align::CenterX), egui::include_image!("../../assets/icons/align-center-x.svg"), &format!("Align centres horizontally — {middle}"));
-    btn(ui, align(Align::Right), egui::include_image!("../../assets/icons/align-right.svg"), &format!("Align right — {edge}"));
-    btn(ui, align(Align::Top), egui::include_image!("../../assets/icons/align-top.svg"), &format!("Align top — {edge}"));
-    btn(ui, align(Align::CenterY), egui::include_image!("../../assets/icons/align-center-y.svg"), &format!("Align centres vertically — {middle}"));
-    btn(ui, align(Align::Bottom), egui::include_image!("../../assets/icons/align-bottom.svg"), &format!("Align bottom — {edge}"));
+    btn(ui, align(Align::Left), egui::include_image!("../../assets/icons/align-left.svg"), &format!("Align left — {edge}"), k.align_left);
+    btn(ui, align(Align::CenterX), egui::include_image!("../../assets/icons/align-center-x.svg"), &format!("Align centres horizontally — {middle}"), k.align_center_x);
+    btn(ui, align(Align::Right), egui::include_image!("../../assets/icons/align-right.svg"), &format!("Align right — {edge}"), k.align_right);
+    btn(ui, align(Align::Top), egui::include_image!("../../assets/icons/align-top.svg"), &format!("Align top — {edge}"), k.align_top);
+    btn(ui, align(Align::CenterY), egui::include_image!("../../assets/icons/align-center-y.svg"), &format!("Align centres vertically — {middle}"), k.align_center_y);
+    btn(ui, align(Align::Bottom), egui::include_image!("../../assets/icons/align-bottom.svg"), &format!("Align bottom — {edge}"), k.align_bottom);
     divider(ui);
     btn(ui, Arrange::DistributeX, egui::include_image!("../../assets/icons/distribute-x.svg"),
-        "Distribute horizontally — equal gaps (3 or more objects)");
+        "Distribute horizontally — equal gaps (3 or more objects)", k.distribute_x);
     btn(ui, Arrange::DistributeY, egui::include_image!("../../assets/icons/distribute-y.svg"),
-        "Distribute vertically — equal gaps (3 or more objects)");
+        "Distribute vertically — equal gaps (3 or more objects)", k.distribute_y);
     divider(ui);
-    let mut size = |ui: &mut egui::Ui, m: Match, img: egui::ImageSource<'static>, tip: &str| {
-        if icon_btn(ui, img, true, tip) {
+    let mut size = |ui: &mut egui::Ui, m: Match, img: egui::ImageSource<'static>, tip: &str, key: Option<Binding>| {
+        if icon_btn(ui, img, true, &with_key(tip, key)) {
             *picked = Some(BarAction::Match(m));
         }
     };
     size(ui, Match::NarrowestWidth, egui::include_image!("../../assets/icons/match-width-min.svg"),
-        "Same width as the narrowest — each object scales, keeping its proportions and its top-left corner");
+        "Same width as the narrowest — each object scales, keeping its proportions and its top-left corner", k.match_narrowest_width);
     size(ui, Match::WidestWidth, egui::include_image!("../../assets/icons/match-width-max.svg"),
-        "Same width as the widest — each object scales, keeping its proportions and its top-left corner");
+        "Same width as the widest — each object scales, keeping its proportions and its top-left corner", k.match_widest_width);
     size(ui, Match::ShortestHeight, egui::include_image!("../../assets/icons/match-height-min.svg"),
-        "Same height as the shortest — each object scales, keeping its proportions and its top-left corner");
+        "Same height as the shortest — each object scales, keeping its proportions and its top-left corner", k.match_shortest_height);
     size(ui, Match::TallestHeight, egui::include_image!("../../assets/icons/match-height-max.svg"),
-        "Same height as the tallest — each object scales, keeping its proportions and its top-left corner");
+        "Same height as the tallest — each object scales, keeping its proportions and its top-left corner", k.match_tallest_height);
 }
 
 fn divider(ui: &mut egui::Ui) {

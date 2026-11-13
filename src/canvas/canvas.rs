@@ -1039,34 +1039,65 @@ impl Canvas {
         };
         let edit_shape = |s: &mut Shape| s.restyle(color, width);
 
-        if merge_into_last {
-            let layer = self.layers.get_mut(li);
-            if let (Some(layer), Some(UndoEntry::ObjectsReplaced(l, stroke_log, shape_log))) =
-                (layer, self.undo_log.last_mut())
-            {
-                let same = *l == li
-                    && stroke_log.iter().map(|e| e.0).eq(strokes.iter().copied())
-                    && shape_log.iter().map(|e| e.0).eq(shapes.iter().copied());
-                if same {
-                    for (i, _, after) in stroke_log.iter_mut() {
-                        if let Some(s) = layer.strokes.get_mut(*i) {
-                            edit_stroke(s);
-                            *after = s.clone();
-                        }
-                    }
-                    for (i, _, after) in shape_log.iter_mut() {
-                        if let Some(s) = layer.shapes.get_mut(*i) {
-                            edit_shape(s);
-                            *after = s.clone();
-                        }
-                    }
-                    layer.rev += 1;
-                    self.dirty = true;
-                    return;
-                }
-            }
+        if merge_into_last && self.edit_into_last(li, strokes, shapes, &edit_stroke, &edit_shape) {
+            return;
         }
         self.edit_objects(li, strokes, shapes, |_, s| edit_stroke(s), |_, s| edit_shape(s));
+    }
+
+    /// Shift the chosen objects by `d`, as one undo step: the Select
+    /// tool's nudge keys. `merge_into_last` folds it into the undo entry
+    /// on top of the history instead, as `restyle_objects` does, so a
+    /// held key goes back in one Ctrl+Z. Returns false when nothing
+    /// moved.
+    pub fn nudge_objects(&mut self, li: usize, strokes: &[usize], shapes: &[usize], d: [f32; 2], merge_into_last: bool) -> bool {
+        if d == [0.0, 0.0] {
+            return false;
+        }
+        if merge_into_last && self.edit_into_last(li, strokes, shapes, |s| s.translate(d), |s| s.translate(d)) {
+            return true;
+        }
+        self.edit_objects(li, strokes, shapes, |_, s| s.translate(d), |_, s| s.translate(d))
+    }
+
+    /// Run `edit_stroke` / `edit_shape` over the chosen objects as part of
+    /// the undo entry on top of the history, provided that entry is an
+    /// in-place edit of exactly these objects. Returns false, having
+    /// changed nothing, when it is not.
+    fn edit_into_last(
+        &mut self,
+        li: usize,
+        strokes: &[usize],
+        shapes: &[usize],
+        mut edit_stroke: impl FnMut(&mut Stroke),
+        mut edit_shape: impl FnMut(&mut Shape),
+    ) -> bool {
+        let (Some(layer), Some(UndoEntry::ObjectsReplaced(l, stroke_log, shape_log))) =
+            (self.layers.get_mut(li), self.undo_log.last_mut())
+        else {
+            return false;
+        };
+        let same = *l == li
+            && stroke_log.iter().map(|e| e.0).eq(strokes.iter().copied())
+            && shape_log.iter().map(|e| e.0).eq(shapes.iter().copied());
+        if !same {
+            return false;
+        }
+        for (i, _, after) in stroke_log.iter_mut() {
+            if let Some(s) = layer.strokes.get_mut(*i) {
+                edit_stroke(s);
+                *after = s.clone();
+            }
+        }
+        for (i, _, after) in shape_log.iter_mut() {
+            if let Some(s) = layer.shapes.get_mut(*i) {
+                edit_shape(s);
+                *after = s.clone();
+            }
+        }
+        layer.rev += 1;
+        self.dirty = true;
+        true
     }
 
     /// Remove the chosen objects in one undo step.
@@ -1919,6 +1950,26 @@ mod object_edit_tests {
         c.restyle_objects(0, &[0, 1], &[], None, Some(6.0), false);
         assert!((c.layers[0].strokes[0].base_width - 3.0).abs() < 1e-4, "a pen line looks 6 px wide at 2×");
         assert!((c.layers[0].strokes[1].base_width - 3.0).abs() < 1e-4, "so does a marker line");
+    }
+
+    #[test]
+    fn a_run_of_nudges_is_one_undo_step() {
+        let mut c = canvas(2);
+        assert!(c.nudge_objects(0, &[0], &[], [1.0, 0.0], false));
+        assert!(c.nudge_objects(0, &[0], &[], [1.0, 0.0], true));
+        assert!(c.nudge_objects(0, &[0], &[], [0.0, -10.0], true));
+        assert_eq!(c.undo_log.len(), 1);
+        assert_eq!(c.layers[0].strokes[0].samples[0].pos, [2.0, -10.0]);
+        assert_eq!(c.layers[0].strokes[1].samples[0].pos, [100.0, 0.0], "only the chosen stroke moves");
+        c.undo();
+        assert_eq!(c.layers[0].strokes[0].samples[0].pos, [0.0, 0.0]);
+        c.redo();
+        assert_eq!(c.layers[0].strokes[0].samples[0].pos, [2.0, -10.0]);
+        // Other objects, or none at all: a step of their own.
+        assert!(c.nudge_objects(0, &[1], &[], [1.0, 0.0], true));
+        assert_eq!(c.undo_log.len(), 2);
+        assert!(!c.nudge_objects(0, &[1], &[], [0.0, 0.0], true));
+        assert_eq!(c.undo_log.len(), 2);
     }
 
     #[test]

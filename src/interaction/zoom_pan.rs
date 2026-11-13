@@ -90,19 +90,29 @@ pub fn handle_scroll(
         // Space pans, so with it held the wheel is view navigation too.
         let (pan, zoom) = canvases.active_view_mut();
         zoom_about_cursor(pan, zoom, raw_delta_y, cursor_screen);
-    } else if matches!(tool.kind, ToolKind::Spotlight) {
+    } else if matches!(tool.kind, ToolKind::Spotlight)
+        || !view_only && matches!(tool.kind, ToolKind::Pen | ToolKind::Eraser | ToolKind::FreehandArrow | ToolKind::Fill)
+    {
         if notches == 0 { return; }
-        const STEP: f32 = 5.0;
-        tool.spotlight_size = (tool.spotlight_size + n_f * STEP).clamp(20.0, 800.0);
-    } else if !view_only && matches!(tool.kind, ToolKind::Pen | ToolKind::Eraser | ToolKind::FreehandArrow | ToolKind::Fill) {
-        if notches == 0 { return; }
-        const SIZE_MIN: f32 = 1.0;
-        const SIZE_MAX: f32 = 80.0;
-        tool.size = (tool.size + n_f).clamp(SIZE_MIN, SIZE_MAX);
+        nudge_size(tool, n_f);
     } else {
         // View only: the slide is not flagged for the autosave.
         let (pan, zoom) = canvases.active_view_mut();
         zoom_about_cursor(pan, zoom, raw_delta_y, cursor_screen);
+    }
+}
+
+/// Size up or down by `notches` wheel notches: the spotlight's square
+/// with the Spotlight tool, else the pen's width (what the size slider
+/// sets, and so a selection's).
+pub fn nudge_size(tool: &mut ActiveTool, notches: f32) {
+    if matches!(tool.kind, ToolKind::Spotlight) {
+        const STEP: f32 = 5.0;
+        tool.spotlight_size = (tool.spotlight_size + notches * STEP).clamp(20.0, 800.0);
+    } else {
+        const SIZE_MIN: f32 = 1.0;
+        const SIZE_MAX: f32 = 80.0;
+        tool.size = (tool.size + notches).clamp(SIZE_MIN, SIZE_MAX);
     }
 }
 

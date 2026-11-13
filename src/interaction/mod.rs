@@ -1,6 +1,7 @@
 //! Routes raw user input (egui events + pen events) to the active tool +
 //! canvas. Holds small, focused helpers in submodules.
 
+pub mod action_keys;
 pub mod zoom_pan;
 
 use crate::canvas::CanvasManager;
@@ -94,6 +95,16 @@ pub fn react_tool_shortcut(
     if let Some(b) = t.ellipse        { if b.matches(key, mods) { tool.kind = ToolKind::Ellipse;    return; }}
     if let Some(b) = t.freehand_arrow { if b.matches(key, mods) { tool.kind = ToolKind::FreehandArrow; return; }}
     if let Some(b) = t.arrow          { if b.matches(key, mods) { tool.kind = ToolKind::Arrow;      return; }}
+    if let Some(b) = t.line           { if b.matches(key, mods) { tool.kind = ToolKind::Line;       return; }}
+    // The toolbar's dashed-border button, for the next shape drawn.
+    if let Some(b) = t.dashed_border  { if b.matches(key, mods) {
+        use crate::canvas::shape::BorderStyle;
+        tool.border_style = match tool.border_style {
+            BorderStyle::Solid          => BorderStyle::DashedAnimated,
+            BorderStyle::DashedAnimated => BorderStyle::Solid,
+        };
+        return;
+    }}
 
     // Escape always cancels pending non-modal state regardless of
     // bindings — modal cancel is a UX primitive, not a shortcut.

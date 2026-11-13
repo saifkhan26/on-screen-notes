@@ -64,6 +64,13 @@ impl Binding {
             K::Period => ".",
             K::Minus  => "-",
             K::Equals => "=",
+            K::OpenBracket  => "[",
+            K::CloseBracket => "]",
+            K::Semicolon => ";",
+            K::Quote     => "'",
+            K::Slash     => "/",
+            K::Backslash => "\\",
+            K::Backtick  => "`",
             k => k.name(),
         });
         s
@@ -142,11 +149,21 @@ fn key_from_name(name: &str) -> Option<egui::Key> {
         "arrowdown"  | "down"  => K::ArrowDown,
         "home" => K::Home,
         "end"  => K::End,
+        "pageup"   => K::PageUp,
+        "pagedown" => K::PageDown,
+        "insert"   => K::Insert,
         // Symbols
         "-" | "minus" => K::Minus,
         "=" | "equals" | "equal" => K::Equals,
         "," | "comma" => K::Comma,
         "." | "period" | "dot" => K::Period,
+        "[" | "openbracket" | "bracketleft" => K::OpenBracket,
+        "]" | "closebracket" | "bracketright" => K::CloseBracket,
+        ";" | "semicolon" => K::Semicolon,
+        "'" | "quote" => K::Quote,
+        "/" | "slash" => K::Slash,
+        "\\" | "backslash" => K::Backslash,
+        "`" | "backtick" => K::Backtick,
         // Editing
         "backspace" => K::Backspace,
         "delete" | "del" => K::Delete,
@@ -291,6 +308,11 @@ pub struct ToolSection {
     #[serde(default = "d_ellipse")]        pub ellipse: String,
     #[serde(default = "d_arrow")]          pub arrow: String,
     #[serde(default = "d_freehand_arrow")] pub freehand_arrow: String,
+    // Unbound until set: the empty string binds nothing.
+    #[serde(default)] pub line: String,
+    /// Dashed or solid border for new rectangles, ellipses, lines and
+    /// arrows (the button beside those tools).
+    #[serde(default)] pub dashed_border: String,
 }
 
 impl Default for ToolSection {
@@ -303,6 +325,7 @@ impl Default for ToolSection {
             select: d_select(),
             eyedropper: d_eyedropper(), rect: d_rect(), ellipse: d_ellipse(),
             arrow: d_arrow(), freehand_arrow: d_freehand_arrow(),
+            line: String::new(), dashed_border: String::new(),
         }
     }
 }
@@ -400,12 +423,106 @@ pub struct CanvasSection {
     #[serde(default = "d_bring_front")]      pub bring_front: String,
     /// Paint the selection below everything else of its kind on the layer.
     #[serde(default = "d_send_back")]        pub send_back: String,
+    /// Move the selection 1 or 10 screen pixels. While objects are
+    /// selected these win over the slide and layer keys, so they can
+    /// share the arrows with them (the defaults do).
+    #[serde(default = "d_nudge_left_1px")]   pub nudge_left_1px: String,
+    #[serde(default = "d_nudge_right_1px")]  pub nudge_right_1px: String,
+    #[serde(default = "d_nudge_up_1px")]     pub nudge_up_1px: String,
+    #[serde(default = "d_nudge_down_1px")]   pub nudge_down_1px: String,
+    #[serde(default = "d_nudge_left_10px")]  pub nudge_left_10px: String,
+    #[serde(default = "d_nudge_right_10px")] pub nudge_right_10px: String,
+    #[serde(default = "d_nudge_up_10px")]    pub nudge_up_10px: String,
+    #[serde(default = "d_nudge_down_10px")]  pub nudge_down_10px: String,
 
     // Video / GIF playback. They act on the selected video or GIF, else
     // the one under the pointer, else the only one on the slide.
     #[serde(default = "d_media_play_pause")] pub media_play_pause: String,
     #[serde(default = "d_media_prev_frame")] pub media_prev_frame: String,
     #[serde(default = "d_media_next_frame")] pub media_next_frame: String,
+    /// Loop the video or GIF, or stop looping it (the media bar's button).
+    #[serde(default)] pub media_loop: String,
+
+    // The slide panel's, layer panel's, slide window's and pin bar's
+    // buttons. Unbound until set.
+    /// A new slide after the last one.
+    #[serde(default)] pub new_slide: String,
+    /// Fold the slide panel, or unfold it.
+    #[serde(default)] pub toggle_slide_panel: String,
+    /// Ctrl+Tab steps through slides in order, or recently used first.
+    #[serde(default)] pub toggle_slide_order: String,
+    /// Show the active slide in the slide window, or close the window.
+    #[serde(default)] pub slide_window: String,
+    #[serde(default)] pub new_layer: String,
+    /// The active layer goes, as with the layer panel's bin: no undo.
+    #[serde(default)] pub delete_layer: String,
+    /// The active layer one place up / down the stack. Like the panel's
+    /// arrows, this clears the slide's undo history.
+    #[serde(default)] pub move_layer_up: String,
+    #[serde(default)] pub move_layer_down: String,
+    /// With a pin selected: go to the slide its objects are on.
+    #[serde(default)] pub pin_go_to_slide: String,
+    /// With a pin selected: show it on that slide only, or on every slide.
+    #[serde(default)] pub pin_this_slide_only: String,
+}
+
+/// The toolbar's buttons that are not tools. Unbound until set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolbarSection {
+    /// Pick the palette's first … eighth colour (recolours a selection).
+    pub colour_1: String,
+    pub colour_2: String,
+    pub colour_3: String,
+    pub colour_4: String,
+    pub colour_5: String,
+    pub colour_6: String,
+    pub colour_7: String,
+    pub colour_8: String,
+    /// Pen size (or the spotlight's) up / down, a wheel notch at a time
+    /// (resizes a selection).
+    pub size_up: String,
+    pub size_down: String,
+    /// The Open dialog for pictures, videos, GIFs and PureRef boards.
+    pub insert_media: String,
+    /// Highlight every picture / GIF / video on the slide, or stop.
+    pub highlight_pictures: String,
+    pub highlight_gifs: String,
+    pub highlight_videos: String,
+    /// Select what is highlighted, ready to arrange.
+    pub select_highlighted: String,
+    /// Pin the overlay to a window (then click it), or unpin it.
+    pub pin_to_window: String,
+    /// Background opacity up / down by 10 %.
+    pub background_up: String,
+    pub background_down: String,
+    /// Back to a black background.
+    pub reset_background: String,
+}
+
+/// The arrange bar's buttons, for the Select tool's selection. Unbound
+/// until set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArrangeSection {
+    pub pack: String,
+    pub group_by_type: String,
+    /// Aligning slides objects until they touch, or piles them up.
+    pub keep_apart: String,
+    pub align_left: String,
+    pub align_center_x: String,
+    pub align_right: String,
+    pub align_top: String,
+    pub align_center_y: String,
+    pub align_bottom: String,
+    pub distribute_x: String,
+    pub distribute_y: String,
+    pub match_narrowest_width: String,
+    pub match_widest_width: String,
+    pub match_shortest_height: String,
+    pub match_tallest_height: String,
+    /// Open "Move to slide…".
+    pub move_to_slide: String,
 }
 
 impl Default for CanvasSection {
@@ -439,9 +556,28 @@ impl Default for CanvasSection {
             toggle_pins: d_toggle_pins(),
             bring_front: d_bring_front(),
             send_back: d_send_back(),
+            nudge_left_1px: d_nudge_left_1px(),
+            nudge_right_1px: d_nudge_right_1px(),
+            nudge_up_1px: d_nudge_up_1px(),
+            nudge_down_1px: d_nudge_down_1px(),
+            nudge_left_10px: d_nudge_left_10px(),
+            nudge_right_10px: d_nudge_right_10px(),
+            nudge_up_10px: d_nudge_up_10px(),
+            nudge_down_10px: d_nudge_down_10px(),
             media_play_pause: d_media_play_pause(),
             media_prev_frame: d_media_prev_frame(),
             media_next_frame: d_media_next_frame(),
+            media_loop: String::new(),
+            new_slide: String::new(),
+            toggle_slide_panel: String::new(),
+            toggle_slide_order: String::new(),
+            slide_window: String::new(),
+            new_layer: String::new(),
+            delete_layer: String::new(),
+            move_layer_up: String::new(),
+            move_layer_down: String::new(),
+            pin_go_to_slide: String::new(),
+            pin_this_slide_only: String::new(),
         }
     }
 }
@@ -486,22 +622,35 @@ fn d_pin_selection() -> String { "ctrl+p".into() }
 fn d_toggle_pins() -> String { "shift+p".into() }
 fn d_bring_front() -> String { "ctrl+arrowup".into() }
 fn d_send_back()   -> String { "ctrl+arrowdown".into() }
+fn d_nudge_left_1px()   -> String { "arrowleft".into() }
+fn d_nudge_right_1px()  -> String { "arrowright".into() }
+fn d_nudge_up_1px()     -> String { "arrowup".into() }
+fn d_nudge_down_1px()   -> String { "arrowdown".into() }
+fn d_nudge_left_10px()  -> String { "shift+arrowleft".into() }
+fn d_nudge_right_10px() -> String { "shift+arrowright".into() }
+fn d_nudge_up_10px()    -> String { "shift+arrowup".into() }
+fn d_nudge_down_10px()  -> String { "shift+arrowdown".into() }
 fn d_media_play_pause() -> String { "k".into() }
 fn d_media_prev_frame() -> String { "comma".into() }
 fn d_media_next_frame() -> String { "period".into() }
 
-/// Current file format. 2 moved the global defaults off Ctrl+Shift.
-const FORMAT: u32 = 2;
+/// Current file format. 2 moved the global defaults off Ctrl+Shift; 3
+/// made every button bindable and lists each binding in the file; 4
+/// added the nudge keys.
+const FORMAT: u32 = 4;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeysConfig {
     /// Format the file was written in. Files from before it was
-    /// recorded read as 0 and get `upgrade_text` once; after that a
-    /// binding set back to an old default stays.
+    /// recorded read as 0. An older file is upgraded once (`upgrade_text`,
+    /// `add_missing_keys`); after that a binding set back to an old
+    /// default, or a line deleted, stays so.
     #[serde(default)] pub version: u32,
     #[serde(default)] pub global: GlobalSection,
     #[serde(default)] pub tool:   ToolSection,
+    #[serde(default)] pub toolbar: ToolbarSection,
+    #[serde(default)] pub arrange: ArrangeSection,
     #[serde(default)] pub canvas: CanvasSection,
 }
 
@@ -511,6 +660,8 @@ impl Default for HotkeysConfig {
             version: FORMAT,
             global: GlobalSection::default(),
             tool: ToolSection::default(),
+            toolbar: ToolbarSection::default(),
+            arrange: ArrangeSection::default(),
             canvas: CanvasSection::default(),
         }
     }
@@ -538,6 +689,44 @@ pub struct ToolBindings {
     pub ellipse: Option<Binding>,
     pub arrow: Option<Binding>,
     pub freehand_arrow: Option<Binding>,
+    pub line: Option<Binding>,
+    pub dashed_border: Option<Binding>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ToolbarBindings {
+    /// `colour[N]` picks the palette's colour N + 1.
+    pub colour: [Option<Binding>; 8],
+    pub size_up: Option<Binding>,
+    pub size_down: Option<Binding>,
+    pub insert_media: Option<Binding>,
+    /// Indexed like `MediaType::ALL`: pictures, GIFs, videos.
+    pub highlight: [Option<Binding>; 3],
+    pub select_highlighted: Option<Binding>,
+    pub pin_to_window: Option<Binding>,
+    pub background_up: Option<Binding>,
+    pub background_down: Option<Binding>,
+    pub reset_background: Option<Binding>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArrangeBindings {
+    pub pack: Option<Binding>,
+    pub group_by_type: Option<Binding>,
+    pub keep_apart: Option<Binding>,
+    pub align_left: Option<Binding>,
+    pub align_center_x: Option<Binding>,
+    pub align_right: Option<Binding>,
+    pub align_top: Option<Binding>,
+    pub align_center_y: Option<Binding>,
+    pub align_bottom: Option<Binding>,
+    pub distribute_x: Option<Binding>,
+    pub distribute_y: Option<Binding>,
+    pub match_narrowest_width: Option<Binding>,
+    pub match_widest_width: Option<Binding>,
+    pub match_shortest_height: Option<Binding>,
+    pub match_tallest_height: Option<Binding>,
+    pub move_to_slide: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -574,9 +763,23 @@ pub struct CanvasBindings {
     pub toggle_pins: Option<Binding>,
     pub bring_front: Option<Binding>,
     pub send_back: Option<Binding>,
+    /// Left, right, up, down; by 1 / by 10 pixels.
+    pub nudge_1px: [Option<Binding>; 4],
+    pub nudge_10px: [Option<Binding>; 4],
     pub media_play_pause: Option<Binding>,
     pub media_prev_frame: Option<Binding>,
     pub media_next_frame: Option<Binding>,
+    pub media_loop: Option<Binding>,
+    pub new_slide: Option<Binding>,
+    pub toggle_slide_panel: Option<Binding>,
+    pub toggle_slide_order: Option<Binding>,
+    pub slide_window: Option<Binding>,
+    pub new_layer: Option<Binding>,
+    pub delete_layer: Option<Binding>,
+    pub move_layer_up: Option<Binding>,
+    pub move_layer_down: Option<Binding>,
+    pub pin_go_to_slide: Option<Binding>,
+    pub pin_this_slide_only: Option<Binding>,
 }
 
 /// The `[global]` bindings, for showing them in the help panel. The OS
@@ -593,15 +796,20 @@ pub struct GlobalBindings {
 pub struct ParsedHotkeys {
     pub global: GlobalBindings,
     pub tool:   ToolBindings,
+    pub toolbar: ToolbarBindings,
+    pub arrange: ArrangeBindings,
     pub canvas: CanvasBindings,
 }
 
 impl HotkeysConfig {
     /// Compile every string in the file into a `Binding`. Bad strings
     /// become `None` and silently disable that binding (logged at
-    /// warn level).
+    /// warn level); an empty one is a binding left unset.
     pub fn parsed(&self) -> ParsedHotkeys {
         let p = |label: &str, s: &str| -> Option<Binding> {
+            if s.trim().is_empty() {
+                return None;
+            }
             match parse(s) {
                 Some(b) => Some(b),
                 None => {
@@ -610,6 +818,7 @@ impl HotkeysConfig {
                 }
             }
         };
+        let (tb, ar, cv) = (&self.toolbar, &self.arrange, &self.canvas);
         ParsedHotkeys {
             // Not `p`: a global the OS takes but `parse` does not know
             // (F13 and up) is no reason to warn, it just goes unlisted.
@@ -636,6 +845,51 @@ impl HotkeysConfig {
                 ellipse:        p("tool.ellipse",        &self.tool.ellipse),
                 arrow:          p("tool.arrow",          &self.tool.arrow),
                 freehand_arrow: p("tool.freehand_arrow", &self.tool.freehand_arrow),
+                line:           p("tool.line",           &self.tool.line),
+                dashed_border:  p("tool.dashed_border",  &self.tool.dashed_border),
+            },
+            toolbar: ToolbarBindings {
+                colour: [
+                    p("toolbar.colour_1", &tb.colour_1),
+                    p("toolbar.colour_2", &tb.colour_2),
+                    p("toolbar.colour_3", &tb.colour_3),
+                    p("toolbar.colour_4", &tb.colour_4),
+                    p("toolbar.colour_5", &tb.colour_5),
+                    p("toolbar.colour_6", &tb.colour_6),
+                    p("toolbar.colour_7", &tb.colour_7),
+                    p("toolbar.colour_8", &tb.colour_8),
+                ],
+                size_up:            p("toolbar.size_up",            &tb.size_up),
+                size_down:          p("toolbar.size_down",          &tb.size_down),
+                insert_media:       p("toolbar.insert_media",       &tb.insert_media),
+                highlight: [
+                    p("toolbar.highlight_pictures", &tb.highlight_pictures),
+                    p("toolbar.highlight_gifs",     &tb.highlight_gifs),
+                    p("toolbar.highlight_videos",   &tb.highlight_videos),
+                ],
+                select_highlighted: p("toolbar.select_highlighted", &tb.select_highlighted),
+                pin_to_window:      p("toolbar.pin_to_window",      &tb.pin_to_window),
+                background_up:      p("toolbar.background_up",      &tb.background_up),
+                background_down:    p("toolbar.background_down",    &tb.background_down),
+                reset_background:   p("toolbar.reset_background",   &tb.reset_background),
+            },
+            arrange: ArrangeBindings {
+                pack:           p("arrange.pack",           &ar.pack),
+                group_by_type:  p("arrange.group_by_type",  &ar.group_by_type),
+                keep_apart:     p("arrange.keep_apart",     &ar.keep_apart),
+                align_left:     p("arrange.align_left",     &ar.align_left),
+                align_center_x: p("arrange.align_center_x", &ar.align_center_x),
+                align_right:    p("arrange.align_right",    &ar.align_right),
+                align_top:      p("arrange.align_top",      &ar.align_top),
+                align_center_y: p("arrange.align_center_y", &ar.align_center_y),
+                align_bottom:   p("arrange.align_bottom",   &ar.align_bottom),
+                distribute_x:   p("arrange.distribute_x",   &ar.distribute_x),
+                distribute_y:   p("arrange.distribute_y",   &ar.distribute_y),
+                match_narrowest_width: p("arrange.match_narrowest_width", &ar.match_narrowest_width),
+                match_widest_width:    p("arrange.match_widest_width",    &ar.match_widest_width),
+                match_shortest_height: p("arrange.match_shortest_height", &ar.match_shortest_height),
+                match_tallest_height:  p("arrange.match_tallest_height",  &ar.match_tallest_height),
+                move_to_slide:  p("arrange.move_to_slide",  &ar.move_to_slide),
             },
             canvas: CanvasBindings {
                 undo:          p("canvas.undo",          &self.canvas.undo),
@@ -680,12 +934,71 @@ impl HotkeysConfig {
                 toggle_pins: p("canvas.toggle_pins", &self.canvas.toggle_pins),
                 bring_front: p("canvas.bring_front", &self.canvas.bring_front),
                 send_back:   p("canvas.send_back",   &self.canvas.send_back),
+                nudge_1px: [
+                    p("canvas.nudge_left_1px",  &cv.nudge_left_1px),
+                    p("canvas.nudge_right_1px", &cv.nudge_right_1px),
+                    p("canvas.nudge_up_1px",    &cv.nudge_up_1px),
+                    p("canvas.nudge_down_1px",  &cv.nudge_down_1px),
+                ],
+                nudge_10px: [
+                    p("canvas.nudge_left_10px",  &cv.nudge_left_10px),
+                    p("canvas.nudge_right_10px", &cv.nudge_right_10px),
+                    p("canvas.nudge_up_10px",    &cv.nudge_up_10px),
+                    p("canvas.nudge_down_10px",  &cv.nudge_down_10px),
+                ],
                 media_play_pause: p("canvas.media_play_pause", &self.canvas.media_play_pause),
                 media_prev_frame: p("canvas.media_prev_frame", &self.canvas.media_prev_frame),
                 media_next_frame: p("canvas.media_next_frame", &self.canvas.media_next_frame),
+                media_loop:       p("canvas.media_loop",       &cv.media_loop),
+                new_slide:          p("canvas.new_slide",          &cv.new_slide),
+                toggle_slide_panel: p("canvas.toggle_slide_panel", &cv.toggle_slide_panel),
+                toggle_slide_order: p("canvas.toggle_slide_order", &cv.toggle_slide_order),
+                slide_window:       p("canvas.slide_window",       &cv.slide_window),
+                new_layer:          p("canvas.new_layer",          &cv.new_layer),
+                delete_layer:       p("canvas.delete_layer",       &cv.delete_layer),
+                move_layer_up:      p("canvas.move_layer_up",      &cv.move_layer_up),
+                move_layer_down:    p("canvas.move_layer_down",    &cv.move_layer_down),
+                pin_go_to_slide:    p("canvas.pin_go_to_slide",    &cv.pin_go_to_slide),
+                pin_this_slide_only: p("canvas.pin_this_slide_only", &cv.pin_this_slide_only),
             },
         }
     }
+
+    /// Every pair of in-app bindings (`[tool]`, `[toolbar]`, `[arrange]`,
+    /// `[canvas]`) set to the same keys, as `(name, name, keys)`. Both
+    /// would fire on one press, so the file's loader warns about them —
+    /// all but a nudge key on a slide or layer key, where one press does
+    /// only one of them (`nudge_shares_with`).
+    pub fn clashes(&self) -> Vec<(String, String, String)> {
+        let Ok(value) = toml::Value::try_from(self) else { return Vec::new() };
+        let mut seen: Vec<(String, Binding)> = Vec::new();
+        let mut out = Vec::new();
+        for section in ["tool", "toolbar", "arrange", "canvas"] {
+            let Some(table) = value.get(section).and_then(|v| v.as_table()) else { continue };
+            for (name, s) in table {
+                let Some(b) = s.as_str().and_then(parse) else { continue };
+                let name = format!("{section}.{name}");
+                if let Some((other, _)) = seen.iter().find(|(o, ob)| *ob == b && !nudge_shares_with(o, &name)) {
+                    out.push((other.clone(), name.clone(), b.label()));
+                }
+                seen.push((name, b));
+            }
+        }
+        out
+    }
+}
+
+/// A nudge key and a slide or layer key (`interaction::react_canvas_nav`,
+/// `react_layer_nav`) may be the same keys, as the arrows are by default:
+/// with objects selected the press nudges them, else it goes to the
+/// slide or layer.
+fn nudge_shares_with(a: &str, b: &str) -> bool {
+    const NAV: [&str; 8] = [
+        "canvas.prev_canvas", "canvas.next_canvas", "canvas.cycle_prev_slide", "canvas.cycle_next_slide",
+        "canvas.first_slide", "canvas.last_slide", "canvas.prev_layer", "canvas.next_layer",
+    ];
+    let nudge = |n: &str| n.starts_with("canvas.nudge_");
+    (nudge(a) && NAV.contains(&b)) || (nudge(b) && NAV.contains(&a))
 }
 
 // ============================================================================
@@ -714,10 +1027,11 @@ impl HotkeysConfig {
     /// fresh installs writes the defaults to the exe-adjacent path so
     /// the user has something concrete to edit.
     pub fn load_or_default() -> Self {
-        if let Some(c) = Self::load(&exe_path()) {
-            return c;
-        }
-        if let Some(c) = user_config_path().and_then(|p| Self::load(&p)) {
+        let loaded = Self::load(&exe_path()).or_else(|| user_config_path().and_then(|p| Self::load(&p)));
+        if let Some(c) = loaded {
+            for (a, b, keys) in c.clashes() {
+                log::warn!("hotkeys {a} and {b} are both {keys}: one press does both");
+            }
             return c;
         }
         let defaults = Self::default();
@@ -735,10 +1049,13 @@ impl HotkeysConfig {
         let toml_str = toml::to_string_pretty(self).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
         })?;
+        let toml_str = annotate(&toml_str);
         let header = "# On-Screen Notes — hotkeys.toml\n\
                       # Strings are case-insensitive. Modifiers: ctrl, shift, alt.\n\
-                      # Special keys: arrowleft/right/up/down, home, end, backspace,\n\
-                      # delete, enter, escape, tab, space, f1..f12.\n\n";
+                      # Special keys: arrowleft/right/up/down, home, end, pageup,\n\
+                      # pagedown, insert, backspace, delete, enter, escape, tab,\n\
+                      # space, f1..f12, and [ ] ; ' / \\ ` , . - =.\n\
+                      # \"\" leaves an action unbound.\n\n";
         let full = format!("{header}{toml_str}");
         std::fs::write(&p, full)
     }
@@ -759,7 +1076,7 @@ impl HotkeysConfig {
         if cfg.version >= FORMAT {
             return Some(cfg);
         }
-        let upgraded = upgrade_text(&text);
+        let upgraded = add_missing_keys(&upgrade_text(&text, cfg.version));
         match toml::from_str::<Self>(&upgraded) {
             Ok(c) => {
                 // Unwritable (a read-only install dir): the upgrade
@@ -778,11 +1095,12 @@ impl HotkeysConfig {
     }
 }
 
-/// Bring the text of a hotkeys file from before `FORMAT` up to date:
-/// each `[global]` binding still on its old default moves to the new
-/// one, and the format is recorded so this happens once. Comments,
-/// layout and the user's own bindings are kept as written.
-fn upgrade_text(text: &str) -> String {
+/// Bring the text of a hotkeys file written in format `from` up to
+/// `FORMAT`: from before 2, each `[global]` binding still on its old
+/// default moves to the new one; the format is recorded so this happens
+/// once. Comments, layout and the user's own bindings are kept as
+/// written. (`add_missing_keys` does format 3's and 4's part.)
+fn upgrade_text(text: &str, from: u32) -> String {
     let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let version_line = format!("version = {FORMAT}");
     let mut out = String::with_capacity(text.len() + 32);
@@ -809,7 +1127,7 @@ fn upgrade_text(text: &str) -> String {
             version_written = true;
             continue;
         }
-        if section == "global" {
+        if section == "global" && from < 2 {
             if let Some(new) = upgrade_global_line(body) {
                 out.push_str(&new);
                 out.push_str(ending);
@@ -849,6 +1167,264 @@ fn upgrade_global_line(line: &str) -> Option<String> {
     Some(format!("{key}={before}{quote}{}{quote}{after}", new()))
 }
 
+/// What the binding `key` in `[section]` does, as the file says it next
+/// to the key. Every binding has one (a test checks).
+fn note(section: &str, key: &str) -> Option<String> {
+    if let Some(n) = key.strip_prefix("opacity_").and_then(|n| n.parse::<u32>().ok()) {
+        return Some(format!("Active layer's opacity to {} %", n * 10));
+    }
+    if let Some(n) = key.strip_prefix("colour_").and_then(|n| n.parse::<u32>().ok()) {
+        return Some(format!("Palette colour {n} (recolours a selection)"));
+    }
+    let text = match (section, key) {
+        ("global", "toggle_overlay") => "Show / hide the overlay, from any app",
+        ("global", "screenshot")     => "Screenshot of the screen and the ink, from any app",
+        ("global", "start_record")   => "Start / stop recording, from any app",
+        ("global", "pause_record")   => "Pause / resume recording, from any app",
+
+        ("tool", "pen")            => "Pen",
+        ("tool", "pencil")         => "Pencil",
+        ("tool", "marker")         => "Marker (highlighter)",
+        ("tool", "airbrush")       => "Airbrush (spray)",
+        ("tool", "fill")           => "Fill",
+        ("tool", "laser")          => "Laser pointer",
+        ("tool", "text")           => "Text",
+        ("tool", "spotlight")      => "Spotlight (again: back to the pen)",
+        ("tool", "lasso")          => "Lasso erase",
+        ("tool", "lasso_select")   => "Lasso capture: screen pixels to a picture",
+        ("tool", "select")         => "Select",
+        ("tool", "eyedropper")     => "Eyedropper, for one pick",
+        ("tool", "rect")           => "Rectangle",
+        ("tool", "ellipse")        => "Ellipse",
+        ("tool", "arrow")          => "Straight arrow",
+        ("tool", "freehand_arrow") => "Freehand arrow",
+        ("tool", "line")           => "Line",
+        ("tool", "dashed_border")  => "Dashed / solid border for new rectangles, ellipses, lines, arrows",
+
+        ("toolbar", "size_up")            => "Pen size up a wheel notch (Spotlight: its size; resizes a selection)",
+        ("toolbar", "size_down")          => "Pen size down a wheel notch (Spotlight: its size; resizes a selection)",
+        ("toolbar", "insert_media")       => "Insert a picture, video, GIF or PureRef board",
+        ("toolbar", "highlight_pictures") => "Highlight the slide's pictures, or stop",
+        ("toolbar", "highlight_gifs")     => "Highlight the slide's GIFs, or stop",
+        ("toolbar", "highlight_videos")   => "Highlight the slide's videos, or stop",
+        ("toolbar", "select_highlighted") => "Select what is highlighted, ready to arrange",
+        ("toolbar", "pin_to_window")      => "Pin the overlay to a window (then click it), or unpin it",
+        ("toolbar", "background_up")      => "Background opacity +10 %",
+        ("toolbar", "background_down")    => "Background opacity -10 %",
+        ("toolbar", "reset_background")   => "Black background",
+
+        ("arrange", "pack")                  => "Pack the selection into a tight block, sizes kept",
+        ("arrange", "group_by_type")         => "Group the selection: pictures, GIFs, videos, the rest",
+        ("arrange", "keep_apart")            => "Keep-apart switch: aligning slides objects until they touch, or piles them up",
+        ("arrange", "align_left")            => "Align the selection left",
+        ("arrange", "align_center_x")        => "Align the selection's centres across",
+        ("arrange", "align_right")           => "Align the selection right",
+        ("arrange", "align_top")             => "Align the selection to the top",
+        ("arrange", "align_center_y")        => "Align the selection's centres down",
+        ("arrange", "align_bottom")          => "Align the selection to the bottom",
+        ("arrange", "distribute_x")          => "Equal gaps across (3 or more selected)",
+        ("arrange", "distribute_y")          => "Equal gaps down (3 or more selected)",
+        ("arrange", "match_narrowest_width") => "Every selected object as wide as the narrowest",
+        ("arrange", "match_widest_width")    => "Every selected object as wide as the widest",
+        ("arrange", "match_shortest_height") => "Every selected object as tall as the shortest",
+        ("arrange", "match_tallest_height")  => "Every selected object as tall as the tallest",
+        ("arrange", "move_to_slide")         => "Open \"Move to slide...\" for the selection",
+
+        ("canvas", "undo")                 => "Undo",
+        ("canvas", "redo")                 => "Redo",
+        ("canvas", "clear_layer")          => "Clear the active layer",
+        ("canvas", "delete_canvas")        => "Delete the slide",
+        ("canvas", "reset_view")           => "Reset zoom and pan",
+        ("canvas", "reset_layer_pos")      => "Undo the active layer's moves",
+        ("canvas", "reset_layer_zoom")     => "Undo the active layer's zooms",
+        ("canvas", "freeze_frame")         => "Freeze the screen into a new layer",
+        ("canvas", "prev_canvas")          => "Previous slide",
+        ("canvas", "next_canvas")          => "Next slide (past the last: a new one)",
+        ("canvas", "cycle_next_slide")     => "Next slide, wrapping round (or recently used)",
+        ("canvas", "cycle_prev_slide")     => "Previous slide, wrapping round",
+        ("canvas", "first_slide")          => "First slide",
+        ("canvas", "last_slide")           => "Last slide",
+        ("canvas", "rename_slide")         => "Name the slide",
+        ("canvas", "lock_slide")           => "Lock / unlock the slide against edits",
+        ("canvas", "prev_layer")           => "Layer below",
+        ("canvas", "next_layer")           => "Layer above",
+        ("canvas", "toggle_ui")            => "Hide / show the toolbar and panels",
+        ("canvas", "opacity_dec")          => "Active layer's opacity -10 %",
+        ("canvas", "opacity_inc")          => "Active layer's opacity +10 %",
+        ("canvas", "preview_layer")        => "Preview the active layer",
+        ("canvas", "toggle_layer_visible") => "Hide / show the active layer",
+        ("canvas", "delete_selection")     => "Delete the selection",
+        ("canvas", "duplicate")            => "Duplicate the selection",
+        ("canvas", "copy_to_new_slide")    => "Copy the selection to a new slide",
+        ("canvas", "pin_selection")        => "Pin the selection to every slide, or unpin it",
+        ("canvas", "toggle_pins")          => "Hide / show every pin",
+        ("canvas", "bring_front")          => "Selection to the front",
+        ("canvas", "send_back")            => "Selection to the back",
+        ("canvas", "nudge_left_1px")       => "Selection 1 px left (wins over slide / layer keys while selected)",
+        ("canvas", "nudge_right_1px")      => "Selection 1 px right",
+        ("canvas", "nudge_up_1px")         => "Selection 1 px up",
+        ("canvas", "nudge_down_1px")       => "Selection 1 px down",
+        ("canvas", "nudge_left_10px")      => "Selection 10 px left",
+        ("canvas", "nudge_right_10px")     => "Selection 10 px right",
+        ("canvas", "nudge_up_10px")        => "Selection 10 px up",
+        ("canvas", "nudge_down_10px")      => "Selection 10 px down",
+        ("canvas", "media_play_pause")     => "Play / pause the video or GIF",
+        ("canvas", "media_prev_frame")     => "Video or GIF: previous frame",
+        ("canvas", "media_next_frame")     => "Video or GIF: next frame",
+        ("canvas", "media_loop")           => "Loop the video or GIF, or stop looping",
+        ("canvas", "new_slide")            => "New slide after the last one",
+        ("canvas", "toggle_slide_panel")   => "Fold / unfold the slide panel",
+        ("canvas", "toggle_slide_order")   => "Ctrl+Tab: slides in order, or recently used first",
+        ("canvas", "slide_window")         => "Show the slide in the slide window, or close it",
+        ("canvas", "new_layer")            => "New layer",
+        ("canvas", "delete_layer")         => "Delete the active layer (no undo)",
+        ("canvas", "move_layer_up")        => "Active layer one place up (clears the undo history)",
+        ("canvas", "move_layer_down")      => "Active layer one place down (clears the undo history)",
+        ("canvas", "pin_go_to_slide")      => "Selected pin: go to the slide its objects are on",
+        ("canvas", "pin_this_slide_only")  => "Selected pin: show it on its slide only, or on every slide",
+        _ => return None,
+    };
+    Some(text.to_owned())
+}
+
+/// `lines`, one section's `key = value` lines, each followed by its
+/// key's note (`note`), the notes lined up.
+fn with_notes(section: &str, lines: &[String]) -> Vec<String> {
+    let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    lines
+        .iter()
+        .map(|l| {
+            let key = l.split_once('=').map(|(k, _)| k.trim().trim_matches('"'));
+            match key.and_then(|k| note(section, k)) {
+                Some(n) => format!("{l:<width$}  # {n}"),
+                None => l.clone(),
+            }
+        })
+        .collect()
+}
+
+/// `text`, a file as `toml` writes it, with a note after every binding.
+fn annotate(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    let mut section = String::new();
+    let mut block: Vec<String> = Vec::new();
+    let flush = |out: &mut String, section: &str, block: &mut Vec<String>| {
+        for l in with_notes(section, block) {
+            out.push_str(&l);
+            out.push('\n');
+        }
+        block.clear();
+    };
+    for line in text.lines() {
+        if !section.is_empty() && table_header(line).is_none() && line.contains('=') {
+            block.push(line.to_owned());
+            continue;
+        }
+        flush(&mut out, &section, &mut block);
+        if let Some(name) = table_header(line) {
+            section = name.to_owned();
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    flush(&mut out, &section, &mut block);
+    out
+}
+
+/// The name of the table a `[name]` line opens, if `line` is one.
+fn table_header(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let rest = t.strip_prefix('[')?;
+    Some(rest[..rest.find(']')?].trim())
+}
+
+/// `text` with every binding it does not list added at its default —
+/// `""`, unbound, for most — so each action the app can bind shows up in
+/// the file, ready to be set. They go under a comment after the last
+/// line of their section; a section the file lacks goes at its end.
+/// Comments, layout and the user's own lines are kept as written. Run
+/// once per format upgrade (format 3 on, every one of them adds keys),
+/// so a line deleted later stays so until the next format.
+fn add_missing_keys(text: &str) -> String {
+    let Ok(have) = toml::from_str::<toml::Table>(text) else { return text.to_owned() };
+    let Ok(defaults) = toml::to_string_pretty(&HotkeysConfig::default()) else { return text.to_owned() };
+    // Each section's missing lines, in the order the app lists them.
+    let mut missing: Vec<(String, Vec<String>)> = Vec::new();
+    let mut section = "";
+    for line in defaults.lines() {
+        if let Some(name) = table_header(line) {
+            section = name;
+            continue;
+        }
+        let Some((key, _)) = line.split_once('=') else { continue };
+        let key = key.trim().trim_matches('"');
+        let listed = have.get(section).and_then(|v| v.as_table()).is_some_and(|t| t.contains_key(key));
+        if section.is_empty() || listed {
+            continue;
+        }
+        match missing.last_mut() {
+            Some((s, lines)) if s == section => lines.push(line.trim().to_owned()),
+            _ => missing.push((section.to_owned(), vec![line.trim().to_owned()])),
+        }
+    }
+    if missing.is_empty() {
+        return text.to_owned();
+    }
+
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let block = |section: &str, lines: &[String]| {
+        let mut s = format!("# Added by an update; \"\" leaves an action unbound.{nl}");
+        for l in with_notes(section, lines) {
+            s.push_str(&l);
+            s.push_str(nl);
+        }
+        s
+    };
+    let mut out = String::with_capacity(text.len() + 2048);
+    let mut placed: Vec<&str> = Vec::new();
+    // One section's lines at a time, its header first; the lines before
+    // the first header belong to none.
+    let mut flush = |out: &mut String, name: Option<&str>, lines: &[&str]| {
+        let lines_for = name.and_then(|n| missing.iter().find(|(s, _)| s == n));
+        let Some((name, add)) = lines_for else {
+            lines.iter().for_each(|l| out.push_str(l));
+            return;
+        };
+        // After the last line with something on it, before the blank
+        // lines that part it from the next section.
+        let split = lines.iter().rposition(|l| !l.trim().is_empty()).map_or(0, |i| i + 1);
+        lines[..split].iter().for_each(|l| out.push_str(l));
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(nl);
+        }
+        out.push_str(&block(name, add));
+        lines[split..].iter().for_each(|l| out.push_str(l));
+        placed.push(name);
+    };
+    let mut name: Option<&str> = None;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.split_inclusive('\n') {
+        if let Some(next) = table_header(line) {
+            flush(&mut out, name, &lines);
+            lines.clear();
+            name = Some(next);
+        }
+        lines.push(line);
+    }
+    flush(&mut out, name, &lines);
+    for (name, add) in &missing {
+        if placed.contains(&name.as_str()) {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(nl);
+        }
+        out.push_str(&format!("{nl}[{name}]{nl}"));
+        out.push_str(&block(name, add));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,21 +1462,136 @@ mod tests {
 
     #[test]
     fn default_bindings_parse_and_do_not_collide() {
-        // Every `[tool]` and `[canvas]` default, found through serde so a
-        // binding added later is checked without listing it here.
-        let value = toml::Value::try_from(HotkeysConfig::default()).unwrap();
-        let mut seen: Vec<(String, Binding)> = Vec::new();
-        for section in ["tool", "canvas"] {
+        // Every in-app default, found through serde so a binding added
+        // later is checked without listing it here. Unbound is "".
+        let cfg = HotkeysConfig::default();
+        let value = toml::Value::try_from(&cfg).unwrap();
+        let mut bound = 0;
+        for section in ["tool", "toolbar", "arrange", "canvas"] {
             for (name, s) in value[section].as_table().unwrap() {
                 let s = s.as_str().unwrap();
-                let b = parse(s).unwrap_or_else(|| panic!("{section}.{name} = {s:?} does not parse"));
-                if let Some((other, _)) = seen.iter().find(|(_, o)| *o == b) {
-                    panic!("{section}.{name} and {other} are both {s:?}");
-                }
-                seen.push((format!("{section}.{name}"), b));
+                if s.is_empty() { continue; }
+                parse(s).unwrap_or_else(|| panic!("{section}.{name} = {s:?} does not parse"));
+                bound += 1;
             }
         }
-        assert!(seen.iter().any(|(n, b)| n == "canvas.toggle_layer_visible" && b.key == egui::Key::H));
+        assert!(bound > 50, "only {bound} default bindings found");
+        assert_eq!(cfg.clashes(), vec![]);
+        assert_eq!(cfg.parsed().canvas.toggle_layer_visible.map(|b| b.key), Some(egui::Key::H));
+    }
+
+    #[test]
+    fn button_actions_start_unbound_and_take_any_key() {
+        let keys = HotkeysConfig::default().parsed();
+        assert!(keys.arrange.align_left.is_none() && keys.toolbar.colour[0].is_none() && keys.tool.line.is_none());
+        let cfg: HotkeysConfig = toml::from_str(
+            "[arrange]\nalign_left = \"alt+a\"\nkeep_apart = \"[\"\n\
+             [toolbar]\ncolour_1 = \"shift+1\"\nsize_up = \"]\"\n\
+             [canvas]\nnew_layer = \"ctrl+shift+n\"\n",
+        )
+        .unwrap();
+        let keys = cfg.parsed();
+        let b = |b: Option<Binding>| b.map(|b| (b.key, b.ctrl, b.shift, b.alt));
+        assert_eq!(b(keys.arrange.align_left), Some((egui::Key::A, false, false, true)));
+        assert_eq!(b(keys.arrange.keep_apart), Some((egui::Key::OpenBracket, false, false, false)));
+        assert_eq!(b(keys.toolbar.colour[0]), Some((egui::Key::Num1, false, true, false)));
+        assert_eq!(b(keys.toolbar.size_up), Some((egui::Key::CloseBracket, false, false, false)));
+        assert_eq!(b(keys.canvas.new_layer), Some((egui::Key::N, true, true, false)));
+        // The rest keep their defaults.
+        assert_eq!(cfg.canvas.undo, "ctrl+z");
+        assert_eq!(parse("]").unwrap().label(), "]");
+        // Bound twice: reported.
+        let cfg: HotkeysConfig = toml::from_str("[arrange]\npack = \"ctrl+z\"\n").unwrap();
+        assert_eq!(cfg.clashes(), vec![("arrange.pack".into(), "canvas.undo".into(), "Ctrl+Z".into())]);
+    }
+
+    /// A hotkeys file as an older build wrote it: format 2, some keys
+    /// rebound, a comment, no `[toolbar]` or `[arrange]`.
+    const FORMAT_2: &str = "# On-Screen Notes — hotkeys.toml\n\n\
+                            version = 2\n\n\
+                            [global]\n\
+                            toggle_overlay = \"ctrl+shift+n\"\n\
+                            screenshot = \"ctrl+alt+shift+s\"\n\n\
+                            [tool]\n\
+                            pen = \"q\"  # mine\n\
+                            pencil = \"b\"\n\n\
+                            [canvas]\n\
+                            undo = \"ctrl+z\"\n";
+
+    #[test]
+    fn format_2_files_keep_their_globals_and_gain_every_key() {
+        // A global set to what was the default before format 2 is the
+        // user's choice by now.
+        let up = upgrade_text(FORMAT_2, 2);
+        assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
+        assert!(up.contains("version = 4"));
+
+        let new = add_missing_keys(&up);
+        let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
+        assert_eq!(cfg.version, FORMAT);
+        assert_eq!(cfg.global.toggle_overlay, "ctrl+shift+n");
+        assert_eq!(cfg.tool.pen, "q");
+        // What was there stays as written, the new lines go at the end of
+        // their section and new sections at the end of the file.
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 4\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
+        assert!(new.contains("pen = \"q\"  # mine\n"));
+        assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
+        // Each added line says what it does, the notes lined up in each
+        // block; the user's own lines get none.
+        let added = |key: &str| new.lines().find(|l| l.starts_with(&format!("{key} = "))).unwrap().to_owned();
+        assert!(added("marker").ends_with("  # Marker (highlighter)"));
+        assert!(added("align_left").ends_with("  # Align the selection left"));
+        assert!(added("colour_3").ends_with("  # Palette colour 3 (recolours a selection)"));
+        assert!(added("delete_layer").ends_with("# Delete the active layer (no undo)"));
+        assert_eq!(added("pencil"), "pencil = \"b\"");
+        let column = |key: &str| added(key).find("  # ").unwrap();
+        assert_eq!(column("marker"), column("dashed_border"));
+        assert_eq!(column("pack"), column("match_narrowest_width"));
+        let toolbar = new.find("\n[toolbar]\n").expect("toolbar section added");
+        let arrange = new.find("\n[arrange]\n").expect("arrange section added");
+        assert!(new.find("\n[canvas]\n").unwrap() < toolbar && toolbar < arrange);
+        // Every binding the app has is listed now, and a second run adds
+        // nothing.
+        let listed: toml::Table = toml::from_str(&new).unwrap();
+        let all = toml::Value::try_from(HotkeysConfig::default()).unwrap();
+        for section in ["global", "tool", "toolbar", "arrange", "canvas"] {
+            for key in all[section].as_table().unwrap().keys() {
+                assert!(listed[section].as_table().unwrap().contains_key(key), "{section}.{key} not listed");
+            }
+        }
+        assert_eq!(add_missing_keys(&new), new);
+        // Line endings follow the file's.
+        let crlf = add_missing_keys(&up.replace('\n', "\r\n"));
+        assert!(!crlf.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn format_3_files_gain_the_nudge_keys() {
+        let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
+        let new = add_missing_keys(&upgrade_text(old, 3));
+        assert!(new.starts_with("version = 4\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
+        assert_eq!(cfg.version, FORMAT);
+        assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
+        assert_eq!(cfg.arrange.align_left, "ctrl+arrowleft");
+        let line = |key: &str| new.lines().find(|l| l.starts_with(&format!("{key} = "))).unwrap().to_owned();
+        assert!(line("nudge_left_1px").starts_with("nudge_left_1px = \"arrowleft\""));
+        assert!(line("nudge_down_10px").starts_with("nudge_down_10px = \"shift+arrowdown\""));
+        assert!(line("nudge_up_10px").ends_with("# Selection 10 px up"));
+    }
+
+    #[test]
+    fn nudge_keys_may_share_only_slide_and_layer_keys() {
+        let keys = HotkeysConfig::default().parsed().canvas;
+        let b = |b: Option<Binding>| b.map(|b| (b.key, b.shift));
+        assert_eq!(b(keys.nudge_1px[0]), Some((egui::Key::ArrowLeft, false)));
+        assert_eq!(b(keys.nudge_10px[3]), Some((egui::Key::ArrowDown, true)));
+        // The arrows are slide and layer keys too by default: no clash.
+        assert_eq!(keys.prev_canvas, keys.nudge_1px[0]);
+        assert_eq!(HotkeysConfig::default().clashes(), vec![]);
+        let cfg: HotkeysConfig = toml::from_str("[canvas]\nnudge_left_1px = \"ctrl+z\"\nnudge_up_1px = \"home\"\n").unwrap();
+        assert_eq!(cfg.clashes(), vec![("canvas.nudge_left_1px".into(), "canvas.undo".into(), "Ctrl+Z".into())]);
     }
 
     #[test]
@@ -930,6 +1621,39 @@ mod tests {
         let cfg: HotkeysConfig = toml::from_str(&text).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!(cfg.global.screenshot, "ctrl+alt+shift+s");
+        // As a fresh install writes it: every binding with its note, and
+        // the notes do not change what it reads as.
+        let noted = annotate(&text);
+        let back: HotkeysConfig = toml::from_str(&noted).unwrap();
+        assert_eq!(toml::to_string_pretty(&back).unwrap(), text);
+        assert!(noted.contains("\nalign_left "));
+        for line in noted.lines().filter(|l| l.contains(" = ") && !l.starts_with("version")) {
+            assert!(line.contains("  # "), "no note: {line}");
+        }
+    }
+
+    /// Bring a hotkeys file up to date in place, as the app does when it
+    /// starts with it beside the exe: `OSN_HOTKEYS_FILE` names the file.
+    #[test]
+    #[ignore]
+    fn upgrade_a_hotkeys_file() {
+        let path = std::env::var_os("OSN_HOTKEYS_FILE").expect("set OSN_HOTKEYS_FILE to the file to upgrade");
+        let cfg = HotkeysConfig::load(Path::new(&path)).expect("the file reads");
+        assert_eq!(cfg.version, FORMAT);
+        for (a, b, keys) in cfg.clashes() {
+            println!("{a} and {b} are both {keys}");
+        }
+    }
+
+    #[test]
+    fn every_binding_has_a_note() {
+        let all = toml::Value::try_from(HotkeysConfig::default()).unwrap();
+        for section in ["global", "tool", "toolbar", "arrange", "canvas"] {
+            for key in all[section].as_table().unwrap().keys() {
+                assert!(note(section, key).is_some(), "{section}.{key} has no note");
+            }
+        }
+        assert_eq!(note("canvas", "opacity_7").as_deref(), Some("Active layer's opacity to 70 %"));
     }
 
     #[test]
@@ -945,11 +1669,11 @@ mod tests {
         let cfg: HotkeysConfig = toml::from_str(old).unwrap();
         assert_eq!(cfg.version, 0);
 
-        let new = upgrade_text(old);
+        let new = upgrade_text(old, 0);
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 2\n\n\
+             version = 4\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -969,14 +1693,14 @@ mod tests {
 
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
-        let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n");
-        assert_eq!(new, "version = 2\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
+        assert_eq!(new, "version = 4\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
-        let new = upgrade_text("version = 1");
-        assert_eq!(new, "version = 2");
-        assert_eq!(upgrade_text(""), "version = 2\n");
+        let new = upgrade_text("version = 1", 1);
+        assert_eq!(new, "version = 4");
+        assert_eq!(upgrade_text("", 0), "version = 4\n");
     }
 
     #[test]
