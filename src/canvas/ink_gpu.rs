@@ -913,9 +913,18 @@ mod tests {
         assert!(!drawable(&live));
         let ctx = egui::Context::default();
         let plans = plan_layer(&ctx, &[stroke(10, StrokeStyle::Marker), filled, live], 0.5);
-        let p = &plans[0];
-        assert!(!p.all);
-        assert_eq!(p.starts[2], p.starts[1]);
-        assert_eq!(p.starts[3], p.starts[2]);
+        // Where chunks end depends on a hash of the strokes (and their
+        // cache revisions, which every test bumps), so a boundary may
+        // fall anywhere: look each stroke up in whichever chunk has it.
+        let items = |i: usize| {
+            let p = plans.iter().find(|p| p.first <= i && i < p.first + p.len).expect("every stroke is in a chunk");
+            (p.all, p.starts[i - p.first + 1] - p.starts[i - p.first])
+        };
+        assert!(items(0).1 > 0, "the marker is drawn on the GPU");
+        for i in [1, 2] {
+            let (all, n) = items(i);
+            assert_eq!(n, 0, "stroke {i} stays on egui");
+            assert!(!all, "its chunk is not all GPU");
+        }
     }
 }
