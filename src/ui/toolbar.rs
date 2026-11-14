@@ -595,7 +595,10 @@ fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
     });
     ui.add_space(6.0);
     ui.label(
-        egui::RichText::new("Keys can be changed in hotkeys.toml, where every button can be given one too.")
+        egui::RichText::new(match keys.canvas.command_palette {
+            Some(b) => format!("{}: find any command by name. Keys can be changed in hotkeys.toml, where every button can be given one too.", b.label()),
+            None => "Keys can be changed in hotkeys.toml, where every button can be given one too.".to_string(),
+        })
             .small()
             .color(theme::TEXT_MUTED),
     );

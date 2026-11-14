@@ -17,6 +17,10 @@ layers.
   Windows, XInput2 on X11, tablet-v2 on Wayland)
 - **Krita-parity stroke smoothing** — five algorithms, per-mode knobs (see
   [Stroke smoothing](#stroke-smoothing))
+- **Command palette** — `Ctrl+K` opens a search box: type a few letters
+  of any command (a tool, an edit, a slide or layer command, any button,
+  "go to" a slide by name), see its key, `Enter` runs it. Recently run
+  commands come first; what needs a selection only shows with one
 - **Shape snap** — finish a stroke and hold the pen still for half a
   second: it springs into the straight line, triangle, rectangle, other
   polygon (up to six sides), circle or ellipse it was meant to be. See
@@ -459,6 +463,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Move the active slide one place up / down (or drag it in the slide panel) | unbound; set `move_slide_up` / `move_slide_down` |
 | Previous / next layer | `↓` / `↑` |
 | Hide / show the active layer | `H` |
+| Command palette: find any command by name (`↑` / `↓`, `Enter` runs, `Esc` closes) | `Ctrl+K` |
 | Reset pan + zoom | `Ctrl+0` |
 | Zoom to fit everything on the slide | `Ctrl+1` |
 | Zoom to the selection (nothing selected: the whole slide) | `Ctrl+2` |
@@ -516,7 +521,7 @@ one shortcut goes dead, the rest still work. Look at `RUST_LOG=warn`
 output for the offending line.
 
 ```toml
-version = 8
+version = 9
 
 [global]
 toggle_overlay = "ctrl+alt+shift+n"

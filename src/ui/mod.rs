@@ -4,6 +4,7 @@
 //! composes them.
 
 pub mod arrange_bar;
+pub mod command_palette;
 pub mod layer_panel;
 pub mod loupe;
 pub mod media_controls;

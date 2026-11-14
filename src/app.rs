@@ -203,6 +203,8 @@ pub struct OnScreenNotesApp {
     /// The palette from before "Use as palette", for "Restore palette".
     /// Kept until the app closes.
     palette_before: Option<Vec<[u8; 4]>>,
+    /// The command palette (Ctrl+K). Keys go to it alone while it is up.
+    commands: ui::command_palette::Palette,
     /// Last rect applied via `ViewportCommand` so we can skip the
     /// re-emit when the target window hasn't moved.
     pinned_last_rect: Option<(i32, i32, i32, i32)>,
@@ -607,6 +609,7 @@ impl OnScreenNotesApp {
             peek: None,
             picture_colours: None,
             palette_before: None,
+            commands: Default::default(),
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),
             obj_clipboard: (Vec::new(), Vec::new()),
@@ -1860,6 +1863,7 @@ impl OnScreenNotesApp {
                 say(self, msg.to_string());
             }
             K::Onion => self.toggle_onion(),
+            K::CommandPalette => self.commands.open(),
             K::Group(on) => {
                 if selecting {
                     self.group_selection(on);
@@ -2621,6 +2625,79 @@ impl OnScreenNotesApp {
         }
         if out.toggle_onion {
             self.toggle_onion();
+        }
+    }
+
+    /// Run what was picked in the command palette, as its key or button
+    /// would.
+    fn run_command(&mut self, cmd: ui::command_palette::Command, ctx: &egui::Context, canvas_rect: egui::Rect) {
+        use ui::command_palette::Command as C;
+        let ppp = ctx.pixels_per_point();
+        let sel = |app: &mut Self, action: SelAction| {
+            // Copying changes nothing; the rest want a slide that takes edits.
+            if matches!(action, SelAction::Copy | SelAction::CopyToNewSlide) || app.may_edit() {
+                app.apply_sel_action(action, canvas_rect, ppp);
+            }
+        };
+        match cmd {
+            C::Key(k) => self.apply_key_action(k, ctx),
+            C::Tool(kind, style) => {
+                self.tool.kind = kind;
+                if let Some(s) = style {
+                    self.tool.style = s;
+                }
+            }
+            C::Eyedropper => self.tool.eyedropper_pending = true,
+            C::Undo | C::Redo => {
+                if self.may_edit() {
+                    let c = self.canvases.active_mut();
+                    if cmd == C::Undo { c.undo() } else { c.redo() }
+                    self.restyle_run = None;
+                    self.nudge_run = None;
+                }
+            }
+            C::ClearLayer => {
+                if self.may_edit() {
+                    self.canvases.active_mut().clear();
+                }
+            }
+            C::DeleteSlide => {
+                if self.may_edit() {
+                    self.request_slide_delete();
+                }
+            }
+            C::LockSlide => self.toggle_lock(),
+            C::RenameSlide => {
+                let i = self.canvases.active_index();
+                self.slide_panel.start_rename(i, self.canvases.name(i));
+                self.config.slide_panel_open = true;
+                self.ui_visible = true;
+            }
+            C::ResetView => {
+                let (pan, zoom) = self.canvases.active_view_mut();
+                *zoom = 1.0;
+                *pan = [0.0, 0.0];
+            }
+            C::FreezeFrame => {
+                if self.may_edit() {
+                    self.queue_freeze(ppp);
+                }
+            }
+            C::ToggleUi => self.ui_visible = !self.ui_visible,
+            C::TogglePins => self.set_pins_hidden(!self.canvases.pins_hidden()),
+            C::Duplicate => sel(self, SelAction::Duplicate),
+            C::CopyToNewSlide => sel(self, SelAction::CopyToNewSlide),
+            C::TogglePin => sel(self, SelAction::TogglePin),
+            C::ToFront => sel(self, SelAction::ToFront),
+            C::ToBack => sel(self, SelAction::ToBack),
+            C::DeleteSelection => sel(self, SelAction::Delete),
+            C::ShapeSnap => {
+                self.config.shape_snap = !self.config.shape_snap;
+                self.tool.shape_snap = self.config.shape_snap;
+                let msg = if self.config.shape_snap { "Shape snap on" } else { "Shape snap off" };
+                self.toast = Some((msg.to_string(), Instant::now()));
+            }
+            C::GoTo(i) => self.canvases.go_to(i),
         }
     }
 
@@ -3457,6 +3534,29 @@ impl eframe::App for OnScreenNotesApp {
             self.media_ui.ffmpeg_window(ctx, self.osn_hwnd, &mut media_out);
             self.apply_media_out(media_out);
             self.show_delete_confirm(ctx);
+            if self.commands.is_open() {
+                let picked = {
+                    let cx = ui::command_palette::Context {
+                        keys: &self.hotkeys_cfg,
+                        selected: if self.tool.kind == crate::tools::ToolKind::Select {
+                            self.tool.select.sel.strokes.len() + self.tool.select.sel.shapes.len()
+                        } else {
+                            0
+                        },
+                        picture: self.selected_picture().is_some(),
+                        grouped: self.selection_grouped(),
+                        pin: self.pin_tool.selected.is_some() && self.tool.kind == crate::tools::ToolKind::Select,
+                        palette: &self.config.palette,
+                        slides: (0..self.canvases.count()).map(|i| self.canvases.name(i).to_string()).collect(),
+                        active_slide: self.canvases.active_index(),
+                    };
+                    let all = ui::command_palette::entries(&cx);
+                    self.commands.show(ctx, &all)
+                };
+                if let Some(cmd) = picked {
+                    self.run_command(cmd, ctx, canvas_rect);
+                }
+            }
 
             // ---- Screenshot region selection --------------------------------
             // Draws the dimmed rubber-band over the canvas and, on release,
@@ -4132,8 +4232,9 @@ impl eframe::App for OnScreenNotesApp {
                 // takes raw bools (not Modifiers).
                 let ctrl  = mods.ctrl || mods.command;
                 let shift = mods.shift;
-                // "Delete this slide?" takes the keys while it is up.
-                if text_consumed || self.confirm_delete.is_some() {
+                // "Delete this slide?" and the command palette take the
+                // keys while they are up.
+                if text_consumed || self.confirm_delete.is_some() || self.commands.is_open() {
                     // Still allow scroll-wheel events (handled below
                     // outside this for-loop) but drop key events.
                     // Falling through to the wheel block below means

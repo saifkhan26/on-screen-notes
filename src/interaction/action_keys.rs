@@ -60,6 +60,8 @@ pub enum KeyAction {
     Group(bool),
     /// Onion skin on / off for every GIF and video.
     Onion,
+    /// Open the command palette.
+    CommandPalette,
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -114,6 +116,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.zoom_to_fit, KeyAction::ZoomToFit),
         (c.zoom_to_selection, KeyAction::ZoomToSelection),
         (c.media_onion, KeyAction::Onion),
+        (c.command_palette, KeyAction::CommandPalette),
         (c.group, KeyAction::Group(true)),
         (c.ungroup, KeyAction::Group(false)),
         (c.move_slide_up, KeyAction::MoveSlide(-1)),
@@ -187,6 +190,7 @@ mod tests {
         assert_eq!(press(&keys, egui::Key::Num2, ctrl), vec![KeyAction::ZoomToSelection]);
         assert_eq!(press(&keys, egui::Key::Num1, egui::Modifiers::NONE), vec![], "1 alone is the opacity key");
         assert_eq!(press(&keys, egui::Key::G, ctrl), vec![KeyAction::Group(true)]);
+        assert_eq!(press(&keys, egui::Key::K, ctrl), vec![KeyAction::CommandPalette]);
         assert_eq!(press(&keys, egui::Key::G, ctrl | egui::Modifiers::SHIFT), vec![KeyAction::Group(false)]);
         let cfg: HotkeysConfig = toml::from_str("[canvas]\nmove_slide_up = \"alt+pageup\"\nmove_slide_down = \"alt+pagedown\"\n").unwrap();
         let keys = cfg.parsed();
