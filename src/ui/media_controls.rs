@@ -43,6 +43,32 @@ pub fn media_on_screen(canvas: &Canvas, canvas_rect: Rect) -> Vec<OnScreen> {
     out
 }
 
+/// Media objects shown in `pins`, bottom pin to top, placed on screen the
+/// way the renderer places them.
+pub fn pinned_media_on_screen(pins: &[crate::canvas::pins::Pinned], canvas_rect: Rect) -> Vec<OnScreen> {
+    let mut out = Vec::new();
+    for p in pins {
+        for m in p.members {
+            let crate::canvas::hit::ObjRef::Shape(i) = m.obj else { continue };
+            // A pin shows whatever its layer's visibility and opacity.
+            let Some(layer) = p.canvas.layers.get(m.layer) else { continue };
+            let Some(shape) = layer.shapes.get(i) else { continue };
+            let Some(media) = shape.media() else { continue };
+            let [x0, y0, x1, y1] = p.shape_obb(shape).aabb();
+            out.push(OnScreen { id: media.id, rect: Rect::from_min_max(canvas_rect.min + Vec2::new(x0, y0), canvas_rect.min + Vec2::new(x1, y1)) });
+        }
+    }
+    out
+}
+
+/// The video or GIF that pin `id` shows, when it shows that one object.
+pub fn pinned_media(pins: &[crate::canvas::pins::Pinned], id: u64) -> Option<u64> {
+    let p = pins.iter().find(|p| p.pin.id == id)?;
+    let [m] = p.members else { return None };
+    let crate::canvas::hit::ObjRef::Shape(i) = m.obj else { return None };
+    p.canvas.layers.get(m.layer)?.shapes.get(i)?.media().map(|media| media.id)
+}
+
 /// The media object selected on its own in the Select tool, if any.
 pub fn selected_media(canvas: &Canvas, sel: &crate::canvas::hit::Selection) -> Option<u64> {
     if sel.shapes.len() != 1 || !sel.strokes.is_empty() { return None; }
@@ -86,6 +112,8 @@ pub struct MediaUiOut {
     /// Picked with "Locate ffmpeg…"; to be saved in config.
     pub located: Option<PathBuf>,
     pub toast: Option<String>,
+    /// The onion-skin button was clicked.
+    pub toggle_onion: bool,
 }
 
 impl MediaUi {
@@ -107,19 +135,28 @@ impl MediaUi {
         let mut out = MediaUiOut::default();
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         // Only the topmost object under the pointer counts.
-        let over = pointer.and_then(|p| objs.iter().rev().find(|o| o.rect.contains(p)).map(|o| o.id));
+        let topmost = pointer.and_then(|p| objs.iter().rposition(|o| o.rect.contains(p)));
+        let over = topmost.map(|k| objs[k].id);
         let scrubbing = self.scrubbing.take();
+        // One object can show twice — on its slide and in a pin — but it
+        // has one player, so one bar: by the showing under the pointer,
+        // else the topmost.
+        let mut showing: HashMap<u64, usize> = objs.iter().enumerate().map(|(k, o)| (o.id, k)).collect();
+        if let Some(k) = topmost {
+            showing.insert(objs[k].id, k);
+        }
 
         let mut drawn = HashMap::new();
         if show_bars {
-            for o in objs {
+            for (k, o) in objs.iter().enumerate() {
+                if showing.get(&o.id) != Some(&k) { continue; }
                 let on_bar = pointer
                     .zip(self.bar_rects.get(&o.id))
                     .is_some_and(|(p, bar)| bar.contains(p) || gap(o.rect, *bar).contains(p));
                 let shown = over == Some(o.id) || on_bar || scrubbing == Some(o.id) || selected == Some(o.id);
                 if !shown { continue; }
                 let Some(status) = hub.status(o.id) else { continue };
-                let rect = self.bar(ctx, o, &status, canvas_rect, &mut out);
+                let rect = self.bar(ctx, o, &status, hub.onion(), canvas_rect, &mut out);
                 drawn.insert(o.id, rect);
             }
         }
@@ -127,7 +164,7 @@ impl MediaUi {
         out
     }
 
-    fn bar(&mut self, ctx: &egui::Context, o: &OnScreen, st: &PlayerStatus, canvas_rect: Rect, out: &mut MediaUiOut) -> Rect {
+    fn bar(&mut self, ctx: &egui::Context, o: &OnScreen, st: &PlayerStatus, onion: bool, canvas_rect: Rect, out: &mut MediaUiOut) -> Rect {
         let width = o.rect.width().clamp(300.0, 560.0);
         let gap = 6.0;
         let x = (o.rect.center().x - width * 0.5).clamp(canvas_rect.left() + 4.0, (canvas_rect.right() - width - 4.0).max(canvas_rect.left()));
@@ -172,7 +209,7 @@ impl MediaUi {
 
                         let label = time_label(st);
                         let galley = ui.painter().layout_no_wrap(label, egui::FontId::proportional(11.0), theme::TEXT_MUTED);
-                        let reserved = galley.size().x + BTN + 14.0 + if st.loading { 16.0 } else { 0.0 };
+                        let reserved = galley.size().x + 2.0 * BTN + 16.0 + if st.loading { 16.0 } else { 0.0 };
                         let scrub_w = (ui.available_width() - reserved).max(40.0);
                         let (seek, held) = scrubber(ui, scrub_w, st);
                         if let Some(c) = seek { cmd(c, out); }
@@ -184,6 +221,15 @@ impl MediaUi {
                         ui.painter().galley(Pos2::new(r.left() + 3.0, r.center().y - galley.size().y * 0.5), galley, theme::TEXT_MUTED);
                         if icon_btn(ui, Icon::Repeat, st.looping, if st.looping { "Loop: on" } else { "Loop: off" }) {
                             cmd(Cmd::ToggleLoop, out);
+                        }
+                        let tip = if onion {
+                            "Onion skin: on — while paused, the frame before shows in red and the one after in green, where they differ (every GIF and video)"
+                        } else {
+                            "Onion skin: off — click to see, while paused, the frame before in red and the one after in green, where they differ"
+                        };
+                        if icon_btn(ui, Icon::Onion, onion, tip) {
+                            out.toggle_onion = true;
+                            out.clicked = true;
                         }
                     });
                 });
@@ -345,6 +391,7 @@ enum Icon {
     StepBack,
     StepForward,
     Repeat,
+    Onion,
 }
 
 fn icon_btn(ui: &mut egui::Ui, icon: Icon, active: bool, tooltip: &str) -> bool {
@@ -363,6 +410,7 @@ fn icon_btn(ui: &mut egui::Ui, icon: Icon, active: bool, tooltip: &str) -> bool 
         Icon::StepBack => egui::Image::new(egui::include_image!("../../assets/icons/step-back.svg")),
         Icon::StepForward => egui::Image::new(egui::include_image!("../../assets/icons/step-forward.svg")),
         Icon::Repeat => egui::Image::new(egui::include_image!("../../assets/icons/repeat.svg")),
+        Icon::Onion => egui::Image::new(egui::include_image!("../../assets/icons/onion.svg")),
     };
     let icon_rect = rect.shrink(rect.width() * 0.24);
     let tint = if active || resp.hovered() { theme::TEXT_PRIMARY } else { Color32::from_gray(205) };

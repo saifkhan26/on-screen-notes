@@ -9,6 +9,8 @@ use crate::canvas::shape::{BorderStyle, MediaType};
 use crate::canvas::smoothing::{SmoothingOptions, SmoothingType};
 use crate::canvas::stroke::StrokeStyle;
 use crate::config::SmoothingLevel;
+use crate::input::hotkeys_config::{Binding, ParsedHotkeys};
+use crate::tools::beside::{BesideFit, BesideSide};
 use crate::tools::{ActiveTool, ToolKind};
 use crate::ui::media_filter::{self, MediaFilter};
 use crate::ui::theme;
@@ -16,24 +18,37 @@ use egui::{Color32, Rounding, Stroke, Vec2};
 
 /// Render the toolbar. Returns `true` if the user interacted with any
 /// element this frame.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
     tool: &mut ActiveTool,
     bg_opacity: &mut f32,
     bg_color: &mut [u8; 3],
-    palette: &mut Vec<[u8; 4]>,
+    palette: &mut [[u8; 4]],
     smoothing: &mut SmoothingLevel,
     smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
+    // Shape snap and smart guides on / off, in the settings popup.
+    snaps: (&mut bool, &mut bool),
+    // New media beside the selected picture: what it matches and which
+    // side, in the settings popup.
+    beside: (&mut BesideFit, &mut BesideSide),
     pinned_hwnd: &mut Option<isize>,
     pin_picking: &mut bool,
     // Set when the "Insert video / GIF" button is clicked.
     insert_media: &mut bool,
     media_filter: &mut MediaFilter,
     // Pictures / GIFs / videos on the slide, for the filter popup.
-    media_counts: [usize; 3],
+    media_counts: &media_filter::Counts,
     // Set when the filter's "Select these" is clicked.
     select_filtered: &mut bool,
+    // Whether pins are hidden; `None` when there are no pins, which
+    // hides the button.
+    pins_hidden: Option<&mut bool>,
+    // Text labels are selected: the text-box switch shows for them.
+    text_selected: bool,
+    // The hotkeys as bound, for the help panel.
+    keys: &ParsedHotkeys,
 ) -> bool {
     let mut interacted = false;
 
@@ -58,6 +73,11 @@ pub fn show(
                     interacted |= tool_btn(ui, tool, ToolKind::Fill,          "Fill — F");
                     interacted |= tool_btn(ui, tool, ToolKind::Laser,         "Laser pointer — L  (fades after pen-up)");
                     interacted |= tool_btn(ui, tool, ToolKind::Text,          "Text — T  (click to place, Enter to commit, Shift+Enter newline)");
+                    // Contextual, like the dashed-border switch: with the
+                    // Text tool, or with labels selected.
+                    if tool.kind == ToolKind::Text || text_selected {
+                        interacted |= text_box_btn(ui, tool, keys.toolbar.text_box);
+                    }
                     interacted |= tool_btn(ui, tool, ToolKind::Spotlight,     "Spotlight — S  (dim everything except a square around the cursor; wheel resizes)");
                     interacted |= tool_btn(ui, tool, ToolKind::LassoErase,    "Lasso erase — X  (draw a closed loop, or click corner by corner for a polygon and close it on the first corner, with a double click or Enter; ink whose centroid lands inside is removed)");
                     interacted |= tool_btn(ui, tool, ToolKind::LassoSelect,   "Lasso capture — Shift+X  (draw a closed loop, or click corner by corner for a polygon and close it on the first corner, with a double click or Enter; the screen pixels inside become an image on the active layer)");
@@ -67,7 +87,8 @@ pub fn show(
                     // Group 2: shape tools
                     interacted |= tool_btn(ui, tool, ToolKind::Rect,          "Rectangle — R");
                     interacted |= tool_btn(ui, tool, ToolKind::Ellipse,       "Ellipse — O");
-                    interacted |= tool_btn(ui, tool, ToolKind::Line,          "Line — straight line (toolbar only)");
+                    let line_tip = keys.tool.line.map_or_else(|| "Line — straight line".to_string(), |b| format!("Line — {}", b.label()));
+                    interacted |= tool_btn(ui, tool, ToolKind::Line,          &line_tip);
                     interacted |= tool_btn(ui, tool, ToolKind::Arrow,         "Arrow — A");
                     interacted |= tool_btn(ui, tool, ToolKind::FreehandArrow, "Freehand arrow — Shift+A");
                     // Contextual dashed-border toggle — visible only
@@ -81,10 +102,9 @@ pub fn show(
                     spacer(ui);
 
                     // Group 3: colours
-                    for i in 0..palette.len() {
-                        let slot = palette[i];
-                        let (new_slot, hit) = colour_swatch(ui, tool, slot, i);
-                        palette[i] = new_slot;
+                    for (i, slot) in palette.iter_mut().enumerate() {
+                        let (new_slot, hit) = colour_swatch(ui, tool, *slot, i);
+                        *slot = new_slot;
                         interacted |= hit;
                     }
                     spacer(ui);
@@ -96,9 +116,12 @@ pub fn show(
                     // Group 5: utilities (insert media + pin + settings + help)
                     interacted |= insert_media_btn(ui, insert_media);
                     interacted |= filter_btn(ui, media_filter, media_counts, select_filtered);
+                    if let Some(hidden) = pins_hidden {
+                        interacted |= pins_btn(ui, hidden);
+                    }
                     interacted |= pin_btn(ui, pinned_hwnd, pin_picking);
-                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve);
-                    interacted |= help_btn(ui);
+                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve, (&mut *snaps.0, &mut *snaps.1), (&mut *beside.0, &mut *beside.1));
+                    interacted |= help_btn(ui, keys);
                 });
             });
         });
@@ -204,9 +227,41 @@ fn insert_media_btn(ui: &mut egui::Ui, clicked: &mut bool) -> bool {
     response.hovered() || response.is_pointer_button_down_on()
 }
 
-/// Media filter: highlights pictures, GIFs and / or videos on the slide.
-/// Lit while any type is on; the popup picks the types.
-fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: [usize; 3], select: &mut bool) -> bool {
+/// Show / hide every pin (objects kept on screen). Lit while they
+/// are hidden, so a hidden state is never forgotten.
+fn pins_btn(ui: &mut egui::Ui, hidden: &mut bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
+    let bg = if *hidden {
+        theme::ACCENT
+    } else if response.hovered() {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+    let icon = if *hidden {
+        egui::include_image!("../../assets/icons/eye-off.svg")
+    } else {
+        egui::include_image!("../../assets/icons/eye.svg")
+    };
+    let icon_rect = rect.shrink(rect.width() * 0.22);
+    egui::Image::new(icon).tint(theme::TEXT_PRIMARY).fit_to_exact_size(icon_rect.size()).paint_at(ui, icon_rect);
+    let tooltip = if *hidden {
+        "Pinned objects are hidden — click to show them again (Shift+P)"
+    } else {
+        "Hide all pins (Shift+P). Their originals stay on their own slides"
+    };
+    let response = response.on_hover_text(tooltip);
+    if response.clicked() {
+        *hidden = !*hidden;
+        return true;
+    }
+    response.hovered() || response.is_pointer_button_down_on()
+}
+
+/// Media filter: highlights pictures, GIFs and / or videos on the slide,
+/// its groups, and what is tagged. Lit while any is on; the popup picks.
+fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: &media_filter::Counts, select: &mut bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
     let bg = if filter.any() {
         theme::ACCENT
@@ -221,7 +276,7 @@ fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: [usize; 3], s
         .tint(theme::TEXT_PRIMARY)
         .fit_to_exact_size(icon_rect.size())
         .paint_at(ui, icon_rect);
-    let response = response.on_hover_text("Highlight pictures, GIFs or videos");
+    let response = response.on_hover_text("Highlight pictures, GIFs, videos, groups or tags");
     let popup_id = ui.make_persistent_id("osn_media_filter_popup");
     let mut interacted = response.hovered() || response.is_pointer_button_down_on();
     if response.clicked() {
@@ -237,16 +292,51 @@ fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: [usize; 3], s
             ui.set_min_width(200.0);
             ui.label(egui::RichText::new("Highlight media").small().color(theme::TEXT_MUTED));
             ui.add_space(2.0);
-            for (t, n) in MediaType::ALL.into_iter().zip(counts) {
+            let dot_row = |ui: &mut egui::Ui, colour: Color32, on: &mut bool, text: String| {
                 ui.horizontal(|ui| {
                     let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 4.5, media_filter::color(t));
-                    ui.toggle_value(filter.flag(t), format!("{}  ({n})", media_filter::label(t)));
+                    ui.painter().circle_filled(dot.center(), 4.5, colour);
+                    ui.toggle_value(on, text);
+                });
+            };
+            for (t, n) in MediaType::ALL.into_iter().zip(counts.media) {
+                dot_row(ui, media_filter::color(t), filter.flag(t), format!("{}  ({n})", media_filter::label(t)));
+            }
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Groups and tags").small().color(theme::TEXT_MUTED));
+            ui.add_space(2.0);
+            dot_row(ui, media_filter::GROUP_COLOUR, &mut filter.groups, format!("Groups  ({})", counts.groups));
+            dot_row(ui, media_filter::TAG_COLOUR, &mut filter.tagged, format!("All tagged  ({})", counts.tagged));
+            // Each tag on this slide, and any picked that is not on it, so
+            // it can be put back.
+            let mut tags = counts.tags.clone();
+            for t in &filter.tags {
+                if !tags.iter().any(|(have, _)| crate::canvas::units::same_tag(have, t)) {
+                    tags.push((t.clone(), 0));
+                }
+            }
+            if tags.is_empty() {
+                ui.label(egui::RichText::new("Nothing here is tagged — select something, then the arrange bar's tag button").small().color(theme::TEXT_MUTED));
+            } else {
+                egui::ScrollArea::vertical().max_height(180.0).auto_shrink([true, true]).show(ui, |ui| {
+                    for (tag, n) in &tags {
+                        ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            let mut on = filter.has_tag(tag);
+                            if ui.toggle_value(&mut on, format!("#{tag}  ({n})")).clicked() {
+                                filter.toggle_tag(tag);
+                            }
+                        });
+                    }
                 });
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let matching: usize = MediaType::ALL.into_iter().zip(counts).filter(|(t, _)| filter.shows(*t)).map(|(_, n)| n).sum();
+                let media: usize = MediaType::ALL.into_iter().zip(counts.media).filter(|(t, _)| filter.shows(*t)).map(|(_, n)| n).sum();
+                let picked: usize = tags.iter().filter(|(t, _)| filter.has_tag(t)).map(|(_, n)| n).sum();
+                let matching = media
+                    + if filter.groups { counts.groups } else { 0 }
+                    + if filter.tagged { counts.tagged } else { picked };
                 if ui
                     .add_enabled(matching > 0, egui::Button::new("Select these"))
                     .on_hover_text("Select the highlighted objects, ready to arrange")
@@ -435,9 +525,10 @@ fn size_widget(ui: &mut egui::Ui, tool: &mut ActiveTool) -> bool {
 }
 
 /// Help "?" button — purely hover-driven. On hover, egui pops a tooltip
-/// listing every keyboard shortcut + scroll-wheel + Alt behaviour. Lives
-/// in the toolbar so it is always discoverable but never in the way.
-fn help_btn(ui: &mut egui::Ui) -> bool {
+/// listing every hotkey as bound in `hotkeys.toml`, plus the mouse,
+/// wheel and held-modifier gestures. Lives in the toolbar so it is
+/// always discoverable but never in the way.
+fn help_btn(ui: &mut egui::Ui, keys: &ParsedHotkeys) -> bool {
     let size = Vec2::splat(BTN_SIZE);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
 
@@ -462,90 +553,294 @@ fn help_btn(ui: &mut egui::Ui) -> bool {
         theme::TEXT_PRIMARY,
     );
 
-    // Rich tooltip on hover — three-column grid of action / shortcut. Using
-    // `on_hover_ui` (not `on_hover_text`) gives us proper layout control.
-    response.on_hover_ui(|ui| {
-        ui.set_max_width(360.0);
-        ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new("Keyboard & input shortcuts")
-                    .strong()
-                    .size(13.0),
-            );
-            ui.add_space(4.0);
-
-            egui::Grid::new("osn_help_grid")
-                .num_columns(2)
-                .spacing([18.0, 4.0])
-                .show(ui, |ui| {
-                    let row = |ui: &mut egui::Ui, action: &str, keys: &str| {
-                        ui.label(action);
-                        ui.label(
-                            egui::RichText::new(keys)
-                                .monospace()
-                                .color(Color32::from_rgb(232, 200, 200)),
-                        );
-                        ui.end_row();
-                    };
-                    row(ui, "Pen",                "P");
-                    row(ui, "Pencil (brush)",     "B");
-                    row(ui, "Marker (highlighter)","M");
-                    row(ui, "Airbrush (spray)",   "G");
-                    row(ui, "Fill",               "F");
-                    row(ui, "Laser pointer",      "L");
-                    row(ui, "Spotlight",          "S");
-                    row(ui, "Lasso erase",        "X");
-                    row(ui, "Lasso capture",      "Shift + X  (screen → image on active layer)");
-                    row(ui, "  lasso polygon",    "click corners; first corner / double click / Enter closes, Backspace = undo corner");
-                    row(ui, "Select",             "V  (Shift+click = add / remove, drag = box)");
-                    row(ui, "  move / resize / rotate", "drag inside / handles / top knob (Shift = 15°)");
-                    row(ui, "  delete / duplicate", "Delete / Ctrl+D");
-                    row(ui, "  copy to new slide", "Ctrl+Shift+D  (new slide after the last)");
-                    row(ui, "  arrange (2+ selected)", "bar under the toolbar: pack, group by type, align, distribute");
-                    row(ui, "Highlight pictures / GIFs / videos", "funnel button; \"Select these\" selects them");
-                    row(ui, "  copy / cut / paste", "Ctrl+C / Ctrl+X / Ctrl+V  (also pastes images)");
-                    row(ui, "  to front / to back", "Ctrl+↑ / Ctrl+↓");
-                    row(ui, "  recolour / resize line", "pick a colour / move the size slider");
-                    row(ui, "Eyedropper (1 shot)","I");
-                    row(ui, "Magnifier loupe",    "Hold Z  (wheel resizes zoom)");
-                    row(ui, "Text",               "T  (Enter = commit, Shift+Enter = newline)");
-                    row(ui, "Insert picture / video / GIF", "film button, or drop a file on the canvas");
-                    row(ui, "  play / pause",     "K  (hover or select it; bar appears below)");
-                    row(ui, "  prev / next frame", ", / .");
-                    row(ui, "Rectangle",          "R");
-                    row(ui, "Ellipse",            "O");
-                    row(ui, "Straight arrow",     "A");
-                    row(ui, "Freehand arrow",     "Shift + A");
-                    row(ui, "Undo / Redo",        "Ctrl+Z / Ctrl+Shift+Z");
-                    row(ui, "Clear canvas",       "Ctrl + Delete");
-                    row(ui, "Delete this canvas", "Ctrl + Shift + Backspace");
-                    row(ui, "Prev / next canvas", "← / →");
-                    row(ui, "Prev / next layer",  "↓ / ↑");
-                    row(ui, "Hide / show UI",     "Tab");
-                    row(ui, "Background opacity", "Ctrl + Scroll");
-                    row(ui, "Layer opacity",      "Shift + Scroll");
-                    row(ui, "Click-through",      "Hold Alt");
-                    row(ui, "Temporary eraser",   "Hold Ctrl + draw");
-                    row(ui, "Pick colour",        "Hold Shift + tap");
-                    row(ui, "Pan canvas",         "Hold Space + drag");
-                    row(ui, "Pan canvas (mouse)", "Middle-click + drag");
-                    row(ui, "Pan active layer",   "Hold Shift + Space + drag");
-                    row(ui, "Pen size (pen tool)","Scroll");
-                    row(ui, "Zoom (other tools)", "Scroll");
-                    row(ui, "Reset zoom + pan",   "Ctrl + 0");
-                    row(ui, "Reset layer position","Ctrl + Shift + 0");
-                    row(ui, "Screenshot (bg+ink)","Ctrl + Shift + S");
-                    row(ui, "Freeze frame → layer","Ctrl + Shift + F");
-                    row(ui, "Pin to window",      "toolbar pin button");
-                    row(ui, "Pause / resume record","Ctrl + Shift + P");
-                    row(ui, "Toggle overlay",     "Ctrl + Shift + N");
-                });
-        });
-    });
+    // Rich tooltip on hover. Using `on_hover_ui` (not `on_hover_text`)
+    // gives us proper layout control.
+    response.on_hover_ui(|ui| help_panel(ui, keys));
 
     // Hover is *not* a click — never report it as a user interaction so
     // pen events still flow to the canvas.
     false
+}
+
+/// One titled group of help rows, each an action and how to do it.
+type HelpSection = (&'static str, Vec<(&'static str, String)>);
+
+/// The help tooltip: titled sections of action / keys grids, flowed
+/// into as many columns as the screen fits so the list never runs off
+/// the bottom of it.
+fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
+    // Room a column takes, with the gap after it.
+    const COL_W: f32 = 400.0;
+    let sections = help_sections(keys);
+    let screen_w = ui.ctx().screen_rect().width() - 40.0;
+    let cols = (screen_w / COL_W).floor().clamp(1.0, 3.0) as usize;
+    // A tooltip stops at `spacing.tooltip_width` (500), which would
+    // wrap every column past the first.
+    ui.set_max_width(screen_w);
+
+    // Fill columns in order, a heading counting as a row. A section
+    // starts the next column when more than half of it would spill
+    // past an even share.
+    let total: usize = sections.iter().map(|(_, rows)| rows.len() + 1).sum();
+    let share = total.div_ceil(cols);
+    let mut columns: Vec<Vec<&HelpSection>> = vec![Vec::new()];
+    let mut filled = 0;
+    for s in &sections {
+        let n = s.1.len() + 1;
+        if filled > 0 && filled + n / 2 > share && columns.len() < cols {
+            columns.push(Vec::new());
+            filled = 0;
+        }
+        columns.last_mut().unwrap().push(s);
+        filled += n;
+    }
+
+    ui.label(
+        egui::RichText::new("Keyboard & input shortcuts")
+            .strong()
+            .size(13.0),
+    );
+    ui.add_space(4.0);
+    // Taller than the screen allows, the columns scroll: a scroll bar
+    // makes the tooltip one the pointer can move onto, so it stays open
+    // to be scrolled.
+    let room = (ui.ctx().screen_rect().height() - 150.0).max(200.0);
+    egui::ScrollArea::vertical().max_height(room).auto_shrink([true, true]).show(ui, |ui| {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 24.0;
+        for (ci, column) in columns.iter().enumerate() {
+            ui.vertical(|ui| {
+                for (si, (title, rows)) in column.iter().enumerate() {
+                    if si > 0 {
+                        ui.add_space(6.0);
+                    }
+                    ui.label(egui::RichText::new(*title).strong().color(theme::TEXT_MUTED));
+                    egui::Grid::new(("osn_help_grid", ci, si))
+                        .num_columns(2)
+                        .spacing([18.0, 2.0])
+                        .show(ui, |ui| {
+                            for (action, how) in rows {
+                                ui.label(*action);
+                                ui.label(
+                                    egui::RichText::new(how)
+                                        .monospace()
+                                        .color(Color32::from_rgb(232, 200, 200)),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+        }
+    });
+    });
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(match keys.canvas.command_palette {
+            Some(b) => format!(
+                "{}: find any command by name.{} Keys can be changed in hotkeys.toml, where every button can be given one too.",
+                b.label(),
+                keys.canvas.find.map_or(String::new(), |f| format!(" {}: find text on the slides.", f.label())),
+            ),
+            None => "Keys can be changed in hotkeys.toml, where every button can be given one too.".to_string(),
+        })
+            .small()
+            .color(theme::TEXT_MUTED),
+    );
+}
+
+/// Every hotkey as bound (a rebound key shows its new combo, an unbound
+/// or unreadable one a dash) and the fixed mouse / modifier gestures.
+/// The buttons' own keys, unbound until set, are listed once they are.
+fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
+    let mut sections = fixed_help_sections(keys);
+    let (t, tb, a, c) = (&keys.tool, &keys.toolbar, &keys.arrange, &keys.canvas);
+    let bound = |rows: Vec<(&'static str, Option<Binding>)>| -> Vec<(&'static str, String)> {
+        rows.into_iter().filter_map(|(name, b)| b.map(|b| (name, b.label()))).collect()
+    };
+    let mut more = [
+        ("Toolbar buttons", bound(vec![
+            ("Dashed / solid border",    t.dashed_border),
+            ("Colour 1",                 tb.colour[0]),
+            ("Colour 2",                 tb.colour[1]),
+            ("Colour 3",                 tb.colour[2]),
+            ("Colour 4",                 tb.colour[3]),
+            ("Colour 5",                 tb.colour[4]),
+            ("Colour 6",                 tb.colour[5]),
+            ("Colour 7",                 tb.colour[6]),
+            ("Colour 8",                 tb.colour[7]),
+            ("Size up",                  tb.size_up),
+            ("Size down",                tb.size_down),
+            ("Insert picture / video / GIF", tb.insert_media),
+            ("Highlight pictures",       tb.highlight[0]),
+            ("Highlight GIFs",           tb.highlight[1]),
+            ("Highlight videos",         tb.highlight[2]),
+            ("Select the highlighted",   tb.select_highlighted),
+            ("Pin to a window / unpin",  tb.pin_to_window),
+            ("Background opacity up",    tb.background_up),
+            ("Background opacity down",  tb.background_down),
+            ("Black background",         tb.reset_background),
+            ("Text in a box on / off",   tb.text_box),
+        ])),
+        ("Arrange (2+ selected)", bound(vec![
+            ("Pack",                     a.pack),
+            ("Group by type",            a.group_by_type),
+            ("Keep apart on / off",      a.keep_apart),
+            ("Align left",               a.align_left),
+            ("Align centres across",     a.align_center_x),
+            ("Align right",              a.align_right),
+            ("Align top",                a.align_top),
+            ("Align centres down",       a.align_center_y),
+            ("Align bottom",             a.align_bottom),
+            ("Distribute across",        a.distribute_x),
+            ("Distribute down",          a.distribute_y),
+            ("Width of the narrowest",   a.match_narrowest_width),
+            ("Width of the widest",      a.match_widest_width),
+            ("Height of the shortest",   a.match_shortest_height),
+            ("Height of the tallest",    a.match_tallest_height),
+            ("Move to slide…",           a.move_to_slide),
+            ("Flip left to right",       a.flip_horizontal),
+            ("Flip top to bottom",       a.flip_vertical),
+            ("A picture's colours",      a.picture_colours),
+        ])),
+        ("Panels & pins", bound(vec![
+            ("New slide",                c.new_slide),
+            ("Move the slide up",        c.move_slide_up),
+            ("Move the slide down",      c.move_slide_down),
+            ("Fold / unfold slide panel", c.toggle_slide_panel),
+            ("Ctrl+Tab: in order / recent", c.toggle_slide_order),
+            ("Slide window open / close", c.slide_window),
+            ("New layer",                c.new_layer),
+            ("Delete layer (no undo)",   c.delete_layer),
+            ("Pin: go to its slide",     c.pin_go_to_slide),
+            ("Pin: this slide only / every slide", c.pin_this_slide_only),
+            ("Loop video / GIF",         c.media_loop),
+            ("Onion skin on / off",      c.media_onion),
+        ])),
+    ];
+    // Both layer moves on one row, when either is bound.
+    if c.move_layer_up.is_some() || c.move_layer_down.is_some() {
+        let label = |b: Option<Binding>| b.map_or_else(|| "—".to_owned(), |b| b.label());
+        more[2].1.push(("Move layer up / down", format!("{} / {}", label(c.move_layer_up), label(c.move_layer_down))));
+    }
+    sections.extend(more.into_iter().filter(|(_, rows)| !rows.is_empty()));
+    sections
+}
+
+/// `help_sections`' rows that always show.
+fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
+    let k = |b: Option<Binding>| b.map_or_else(|| "—".to_owned(), |b| b.label());
+    let k2 = |a: Option<Binding>, b: Option<Binding>| format!("{} / {}", k(a), k(b));
+    let s = |text: &str| text.to_owned();
+    // One key per direction, a modifier they share said once:
+    // "Shift+← → ↑ ↓".
+    let k4 = |bs: [Option<Binding>; 4]| {
+        let mods = |b: Binding| (b.ctrl, b.shift, b.alt);
+        let bare = |b: Binding| Binding { ctrl: false, shift: false, alt: false, ..b }.label();
+        match bs {
+            [Some(first), ..] if bs.iter().all(|b| b.is_some_and(|b| mods(b) == mods(first))) => {
+                let full = first.label();
+                let prefix = &full[..full.len() - bare(first).len()];
+                format!("{prefix}{}", bs.map(|b| b.map_or_else(String::new, bare)).join(" "))
+            }
+            _ => bs.map(&k).join(" "),
+        }
+    };
+    let (t, c, g) = (&keys.tool, &keys.canvas, &keys.global);
+    vec![
+        ("Tools", vec![
+            ("Pen",                         k(t.pen)),
+            ("Pencil",                      k(t.pencil)),
+            ("Marker (highlighter)",        k(t.marker)),
+            ("Airbrush (spray)",            k(t.airbrush)),
+            ("Fill",                        k(t.fill)),
+            ("Laser pointer",               k(t.laser)),
+            ("Spotlight (again: pen)",      k(t.spotlight)),
+            ("Text",                        k(t.text)),
+            ("Rectangle",                   k(t.rect)),
+            ("Ellipse",                     k(t.ellipse)),
+            ("Line",                        t.line.map_or_else(|| s("toolbar (or bind tool.line)"), |b| b.label())),
+            ("Straight arrow",              k(t.arrow)),
+            ("Freehand arrow",              k(t.freehand_arrow)),
+            ("Lasso erase",                 k(t.lasso)),
+            ("Lasso capture (screen to picture)", k(t.lasso_select)),
+            ("Select",                      k(t.select)),
+            ("Eyedropper (one pick)",       k(t.eyedropper)),
+            ("Magnifier loupe",             s("hold Z (wheel zooms)")),
+        ]),
+        ("Text & lasso", vec![
+            ("Text: commit / new line",     s("Enter / Shift+Enter")),
+            ("Lasso polygon",               s("click corner by corner")),
+            ("  close it",                  s("Enter / double click")),
+            ("  take back a corner",        s("Backspace")),
+            ("Cancel what is in progress",  s("Esc")),
+        ]),
+        ("Selection (Select tool)", vec![
+            ("Add / remove; one of a group", s("Shift+click; Alt+click")),
+            ("Group / ungroup",             k2(c.group, c.ungroup)),
+            ("Box select",                  s("drag on empty space")),
+            ("Move / resize / rotate",      s("drag / handles / knob")),
+            ("Nudge 1 px",                  k4(c.nudge_1px)),
+            ("Nudge 10 px",                 k4(c.nudge_10px)),
+            ("Rotate in 15° steps",         s("hold Shift")),
+            ("Delete",                      format!("{} / Backspace", k(c.delete_selection))),
+            ("Duplicate",                   k(c.duplicate)),
+            ("Copy / cut / paste (pictures too)", s("Ctrl+C / X / V")),
+            ("To front / to back",          k2(c.bring_front, c.send_back)),
+            ("Copy to a new slide",         k(c.copy_to_new_slide)),
+            ("Pin / unpin; hide all pins",  format!("{}; {}", k(c.pin_selection), k(c.toggle_pins))),
+            ("Arrange, flip, a picture's colours", s("bar under the toolbar")),
+            ("Recolour / resize",           s("palette / size slider")),
+        ]),
+        ("Pictures, videos & GIFs", vec![
+            ("Insert",                      s("film button / drop a file")),
+            ("Play / pause",                k(c.media_play_pause)),
+            ("Previous / next frame",       k2(c.media_prev_frame, c.media_next_frame)),
+            ("Highlight by type",           s("funnel button")),
+        ]),
+        ("Slides", vec![
+            ("Previous / next (adds one at the end)", k2(c.prev_canvas, c.next_canvas)),
+            ("Previous / next, wrapping",   k2(c.cycle_prev_slide, c.cycle_next_slide)),
+            ("First / last",                k2(c.first_slide, c.last_slide)),
+            ("Name the slide",              k(c.rename_slide)),
+            ("Lock / unlock",               k(c.lock_slide)),
+            ("Undo / redo",                 k2(c.undo, c.redo)),
+            ("Delete the slide (asks first)", k(c.delete_canvas)),
+            ("Zoom to fit / selection / while held", format!("{} / hold {}", k2(c.zoom_to_fit, c.zoom_to_selection), k(c.hold_zoom_to_selection))),
+        ]),
+        ("Layers (the active one)", vec![
+            ("Previous / next layer",       k2(c.prev_layer, c.next_layer)),
+            ("Hide / show",                 k(c.toggle_layer_visible)),
+            ("Preview",                     k(c.preview_layer)),
+            ("Clear",                       k(c.clear_layer)),
+            ("Opacity 0 / 10 … 90 %",       format!("{} / {} … {}", k(c.opacity[0]), k(c.opacity[1]), k(c.opacity[9]))),
+            ("Opacity −10 / +10 %",         k2(c.opacity_dec, c.opacity_inc)),
+            ("Opacity, finely",             s("Shift+Scroll")),
+            ("Pan",                         s("Shift+Space+drag")),
+            ("Zoom",                        s("Shift+Space+Scroll")),
+            ("Reset position",              k(c.reset_layer_pos)),
+            ("Reset zoom",                  k(c.reset_layer_zoom)),
+            ("Freeze screen to a new layer", k(c.freeze_frame)),
+        ]),
+        ("View & input", vec![
+            ("Hide / show UI",              k(c.toggle_ui)),
+            ("Pan",                         s("Space+drag / middle drag")),
+            ("Zoom",                        s("Scroll / Space+Scroll")),
+            ("  pen tools, fill, spotlight: size", s("Scroll")),
+            ("Reset zoom + pan",            k(c.reset_view)),
+            ("Background opacity",          s("Ctrl+Scroll")),
+            ("Erase while drawing",         s("hold Ctrl")),
+            ("Pick a colour",               s("hold Shift + tap")),
+            ("Recolour a swatch",           s("right-click it")),
+            ("Pin to a window",             s("pin button")),
+        ]),
+        ("Global (from any app)", vec![
+            ("Show / hide overlay",         k(g.toggle_overlay)),
+            ("Screenshot (bg + ink)",       k(g.screenshot)),
+            ("Start / stop recording",      k(g.start_record)),
+            ("Pause / resume recording",    k(g.pause_record)),
+        ]),
+    ]
 }
 
 /// Smoothing-level picker: Low / Medium / High as inline
@@ -650,10 +945,47 @@ fn dash_toggle_btn(ui: &mut egui::Ui, tool: &mut ActiveTool) -> bool {
     response.hovered() || response.is_pointer_button_down_on()
 }
 
+/// Text-in-a-box switch: flips `tool.text_box`, which the Text tool
+/// reads when it places a label (and the app applies to selected
+/// labels).
+fn text_box_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, key: Option<Binding>) -> bool {
+    let on = tool.text_box;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
+    let bg = if on {
+        theme::ACCENT
+    } else if response.hovered() {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+    let icon = rect.shrink(rect.width() * 0.22);
+    egui::Image::new(egui::include_image!("../../assets/icons/text-box.svg"))
+        .tint(theme::TEXT_PRIMARY)
+        .fit_to_exact_size(icon.size())
+        .paint_at(ui, icon);
+    let tip = if on {
+        "Text in a box ON — labels get a box that keeps them readable (click for plain text; applies to selected labels too)"
+    } else {
+        "Text in a box OFF — click to put labels in a box that keeps them readable (applies to selected labels too)"
+    };
+    let tip = match key {
+        Some(b) => format!("{tip} — {}", b.label()),
+        None => tip.to_string(),
+    };
+    let response = response.on_hover_text(tip);
+    if response.clicked() {
+        tool.text_box = !tool.text_box;
+        return true;
+    }
+    response.hovered() || response.is_pointer_button_down_on()
+}
+
 /// Pin-to-window toolbar button. Three visual states:
 ///   * No pin set, no picking → idle outline.
 ///   * Pin picking armed → accent fill + crosshair tooltip.
 ///   * Pinned to a window → accent fill + "unpin" tooltip.
+///
 /// Click semantics: idle → arm picking; picking → cancel; pinned →
 /// unpin. The actual pick-and-follow logic lives in `app.rs`.
 fn pin_btn(
@@ -704,6 +1036,7 @@ fn pin_btn(
 /// Combined settings button — opens a popup with background-opacity and
 /// smoothing-level controls. Folding these secondary controls behind a
 /// single button keeps the always-visible toolbar tight.
+#[allow(clippy::too_many_arguments)]
 fn settings_btn(
     ui: &mut egui::Ui,
     bg_opacity: &mut f32,
@@ -711,6 +1044,8 @@ fn settings_btn(
     smoothing: &mut SmoothingLevel,
     smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
+    (shape_snap, smart_guides): (&mut bool, &mut bool),
+    (beside_fit, beside_side): (&mut BesideFit, &mut BesideSide),
 ) -> bool {
     let size = Vec2::splat(BTN_SIZE);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -922,6 +1257,41 @@ fn settings_btn(
                     );
                 }
             });
+            ui.add_space(6.0);
+            ui.checkbox(shape_snap, "Shape snap").on_hover_text(
+                "Hold the pen still at the end of a stroke and it snaps to the line, \
+                 triangle, rectangle, polygon, circle or ellipse it was meant to be",
+            );
+            ui.checkbox(smart_guides, "Smart guides").on_hover_text(
+                "While a selection is moved, its edges and middle line up with those of the \
+                 objects around it, and a line shows each. Hold Alt to move it freely",
+            );
+            ui.add_space(6.0);
+            // Pills, not a ComboBox: see the smoothing mode row.
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("New picture beside the selected one")
+                        .small()
+                        .color(theme::TEXT_MUTED),
+                );
+                let about = "With a picture, GIF or video selected, one you drop, paste or insert \
+                             comes in at its height (or width) and lands right beside it, past any \
+                             already there. With nothing like that selected, or Off, new ones come \
+                             in at their own size where they fall";
+                ui.horizontal(|ui| {
+                    for f in BesideFit::ALL {
+                        ui.selectable_value(beside_fit, f, f.label()).on_hover_text(about);
+                    }
+                });
+                if *beside_fit != BesideFit::Off {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("on the").small().color(theme::TEXT_MUTED));
+                        for s in BesideSide::ALL {
+                            ui.selectable_value(beside_side, s, s.label());
+                        }
+                    });
+                }
+            });
         },
     );
 
@@ -929,4 +1299,60 @@ fn settings_btn(
         interacted = true;
     }
     interacted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::hotkeys_config::HotkeysConfig;
+
+    /// Size the help panel lays out to on a screen of `w` × `h` points.
+    fn help_panel_size(w: f32, h: f32) -> Vec2 {
+        let keys = HotkeysConfig::default().parsed();
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        let mut size = Vec2::ZERO;
+        // A second frame, so the grids lay out with last frame's widths.
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::Area::new(egui::Id::new("help")).show(ctx, |ui| {
+                    // As `on_hover_ui` hands it over.
+                    ui.set_max_width(ui.spacing().tooltip_width);
+                    size = ui.scope(|ui| help_panel(ui, &keys)).response.rect.size();
+                });
+            });
+        }
+        size
+    }
+
+    #[test]
+    fn help_panel_fits_the_screen() {
+        // 1080p at 100 % and 150 % scaling, a 768-tall laptop, and a
+        // short window, where the columns scroll.
+        for (w, h) in [(1920.0, 1080.0), (1280.0, 720.0), (1366.0, 768.0), (1280.0, 560.0)] {
+            let size = help_panel_size(w, h);
+            assert!(size.x < w && size.y < h - 60.0, "{size:?} on {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn help_panel_text_has_glyphs() {
+        // The default proportional font has no arrows, so "→" in an
+        // action would show as a box.
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let body = egui::FontId::proportional(14.0);
+        let mono = egui::FontId::monospace(14.0);
+        for (title, rows) in help_sections(&HotkeysConfig::default().parsed()) {
+            let texts = std::iter::once((title.to_owned(), &body))
+                .chain(rows.into_iter().flat_map(|(a, k)| [(a.to_owned(), &body), (k, &mono)]));
+            for (text, font) in texts {
+                assert!(ctx.fonts(|f| f.has_glyphs(font, &text)), "no glyph for part of {text:?}");
+            }
+        }
+    }
 }

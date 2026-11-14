@@ -7,14 +7,19 @@
 //! `Canvas::transform_objects` call (one undo step). That is the same
 //! preview-then-commit split the Shift+Space layer gesture uses.
 //!
+//! A selection being moved lines up with the objects around it (smart
+//! guides, `tools::guides`) unless Alt is held or they are switched off.
+//!
 //! Coordinates are canvas-local throughout. Sizes that should look the
 //! same at any zoom (handle size, click slop) are given in screen pixels
 //! and divided by the canvas zoom where they are used.
 
 use crate::canvas::affine::Affine;
-use crate::canvas::canvas::{shape_bounds, Canvas, Layer};
+use crate::canvas::canvas::{shape_bounds, shape_bounds_turned, Canvas, Layer};
 use crate::canvas::hit::{self, CanvasHit, ObjRef, Selection};
 use crate::canvas::shape::{Obb, Shape};
+use crate::tools::guides::{Bounds, Guides};
+use std::collections::HashSet;
 
 /// How close (screen px) a click must land to an object to pick it.
 const CLICK_SLOP_PX: f32 = 6.0;
@@ -32,6 +37,9 @@ pub const ROTATE_STEM_PX: f32 = 28.0;
 /// Smallest factor a resize may shrink to. Stops a drag through the
 /// anchor from collapsing or mirroring the selection.
 const MIN_SCALE: f32 = 0.02;
+/// How close (screen px) a moved selection's edge or middle comes to
+/// another object's before the smart guides line them up.
+const GUIDE_REACH_PX: f32 = 6.0;
 /// Rotation snap while Shift is held.
 const ROTATE_SNAP: f32 = std::f32::consts::PI / 12.0;
 
@@ -80,6 +88,12 @@ pub struct Chrome {
     pub rotate_stem: Option<([f32; 2], [f32; 2])>,
     /// Rubber-band box `[x0, y0, x1, y1]`.
     pub marquee: Option<[f32; 4]>,
+    /// Corners of the box around each group in the selection, when the
+    /// selection is more than one group: groups show inside the frame.
+    pub groups: Vec<[[f32; 2]; 4]>,
+    /// Smart guides the moving selection lines up on: each from one end
+    /// to the other.
+    pub guides: Vec<[[f32; 2]; 2]>,
 }
 
 #[derive(Default)]
@@ -89,6 +103,15 @@ pub struct SelectState {
     /// Shift state for the current frame, pushed in by the app: adds to
     /// / removes from the selection on click, snaps rotation.
     pub shift: bool,
+    /// Alt state, likewise: a click takes just the object under the
+    /// pointer, not the group it is in; held while moving, the smart
+    /// guides let go.
+    pub alt: bool,
+    /// Smart guides on (the settings' switch), pushed in by the app.
+    pub guides_on: bool,
+    /// What the selection being moved can line up with, taken when the
+    /// move began.
+    guides: Option<Guides>,
     /// Which canvas / layer / object counts `sel` was made against. Its
     /// indices mean nothing once any of these change.
     bound: (usize, usize, usize, usize),
@@ -132,9 +155,35 @@ impl SelectState {
         (canvas_idx, li, n_strokes, n_shapes)
     }
 
+    /// `obj` and, unless Alt is held, everything grouped with it.
+    fn reach(&self, layer: &Layer, obj: ObjRef) -> Vec<ObjRef> {
+        if self.alt { vec![obj] } else { layer.with_group(obj) }
+    }
+
+    /// Select `obj` (and its group) and nothing else.
+    fn take_only(&mut self, layer: &Layer, obj: ObjRef) {
+        let all = self.reach(layer, obj);
+        self.sel.clear();
+        for o in all {
+            self.sel.insert(o);
+        }
+    }
+
+    /// Shift+click: `obj` (and its group) leaves the selection if `obj`
+    /// is in it, else joins it.
+    fn toggle_taken(&mut self, layer: &Layer, obj: ObjRef) {
+        let was = self.sel.contains(obj);
+        for o in self.reach(layer, obj) {
+            if self.sel.contains(o) == was {
+                self.sel.toggle(o);
+            }
+        }
+    }
+
     /// Cancel an in-flight gesture, or — if there is none — drop the
     /// selection. One `Esc` backs out one level.
     pub fn cancel(&mut self) {
+        self.guides = None;
         if self.gesture.take().is_none() {
             self.sel.clear();
         }
@@ -144,8 +193,11 @@ impl SelectState {
 
     /// The box the handles sit on. A lone rectangle, ellipse, image or
     /// text label keeps its own orientation, so its frame turns with
-    /// it. Anything else (strokes, lines, several objects) gets the
-    /// upright box around everything selected.
+    /// it. Anything else (strokes, lines, several objects) gets the box
+    /// around everything selected, turned by the turn they share (see
+    /// `Shape::turn`) — so a group, or strokes, turned with the knob or
+    /// the quarter-turn buttons keep a turned frame — and upright when
+    /// they share none.
     pub fn frame(&self, layer: &Layer, zoom: f32) -> Option<Obb> {
         if self.sel.is_empty() { return None; }
         let mut frame = match (self.sel.strokes.as_slice(), self.sel.shapes.as_slice()) {
@@ -157,8 +209,16 @@ impl SelectState {
                     o
                 }
                 s @ (Shape::Raster { .. } | Shape::Text { .. }) => s.obb(),
+                s if s.turn() != 0.0 => turned_frame(shape_bounds_turned(s, s.turn()), s.turn()),
                 s => aabb_frame(shape_bounds(s)),
             },
+            _ if self.shared_turn(layer) != 0.0 => {
+                let angle = self.shared_turn(layer);
+                let strokes = self.sel.strokes.iter().filter_map(|&i| layer.strokes.get(i)?.bounds_turned(angle));
+                let shapes = self.sel.shapes.iter().filter_map(|&i| Some(shape_bounds_turned(layer.shapes.get(i)?, angle)));
+                let b = strokes.chain(shapes).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])?;
+                turned_frame(b, angle)
+            }
             _ => {
                 let mut bb: Option<[f32; 4]> = None;
                 let mut grow = |b: [f32; 4]| {
@@ -199,13 +259,29 @@ impl SelectState {
         if self.sel.strokes.is_empty() && self.sel.shapes.len() == 1 {
             return !matches!(shape(&self.sel.shapes[0]), Some(Shape::Text { .. }) | None);
         }
+        // A box lined up with the frame (a quarter turn off is lined up
+        // too) stretches along its own sides.
+        let angle = self.shared_turn(layer);
+        let lined_up = |r: f32| {
+            let k = (r - angle) / std::f32::consts::FRAC_PI_2;
+            (k - k.round()).abs() < 1e-3
+        };
         self.sel.shapes.iter().all(|i| match shape(i) {
             Some(Shape::Rect { rotation, .. })
             | Some(Shape::Ellipse { rotation, .. })
-            | Some(Shape::Raster { rotation, .. }) => *rotation == 0.0,
+            | Some(Shape::Raster { rotation, .. }) => lined_up(*rotation),
             Some(Shape::Line { .. }) | Some(Shape::Arrow { .. }) => true,
             Some(Shape::Text { .. }) | None => false,
         })
+    }
+
+    /// The turn every selected object shares (`Shape::turn`), or 0 when
+    /// they share none.
+    fn shared_turn(&self, layer: &Layer) -> f32 {
+        let strokes = self.sel.strokes.iter().filter_map(|&i| layer.strokes.get(i)).map(|s| s.turn);
+        let mut turns = strokes.chain(self.sel.shapes.iter().filter_map(|&i| layer.shapes.get(i)).map(|s| s.turn()));
+        let Some(first) = turns.next() else { return 0.0 };
+        if turns.all(|t| (t - first).abs() < 1e-4) { first } else { 0.0 }
     }
 
     // ---- gesture → transform ----------------------------------------------
@@ -220,7 +296,10 @@ impl SelectState {
             Gesture::Move { start, cur } => {
                 let d = [cur[0] - start[0], cur[1] - start[1]];
                 if (d[0] * d[0] + d[1] * d[1]).sqrt() < DRAG_SLOP_PX / zoom { return None; }
-                Affine::translate(d)
+                match self.live_guides() {
+                    Some(g) => Affine::translate(g.snap(d, GUIDE_REACH_PX / zoom).d),
+                    None => Affine::translate(d),
+                }
             }
             Gesture::Rotate { frame, start, cur } => {
                 let c = frame.center;
@@ -271,7 +350,7 @@ impl SelectState {
     /// Frame, handles and marquee as they should be drawn right now —
     /// i.e. with the in-flight gesture applied.
     pub fn chrome(&self, canvas: &Canvas) -> Chrome {
-        let mut out = Chrome { frame: None, handles: Vec::new(), rotate_stem: None, marquee: None };
+        let mut out = Chrome { frame: None, handles: Vec::new(), rotate_stem: None, marquee: None, groups: Vec::new(), guides: Vec::new() };
         if let Some(Gesture::Marquee { start, cur, .. }) = self.gesture {
             out.marquee = Some([
                 start[0].min(cur[0]), start[1].min(cur[1]),
@@ -288,8 +367,14 @@ impl SelectState {
         };
         let Some(base) = base else { return out };
         let m = self.preview_affine(zoom).unwrap_or(Affine::IDENTITY);
+        if let (Some(Gesture::Move { start, cur }), Some(g)) = (self.gesture, self.live_guides()) {
+            if !m.is_identity() {
+                out.guides = g.snap([cur[0] - start[0], cur[1] - start[1]], GUIDE_REACH_PX / zoom).lines;
+            }
+        }
         let c = base.corners().map(|p| m.apply(p));
         out.frame = Some(c);
+        out.groups = self.group_boxes(layer).into_iter().map(|b| aabb_frame(b).corners().map(|p| m.apply(p))).collect();
 
         let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
         let corners = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
@@ -312,6 +397,35 @@ impl SelectState {
         out.rotate_stem = Some((top, knob));
         out.handles.push((knob, Handle::Rotate));
         out
+    }
+
+    /// The box around each group with objects in the selection — none
+    /// when the selection is a single group and nothing else, whose box
+    /// the frame already is.
+    fn group_boxes(&self, layer: &Layer) -> Vec<[f32; 4]> {
+        let mut boxes: Vec<(u64, [f32; 4])> = Vec::new();
+        let mut loose = false;
+        let mut add = |g: u64, b: Option<[f32; 4]>| {
+            let Some(b) = b else { return };
+            if g == 0 {
+                loose = true;
+                return;
+            }
+            match boxes.iter_mut().find(|(id, _)| *id == g) {
+                Some((_, a)) => *a = [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
+                None => boxes.push((g, b)),
+            }
+        };
+        for &i in &self.sel.strokes {
+            if let Some(s) = layer.strokes.get(i) { add(s.group, s.bounds()); }
+        }
+        for &i in &self.sel.shapes {
+            if let Some(s) = layer.shapes.get(i) { add(s.group(), Some(shape_bounds(s))); }
+        }
+        if boxes.len() == 1 && !loose {
+            return Vec::new();
+        }
+        boxes.into_iter().map(|(_, b)| b).collect()
     }
 
     /// Handle under `p`, if any. The rotate knob is checked first, then
@@ -381,7 +495,51 @@ impl SelectState {
     /// something on another layer makes that layer the active one (a
     /// selection lives on a single layer). The canvas is only written
     /// to here to make that switch; no object is touched until `end`.
+    /// Pen-down at `p`: start a move, resize, rotate or marquee (see
+    /// `begin_gesture`), and for a move take what it can line up with.
     pub fn begin(&mut self, p: [f32; 2], canvas: &mut Canvas) {
+        self.begin_gesture(p, canvas);
+        self.guides = match self.gesture {
+            Some(Gesture::Move { .. }) if self.guides_on => self.make_guides(canvas),
+            _ => None,
+        };
+    }
+
+    /// The guides while they apply: switched on, and Alt not held.
+    fn live_guides(&self) -> Option<&Guides> {
+        self.guides.as_ref().filter(|_| !self.alt)
+    }
+
+    /// Smart guides for a move of the selection: its box, and the box of
+    /// every other object on the shown layers and of each group there
+    /// (one the selection is in counts only if it is not moving).
+    fn make_guides(&self, canvas: &Canvas) -> Option<Guides> {
+        let li = canvas.active_layer;
+        let layer = canvas.layers.get(li)?;
+        let strokes: HashSet<usize> = self.sel.strokes.iter().copied().collect();
+        let shapes: HashSet<usize> = self.sel.shapes.iter().copied().collect();
+        let start = crate::canvas::units::bounds_of(layer, &self.sel.strokes, &self.sel.shapes)?;
+        let mut targets: Vec<Bounds> = Vec::new();
+        for (i, l) in canvas.layers.iter().enumerate() {
+            if !l.visible || l.opacity <= 0.0 {
+                continue;
+            }
+            let here = i == li;
+            let moving_stroke = |k: usize| here && strokes.contains(&k);
+            let moving_shape = |k: usize| here && shapes.contains(&k);
+            targets.extend(l.strokes.iter().enumerate().filter(|(k, _)| !moving_stroke(*k)).filter_map(|(_, s)| s.bounds()));
+            targets.extend(l.shapes.iter().enumerate().filter(|(k, _)| !moving_shape(*k)).map(|(_, s)| shape_bounds(s)));
+            for g in crate::canvas::units::groups(l) {
+                if g.strokes.iter().any(|&k| moving_stroke(k)) || g.shapes.iter().any(|&k| moving_shape(k)) {
+                    continue;
+                }
+                targets.extend(crate::canvas::units::bounds_of(l, &g.strokes, &g.shapes));
+            }
+        }
+        Some(Guides::new(start, targets))
+    }
+
+    fn begin_gesture(&mut self, p: [f32; 2], canvas: &mut Canvas) {
         self.gesture = None;
         let active = canvas.active_layer;
         let Some(layer) = canvas.layers.get(active) else { return };
@@ -404,9 +562,9 @@ impl SelectState {
                 if self.shift {
                     // Shift+click only edits membership; a drag that
                     // follows moves whatever is selected afterwards.
-                    self.sel.toggle(obj);
-                } else if !self.sel.contains(obj) {
-                    self.sel.set_only(obj);
+                    self.toggle_taken(layer, obj);
+                } else if !self.sel.contains(obj) || self.alt {
+                    self.take_only(layer, obj);
                 }
                 if self.sel.contains(obj) {
                     self.gesture = Some(Gesture::Move { start: p, cur: p });
@@ -431,7 +589,8 @@ impl SelectState {
             //    frame, so a selection over a picture can still be
             //    dragged by its empty middle.
             Some(CanvasHit::Object(li, obj)) if li == active => {
-                if self.shift { self.sel.toggle(obj); } else { self.sel.set_only(obj); }
+                let layer = &canvas.layers[li];
+                if self.shift { self.toggle_taken(layer, obj); } else { self.take_only(layer, obj); }
                 if self.sel.contains(obj) {
                     self.gesture = Some(Gesture::Move { start: p, cur: p });
                 }
@@ -439,7 +598,7 @@ impl SelectState {
             // 5) Ink on another layer: go to that layer and take it.
             Some(CanvasHit::Object(li, obj)) if !is_raster(canvas, li, obj) => {
                 canvas.active_layer = li;
-                self.sel.set_only(obj);
+                self.take_only(&canvas.layers[li], obj);
                 self.rebind_here(canvas);
                 self.gesture = Some(Gesture::Move { start: p, cur: p });
             }
@@ -484,7 +643,8 @@ impl SelectState {
             canvas.active_layer = li;
             self.sel.clear();
         }
-        if self.shift { self.sel.toggle(obj); } else { self.sel.set_only(obj); }
+        let layer = &canvas.layers[li];
+        if self.shift { self.toggle_taken(layer, obj); } else { self.take_only(layer, obj); }
         self.rebind_here(canvas);
     }
 
@@ -546,8 +706,11 @@ impl SelectState {
                             found = sel;
                         }
                     }
-                    for i in found.strokes { self.sel.insert(ObjRef::Stroke(i)); }
-                    for i in found.shapes { self.sel.insert(ObjRef::Shape(i)); }
+                    // An object in the box brings its group along.
+                    let layer = &canvas.layers[canvas.active_layer];
+                    let objs = found.strokes.into_iter().map(ObjRef::Stroke).chain(found.shapes.into_iter().map(ObjRef::Shape));
+                    let taken: Vec<ObjRef> = objs.flat_map(|o| self.reach(layer, o)).collect();
+                    for o in taken { self.sel.insert(o); }
                     self.rebind_here(canvas);
                 }
             }
@@ -561,12 +724,25 @@ impl SelectState {
             None => {}
         }
         self.gesture = None;
+        self.guides = None;
     }
 }
 
 fn is_raster(canvas: &Canvas, li: usize, obj: ObjRef) -> bool {
     matches!(obj, ObjRef::Shape(i)
         if matches!(canvas.layers.get(li).and_then(|l| l.shapes.get(i)), Some(Shape::Raster { .. })))
+}
+
+/// The frame turned by `angle` whose box along its own axes is `b`
+/// (see `canvas::unturn`).
+fn turned_frame(b: [f32; 4], angle: f32) -> Obb {
+    let local = [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5];
+    let (s, c) = angle.sin_cos();
+    Obb {
+        center: [c * local[0] - s * local[1], s * local[0] + c * local[1]],
+        half: [(b[2] - b[0]) * 0.5, (b[3] - b[1]) * 0.5],
+        angle,
+    }
 }
 
 fn aabb_frame(b: [f32; 4]) -> Obb {
@@ -599,7 +775,7 @@ mod tests {
     }
 
     fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0 }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
     }
 
     fn image(pos: [f32; 2], size: [f32; 2]) -> Shape {
@@ -607,6 +783,11 @@ mod tests {
             pos, size, png: Arc::new(Vec::new()), px_size: [1, 1], color: [0; 4],
             rotation: 0.0, kind: RasterKind::Image, media: None,
             picture: None,
+            pin: 0,
+            flip: false,
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -631,6 +812,35 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_selection_lines_up_with_its_neighbours_unless_alt_is_held() {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(image([0.0, 0.0], [100.0, 50.0])); // dragged
+        c.layers[0].shapes.push(image([300.0, 200.0], [100.0, 50.0])); // stays
+        let left_after = |guides_on: bool, alt: bool| {
+            let mut c = c.clone();
+            let mut t = tool(&c);
+            t.guides_on = guides_on;
+            click(&mut t, &mut c, [50.0, 25.0]);
+            t.alt = alt;
+            t.begin([50.0, 25.0], &mut c);
+            assert!(matches!(t.gesture, Some(Gesture::Move { .. })));
+            // Its left edge lands 3 short of the other's (zoom 1: within reach).
+            let to = [50.0 + 297.0, 25.0 + 100.0];
+            t.drag(to);
+            let lines = t.chrome(&c).guides.len();
+            t.end(to, &mut c);
+            let x = match &c.layers[0].shapes[0] {
+                Shape::Raster { pos, .. } => pos[0],
+                other => panic!("{other:?}"),
+            };
+            (x, lines)
+        };
+        assert_eq!(left_after(true, false), (300.0, 1), "lined up, one guide");
+        assert_eq!(left_after(true, true), (297.0, 0), "Alt: where it was let go");
+        assert_eq!(left_after(false, false), (297.0, 0), "switched off");
+    }
+
+    #[test]
     fn click_selects_and_shift_click_adds_and_removes() {
         let mut c = canvas();
         let mut t = tool(&c);
@@ -651,6 +861,49 @@ mod tests {
         click(&mut t, &mut c, [800.0, 800.0]);
         assert!(t.sel.is_empty());
         assert!(c.undo_log.is_empty(), "selecting must not touch the canvas");
+    }
+
+    #[test]
+    fn a_group_selects_as_one_and_alt_takes_one_member() {
+        let mut c = canvas();
+        // The top stroke and the rectangle are one group.
+        let ok = c.set_group(0, &[0], &[0], 42);
+        assert!(ok && c.undo_log.len() == 1, "grouping is one undo step");
+        let mut t = tool(&c);
+        click(&mut t, &mut c, [50.0, 0.0]);
+        assert_eq!(t.sel, Selection { strokes: vec![0], shapes: vec![0] }, "a click takes the whole group");
+        t.shift = true;
+        click(&mut t, &mut c, [50.0, 200.0]);
+        assert_eq!(t.sel, Selection { strokes: vec![0, 1], shapes: vec![0] });
+        click(&mut t, &mut c, [350.0, 300.0]);
+        assert_eq!(t.sel, Selection { strokes: vec![1], shapes: vec![] }, "Shift+click drops the whole group");
+        t.shift = false;
+        t.alt = true;
+        click(&mut t, &mut c, [350.0, 300.0]);
+        assert_eq!(t.sel, Selection { strokes: vec![], shapes: vec![0] }, "Alt+click takes just that one");
+        t.alt = false;
+        // A box around the top stroke alone brings the rectangle along.
+        t.begin([-20.0, -20.0], &mut c);
+        t.drag([120.0, 20.0]);
+        t.end([120.0, 20.0], &mut c);
+        assert_eq!(t.sel, Selection { strokes: vec![0], shapes: vec![0] });
+        // Ungrouped, they go their own ways again.
+        c.set_group(0, &[0], &[0], 0);
+        t.cancel();
+        click(&mut t, &mut c, [50.0, 0.0]);
+        assert_eq!(t.sel, Selection { strokes: vec![0], shapes: vec![] });
+    }
+
+    #[test]
+    fn copies_of_a_group_make_a_group_of_their_own() {
+        let c = canvas();
+        let (mut strokes, mut shapes) = (c.layers[0].strokes.clone(), c.layers[0].shapes.clone());
+        strokes[0].group = 5;
+        shapes[0].set_group(5);
+        crate::canvas::canvas::regroup_copies(&mut strokes, &mut shapes);
+        assert_ne!(strokes[0].group, 5);
+        assert_eq!(strokes[0].group, shapes[0].group(), "still together");
+        assert_eq!(strokes[1].group, 0, "ungrouped stays ungrouped");
     }
 
     #[test]
@@ -728,6 +981,40 @@ mod tests {
         t.end([150.0, 25.0], &mut c);
         assert!(matches!(&c.layers[0].shapes[0], Shape::Raster { size, .. }
             if (size[0] - 150.0).abs() < 1e-2 && (size[1] - 50.0).abs() < 1e-2));
+    }
+
+    #[test]
+    fn a_turned_selection_keeps_its_frame_turned() {
+        use std::f32::consts::FRAC_PI_6;
+        let mut c = Canvas::default();
+        c.layers[0].strokes.push(stroke([0.0, 0.0], [100.0, 0.0]));
+        c.layers[0].strokes.push(stroke([0.0, 40.0], [100.0, 40.0]));
+        let mut t = tool(&c);
+        t.sel = Selection { strokes: vec![0, 1], shapes: vec![] };
+        assert_eq!(t.frame(&c.layers[0], 1.0).unwrap().angle, 0.0, "upright to start with");
+        // Turn both by 30° (what the knob or the buttons do).
+        let m = Affine::rotate_about([50.0, 20.0], FRAC_PI_6);
+        c.transform_objects(0, &[0, 1], &[], &m);
+        let f = t.frame(&c.layers[0], 1.0).unwrap();
+        assert!((f.angle - FRAC_PI_6).abs() < 1e-4, "{}", f.angle);
+        // Snug along its own axes: 100 long plus the pen's width each end,
+        // and every sample inside.
+        assert!(f.half[0] < 56.0 && f.half[1] < 26.0, "{:?}", f.half);
+        for s in c.layers[0].strokes.iter().flat_map(|s| s.samples.iter()) {
+            let q = crate::canvas::canvas::unturn([s.pos[0] - f.center[0], s.pos[1] - f.center[1]], f.angle);
+            assert!(q[0].abs() <= f.half[0] + 1e-3 && q[1].abs() <= f.half[1] + 1e-3);
+        }
+        // Selected again later, the same.
+        let mut again = tool(&c);
+        again.sel = Selection { strokes: vec![0, 1], shapes: vec![] };
+        assert!((again.frame(&c.layers[0], 1.0).unwrap().angle - FRAC_PI_6).abs() < 1e-4);
+        // Objects that do not share a turn get the upright box.
+        c.layers[0].strokes.push(stroke([0.0, 80.0], [100.0, 80.0]));
+        again.sel = Selection { strokes: vec![0, 1, 2], shapes: vec![] };
+        assert_eq!(again.frame(&c.layers[0], 1.0).unwrap().angle, 0.0);
+        // A saved slide keeps the turn; an untouched object writes none.
+        let saved = crate::persistence::serialize_canvas(&c).unwrap();
+        assert_eq!(saved.matches("turn:").count(), 2, "only the two turned strokes");
     }
 
     #[test]
@@ -822,6 +1109,11 @@ mod tests {
         c.layers[0].strokes.push(stroke([0.0, 0.0], [100.0, 0.0]));
         c.layers[0].shapes.push(Shape::Text {
             pos: [0.0, 50.0], content: "hi".into(), font_size: 20.0, color: [0; 4], rotation: 0.0,
+            pin: 0,
+            background: None,
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         });
         let mut t = tool(&c);
         t.sel = Selection { strokes: vec![0], shapes: vec![0] };

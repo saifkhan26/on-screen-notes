@@ -1,4 +1,4 @@
-//! Layer panel — minimal floating card bottom-left.
+//! Layer panel — minimal floating card bottom-right.
 //!
 //! Each row is a tight strip of icon buttons only — no heading, no layer
 //! name. Active layer's row gets a translucent-white background so the
@@ -31,9 +31,12 @@ pub fn show(
     manager: &mut CanvasManager,
 ) {
     let mut action: Option<LayerAction> = None;
+    // A locked slide, or one still opening, takes no layer changes: the
+    // panel shows dimmed and ignores clicks.
+    let editable = manager.active_editable();
 
     egui::Area::new(egui::Id::new("osn_layer_panel"))
-        .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(10.0, -10.0))
+        .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-10.0, -10.0))
         .show(ctx, |ui| {
             // Tighter card frame than the global card — kills the
             // extra padding so the panel stays a slim icon-strip.
@@ -47,7 +50,7 @@ pub fn show(
             }
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
-                ui.vertical(|ui| {
+                ui.add_enabled_ui(editable, |ui| ui.vertical(|ui| {
                     // Painting only reads the canvas; the action is
                     // collected here and applied after the panel closes.
                     let canvas = manager.active();
@@ -63,13 +66,13 @@ pub fn show(
                     if add_row(ui).clicked() {
                         action = Some(LayerAction::Add);
                     }
-                });
+                }));
             });
         });
 
     // Only now take the mutable borrow — on the rare frame where the
     // user actually clicked a row.
-    if let Some(a) = action {
+    if let Some(a) = action.filter(|_| editable) {
         let canvas = manager.active_mut();
         match a {
             LayerAction::Add               => canvas.add_layer(),

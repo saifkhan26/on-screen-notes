@@ -367,6 +367,9 @@ pub struct VideoPlayer {
     /// When the view first stopped suiting the decoded size; see
     /// `follow_view`.
     resize_since: Option<Instant>,
+    /// Onion skin is on: while paused, the frame before the one shown is
+    /// decoded too (the one after always is).
+    onion: bool,
 }
 
 impl VideoPlayer {
@@ -403,6 +406,7 @@ impl VideoPlayer {
             pending_resume: resume,
             pending_play: playing,
             resize_since: None,
+            onion: false,
         };
         if playing || resume.is_some_and(|t| t > 0.0) {
             player.wake();
@@ -438,6 +442,10 @@ impl VideoPlayer {
 
     pub fn set_on_screen(&mut self, px: [f32; 2]) {
         self.on_screen = Some(px);
+    }
+
+    pub fn set_onion(&mut self, on: bool) {
+        self.onion = on;
     }
 
     fn info(&self) -> Option<&VideoInfo> {
@@ -538,6 +546,10 @@ impl VideoPlayer {
 
         if !self.cache.contains_key(&target) {
             self.ensure_decoder(now, target, playing);
+        } else if !playing && self.onion && target > 0 && !self.cache.contains_key(&(target - 1)) {
+            // The onion skin wants the frame before too: decode from a
+            // little before it, which brings this one back on the way.
+            self.ensure_decoder(now, target - 1, false);
         } else if !playing {
             // Paused with the frame on screen: let an idle decoder go.
             if self.decoder.as_ref().is_some_and(|d| now.duration_since(d.last_activity) > IDLE_DECODER) {
@@ -667,6 +679,25 @@ impl VideoPlayer {
 
     pub fn frame(&self) -> Option<&Arc<ColorImage>> {
         self.shown.as_ref().map(|(_, f)| f)
+    }
+
+    /// Paused with the onion skin on and the frame before still being
+    /// decoded: the app should look again shortly.
+    pub fn onion_pending(&self) -> bool {
+        let Some((i, _)) = &self.shown else { return false };
+        self.onion
+            && self.clock.is_none()
+            && *i > 0
+            && !self.cache.contains_key(&(i - 1))
+            && self.decoder.as_ref().is_some_and(|d| !d.ended)
+    }
+
+    /// The decoded frame `step` frames from the one shown, if it is in
+    /// the cache, for onion skinning.
+    pub fn neighbour(&self, step: i64) -> Option<&Arc<ColorImage>> {
+        let (i, _) = self.shown.as_ref()?;
+        let j = i.checked_add_signed(step)?;
+        (j != *i).then(|| self.cache.get(&j)).flatten()
     }
 
     fn current(&self) -> u64 {

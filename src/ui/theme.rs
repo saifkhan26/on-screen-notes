@@ -60,6 +60,25 @@ pub fn card_frame() -> egui::Frame {
     }
 }
 
+/// Corner radius of a window, points: Windows 11's.
+pub const WINDOW_ROUNDING: f32 = 8.0;
+
+/// A window's background: `tint` (the overlay's colour at its opacity)
+/// filling `rect` with Windows 11's rounded corners, square while the
+/// window is maximized or full screen, as Windows draws them. A thin
+/// rounded border goes round it, as Windows draws round its own
+/// windows, faded with the tint so a clear overlay stays clear. The
+/// windows are see-through, so Windows itself cannot round them (see
+/// `platform::round_corners`).
+pub fn paint_window(painter: &egui::Painter, rect: egui::Rect, tint: Color32, square: bool) {
+    let rounding = if square { Rounding::ZERO } else { Rounding::same(WINDOW_ROUNDING) };
+    painter.rect_filled(rect, rounding, tint);
+    if !square && tint.a() > 0 {
+        let a = (f32::from(tint.a()) / 255.0 * 50.0).round() as u8;
+        painter.rect_stroke(rect.shrink(0.5), rounding, Stroke::new(1.0, Color32::from_white_alpha(a)));
+    }
+}
+
 /// Apply the project-wide style. Called once on startup.
 pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();

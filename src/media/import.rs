@@ -75,6 +75,10 @@ pub struct ImportJob {
     pub path: PathBuf,
     /// Where it was dropped, in screen points; `None` = view centre.
     pub at: Option<egui::Pos2>,
+    /// A picture, GIF or video was selected when it came in (and the
+    /// setting is on): it lands beside the selected one, at its size,
+    /// rather than at `at` (see `tools::beside`). Off by default.
+    pub beside: bool,
     result: Arc<Mutex<Option<std::result::Result<Imported, ImportError>>>>,
 }
 
@@ -90,7 +94,7 @@ impl ImportJob {
         if let Err(e) = spawned {
             *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(ImportError::Failed(e.to_string())));
         }
-        Self { path, at, result }
+        Self { path, at, beside: false, result }
     }
 
     pub fn file_name(&self) -> String {
@@ -220,7 +224,7 @@ fn copy_hashed(src: &Path) -> Result<String> {
 /// `copy_hashed_into` does for a file. Returns the name and whether this
 /// call created the file (`false`: the same content was already there,
 /// so something else may be using it).
-pub(super) fn store_bytes_into(dir: &Path, bytes: &[u8], ext: &str) -> Result<(String, bool)> {
+pub(crate) fn store_bytes_into(dir: &Path, bytes: &[u8], ext: &str) -> Result<(String, bool)> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut hash = FNV_OFFSET;
     for b in bytes {

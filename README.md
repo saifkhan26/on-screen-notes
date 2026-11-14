@@ -4,9 +4,8 @@ A cross-platform pressure-sensitive on-screen pen-annotation app written in Rust
 
 Draw and write directly over anything on your screen — browser, IDE, video,
 slides — with a pressure-sensitive pen tablet. The window is transparent and
-borderless, holds multiple canvases (←/→ to flip), supports per-canvas layers,
-and can be made click-through with **Alt** so the app behind still receives
-input.
+borderless, holds multiple canvases (←/→ to flip) and supports per-canvas
+layers.
 
 ---
 
@@ -18,6 +17,38 @@ input.
   Windows, XInput2 on X11, tablet-v2 on Wayland)
 - **Krita-parity stroke smoothing** — five algorithms, per-mode knobs (see
   [Stroke smoothing](#stroke-smoothing))
+- **Command palette** — `Ctrl+K` opens a search box: type a few letters
+  of any command (a tool, an edit, a slide or layer command, any button,
+  "go to" a slide by name), see its key, `Enter` runs it. Recently run
+  commands come first; what needs a selection only shows with one
+- **Find** — `Ctrl+F` finds text labels on every slide by what they say
+  (case aside), and anything tagged by its tags; lists each with its
+  slide, and goes there: `Enter` walks the matches in turn, `↑` / `↓` or a
+  click picks one, and the view glides to it, which flashes
+- **Turn 90°** — the arrange bar's turn buttons (beside flip) turn the
+  selection a quarter turn left or right about its middle. A group, or
+  strokes, turned with these or with the knob keep a turned frame, also
+  the next time they are selected; set `arrange.rotate_left` /
+  `rotate_right` in hotkeys.toml for keys
+- **Tags** — select anything (a picture, a video, a group, strokes) and
+  the tag button on the arrange bar takes words for it, separated by
+  spaces or commas: `pose ref walk-cycle`. Tags already used are offered
+  as you type (click one, or `Tab` for the first). A group counts as one
+  when every member has the tag. Tags show on the arrange bar while
+  selected; set `arrange.tag` in hotkeys.toml for a key that opens them.
+  The slide panel's tag button (or "Every tag" in the command palette)
+  opens a list of every tag in the app, in the middle of the screen, with
+  its counts: pick some to see only the slides with any of them (going to
+  one lights them up there), or rename / remove a tag everywhere
+  (locked slides are left alone)
+- **Smart guides** — while a selection is moved, its edges and middle
+  line up with those of the objects around it (any shown layer, a group
+  as one), and a thin line shows each. Hold `Alt` to move freely; turn
+  them off with **Smart guides** in the settings
+- **Shape snap** — finish a stroke and hold the pen still for half a
+  second: it springs into the straight line, triangle, rectangle, other
+  polygon (up to six sides), circle or ellipse it was meant to be. See
+  [Shape snap](#shape-snap)
 - **Brush styles**: Pen, Pencil (translucent graphite stamp), Marker
   (highlighter), Airbrush (soft-cloud spray)
 - **Shapes**: rectangle, ellipse, straight line, straight arrow, freehand
@@ -32,20 +63,63 @@ input.
   polygon; the screen pixels inside become an image on the active layer
 - **Select** — pick objects, then move / resize / rotate them with
   handles; multi-select, duplicate, copy / paste, recolour, re-order
-- **Text labels** — click to place, type, Enter to commit
+- **Text labels** — click to place, type, Enter to commit; the box
+  button beside the Text tool puts labels in a rounded box that keeps
+  them readable over anything
 - **Videos, GIFs & pictures** — drop a video, animated GIF or picture
   onto the canvas (or use the film button); videos and GIFs play /
   pause, scrub, and step frame by frame forward and back. See
   [Videos & GIFs](#videos--gifs)
 - **PureRef boards** — drop a `.pur` file (PureRef 1.x or 2.x) to open it
   as a new slide. See [PureRef boards](#pureref-boards)
+- **Zoom to fit / zoom to the selection** — `Ctrl+1` shows everything on
+  the slide, `Ctrl+2` the selection; hold `C` to look at the selection
+  (or the whole slide) and let go to glide back. The view glides there
+  rather than jumping
+- **Flip** the selection left to right or top to bottom, pictures,
+  videos and GIFs included (text moves but keeps reading forwards)
+- **A picture's colours** — select one picture and the palette button on
+  the bar under the toolbar shows the colours that sum it up: click one
+  to draw with it, or keep them all as the toolbar's palette
 - **Multiple canvases**, persistent on disk via RON
+- **Slide panel** — every slide listed in the bottom-left corner by number
+  and name: click one to go there, double-click (or `F2`) to name it,
+  `+` to add a slide, the arrow-to-line button (or `End`) for the last
+  one. **Drag a row** to move the slide (a line shows where it lands), or
+  right-click it for Move to the top / up / down / to the bottom (keys
+  for the slide shown: `move_slide_up` / `move_slide_down` in
+  `hotkeys.toml`, unbound until set). Its name, lock, view, undo
+  history and pins go with it. Moving renames the slide files rather
+  than rewriting them, so a huge slide moves as fast as an empty one; a
+  crash part way is finished on the next start. `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle through the slides by
+  number; the clock button switches them to *recently used* order, like
+  `Alt+Tab` — a tap flips back to the slide you were on before, holding
+  `Ctrl` and tapping again goes further back. The `‹` button folds the
+  panel to a small `n/N` tab. Names are kept in `canvases/names.ron`,
+  so naming never rewrites a slide
+- **Lock a slide** with `Ctrl+R` so nothing on it can change by
+  accident: a drag pans, the wheel zooms, the laser and spotlight still
+  work, and edit keys (undo, delete, paste…) are refused. A badge under
+  the toolbar shows the lock (click it, or `Ctrl+R` again, to unlock);
+  locked slides carry a lock in the slide panel. Kept in
+  `canvases/locks.ron`, so locking never rewrites a slide
+- **Big slides open without freezing the app** — a slide still being
+  read shows a progress bar while it opens, and its pictures load in
+  the background (faint boxes until they arrive) with a count of how
+  many are in
+- **Pictures are kept as files** — a pasted, captured or inserted
+  picture is moved in the background into the `media` folder, byte for
+  byte, and the slide keeps only its file name and a small preview, so a
+  slide of hundreds of screenshots stays a few MB and saves in a moment.
+  Slides from older versions are converted the same way when they load
 - **Multiple layers per canvas** (independent visibility + opacity, and
   each layer can be panned / zoomed on its own with `Shift+Space`)
-- **Click-through** while holding `Alt`
 - **Global hotkey screenshot** — saved PNG contains background + ink
 - **Screen recording** — GIF (built-in) or MP4 (if ffmpeg on PATH)
 - **Pin to window** — overlay follows another window's position
+- **Pins** — keep objects on screen as you pan and zoom their slide,
+  or on every slide, each pin moved and sized on its own. See
+  [Pinning](#pinning)
 - **Freeze frame** — bake the current screen behind into a new layer
 
 ---
@@ -119,7 +193,7 @@ the binary on first launch.
 | Airbrush | `G` | Soft disc spray; hold still to build density |
 | Fill | `F` | Click → flood-fills enclosed region |
 | Laser pointer | `L` | Strokes fade after pen-up |
-| Text | `T` | Click anywhere, type, Enter commits |
+| Text | `T` | Click anywhere, type, Enter commits. The box button beside it puts labels in a box (for selected labels too) |
 | Spotlight | `S` | Press again to exit |
 | Lasso erase | `X` | Draw closed loop, or click corners for a polygon (closes like Lasso capture's) |
 | Lasso capture | `Shift+X` | Draw closed loop → image object on the active layer. Or click corners for a polygon: click the first corner, double-click or `Enter` to close, `Backspace` takes back a corner |
@@ -134,12 +208,34 @@ the binary on first launch.
 | Insert picture / video / GIF | toolbar film button, or drag & drop | See [Videos & GIFs](#videos--gifs) |
 | Open a PureRef board | toolbar film button, or drag & drop a `.pur` | Opens as a new slide; see [PureRef boards](#pureref-boards) |
 
-The pen and pencil draw at the chosen size as it looks on screen,
-whatever the zoom: zoomed in 4×, a new line is a quarter as wide on the
-canvas, so detail work gets fine lines. A line keeps its width once
-drawn and scales with the view like everything else; the size slider
-re-widths selected pen and pencil lines the same way. Marker, airbrush,
-eraser and shapes keep their size in canvas units.
+### Shape snap
+
+With the pen (any brush style), finish a stroke and keep the tip
+pressed and still for about half a second. If the stroke was clearly
+meant as a shape, it morphs onto it, with a little springy overshoot:
+
+- **Open** strokes become a straight line, if they were near one.
+- **Closed** strokes (ending near where they began) become a
+  triangle, a rectangle (level when drawn nearly level, turned when
+  drawn turned), another polygon of up to six sides, a circle (when
+  nearly round) or an ellipse — whichever fits the stroke best, if one
+  fits well. Scribbles, curves and handwriting snap to nothing.
+
+The snapped shape is still a stroke: it keeps its brush (pencil grain,
+marker, airbrush), colour and width, at the stroke's average pressure,
+and is one undo step like any other. Once it has snapped, moving the pen
+before lifting it changes nothing. Turn it off with **Shape snap** in the
+settings (gear button).
+
+The pen, pencil, marker, airbrush and eraser work at the chosen size as
+it looks on screen, whatever the zoom: zoomed in 4×, a new line is a
+quarter as wide on the canvas, so you can sketch zoomed out and zoom in
+for fine detail. Thin lines, airbrush density and smoothing feel the
+same at every zoom too, and the ring at the pointer always shows the
+line you are about to draw (for the eraser, how far it reaches). A line
+keeps its width once drawn and scales with the view like everything
+else; the size slider re-widths selected lines the same way. Freehand
+arrows, the laser and shapes keep their size in canvas units.
 
 ### Dashed border
 
@@ -158,6 +254,8 @@ layer makes that layer the active one.
 |---|---|
 | Click an object | Select it |
 | `Shift` + click | Add it to / remove it from the selection |
+| `Ctrl+G` / `Ctrl+Shift+G` (or the bar's group buttons) | Group the selection / ungroup it. A group selects, moves, resizes and arranges as one |
+| `Alt` + click | Select just that object, not the group it is in |
 | Drag from empty space | Box-select everything fully inside the box (on the active layer; if nothing there is inside, on the topmost layer that has something) |
 | Drag inside the frame | Move the selection |
 | Drag a corner handle | Resize, keeping proportions |
@@ -166,10 +264,14 @@ layer makes that layer the active one.
 | `Delete` / `Backspace` | Delete the selection |
 | `Ctrl+D` | Duplicate |
 | `Ctrl+Shift+D` | Copy to a new slide (added after the last) |
+| `Ctrl+P` | Pin to every slide, or unpin (see [below](#pinning)) |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste (works across slides and layers; on Windows the copy also pastes as a picture in other apps) |
 | `Ctrl+V` with an image on the clipboard | Paste it as an image object |
 | `Ctrl+↑` / `Ctrl+↓` | Bring to front / send to back |
 | Pick a palette colour, move the size slider | Recolour / change line width of the selection |
+| Flip buttons on the bar | Mirror the selection left to right / top to bottom, about its middle |
+| Magnifier-in-a-frame button on the bar, or `Ctrl+2` | Zoom to the selection; hold `C` to look and come back |
+| Palette button on the bar (one picture selected) | Show its colours: click one to draw with it, **Use as palette** keeps them all (**Restore palette** brings the old one back) |
 | `Esc` | Cancel the drag in progress, then deselect |
 
 Every action is one undo step. Things worth knowing:
@@ -187,12 +289,34 @@ Every action is one undo step. Things worth knowing:
   GIFs and videos move one by one, taking the ink drawn on them along;
   other ink moves in touching clusters, so handwriting stays in one
   piece. Its last button copies the selection to a new slide.
+- **Pack** keeps every size and keeps the result on screen. The arrow
+  beside it picks how (remembered across restarts): **Optimal**, the
+  tightest block, shaped like the screen; **Horizontal**, rows left to
+  right in reading order, wrapping at the screen's edge; **Vertical**,
+  columns top to bottom, wrapping at its bottom. A block that fits stays
+  as near where the selection was as it can; one too big for the screen
+  is shaped like it, and the view glides out to show it whole.
 - **Copy to a new slide** (`Ctrl+Shift+D`, any selection) adds a slide
   after the last one holding copies of the selected objects, in the same
   spot and view, and goes there with them selected.
+- **Move to slide…** (the bar's arrow-into-box button) lists the other
+  slides; the selection leaves this slide and lands on the one picked,
+  where it shows now on screen through that slide's own view. One undo
+  step on each slide; moved objects leave their pin.
+- **Slide window** — right-click a slide in the slide panel and pick
+  "Open in a window" to show it in a second window with its own pan and
+  zoom. The toolbar's tool works there too (pens, eraser, shapes, laser,
+  Select; Ctrl+Z on that slide); middle-drag or Space+drag pans. Drag a
+  selection from the canvas into the window, or back, to move it to the
+  other slide, landing where you let go. Its **Pins** toggle shows the
+  pins on every slide there instead of on the canvas; with Select they
+  move, resize and turn there as on the canvas (Delete unpins,
+  double-click goes to the pin's slide).
 - The **funnel** button highlights pictures, GIFs and/or videos on the
-  slide (each type outlined in its own colour, the rest dimmed), and
-  "Select these" selects them, ready to arrange or copy.
+  slide (each type outlined in its own colour, the rest dimmed), its
+  groups (each boxed whole), and what is tagged: everything tagged, or
+  just the tags picked from the slide's list, each labelled with its
+  tags. "Select these" selects them, ready to arrange or copy.
 - Captures made by older versions, and frozen frames, are stored as a
   layer's background rather than as objects. Clicking one turns it into
   an ordinary image object in place — nothing moves — and from then on
@@ -207,6 +331,13 @@ Every action is one undo step. Things worth knowing:
 - While the Select tool is active, `Shift` + click selects rather than
   picking a colour, and `Ctrl` does not erase. `I` still picks a colour.
 - Objects on different layers cannot be in one selection.
+- **Groups.** Clicking, Shift+clicking or box-selecting any object of a
+  group takes the whole group; `Alt`+click takes one object of it. A
+  selection holding groups among other things shows each group as a
+  dashed box inside the frame. Arrange packs, aligns and spaces a group
+  as one block. Duplicates and pastes of a group make a group of their
+  own. Grouping and ungrouping are undo steps. Groups in groups are not
+  kept: grouping again makes one flat group.
 - Pasting an image-only clipboard works on Windows; elsewhere the
   clipboard must also carry text for the paste to be noticed.
 - **Copying into other apps (Windows).** `Ctrl+C` / `Ctrl+X` also put
@@ -219,6 +350,52 @@ Every action is one undo step. Things worth knowing:
   Pasting back into this app still pastes the objects themselves, not
   a flattened picture of them. A big picture takes a moment to reach
   the clipboard.
+
+### Pinning
+
+Select some objects and press `Ctrl+P` (or the pin button on the bar
+under the toolbar) to keep them on screen. The objects stay where they
+are, on their own slide. A *pin* showing them appears a little off to
+the side, selected, ready to be dragged where it should stay. A pin
+holds its place on screen as the slide is panned and zoomed.
+
+- **Global or local.** A new pin is *global*: it shows on every slide,
+  the one its objects are on included. The selected pin's bar switches
+  it between **Every slide** and **This slide**; a local pin shows only
+  on its own slide. Pin things from as many slides as you like.
+
+- **A pin is a live view, not a copy.** Recolour the objects, edit the
+  text, draw over a pinned fill or play a pinned video, and the pin
+  shows it. Their layer's visibility and opacity do not touch the pin:
+  hide or fade the layer on its slide and the pin still shows in full.
+- **Moving, resizing and turning a pin never touches the objects.** With
+  the Select tool, drag a pin to move it, drag a corner to resize it
+  (proportions kept), or drag the knob above it to turn it (`Shift`
+  snaps to 15°). A global pin keeps the same place on every slide.
+- With the Select tool, pins show a faint outline and a pin badge, so
+  they can be told from the slide's own objects. A pin sits on top of
+  the slide, so press on it to take the pin; to reach what is under it,
+  move the pin aside first.
+- A selected pin's bar says which slide its objects are on, goes there
+  (or **double-click** the pin), sets it local or global, and unpins it. `Delete` or `Ctrl+P` on
+  a selected pin unpins it as well. Unpinning only stops the showing:
+  the objects stay on their slide.
+- Pinning and unpinning are undo steps on the objects' slide; moving a
+  pin or switching it between local and global is not an edit of any
+  slide. Pin places are kept in `canvases/pins.ron` beside the slides.
+  Without that file the pins still show, back over their objects and
+  global.
+- Hover a pinned video or GIF for its playback bar, or select its pin.
+  It is the same player as on its own slide, so it keeps playing as you
+  change slides.
+- Copies (duplicate, paste, copy to a new slide) are not pinned. Deleting
+  a slide removes the pins of its objects.
+- Screenshots and recordings include pins.
+- **Hide / show pins** with `Shift+P` or the eye button in the toolbar
+  (it appears once something is pinned, and stays lit while pins are
+  hidden). This hides every pin at once; their objects stay on their own
+  slides. Pins always show again when the app starts, and pinning
+  something new shows them too.
 
 ---
 
@@ -274,14 +451,21 @@ change does not retro-apply.
 
 ## Global hotkeys
 
-Work even when overlay is unfocused.
+Work even when overlay is unfocused. While the app runs, Windows hands
+these combos to it alone — the app in focus never sees them — so the
+defaults use `Ctrl+Alt+Shift`, which other apps leave alone.
 
 | Action | Default |
 |---|---|
-| Toggle overlay visibility | `Ctrl+Shift+N` |
-| Screenshot (bg + ink) | `Ctrl+Shift+S` |
-| Start / stop recording | `Ctrl+Shift+R` |
-| Pause / resume recording | `Ctrl+Shift+P` |
+| Toggle overlay visibility | `Ctrl+Alt+Shift+N` |
+| Screenshot (bg + ink) | `Ctrl+Alt+Shift+S` |
+| Start / stop recording | `Ctrl+Alt+Shift+R` |
+| Pause / resume recording | `Ctrl+Alt+Shift+P` |
+
+They used to be `Ctrl+Shift+N/S/R/P`, which took Save As, VS Code's
+command palette and the browser's hard reload away from other apps. An
+existing `hotkeys.toml` is upgraded once on launch: each global still on
+its old default moves to the new one, and bindings you changed are kept.
 
 All hotkeys (globals + in-overlay shortcuts) are configurable via
 `hotkeys.toml`. See [Customising hotkeys](#customising-hotkeys).
@@ -296,15 +480,26 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Eraser (modifier) | hold `Ctrl` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Shift+Z` |
 | Clear active layer | `Ctrl+Delete` |
-| Delete active canvas | `Ctrl+Shift+Backspace` |
+| Delete active canvas (asks first unless it is empty; `Enter` deletes, `Esc` keeps it) | `Ctrl+Shift+Backspace` |
 | Previous / next canvas | `←` / `→` |
+| Previous / next slide, wrapping round (never adds a slide) — or, with the slide panel's clock button on, back / forward through recently used slides | `Ctrl+Shift+Tab` / `Ctrl+Tab` |
+| First / last slide | `Home` / `End` |
+| Name the active slide (in the slide panel) | `F2` |
+| Lock / unlock the active slide (pan and zoom only) | `Ctrl+R` |
+| Move the active slide one place up / down (or drag it in the slide panel) | unbound; set `move_slide_up` / `move_slide_down` |
 | Previous / next layer | `↓` / `↑` |
+| Hide / show the active layer | `H` |
+| Command palette: find any command by name (`↑` / `↓`, `Enter` runs, `Esc` closes) | `Ctrl+K` |
+| Find text on the slides (`Enter` / `Shift+Enter` next / previous, `↑` / `↓` pick, `Esc` closes) | `Ctrl+F` |
 | Reset pan + zoom | `Ctrl+0` |
+| Zoom to fit everything on the slide | `Ctrl+1` |
+| Zoom to the selection (nothing selected: the whole slide) | `Ctrl+2` |
+| Look at the selection while held, back when let go (a quick tap stays) | hold `C` |
 | Reset active layer position | `Ctrl+Shift+0` |
 | Reset active layer zoom | `Ctrl+Shift+9` |
 | Freeze frame → layer | `Ctrl+Shift+F` |
-| Click-through (passthrough) | hold `Alt` |
 | Pan canvas | hold `Space` + drag |
+| Zoom canvas (any tool, the pen too) | hold `Space` + scroll |
 | Pan active layer | hold `Shift+Space` + drag |
 | Zoom active layer | hold `Shift+Space` + scroll |
 | Active layer opacity — absolute | `1`=10 % … `9`=90 %, `0`=0 % |
@@ -314,12 +509,16 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Cancel pending (eyedropper / lasso / text / selection) | `Esc` |
 | Selection: delete / duplicate | `Delete` / `Ctrl+D` |
 | Selection: copy to a new slide | `Ctrl+Shift+D` |
+| Selection: group / ungroup (`Alt`+click picks one object of a group) | `Ctrl+G` / `Ctrl+Shift+G` |
+| Selection: pin to every slide / unpin | `Ctrl+P` |
+| Hide / show all pins | `Shift+P` |
 | Selection: copy / cut / paste | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` |
 | Selection: bring to front / send to back | `Ctrl+↑` / `Ctrl+↓` |
 | Text mode: newline | `Shift+Enter` |
 | Text mode: commit | `Enter` |
 | Video / GIF: play / pause | `K` |
 | Video / GIF: previous / next frame | `,` / `.` (hold to repeat) |
+| Onion skin on / off (every GIF and video, while paused) | media bar's layers button; or set `media_onion` |
 
 ---
 
@@ -349,11 +548,13 @@ one shortcut goes dead, the rest still work. Look at `RUST_LOG=warn`
 output for the offending line.
 
 ```toml
+version = 10
+
 [global]
-toggle_overlay = "ctrl+shift+n"
-screenshot     = "ctrl+shift+s"
-start_record   = "ctrl+shift+r"
-pause_record   = "ctrl+shift+p"
+toggle_overlay = "ctrl+alt+shift+n"
+screenshot     = "ctrl+alt+shift+s"
+start_record   = "ctrl+alt+shift+r"
+pause_record   = "ctrl+alt+shift+p"
 
 [tool]
 pen        = "p"
@@ -379,6 +580,9 @@ redo          = "ctrl+shift+z"
 clear_layer   = "ctrl+delete"
 delete_canvas = "ctrl+shift+backspace"
 reset_view    = "ctrl+0"
+zoom_to_fit   = "ctrl+1"
+zoom_to_selection = "ctrl+2"
+hold_zoom_to_selection = "c"
 reset_layer_pos = "ctrl+shift+0"
 reset_layer_zoom = "ctrl+shift+9"
 freeze_frame  = "ctrl+shift+f"
@@ -402,11 +606,14 @@ opacity_9 = "9"
 opacity_dec = "-"
 opacity_inc = "="
 preview_layer = "q"
+toggle_layer_visible = "h"
 
 # Select-tool actions (only act while objects are selected).
 delete_selection = "delete"
 duplicate   = "ctrl+d"
 copy_to_new_slide = "ctrl+shift+d"
+pin_selection = "ctrl+p"
+toggle_pins = "shift+p"
 bring_front = "ctrl+arrowup"
 send_back   = "ctrl+arrowdown"
 
@@ -420,7 +627,7 @@ media_next_frame = "period"
 Copy / cut / paste are fixed to `Ctrl+C` / `Ctrl+X` / `Ctrl+V`.
 
 Modifier-key gestures stay hard-coded (they are not shortcuts):
-`Ctrl` (eraser), `Alt` (passthrough), `Space` (pan), `Shift+Space`
+`Ctrl` (eraser), `Space` (pan), `Shift+Space`
 (pan / zoom the active layer instead of the view).
 
 ---
@@ -432,6 +639,7 @@ Modifier-key gestures stay hard-coded (they are not shortcuts):
 | Pen / Pencil / Marker / Airbrush / Eraser | scroll | Adjust brush size |
 | Spotlight active | scroll | Resize spotlight square |
 | Any other tool | scroll | Canvas zoom |
+| Any tool | `Space` + scroll | Canvas zoom (about the cursor) |
 | Any tool | `Shift` + scroll | Active layer opacity |
 | Any tool | `Shift+Space` + scroll | Active layer zoom (about the cursor) |
 
@@ -457,8 +665,9 @@ still, and draw with the mouse.
   last one (infinite on demand). `←` walks backward; wraps from the
   first.
 - Each canvas holds a stack of **layers** (strokes + shapes + optional
-  raster background). `↑` / `↓` walk the active layer. Per-layer
-  visibility + opacity edit lives in the layer panel.
+  raster background). `↑` / `↓` walk the active layer, `H` hides or
+  shows it. Per-layer visibility + opacity edit also lives in the
+  layer panel.
 - Both canvases and layers persist as RON files (`canvases\canvas_N.ron`,
   one per slide, plus `config.ron` and the `media` folder) under the
   platform's data dir: `%APPDATA%\OnScreenNotes\on-screen-notes\data\` on
@@ -474,14 +683,23 @@ still, and draw with the mouse.
 Drop a video or animated GIF from Explorer onto the canvas, or click the
 **film** button in the toolbar and pick one or more files. The object
 lands where it was dropped (or mid-view), sized to its natural size or
-shrunk to fit, and selected. From there it is an ordinary picture:
+shrunk to fit, and selected. **With a picture, GIF or video selected**,
+one you drop, insert or paste (from another app, or an in-app copy)
+instead comes in at the selected one's height and lands right beside
+it, past any already there; several dropped at once line up one after
+another. Settings → *New picture beside the selected one* switches this
+between **Same height**, **Same width** and **Off**, and picks the
+**left** or **right** side (saved with the settings). From there it is
+an ordinary picture:
 move / resize / rotate it with the Select tool, draw over it, undo,
 duplicate (each copy plays on its own), put it on any layer.
 
 **Pictures** (PNG, JPEG, WebP, BMP) drop in the same way and become a
 still image, like a pasted one: turned upright if a phone stored it
-sideways, scaled down to 3840 px on the long side, and saved inside the
-slide (not in the `media` folder). A single-frame GIF does the same.
+sideways and scaled down to 3840 px on the long side. A single-frame GIF
+does the same. Any picture over 64 KB, pasted or inserted, then moves to
+the `media` folder within a second or so, with a small preview left in
+the slide.
 
 - **Formats** — GIF always; MP4, M4V, MOV, MKV, WebM, AVI, WMV through
   FFmpeg. Video plays **muted**.
@@ -494,8 +712,15 @@ slide (not in the `media` folder). A single-frame GIF does the same.
 - **Playback bar** — appears just below the object while the pointer is
   over it (with any tool) and while it is selected:
   previous frame · play / pause · next frame · seek bar · time and
-  frame number · loop. Tapping the bar never draws ink. The bar is
-  never in screenshots or recordings.
+  frame number · loop · onion skin. Tapping the bar never draws ink.
+  The bar is never in screenshots or recordings.
+- **Onion skin** — the layers button on the bar (or `media_onion` in
+  `hotkeys.toml`, unbound until set) turns it on for every GIF and
+  video: while one is paused, the frame before shows in red and the
+  frame after in green, only where they differ from the frame shown, so
+  what moves stands out and what stays still stays clean. Step with
+  `,` / `.` to walk through a motion. A looping GIF wraps round at its
+  ends. Screenshots and copies keep the plain frame.
 - **Keys** — `K` play / pause, `,` / `.` previous / next frame (see
   [In-overlay shortcuts](#in-overlay-shortcuts)).
 - **Screenshots** include the frame each video / GIF is showing.
@@ -507,10 +732,10 @@ slides (`%APPDATA%\OnScreenNotes\on-screen-notes\data\media\` on
 Windows), named after a hash of their content, so moving or deleting
 the original does not break the slide and inserting the same file twice
 stores it once. Slides keep only the file name plus a small poster
-frame.
+frame. Copying slides to another computer means copying `media` too.
 
 Deleting a slide (`Ctrl+Shift+Backspace`) also deletes the copies of its
-videos and GIFs — once the slides have been saved without it, and only
+videos, GIFs and pictures — once the slides have been saved without it, and only
 copies nothing else still uses: no other slide, no undo history on
 another slide, nothing in the in-app clipboard (those wait until the
 app closes). Deleting a single object leaves its file in place, since
@@ -537,9 +762,13 @@ by PureRef 2 (including 2's "save as legacy") both work.
 - **Animated GIFs** come in as GIFs you can play, like a dropped one
   (paused until you start them), unless the board crops or mirrors
   them: those come in as a still of the first frame.
+- **Groups** come over: what moves together in PureRef — a group's
+  contents, a picture and the notes on it — is one group on the slide.
+  A group inside a group becomes part of the outer one.
 - **Notes** become text labels with their colour and rotation, wrapped
-  to the note's width when it has a fixed one. Their background box and
-  rich-text styling are dropped.
+  to the note's width when it has a fixed one. A note's background
+  becomes the label's box, in the note's colour; rich-text styling is
+  dropped.
 - **Not brought over:** pictures that are only linked from disk rather
   than stored in the board, formats the app cannot decode (such as PSD,
   TIFF or EXR in PureRef 2 boards), and drawings. The toast says how
@@ -592,8 +821,8 @@ and always exit with the app.
 
 ## Recording
 
-`Ctrl+Shift+R` starts a screen capture of the area under the overlay;
-press again to stop. `Ctrl+Shift+P` pauses / resumes mid-record.
+`Ctrl+Alt+Shift+R` starts a screen capture of the area under the overlay;
+press again to stop. `Ctrl+Alt+Shift+P` pauses / resumes mid-record.
 
 Output format toggle in settings:
 
@@ -616,8 +845,7 @@ into Slack / Discord.
   and recording. Pen-pressure via octotablet is partial; mouse fallback
   always works.
 - **Linux X11** — pen pressure via XInput2.
-- **Linux Wayland** — pen pressure via tablet-v2. Click-through depends
-  on compositor support.
+- **Linux Wayland** — pen pressure via tablet-v2.
 
 ---
 
@@ -637,7 +865,6 @@ src/
 ├── input/
 │   ├── filter.rs     ─ wobble + One Euro pre-conditioner
 │   ├── hotkeys.rs    ─ global hotkey bindings
-│   ├── modifiers.rs  ─ Ctrl/Alt/Shift tracker
 │   ├── pen.rs        ─ Wintab queue → PenEvent
 │   └── picker.rs     ─ window-pick helpers
 ├── interaction/      ─ keyboard / mouse dispatch
@@ -647,7 +874,7 @@ src/
 ├── recording.rs      ─ frame capture, GIF / MP4 encode
 ├── screenshot/       ─ xcap composite + PNG write
 ├── tools/            ─ ActiveTool dispatch, per-tool helpers
-└── ui/               ─ toolbar, overlay, loupe, status, layer panel,
+└── ui/               ─ toolbar, overlay, loupe, slide panel, layer panel,
                         media playback bar
 ```
 

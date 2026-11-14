@@ -41,9 +41,10 @@ impl PenSample {
 /// Visual style for a stroke. Picked at the moment the user pen-downs and
 /// then frozen into the stroke for the rest of its life — switching the
 /// active style later does not retro-recolour earlier strokes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum StrokeStyle {
     /// Smooth opaque ribbon (existing pen look).
+    #[default]
     Default,
     /// Translucent, grainy line meant to read as a graphite pencil mark.
     Pencil,
@@ -60,21 +61,10 @@ pub enum StrokeStyle {
     Airbrush,
 }
 
-impl Default for StrokeStyle {
-    fn default() -> Self { StrokeStyle::Default }
-}
-
-impl StrokeStyle {
-    /// Pen and pencil lines take the toolbar size as it looks on screen:
-    /// drawn zoomed in 4×, a line is a quarter as wide on the canvas, so
-    /// it comes out the size picked, fine enough for detail. Marker and
-    /// airbrush keep the size in canvas units.
-    pub fn sizes_on_screen(self) -> bool {
-        matches!(self, StrokeStyle::Default | StrokeStyle::Pencil)
-    }
-}
-
 fn default_stroke_style() -> StrokeStyle { StrokeStyle::Default }
+
+fn one() -> f32 { 1.0 }
+fn is_one(v: &f32) -> bool { *v == 1.0 }
 
 /// One pen-down-to-pen-up stroke, with all its visual properties.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +90,33 @@ pub struct Stroke {
     /// existed loading as plain outlines.
     #[serde(default)]
     pub filled: bool,
+
+    /// Id of the pin that keeps this stroke on screen, or 0. See
+    /// `canvas::pins`. A zero is not written, so an unpinned stroke keeps
+    /// its old on-disk form.
+    #[serde(default, skip_serializing_if = "crate::canvas::shape::is_unpinned")]
+    pub pin: u64,
+    /// Group the stroke is in, or 0; see `Shape::group`.
+    #[serde(default, skip_serializing_if = "crate::canvas::shape::is_ungrouped")]
+    pub group: u64,
+    /// Words find (Ctrl+F) knows the stroke by; see `Shape::tags`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// How far the stroke has been turned with a selection; see
+    /// `Shape::turn`. A zero is not written.
+    #[serde(default, skip_serializing_if = "crate::canvas::shape::is_zero")]
+    pub turn: f32,
+
+    /// Canvas units per screen pixel at the zoom the stroke was drawn at
+    /// (1 / zoom). The pen draws at the toolbar size as it looks on
+    /// screen, so zoomed in 4× a line is a quarter as wide on the canvas;
+    /// every limit measured in pixels (thinnest line, sample spacing,
+    /// smoothing distances) is scaled by this too, so a line drawn
+    /// zoomed in looks and feels the same as one drawn at 1×. Scaling
+    /// the stroke scales it along with the width. A 1 is not written,
+    /// so strokes drawn at 1× keep their old on-disk form.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub px: f32,
 
     /// Pre-tessellated polyline cache built lazily on first paint and
     /// invalidated whenever samples change. We keep it out of the on-disk
@@ -306,7 +323,7 @@ pub(crate) fn gaussian_smooth_positions_bidir(pts: &mut [[f32; 2]], sigma: f32) 
     for w in kernel.iter_mut() { *w /= sum; }
 
     let mut out: Vec<[f32; 2]> = vec![[0.0; 2]; n];
-    for i in 0..n {
+    for (i, o) in out.iter_mut().enumerate() {
         let mut ax = 0.0_f32;
         let mut ay = 0.0_f32;
         for k in -radius..=radius {
@@ -316,7 +333,7 @@ pub(crate) fn gaussian_smooth_positions_bidir(pts: &mut [[f32; 2]], sigma: f32) 
             ax += pts[idx][0] * w;
             ay += pts[idx][1] * w;
         }
-        out[i] = [ax, ay];
+        *o = [ax, ay];
     }
     pts.copy_from_slice(&out);
 }
@@ -345,14 +362,14 @@ pub(crate) fn gaussian_smooth_widths_bidir(widths: &mut [f32], sigma: f32) {
     for w in kernel.iter_mut() { *w /= sum; }
 
     let mut out = vec![0.0_f32; n];
-    for i in 0..n {
+    for (i, o) in out.iter_mut().enumerate() {
         let mut a = 0.0_f32;
         for k in -radius..=radius {
             let idx = (i as isize + k).clamp(0, (n - 1) as isize) as usize;
             let w = kernel[(k + radius) as usize];
             a += widths[idx] * w;
         }
-        out[i] = a;
+        *o = a;
     }
     widths.copy_from_slice(&out);
 }
@@ -457,10 +474,15 @@ impl Stroke {
             base_width,
             style,
             filled: false,
+            pin: 0,
+            px: 1.0,
             cache: None,
             filter: None,
             smoothing: SmoothingOptions::default(),
             mode_state: None,
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -479,10 +501,15 @@ impl Stroke {
             base_width,
             style,
             filled: false,
+            pin: 0,
+            px: 1.0,
             cache: None,
             filter: None,
             smoothing,
             mode_state: None,
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -499,10 +526,15 @@ impl Stroke {
             base_width,
             style: StrokeStyle::Default,
             filled: true,
+            pin: 0,
+            px: 1.0,
             cache: None,
             filter: None,
             smoothing: SmoothingOptions::default(),
             mode_state: None,
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -559,14 +591,19 @@ impl Stroke {
     /// Existing pipeline: in-stroke One Euro on positions + min-dist
     /// gate. Preserves byte-for-byte legacy behaviour.
     fn push_adaptive(&mut self, mut sample: PenSample) {
+        // The filter's speed coupling is tuned for screen pixels, so it
+        // runs in them: zoomed in, the pen moves fewer canvas units for
+        // the same hand speed and would otherwise feel sluggish.
+        let px = self.px;
         let filter = self.filter.get_or_insert_with(OneEuroFilter::new);
-        sample.pos = filter.filter(sample.pos);
+        let f = filter.filter([sample.pos[0] / px, sample.pos[1] / px]);
+        sample.pos = [f[0] * px, f[1] * px];
 
         if let Some(last) = self.samples.last() {
             let dx = sample.pos[0] - last.pos[0];
             let dy = sample.pos[1] - last.pos[1];
             let d2 = dx * dx + dy * dy;
-            let min_dist = (self.base_width * 0.15).clamp(1.0, 4.0);
+            let min_dist = (self.base_width * 0.15).clamp(px, 4.0 * px);
             if d2 < min_dist * min_dist {
                 return;
             }
@@ -613,6 +650,7 @@ impl Stroke {
             s.pos[1] = a * s.pos[1] + b[1];
         }
         self.base_width *= a;
+        self.px *= a;
         if let Some(c) = self.cache.as_mut() {
             for p in &mut c.points {
                 p[0] = a * p[0] + b[0];
@@ -636,11 +674,13 @@ impl Stroke {
     /// cached polyline through this exact transform, so mapping the
     /// cache makes the committed stroke identical to what the user saw.
     pub fn apply_affine(&mut self, m: &crate::canvas::affine::Affine) {
+        self.turn = m.turn(self.turn);
         let s = m.linear_scale();
         for sample in &mut self.samples {
             sample.pos = m.apply(sample.pos);
         }
         self.base_width *= s;
+        self.px *= s;
         if let Some(c) = self.cache.as_mut() {
             for p in &mut c.points {
                 *p = m.apply(*p);
@@ -673,7 +713,7 @@ impl Stroke {
         if let Some(last) = self.samples.last() {
             let dx = sample.pos[0] - last.pos[0];
             let dy = sample.pos[1] - last.pos[1];
-            if dx * dx + dy * dy < 0.25 { return; }
+            if dx * dx + dy * dy < 0.25 * self.px * self.px { return; }
         }
         self.accept(sample);
     }
@@ -681,7 +721,7 @@ impl Stroke {
     /// Krita SIMPLE_SMOOTHING: average against the previous raw sample.
     fn push_simple(&mut self, sample: PenSample) {
         let state = self.mode_state
-            .get_or_insert_with(|| ModeState::Simple { prev: None });
+            .get_or_insert(ModeState::Simple { prev: None });
         let out = if let ModeState::Simple { prev } = state {
             smoothing::simple_step(prev, sample)
         } else {
@@ -692,7 +732,8 @@ impl Stroke {
 
     /// Krita WEIGHTED_SMOOTHING: Gaussian-weighted history accumulation.
     fn push_weighted(&mut self, sample: PenSample) {
-        let opts = self.smoothing;
+        let mut opts = self.smoothing;
+        opts.smoothness_distance *= self.px;
         let state = self.mode_state
             .get_or_insert_with(|| ModeState::Weighted(WeightedState::new()));
         let out = if let ModeState::Weighted(w) = state {
@@ -706,7 +747,9 @@ impl Stroke {
     /// Krita STABILIZER: queue + delay-distance gate. Returns the
     /// blended output (or `None` when the gate suppresses the sample).
     fn push_stabilizer(&mut self, sample: PenSample, force: bool) -> Option<PenSample> {
-        let opts = self.smoothing;
+        // `smoothness_distance` is the queue length here, not a distance.
+        let mut opts = self.smoothing;
+        opts.delay_distance *= self.px;
         let state = self.mode_state.get_or_insert_with(|| {
             ModeState::Stabilizer(StabilizerState::new(
                 sample,
@@ -727,7 +770,7 @@ impl Stroke {
         if let Some(last) = self.samples.last() {
             let dx = sample.pos[0] - last.pos[0];
             let dy = sample.pos[1] - last.pos[1];
-            if dx * dx + dy * dy < 0.25 { return; }
+            if dx * dx + dy * dy < 0.25 * self.px * self.px { return; }
         }
         self.samples.push(sample);
         self.cache = None;
@@ -756,7 +799,7 @@ impl Stroke {
         // live-preview path (`paint_stroke_live`) calls the same
         // `build_spine`, so an in-progress stroke matches its committed
         // form exactly.
-        self.cache = Some(build_spine(&self.samples, self.base_width, position_passes));
+        self.cache = Some(build_spine(&self.samples, self.base_width, self.px, position_passes));
     }
 
     // -- pressure curve global --------------------------------------------
@@ -764,6 +807,20 @@ impl Stroke {
 
     /// Bounding box (axis-aligned) of all samples. Used for hit-testing
     /// (eraser) and for clipping render work to dirty regions.
+    /// `bounds` along the axes of a frame turned by `angle` (see
+    /// `canvas::unturn`).
+    pub fn bounds_turned(&self, angle: f32) -> Option<[f32; 4]> {
+        let mut iter = self.samples.iter().map(|s| crate::canvas::canvas::unturn(s.pos, angle));
+        let first = iter.next()?;
+        let (mut min, mut max) = (first, first);
+        for p in iter {
+            min = [min[0].min(p[0]), min[1].min(p[1])];
+            max = [max[0].max(p[0]), max[1].max(p[1])];
+        }
+        let pad = self.base_width.max(0.5 * self.px);
+        Some([min[0] - pad, min[1] - pad, max[0] + pad, max[1] + pad])
+    }
+
     pub fn bounds(&self) -> Option<[f32; 4]> {
         let mut iter = self.samples.iter();
         let first = iter.next()?;
@@ -777,7 +834,7 @@ impl Stroke {
         }
         // Inflate by the base width so a thick stroke isn't clipped to its
         // sample-points alone.
-        let pad = self.base_width.clamp(0.5, 80.0);
+        let pad = self.base_width.max(0.5 * self.px);
         Some([min[0] - pad, min[1] - pad, max[0] + pad, max[1] + pad])
     }
 }
@@ -837,7 +894,7 @@ pub fn apply_curve(raw: f32, curve: f32) -> f32 {
 
 /// Emit a spine node when the tangent has turned more than this since the
 /// last node, regardless of arc length. `cos(10°)`.
-const ANGLE_COS: f32 = 0.984_807_75;
+const ANGLE_COS: f32 = 0.984_807_7;
 
 /// Build the ribbon spine for a stroke: centripetal Catmull-Rom through the
 /// pre-smoothed sample positions, adaptively decimated into
@@ -845,9 +902,12 @@ const ANGLE_COS: f32 = 0.984_807_75;
 /// MA passes pre-smooth the control points (already mapped through the
 /// active Krita mode by the caller). Widths are `base_width` modulated by
 /// the pressure curve; Marker (constant-width) overrides them at paint time.
-pub fn build_spine(samples: &[PenSample], base_width: f32, position_passes: usize) -> StrokeCache {
-    const MAX_WIDTH: f32 = 80.0;
-    let base_width = base_width.clamp(0.5, MAX_WIDTH);
+/// `px` is the stroke's `Stroke::px`: the pixel limits below are screen
+/// pixels at the zoom the stroke was drawn at, so the spine of a stroke
+/// drawn zoomed in is the 1× spine scaled down, not a coarser one.
+pub fn build_spine(samples: &[PenSample], base_width: f32, px: f32, position_passes: usize) -> StrokeCache {
+    let px = if px.is_finite() && px > 0.0 { px } else { 1.0 };
+    let base_width = base_width.max(0.5 * px);
     let curve = pressure_curve();
 
     let n = samples.len();
@@ -856,10 +916,10 @@ pub fn build_spine(samples: &[PenSample], base_width: f32, position_passes: usiz
     }
     // Width at a node: base_width scaled by (curved) pressure, floored so a
     // near-zero-pressure sample still paints a hairline rather than nothing.
-    let width_at = |pr: f32| (base_width * pr.clamp(0.05, 1.0)).max(0.8);
+    let width_at = |pr: f32| (base_width * pr.clamp(0.05, 1.0)).max(0.8 * px);
     if n == 1 {
         let s = samples[0];
-        let w = (base_width * apply_curve(s.pressure, curve).max(0.1)).max(0.8);
+        let w = (base_width * apply_curve(s.pressure, curve).max(0.1)).max(0.8 * px);
         return StrokeCache { points: vec![s.pos], widths: vec![w], rev: next_cache_rev() };
     }
 
@@ -875,10 +935,10 @@ pub fn build_spine(samples: &[PenSample], base_width: f32, position_passes: usiz
 
     let radius = base_width * 0.5;
     // Node spacing: a fraction of the radius, never below 1px.
-    let spacing = (radius * 0.3).max(1.0);
+    let spacing = (radius * 0.3).max(px);
     // Dense-eval step size along each segment: keep sub-node samples well
     // under the radius so arc length / turn angle are measured finely.
-    let eval_gap = (radius * 0.25).max(0.5);
+    let eval_gap = (radius * 0.25).max(0.5 * px);
 
     let mut points: Vec<[f32; 2]> = Vec::with_capacity(n * 2);
     let mut widths: Vec<f32> = Vec::with_capacity(n * 2);
@@ -943,7 +1003,7 @@ pub fn build_spine(samples: &[PenSample], base_width: f32, position_passes: usiz
     let end = ctrl[n - 1];
     let need_end = points
         .last()
-        .map(|p| (p[0] - end[0]).abs() > 0.01 || (p[1] - end[1]).abs() > 0.01)
+        .map(|p| (p[0] - end[0]).abs() > 0.01 * px || (p[1] - end[1]).abs() > 0.01 * px)
         .unwrap_or(true);
     if need_end {
         points.push(end);
@@ -969,10 +1029,10 @@ mod spine_tests {
 
     #[test]
     fn empty_and_single_sample() {
-        let c = build_spine(&[], 6.0, 3);
+        let c = build_spine(&[], 6.0, 1.0, 3);
         assert!(c.points.is_empty() && c.widths.is_empty());
 
-        let c = build_spine(&[sample(10.0, 10.0, 1.0)], 6.0, 3);
+        let c = build_spine(&[sample(10.0, 10.0, 1.0)], 6.0, 1.0, 3);
         assert_eq!(c.points.len(), 1);
         assert_eq!(c.points[0], [10.0, 10.0]);
         assert!(c.widths[0] > 0.0);
@@ -984,7 +1044,7 @@ mod spine_tests {
         // apart, monotone in x, and land on the endpoints.
         let samples: Vec<PenSample> = (0..=20).map(|i| sample(i as f32 * 5.0, 0.0, 1.0)).collect();
         let base_width = 6.0;
-        let c = build_spine(&samples, base_width, 0);
+        let c = build_spine(&samples, base_width, 1.0, 0);
         assert!(c.points.len() >= 2);
         // First and last cache points land on the drag ends.
         assert!((c.points[0][0] - 0.0).abs() < 0.5);
@@ -1011,8 +1071,8 @@ mod spine_tests {
     fn deterministic() {
         let samples: Vec<PenSample> =
             (0..30).map(|i| sample(i as f32 * 3.0, (i as f32 * 0.5).sin() * 20.0, 1.0)).collect();
-        let a = build_spine(&samples, 8.0, 3);
-        let b = build_spine(&samples, 8.0, 3);
+        let a = build_spine(&samples, 8.0, 1.0, 3);
+        let b = build_spine(&samples, 8.0, 1.0, 3);
         assert_eq!(a.points, b.points);
         assert_eq!(a.widths, b.widths);
     }
@@ -1030,8 +1090,8 @@ mod spine_tests {
             corner.push(sample(100.0, i as f32 * 10.0, 1.0));
         }
         let straight: Vec<PenSample> = (0..=20).map(|i| sample(i as f32 * 10.0, 0.0, 1.0)).collect();
-        let c = build_spine(&corner, 6.0, 0);
-        let s = build_spine(&straight, 6.0, 0);
+        let c = build_spine(&corner, 6.0, 1.0, 0);
+        let s = build_spine(&straight, 6.0, 1.0, 0);
         // The corner path bends 90°, so it needs more nodes than a straight
         // path of equal arc length.
         assert!(
@@ -1040,5 +1100,54 @@ mod spine_tests {
             c.points.len(),
             s.points.len()
         );
+    }
+
+    /// A line drawn zoomed in 4× (a quarter of the size on the canvas,
+    /// `px` = 0.25) gets the 1× spine scaled down — the hairline floor
+    /// and node spacing shrink with it instead of fattening and
+    /// coarsening the line.
+    #[test]
+    fn a_spine_drawn_zoomed_in_is_the_1x_spine_scaled_down() {
+        let at = |k: f32| -> Vec<PenSample> {
+            (0..40)
+                .map(|i| {
+                    let t = i as f32;
+                    sample(t * 3.0 * k, (t * 0.4).sin() * 25.0 * k, 0.05 + 0.02 * t)
+                })
+                .collect()
+        };
+        let one = build_spine(&at(1.0), 3.0, 1.0, 2);
+        let zoomed = build_spine(&at(0.25), 0.75, 0.25, 2);
+        assert_eq!(one.points.len(), zoomed.points.len());
+        for (a, b) in one.points.iter().zip(&zoomed.points) {
+            assert!((a[0] * 0.25 - b[0]).abs() < 1e-3 && (a[1] * 0.25 - b[1]).abs() < 1e-3, "{a:?} vs {b:?}");
+        }
+        for (a, b) in one.widths.iter().zip(&zoomed.widths) {
+            assert!((a * 0.25 - b).abs() < 1e-4, "{a} vs {b}");
+        }
+        assert!(zoomed.widths[0] < 0.8, "the hairline floor is a screen pixel, not a canvas one");
+    }
+
+    /// A stroke drawn at 1× saves exactly as before; one drawn zoomed
+    /// in keeps its pixel size through a save.
+    #[test]
+    fn the_pixel_size_is_saved_only_when_zoomed() {
+        let mut s = Stroke::with_style([0, 0, 0, 255], 4.0, StrokeStyle::Airbrush);
+        s.samples.push(sample(1.0, 2.0, 1.0));
+        let flat = ron::to_string(&s).unwrap();
+        assert!(!flat.contains("px"), "{flat}");
+        assert_eq!(ron::from_str::<Stroke>(&flat).unwrap().px, 1.0);
+        s.px = 0.25;
+        let zoomed = ron::to_string(&s).unwrap();
+        assert_eq!(ron::from_str::<Stroke>(&zoomed).unwrap().px, 0.25);
+    }
+
+    /// Drawn zoomed out, a big brush is wider than 80 canvas pixels and
+    /// must keep that width.
+    #[test]
+    fn a_wide_line_is_not_capped() {
+        let samples: Vec<PenSample> = (0..10).map(|i| sample(i as f32 * 50.0, 0.0, 1.0)).collect();
+        let c = build_spine(&samples, 160.0, 4.0, 0);
+        assert!(c.widths.iter().all(|w| (w - 160.0).abs() < 1e-3), "{:?}", c.widths);
     }
 }

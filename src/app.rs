@@ -13,17 +13,31 @@
 
 use std::time::{Duration, Instant};
 
+use crate::canvas::shape::Shape;
 use crate::canvas::CanvasManager;
 use crate::config::AppConfig;
 use crate::input::{
     hotkeys::{HotkeyId, Hotkeys},
-    modifiers::ModifierTracker,
     pen::{PenInput, RawHandleHolder},
 };
 use crate::interaction;
-use crate::interaction::click_through;
 use crate::tools::ActiveTool;
 use crate::ui;
+
+mod capture;
+mod frame;
+mod frames;
+mod keys;
+mod layer_gesture;
+mod selection;
+mod sel_actions;
+mod view;
+mod slides;
+mod pins;
+mod pointer;
+mod media;
+mod commands;
+mod find;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
@@ -34,11 +48,10 @@ pub struct OnScreenNotesApp {
     tool: ActiveTool,
     pen: PenInput,
     hotkeys: Option<Hotkeys>,
-    modifiers: ModifierTracker,
     overlay_cache: ui::overlay::OverlayCache,
 
     /// Whether the main overlay is shown. Toggled by the global hotkey
-    /// (default Ctrl+Shift+N).
+    /// (default Ctrl+Alt+Shift+N).
     overlay_visible: bool,
     /// Whether mouse left-button was down on the previous frame; used to
     /// synthesise pen events from mouse for the no-tablet fallback.
@@ -51,7 +64,7 @@ pub struct OnScreenNotesApp {
     idle_frame: Duration,
 
     /// Set to false after the very first `update` runs. Used to push
-    /// initial-state viewport commands (e.g. clear click-through).
+    /// initial-state viewport commands (take input, take focus).
     first_frame: bool,
 
     /// Anchor for "hold Space + drag to pan". `Some(p)` while the user is
@@ -121,14 +134,18 @@ pub struct OnScreenNotesApp {
     /// Native window handle of the overlay viewport, stored as the
     /// platform-native integer (HWND cast to `isize` on Windows, 0 on
     /// other platforms or when capture fails). Used by
-    /// `crate::platform` to reclaim the foreground after a click-through,
-    /// among other things. 0 disables those calls.
+    /// `crate::platform` to reclaim the foreground after the user worked
+    /// in another app, among other things. 0 disables those calls.
     osn_hwnd: isize,
 
     /// Screen-recording state machine. Idle by default; toggled on /
-    /// off via `Ctrl+Shift+R`. While capturing we hide the floating UI
-    /// so it doesn't end up in the saved GIF.
+    /// off via the global hotkey (default `Ctrl+Alt+Shift+R`). While
+    /// capturing we hide the floating UI so it doesn't end up in the
+    /// saved GIF.
     recorder: crate::recording::Recorder,
+    /// That hotkey as the REC badge shows it, e.g. "Ctrl+Shift+Alt+R";
+    /// `None` when the binding does not parse.
+    record_hotkey: Option<String>,
 
     /// Saved `ui_visible` value at the moment recording started, so we
     /// can restore the user's chrome state after the recording
@@ -183,6 +200,34 @@ pub struct OnScreenNotesApp {
     /// LMB state on the previous frame — used to detect the rising
     /// edge of a click during pin-picking.
     pin_prev_lmb: bool,
+    /// The arrange bar's "Move to slide…" list opens next frame: its
+    /// key was pressed after the bar was drawn.
+    move_picker_pending: bool,
+    /// Slide waiting on "Delete this slide?" — the delete key was
+    /// pressed on a slide with something on it. Keys go to the dialog
+    /// alone while it is up.
+    confirm_delete: Option<usize>,
+    /// Zoom to fit / to selection in progress: the view glides there
+    /// over a few frames instead of jumping.
+    view_glide: Option<interaction::zoom_pan::ViewGlide>,
+    /// The peek key is held: the view went to the selection (or the
+    /// whole slide) and goes back here when the key is let go.
+    peek: Option<Peek>,
+    /// The selected picture's colours, while the arrange bar shows them.
+    picture_colours: Option<PictureColours>,
+    /// The palette from before "Use as palette", for "Restore palette".
+    /// Kept until the app closes.
+    palette_before: Option<Vec<[u8; 4]>>,
+    /// The command palette (Ctrl+K). Keys go to it alone while it is up.
+    commands: ui::command_palette::Palette,
+    /// Find (Ctrl+F): text labels on every slide. Keys go to it alone
+    /// while it is up.
+    find: ui::find_bar::FindBar,
+    /// The label find just went to, flashing.
+    find_flash: Option<find::FindFlash>,
+    /// The selection's tags being typed on the arrange bar. Keys go to
+    /// it alone while it is open.
+    tag_edit: Option<ui::arrange_bar::TagEdit>,
     /// Last rect applied via `ViewportCommand` so we can skip the
     /// re-emit when the target window hasn't moved.
     pinned_last_rect: Option<(i32, i32, i32, i32)>,
@@ -204,6 +249,10 @@ pub struct OnScreenNotesApp {
     /// tick is folded into that same undo entry — a slider drag is one
     /// Ctrl+Z, not hundreds.
     restyle_run: Option<(usize, usize)>,
+    /// `(canvas index, undo-log length, when)` right after the last
+    /// nudge, likewise: a nudge soon after it on the same objects joins
+    /// its undo entry, so a held arrow key is one Ctrl+Z.
+    nudge_run: Option<(usize, usize, Instant)>,
     /// Ctrl+V state on the previous frame, for edge detection — see
     /// `platform::paste_chord_down`.
     paste_chord_prev: bool,
@@ -218,6 +267,14 @@ pub struct OnScreenNotesApp {
     media_ui: ui::media_controls::MediaUi,
     /// Media types the toolbar's filter highlights.
     media_filter: ui::media_filter::MediaFilter,
+    /// The Select tool's hold on pins (objects kept on screen, on their
+    /// own slide or on every slide):
+    /// which one is selected, and the move / resize / turn in flight.
+    pin_tool: crate::canvas::pins::PinTool,
+    /// The slide panel (bottom-left): which slide is being named.
+    slide_panel: ui::slide_panel::SlidePanel,
+    /// The second window showing one slide, while it is open.
+    slide_window: Option<ui::slide_window::SlideWindow>,
     /// Files being copied in and read as videos / GIFs.
     media_imports: Vec<crate::media::import::ImportJob>,
     /// Videos picked or dropped before FFmpeg was set up, with where
@@ -234,6 +291,10 @@ pub struct OnScreenNotesApp {
     /// paste that finds it there pastes the objects instead. Set by the
     /// thread that builds it.
     clip_image: std::sync::Arc<std::sync::Mutex<Option<crate::clipboard::Fingerprint>>>,
+
+    /// Since when the slide-loading bar has had something to show, so a
+    /// quick load does not flash it.
+    progress_since: Option<Instant>,
 }
 
 /// How long after the pen was last used the pointer still counts as
@@ -264,6 +325,25 @@ fn refresh_period(hwnd: isize) -> Duration {
 /// in a paste means the newest thing the user copied is `obj_clipboard`.
 const CLIP_MARKER: &str = "on-screen-notes:selection";
 
+/// The view the peek key goes back to (`OnScreenNotesApp::update_peek`).
+struct Peek {
+    slide: usize,
+    back: ([f32; 2], f32),
+    since: Instant,
+}
+
+/// Colours found in a picture, for the arrange bar.
+struct PictureColours {
+    /// `(slide, layer, shape)` of the picture.
+    at: (usize, usize, usize),
+    colours: Vec<[u8; 4]>,
+}
+
+/// The box `[x0, y0, x1, y1]` around two others.
+fn union_box(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+
 /// A Select-tool command picked out of this frame's key events, run
 /// after egui's input lock is released.
 #[derive(Clone, Copy)]
@@ -271,6 +351,7 @@ enum SelAction {
     Delete,
     Duplicate,
     CopyToNewSlide,
+    TogglePin,
     ToFront,
     ToBack,
     Copy,
@@ -471,6 +552,8 @@ impl OnScreenNotesApp {
         // cached on the App for the in-overlay dispatcher.
         let hotkeys_file = crate::input::hotkeys_config::HotkeysConfig::load_or_default();
         let hotkeys_cfg = hotkeys_file.parsed();
+        let record_hotkey = crate::input::hotkeys_config::parse(&hotkeys_file.global.start_record)
+            .map(|b| b.label());
 
         let hotkeys = match Hotkeys::register(&hotkeys_file.global) {
             Ok(h) => Some(h),
@@ -495,7 +578,7 @@ impl OnScreenNotesApp {
             match cc.window_handle() {
                 Ok(h) => match h.as_raw() {
                     #[cfg(target_os = "windows")]
-                    RawWindowHandle::Win32(w) => w.hwnd.get() as isize,
+                    RawWindowHandle::Win32(w) => w.hwnd.get(),
                     _ => 0,
                 },
                 Err(e) => {
@@ -514,7 +597,6 @@ impl OnScreenNotesApp {
             tool,
             pen,
             hotkeys,
-            modifiers: ModifierTracker::default(),
             overlay_cache: ui::overlay::OverlayCache::new(),
             overlay_visible: true,
             mouse_was_down: false,
@@ -533,6 +615,7 @@ impl OnScreenNotesApp {
             ui_visible: true,
             osn_hwnd,
             recorder: crate::recording::Recorder::default(),
+            record_hotkey,
             ui_visible_before_record: true,
             toast: None,
             pending_screenshot: None,
@@ -543,1071 +626,54 @@ impl OnScreenNotesApp {
             pinned_hwnd: None,
             pin_picking: false,
             pin_prev_lmb: false,
+            move_picker_pending: false,
+            confirm_delete: None,
+            view_glide: None,
+            peek: None,
+            picture_colours: None,
+            palette_before: None,
+            commands: Default::default(),
+            find: Default::default(),
+            find_flash: None,
+            tag_edit: None,
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),
             obj_clipboard: (Vec::new(), Vec::new()),
             paste_count: 0,
             restyle_run: None,
+            nudge_run: None,
             paste_chord_prev: false,
             mouse_gesture: false,
             media: crate::media::MediaHub::new(),
             media_ui: ui::media_controls::MediaUi::new(),
             media_filter: ui::media_filter::MediaFilter::default(),
+            pin_tool: Default::default(),
+            slide_panel: Default::default(),
+            slide_window: None,
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
             media_dialog: None,
             pureref_jobs: Vec::new(),
             last_frame_at: None,
             clip_image: Default::default(),
+            progress_since: None,
         }
     }
 
-    /// Run the deferred screenshot once its frame countdown elapses. A
-    /// `region_rect` captures only the user-selected rectangle (compositing
-    /// the overlay tint back in); otherwise the whole monitor OSN is on
-    /// is grabbed. Logs success/failure but never panics.
-    fn do_screenshot(&mut self, ps: &PendingShot) {
-        let res = if let Some(rect) = ps.region_rect {
-            crate::screenshot::capture_region_and_save(
-                self.canvases.active(),
-                &self.config,
-                ps.pixels_per_point,
-                self.osn_hwnd,
-                rect,
-                ps.bg_color,
-                ps.bg_opacity_before,
-                &self.media.current_frames(),
-            )
-        } else {
-            crate::screenshot::capture_and_save(
-                self.canvases.active(),
-                &self.config,
-                ps.pixels_per_point,
-                self.osn_hwnd,
-                &self.media.current_frames(),
-            )
-        };
-        match res {
-            Ok(r) => {
-                log::info!("screenshot saved to {:?} (clipboard={})", r.path, r.clipboard);
-                let msg = if r.clipboard {
-                    format!("Screenshot saved: {} · clipboard ✓", r.path.display())
-                } else {
-                    format!("Screenshot saved: {}", r.path.display())
-                };
-                self.toast = Some((msg, std::time::Instant::now()));
-            }
-            Err(e) => log::warn!("screenshot failed: {e}"),
-        }
-    }
-
-    /// Begin an interactive screenshot region selection. Hides the floating
-    /// UI so it stays out of the way (and out of the capture); the actual
-    /// grab is deferred until the user drags out a rectangle, handled in
-    /// `update_region_select`. The background tint is left alone so the user
-    /// aims over a still-visible desktop — it is dropped only at the moment
-    /// the region is confirmed, then re-composited into the saved image.
-    fn begin_region_select(&mut self) {
-        if self.region_select.is_some() || self.pending_screenshot.is_some() {
-            return;
-        }
-        self.region_select = Some(RegionSelect {
-            start: None,
-            current: egui::Pos2::ZERO,
-            ui_visible_before: self.ui_visible,
-        });
-        self.ui_visible = false;
-    }
-
-    /// Handle the interactive region-selection overlay for one frame: read
-    /// the drag, draw the dimmed rubber-band, and on release turn the
-    /// selection into a region `pending_screenshot` (or cancel). No-op when
-    /// no selection is active.
-    fn update_region_select(&mut self, ctx: &egui::Context) {
-        let Some(mut rs) = self.region_select else { return };
-
-        let (pressed, released, esc, pos) = ctx.input(|i| {
-            (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_released(),
-                i.key_pressed(egui::Key::Escape),
-                i.pointer.latest_pos().or(i.pointer.interact_pos()),
-            )
-        });
-
-        // Esc cancels: restore the chrome, leave the tint untouched.
-        if esc {
-            self.ui_visible = rs.ui_visible_before;
-            self.region_select = None;
-            return;
-        }
-
-        if let Some(p) = pos {
-            rs.current = p;
-            if pressed {
-                rs.start = Some(p);
-            }
-        }
-
-        if released {
-            if let Some(start) = rs.start {
-                let sel = egui::Rect::from_two_pos(start, rs.current);
-                let ppp = ctx.pixels_per_point().max(0.01);
-                // Reject a too-small drag (a stray click) — treat as cancel.
-                if sel.width() * ppp >= 4.0 && sel.height() * ppp >= 4.0 {
-                    self.pending_screenshot = Some(PendingShot {
-                        ui_visible_before: rs.ui_visible_before,
-                        bg_opacity_before: self.config.bg_opacity,
-                        frames_to_wait: 2,
-                        pixels_per_point: ppp,
-                        bg_color: self.config.bg_color,
-                        region_rect: Some([sel.min.x, sel.min.y, sel.max.x, sel.max.y]),
-                    });
-                    // Drop the live tint so xcap grabs a clean desktop; the
-                    // capture re-applies `bg_color` at the stored opacity.
-                    self.config.bg_opacity = 0.0;
-                } else {
-                    self.ui_visible = rs.ui_visible_before;
-                }
-                self.region_select = None;
-                return;
-            }
-        }
-
-        // Still selecting — persist state and draw the overlay on top.
-        self.region_select = Some(rs);
-        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("osn_region_select"),
-        ));
-        let screen = ctx.screen_rect();
-        let dim = egui::Color32::from_black_alpha(110);
-        if let Some(start) = rs.start {
-            let sel = egui::Rect::from_two_pos(start, rs.current);
-            // Four dim bands around the selection (the selection stays clear).
-            painter.rect_filled(
-                egui::Rect::from_min_max(screen.left_top(), egui::pos2(screen.right(), sel.top())),
-                0.0,
-                dim,
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_max(egui::pos2(screen.left(), sel.bottom()), screen.right_bottom()),
-                0.0,
-                dim,
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_max(egui::pos2(screen.left(), sel.top()), egui::pos2(sel.left(), sel.bottom())),
-                0.0,
-                dim,
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_max(egui::pos2(sel.right(), sel.top()), egui::pos2(screen.right(), sel.bottom())),
-                0.0,
-                dim,
-            );
-            // Animated dashed border (reuses the marching-ants walker).
-            let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
-            let pts = [sel.left_top(), sel.right_top(), sel.right_bottom(), sel.left_bottom(), sel.left_top()];
-            crate::canvas::render::paint_dashed_polyline(&painter, &pts, stroke, 1.0);
-            // Dimension label in physical pixels (what the PNG will be).
-            let ppp = ctx.pixels_per_point().max(0.01);
-            let wpx = (sel.width() * ppp).round() as i32;
-            let hpx = (sel.height() * ppp).round() as i32;
-            let label_pos = egui::pos2(sel.left(), (sel.top() - 6.0).max(screen.top() + 2.0));
-            painter.text(
-                label_pos,
-                egui::Align2::LEFT_BOTTOM,
-                format!("{wpx} × {hpx}"),
-                egui::FontId::proportional(14.0),
-                egui::Color32::WHITE,
-            );
-        } else {
-            // Before the first drag: dim everything + a hint.
-            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(70));
-            painter.text(
-                screen.center(),
-                egui::Align2::CENTER_CENTER,
-                "Drag to select a screenshot region  ·  Esc to cancel",
-                egui::FontId::proportional(18.0),
-                egui::Color32::WHITE,
-            );
-        }
-        // Keep the frame live for the dashed animation + drag tracking.
-        ctx.request_repaint();
-    }
-
-    /// Whether frames should come as fast as they can be drawn, above the
-    /// display's refresh rate: only while ink is going down (pen-to-pixel
-    /// latency is what this app is for) and while a capture or recording
-    /// counts frames.
-    fn needs_live_frames(&self) -> bool {
-        // A pen gesture in another app's window is swallowed
-        // (`pen_blocked`); it needs no frames here, let alone uncapped
-        // ones while the user draws elsewhere.
-        (self.pen.is_down() && !self.pen_blocked)
-            || self.tool.in_progress_stroke.is_some()
-            || self.pending_screenshot.is_some()
-            || self.pending_freeze.is_some()
-            || self.pending_lasso.is_some()
-            || self.recorder.is_recording()
-    }
-
-    /// Whether frames should come every display refresh: a button is
-    /// held or a gesture is under way (a drag, a pan, a selection), the
-    /// pen is in range, something on screen changes by itself, or work
-    /// in flight shows progress.
-    fn needs_steady_frames(&self, ctx: &egui::Context) -> bool {
-        let canvas = self.canvases.active();
-        self.mouse_gesture
-            || ctx.input(|i| i.pointer.any_down())
-            || self.tool.select.gesture.is_some()
-            || self.layer_xform.is_some()
-            || self.pan_drag_anchor.is_some()
-            || self.middle_pan_anchor.is_some()
-            || self.region_select.is_some()
-            || self.loupe.is_some()
-            // Polls the mouse button itself while the overlay is
-            // click-through, so it gets no input events.
-            || self.pin_picking
-            || self.pen.seen_within(PEN_NEARBY)
-            || !self.tool.laser_strokes.is_empty()
-            // The lasso's dashes march.
-            || !self.tool.lasso.points().is_empty()
-            || !self.pureref_jobs.is_empty()
-            || !self.media_imports.is_empty()
-            || self.canvases.is_loading()
-            || self.overlay_cache.pictures_busy()
-            || canvas.layers.iter().any(|l| l.visible && l.shapes.iter().any(crate::canvas::shape::Shape::animates))
-    }
-
-    /// Hold every frame that is not drawing ink to the display's refresh
-    /// rate. Each input event (each mouse move of a drag) makes egui draw
-    /// a frame on top of the ones paced here, and with Mailbox
-    /// presentation nothing waits for the screen: panning drew 800+ full
-    /// frames a second for a 99 Hz display and kept the GPU near 80 %. A
-    /// frame that starts with a button or pen press is never held, and
-    /// once ink is going down frames are not held either, so drawing
-    /// latency is unchanged.
-    fn hold_to_refresh_rate(&mut self, ctx: &egui::Context) {
-        let pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { pressed: true, .. })));
-        if !pressed && !self.needs_live_frames() {
-            if let Some(since) = self.last_frame_at.map(|t| t.elapsed()) {
-                if since < self.idle_frame {
-                    std::thread::sleep(self.idle_frame - since);
-                }
-            }
-        }
-        self.last_frame_at = Some(Instant::now());
-    }
-
-    /// How long until the next frame is due; `None` means at once. Ink
-    /// going down gets every frame it can; gestures, a pen in range and
-    /// things that move get one per display refresh; a playing GIF or
-    /// video gets its own frame times, never above the refresh rate;
-    /// otherwise a slow idle tick.
-    fn next_frame_in(&self, ctx: &egui::Context) -> Option<Duration> {
-        if self.needs_live_frames() {
-            return None;
-        }
-        let refresh = self.idle_frame;
-        let mut wait = IDLE_TICK;
-        if self.needs_steady_frames(ctx) {
-            wait = wait.min(refresh);
-        }
-        if let Some(media) = self.media.next_frame_in() {
-            wait = wait.min(media.max(refresh));
-        }
-        Some(wait)
-    }
 
     // -- Space-drag gestures ---------------------------------------------
 
-    /// Begin a Space-drag. `layer_mode` is whether Shift was down at the
-    /// instant the pointer went down; latching it here (rather than
-    /// re-reading it every frame) means the gesture keeps doing what it
-    /// started doing even if the user's fingers slip off Shift halfway
-    /// through a drag.
-    fn begin_pan_gesture(&mut self, layer_mode: bool) {
-        if !layer_mode {
-            // A plain Space drag pans the viewport. Anything the user
-            // already aimed at the layer (a wheel zoom before touching
-            // the pen) is a finished gesture — bake it rather than
-            // dropping it on the floor.
-            self.commit_layer_xform();
-            return;
-        }
-        let canvas = self.canvases.active_index();
-        let layer = self.canvases.active().active_layer;
-        match self.layer_xform {
-            // Wheel-zoomed first, now dragging: same target, so keep
-            // accumulating into the gesture already in flight instead
-            // of throwing its scale away.
-            Some(x) if x.canvas == canvas && x.layer == layer => {}
-            Some(_) => {
-                self.commit_layer_xform();
-                self.layer_xform = Some(LayerXform::new(canvas, layer));
-            }
-            None => self.layer_xform = Some(LayerXform::new(canvas, layer)),
-        }
-    }
-
-    /// Apply one frame of drag motion, given in window-client pixels.
-    /// Routes to the layer transform or the canvas viewport depending on
-    /// which gesture is in flight.
-    fn apply_pan_delta(&mut self, dx: f32, dy: f32) {
-        let zoom = self.canvases.active().zoom.max(1e-6);
-        if let Some(x) = self.layer_xform.as_mut() {
-            // A layer delta ends up added to canvas-local geometry, so
-            // the view zoom has to come back out of it — otherwise the
-            // layer would race ahead of the cursor at zoom > 1. Canvas
-            // `pan` needs no such division because it is applied
-            // *after* the zoom scale.
-            x.pan([dx / zoom, dy / zoom]);
-        } else {
-            let (pan, _) = self.canvases.active_view_mut();
-            pan[0] += dx;
-            pan[1] += dy;
-        }
-    }
-
-    /// Zoom the gesture's layer by `s` about `pivot` (canvas-local),
-    /// starting a gesture on the active layer if the wheel arrived
-    /// before any drag. The accumulated scale is clamped so the preview
-    /// can't run away past what `transform_layer` will accept.
-    fn apply_layer_zoom(&mut self, s: f32, pivot: [f32; 2]) {
-        if self.layer_xform.is_none() {
-            let canvas = self.canvases.active_index();
-            let layer = self.canvases.active().active_layer;
-            self.layer_xform = Some(LayerXform::new(canvas, layer));
-        }
-        let Some(x) = self.layer_xform.as_mut() else { return };
-        // Clamp against the layer's *total* scale, not just this
-        // gesture's, so ten gestures of 2× stop at the same ceiling one
-        // long gesture would.
-        let already = self
-            .canvases
-            .active()
-            .layers
-            .get(x.layer)
-            .map(|l| l.scaled_by)
-            .unwrap_or(1.0)
-            .max(1e-6);
-        let want = (already * x.scale * s).clamp(LAYER_ZOOM_MIN, LAYER_ZOOM_MAX);
-        let s = want / (already * x.scale).max(1e-6);
-        if (s - 1.0).abs() < 1e-6 { return; }
-        x.zoom(s, pivot);
-    }
-
-    /// End a layer gesture, baking the accumulated transform into the
-    /// layer's geometry. No-op unless a gesture is actually in flight,
-    /// so it is safe to call from every gesture-end path.
-    fn commit_layer_xform(&mut self) {
-        let Some(x) = self.layer_xform.take() else { return };
-        // Canvas nav (←/→) is not gated on Space, so the user can walk
-        // off the sheet mid-gesture. The preview was showing on a
-        // canvas they have since left — drop the transform rather than
-        // bake it into whichever sheet happens to be active now.
-        if x.canvas != self.canvases.active_index() { return; }
-        if (x.scale - 1.0).abs() < 1e-6 {
-            // Pure pan: keep it in the history as a `LayerMoved` so
-            // "reset layer position" and the existing undo path see
-            // exactly what they saw before layer zoom existed.
-            self.canvases.active_mut().move_layer_by(x.layer, x.offset);
-        } else {
-            self.canvases.active_mut().transform_layer(x.layer, x.scale, x.offset);
-        }
-    }
-
-    /// The in-flight layer gesture in the form the renderer wants, or
-    /// `None` when there is no gesture or it belongs to another canvas.
-    fn layer_xform_for_render(&self) -> Option<(usize, f32, [f32; 2])> {
-        self.layer_xform
-            .filter(|x| x.canvas == self.canvases.active_index())
-            .map(|x| (x.layer, x.scale, x.offset))
-    }
-
-    /// Enqueue a deferred freeze-frame. Same UI-hide dance as a
-    /// regular screenshot — we drop OSN's chrome + tint for two
-    /// frames so the captured image is the pure desktop, then insert
-    /// the bytes as a new bottom layer on the active canvas.
-    fn queue_freeze(&mut self, pixels_per_point: f32) {
-        if self.pending_freeze.is_some() { return; }
-        self.pending_freeze = Some(PendingShot {
-            ui_visible_before: self.ui_visible,
-            bg_opacity_before: self.config.bg_opacity,
-            frames_to_wait: 2,
-            pixels_per_point,
-            bg_color: self.config.bg_color,
-            region_rect: None,
-        });
-        self.ui_visible = false;
-        self.config.bg_opacity = 0.0;
-    }
-
-    /// Capture the freeze frame and insert it as a new bottom layer.
-    /// Toast on success / log on failure — never panics.
-    fn do_freeze(&mut self, pixels_per_point: f32) {
-        // Snapshot the active canvas's pan/zoom so the captured
-        // pixels can be positioned in canvas-local coords that land
-        // under the user's current view — without rewriting their
-        // pan/zoom state behind their back.
-        let canvas = self.canvases.active();
-        let pan  = canvas.pan;
-        let zoom = canvas.zoom;
-        match crate::screenshot::capture_freeze_layer(pixels_per_point, self.osn_hwnd, pan, zoom) {
-            Ok(image) => {
-                let label = format!("Frozen frame {}", crate::screenshot::chrono_like_timestamp());
-                self.canvases.active_mut().add_image_layer_bottom(image, label);
-                self.toast = Some((
-                    "Frozen frame added as bottom layer".to_string(),
-                    std::time::Instant::now(),
-                ));
-            }
-            Err(e) => log::warn!("freeze frame failed: {e}"),
-        }
-    }
-
-    /// Enqueue a deferred lasso-select capture. Snapshots the active
-    /// canvas's pan/zoom alongside the polygon, then runs the same
-    /// 2-frame chrome-hide as freeze so the captured pixels are the
-    /// pure desktop behind the overlay.
-    fn queue_lasso_capture(&mut self, polygon: Vec<[f32; 2]>, pixels_per_point: f32) {
-        if self.pending_lasso.is_some() { return; }
-        let canvas = self.canvases.active();
-        self.pending_lasso = Some(PendingLasso {
-            ui_visible_before: self.ui_visible,
-            bg_opacity_before: self.config.bg_opacity,
-            frames_to_wait: 2,
-            pixels_per_point,
-            pan: canvas.pan,
-            zoom: canvas.zoom,
-            polygon,
-        });
-        self.ui_visible = false;
-        self.config.bg_opacity = 0.0;
-    }
-
-    /// Capture the lasso region and drop it onto the **active layer** as
-    /// an image object, selected and ready to move / resize / rotate.
-    /// It paints under that layer's ink (a layer draws its shapes before
-    /// its strokes) and is an ordinary undo step. Toast on success / log
-    /// on failure — never panics.
-    fn do_lasso_capture(
-        &mut self,
-        pixels_per_point: f32,
-        pan: [f32; 2],
-        zoom: f32,
-        polygon: &[[f32; 2]],
-    ) {
-        match crate::screenshot::capture_lasso_layer(
-            pixels_per_point,
-            self.osn_hwnd,
-            pan,
-            zoom,
-            polygon,
-        ) {
-            Ok(image) => {
-                let shape = crate::canvas::shape::Shape::Raster {
-                    pos: image.canvas_origin,
-                    size: image.logical_size,
-                    png: std::sync::Arc::new(image.png),
-                    px_size: image.size,
-                    color: [0, 0, 0, 0],
-                    rotation: 0.0,
-                    kind: crate::canvas::shape::RasterKind::Image,
-                    media: None,
-                    picture: None,
-                };
-                let c = self.canvases.active_mut();
-                c.add_shape(shape);
-                let placed = c.layers[c.active_layer].shapes.len() - 1;
-                self.select_only_shape(placed);
-                self.toast = Some((
-                    "Captured onto the active layer — drag to move, handles to resize / rotate".to_string(),
-                    std::time::Instant::now(),
-                ));
-            }
-            Err(e) => log::warn!("lasso capture failed: {e}"),
-        }
-    }
-
-    /// Switch to the Select tool with exactly the shape at `index` on
-    /// the active layer selected.
-    fn select_only_shape(&mut self, index: usize) {
-        use crate::canvas::hit::ObjRef;
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel.set_only(ObjRef::Shape(index));
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
-    }
-
-    /// Clones of the selected objects on the active layer.
-    fn selected_objects(&self) -> (Vec<crate::canvas::stroke::Stroke>, Vec<crate::canvas::shape::Shape>) {
-        let c = self.canvases.active();
-        let Some(layer) = c.layers.get(c.active_layer) else { return (Vec::new(), Vec::new()) };
-        let sel = &self.tool.select.sel;
-        (
-            sel.strokes.iter().filter_map(|&i| layer.strokes.get(i).cloned()).collect(),
-            sel.shapes.iter().filter_map(|&i| layer.shapes.get(i).cloned()).collect(),
-        )
-    }
-
-    /// Add `strokes` / `shapes` to the active layer, shifted by `offset`
-    /// canvas pixels, as one undo step, and select them.
-    fn insert_and_select(
-        &mut self,
-        mut strokes: Vec<crate::canvas::stroke::Stroke>,
-        mut shapes: Vec<crate::canvas::shape::Shape>,
-        offset: [f32; 2],
-    ) {
-        if strokes.is_empty() && shapes.is_empty() { return; }
-        for s in &mut strokes { s.translate(offset); }
-        for s in &mut shapes {
-            s.translate(offset);
-            // A copy of a video or GIF plays on its own.
-            if let crate::canvas::shape::Shape::Raster { media: Some(m), .. } = s {
-                m.id = crate::canvas::shape::fresh_media_id();
-            }
-        }
-        let c = self.canvases.active_mut();
-        let li = c.active_layer;
-        let placed = c.insert_objects(li, strokes, shapes);
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = placed;
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
-    }
-
-    /// Select every object the media filter highlights. A selection
-    /// lives on one layer: the active layer's matches, or, when it has
-    /// none, those of the topmost visible layer that does.
-    fn select_media_matches(&mut self) {
-        let c = self.canvases.active();
-        let visible = |li: usize| c.layers.get(li).is_some_and(|l| l.visible && l.opacity > 0.0);
-        let found = std::iter::once(c.active_layer)
-            .chain((0..c.layers.len()).rev().filter(|&li| li != c.active_layer))
-            .filter(|&li| visible(li))
-            .map(|li| (li, ui::media_filter::matches_on(c, li, self.media_filter)))
-            .find(|(_, shapes)| !shapes.is_empty());
-        let Some((li, shapes)) = found else { return };
-        if li != c.active_layer {
-            self.canvases.active_mut().active_layer = li;
-        }
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
-    }
-
-    /// Copy the selected objects onto a new slide and go there, with the
-    /// copies selected, at the same spot and in the same view. The slide
-    /// goes after the last one: putting it in mid-deck would renumber,
-    /// and so rewrite, every slide file after it.
-    fn copy_selection_to_new_slide(&mut self) {
-        let (strokes, shapes) = self.selected_objects();
-        let count = strokes.len() + shapes.len();
-        if count == 0 { return; }
-        let (pan, zoom) = { let c = self.canvases.active(); (c.pan, c.zoom) };
-        let (canvas, sel) = crate::canvas::canvas::Canvas::with_objects(strokes, shapes, pan, zoom);
-        let idx = self.canvases.push_canvas(canvas);
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = sel;
-        self.tool.select.rebind(idx, self.canvases.active());
-        let what = if count == 1 { "1 object".to_string() } else { format!("{count} objects") };
-        self.toast = Some((format!("Copied {what} to new slide {}", idx + 1), Instant::now()));
-    }
-
-    /// Pack, group, align or distribute the selection, as one undo step.
-    fn arrange_selection(&mut self, op: crate::tools::arrange::Arrange) {
-        let c = self.canvases.active();
-        let li = c.active_layer;
-        let Some(layer) = c.layers.get(li) else { return };
-        let (strokes, shapes) = crate::tools::arrange::plan(layer, &self.tool.select.sel, op, c.zoom);
-        if !self.canvases.active_mut().move_objects_each(li, &strokes, &shapes) {
-            self.toast = Some(("Nothing to move".to_string(), std::time::Instant::now()));
-        }
-    }
-
-    /// Run one Select-tool command against the current selection.
-    fn apply_sel_action(&mut self, action: SelAction, canvas_rect: egui::Rect, pixels_per_point: f32) {
-        // One nudge so a copy does not sit exactly on its original. Kept
-        // constant on screen, so it is divided by the zoom.
-        let step = 16.0 / self.canvases.active().zoom.max(1e-3);
-        let sel = self.tool.select.sel.clone();
-        let has_selection = self.tool.kind == crate::tools::ToolKind::Select && !sel.is_empty();
-        match action {
-            SelAction::Delete if has_selection => {
-                let c = self.canvases.active_mut();
-                let li = c.active_layer;
-                c.delete_objects(li, &sel.strokes, &sel.shapes);
-                self.tool.select.sel.clear();
-            }
-            SelAction::Duplicate if has_selection => {
-                let (strokes, shapes) = self.selected_objects();
-                self.insert_and_select(strokes, shapes, [step, step]);
-            }
-            SelAction::CopyToNewSlide if has_selection => self.copy_selection_to_new_slide(),
-            SelAction::ToFront | SelAction::ToBack if has_selection => {
-                let to_front = matches!(action, SelAction::ToFront);
-                let c = self.canvases.active_mut();
-                let li = c.active_layer;
-                self.tool.select.sel = c.reorder_objects(li, &sel.strokes, &sel.shapes, to_front);
-            }
-            SelAction::Copy | SelAction::Cut if has_selection => {
-                self.obj_clipboard = self.selected_objects();
-                self.paste_count = 0;
-                // Mark the OS clipboard so a later paste knows this copy
-                // is newer than whatever another app put there before.
-                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(CLIP_MARKER)) {
-                    Ok(()) => {}
-                    Err(e) => log::warn!("could not mark the clipboard: {e}"),
-                }
-                #[cfg(target_os = "windows")]
-                self.copy_image_to_clipboard(pixels_per_point);
-                if matches!(action, SelAction::Cut) {
-                    let c = self.canvases.active_mut();
-                    let li = c.active_layer;
-                    c.delete_objects(li, &sel.strokes, &sel.shapes);
-                    self.tool.select.sel.clear();
-                }
-            }
-            SelAction::PasteObjects => self.paste_objects(step),
-            SelAction::PasteImage => self.paste_clipboard_image(canvas_rect, pixels_per_point, step),
-            // A selection command with nothing selected.
-            _ => {}
-        }
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
-    }
-
-    /// Paste the in-app clipboard's objects, each paste a step further
-    /// along so repeated pastes fan out.
-    fn paste_objects(&mut self, step: f32) {
-        self.paste_count += 1;
-        let d = step * self.paste_count as f32;
-        let (strokes, shapes) = self.obj_clipboard.clone();
-        self.insert_and_select(strokes, shapes, [d, d]);
-    }
-
-    /// Put the objects just copied on the OS clipboard as a picture too,
-    /// for pasting into other apps (see `crate::clipboard`). Built on a
-    /// thread: decoding and encoding a big picture takes a moment, and
-    /// until it lands the clipboard holds the text marker. Windows only:
-    /// elsewhere pasting an image raises no event the app can catch
-    /// (`platform::paste_chord_down`), and in-app paste needs the marker.
-    #[cfg(target_os = "windows")]
-    fn copy_image_to_clipboard(&self, pixels_per_point: f32) {
-        let (strokes, shapes) = self.obj_clipboard.clone();
-        let zoom = self.canvases.active().zoom;
-        let frames = self.media.current_frames();
-        let media_dir = crate::persistence::paths::media_dir().ok();
-        let mark = std::sync::Arc::clone(&self.clip_image);
-        *mark.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        let spawned = std::thread::Builder::new().name("osn-copy-image".into()).spawn(move || {
-            let Some(img) = crate::clipboard::image_of(strokes, shapes, zoom, pixels_per_point, &frames, media_dir.as_deref()) else {
-                return;
-            };
-            let (w, h) = (img.width() as usize, img.height() as usize);
-            let bytes = img.into_raw();
-            let Ok(mut cb) = arboard::Clipboard::new() else { return };
-            // Whatever the user copied elsewhere in the meantime wins.
-            if cb.get_text().ok().as_deref() != Some(CLIP_MARKER) {
-                return;
-            }
-            // Marked first, so a paste right after the image lands
-            // already knows it.
-            let fp = crate::clipboard::fingerprint(w, h, &bytes);
-            *mark.lock().unwrap_or_else(|e| e.into_inner()) = Some(fp);
-            let image = arboard::ImageData { width: w, height: h, bytes: std::borrow::Cow::Owned(bytes) };
-            if let Err(e) = cb.set_image(image) {
-                log::warn!("could not put the copy on the clipboard as a picture: {e}");
-                *mark.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            }
-        });
-        if let Err(e) = spawned {
-            log::warn!("could not start copying a picture: {e}");
-        }
-    }
-
-    /// Paste an image from the OS clipboard onto the active layer as an
-    /// image object, centred in the view at its natural on-screen size
-    /// (shrunk to fit if it is larger than the view). Silently does
-    /// nothing when the clipboard holds no image. The picture of an
-    /// in-app copy pastes as the objects it was made from instead.
-    fn paste_clipboard_image(&mut self, canvas_rect: egui::Rect, pixels_per_point: f32, step: f32) {
-        let img = match arboard::Clipboard::new().and_then(|mut cb| cb.get_image()) {
-            Ok(img) => img,
-            Err(_) => return,
-        };
-        let own = *self.clip_image.lock().unwrap_or_else(|e| e.into_inner());
-        if own.is_some() && own == Some(crate::clipboard::fingerprint(img.width, img.height, &img.bytes)) {
-            self.paste_objects(step);
-            return;
-        }
-        let (w, h) = (img.width as u32, img.height as u32);
-        let Some(rgba) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else { return };
-        if w == 0 || h == 0 { return; }
-        let mut png: Vec<u8> = Vec::new();
-        if let Err(e) = rgba.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png) {
-            log::warn!("could not encode pasted image: {e}");
-            return;
-        }
-        let (pan, zoom) = {
-            let c = self.canvases.active();
-            (c.pan, c.zoom.max(1e-3))
-        };
-        // Natural size: one image pixel per physical screen pixel.
-        let ppp = pixels_per_point.max(0.01);
-        let mut size = [w as f32 / ppp / zoom, h as f32 / ppp / zoom];
-        let view = [canvas_rect.width() / zoom, canvas_rect.height() / zoom];
-        let fit = (view[0] * 0.9 / size[0]).min(view[1] * 0.9 / size[1]).min(1.0);
-        if fit > 0.0 {
-            size = [size[0] * fit, size[1] * fit];
-        }
-        let center = [
-            (canvas_rect.width() * 0.5 - pan[0]) / zoom,
-            (canvas_rect.height() * 0.5 - pan[1]) / zoom,
-        ];
-        let shape = crate::canvas::shape::Shape::Raster {
-            pos: [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
-            size,
-            png: std::sync::Arc::new(png),
-            px_size: [w, h],
-            color: [0, 0, 0, 0],
-            rotation: 0.0,
-            kind: crate::canvas::shape::RasterKind::Image,
-            media: None,
-            picture: None,
-        };
-        self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
-        self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
-    }
-
-    /// Start bringing in a picture, video or GIF. A video waits for
-    /// FFmpeg to be set up first.
-    fn start_media_import(&mut self, path: std::path::PathBuf, at: Option<egui::Pos2>) {
-        use crate::canvas::shape::MediaKind;
-        if crate::media::import::media_kind(&path) == Some(MediaKind::Video) && crate::media::ffmpeg::tools().is_none() {
-            self.media_waiting.push((path, at));
-            self.media_ui.ffmpeg_window = true;
-            return;
-        }
-        let job = crate::media::import::ImportJob::start(path, at);
-        self.toast = Some((format!("Inserting {}…", job.file_name()), Instant::now()));
-        self.media_imports.push(job);
-    }
-
-    /// Where a file was dropped, in screen points. egui's pointer is not
-    /// updated during an OS drag, so ask the OS where the cursor is.
-    fn drop_point(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
-        let ppp = ctx.pixels_per_point().max(0.01);
-        if let (Some((cx, cy)), Some((left, top, _, _))) =
-            (crate::platform::cursor_pos(), crate::platform::client_rect(self.osn_hwnd))
-        {
-            return Some(egui::pos2((cx - left) as f32 / ppp, (cy - top) as f32 / ppp));
-        }
-        ctx.input(|i| i.pointer.hover_pos())
-    }
-
-    /// Collect files from the Open dialog and from drag-and-drop, and
-    /// turn finished imports into objects on the active layer.
-    fn poll_media_inputs(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) {
-        use std::sync::mpsc::TryRecvError;
-        if let Some(rx) = &self.media_dialog {
-            match rx.try_recv() {
-                Ok(paths) => {
-                    self.media_dialog = None;
-                    for p in paths {
-                        if crate::media::pureref::is_pureref(&p) {
-                            self.start_pureref_open(p);
-                        } else {
-                            self.start_media_import(p, None);
-                        }
-                    }
-                }
-                Err(TryRecvError::Disconnected) => self.media_dialog = None,
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-
-        let (dropped, hovering) = ctx.input(|i| (i.raw.dropped_files.clone(), !i.raw.hovered_files.is_empty()));
-        if !dropped.is_empty() {
-            let at = self.drop_point(ctx);
-            for (n, file) in dropped.into_iter().enumerate() {
-                let Some(path) = file.path else { continue };
-                if crate::media::pureref::is_pureref(&path) {
-                    self.start_pureref_open(path);
-                    continue;
-                }
-                if !crate::media::import::is_supported(&path) {
-                    self.toast = Some(("Only pictures, videos, GIFs and PureRef boards can be dropped here".into(), Instant::now()));
-                    continue;
-                }
-                // Several files at once fan out instead of stacking.
-                let at = at.map(|p| p + egui::vec2(24.0, 24.0) * n as f32);
-                self.start_media_import(path, at);
-            }
-        }
-        if hovering {
-            egui::Area::new(egui::Id::new("osn_drop_hint"))
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .interactable(false)
-                .show(ctx, |ui| {
-                    ui::theme::card_frame().inner_margin(egui::Margin::symmetric(16.0, 10.0)).show(ui, |ui| {
-                        ui.label("Drop to insert picture / video / GIF, or open a PureRef board");
-                    });
-                });
-        }
-
-        let mut finished = Vec::new();
-        self.media_imports.retain(|job| match job.take() {
-            Some(r) => {
-                finished.push((job.path.clone(), job.at, job.file_name(), r));
-                false
-            }
-            None => true,
-        });
-        for (path, at, name, result) in finished {
-            use crate::media::import::ImportError;
-            match result {
-                Ok(imported) => {
-                    self.insert_media(imported, at, canvas_rect, ctx.pixels_per_point());
-                    self.toast = Some((format!("Inserted {name}"), Instant::now()));
-                }
-                Err(ImportError::NeedsFfmpeg) => {
-                    self.media_waiting.push((path, at));
-                    self.media_ui.ffmpeg_window = true;
-                }
-                Err(ImportError::Failed(e)) => {
-                    log::warn!("import of {name} failed: {e}");
-                    self.toast = Some((format!("Couldn't insert {name}: {e}"), Instant::now()));
-                }
-            }
-        }
-
-        self.show_pureref_progress(ctx);
-        let mut boards = Vec::new();
-        self.pureref_jobs.retain(|job| match job.take() {
-            Some(r) => {
-                boards.push((job.path.clone(), job.file_name(), r));
-                false
-            }
-            None => true,
-        });
-        for (path, name, result) in boards {
-            match result {
-                Ok(board) => {
-                    let (pictures, notes) = board.counts();
-                    let skipped = board.skipped;
-                    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    let canvas = crate::media::pureref::into_canvas(
-                        board,
-                        [canvas_rect.width(), canvas_rect.height()],
-                        ctx.pixels_per_point(),
-                        &stem,
-                    );
-                    let idx = self.canvases.push_canvas(canvas);
-                    let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-                    let mut msg = format!(
-                        "Opened {name} as slide {} — {}, {}",
-                        idx + 1,
-                        count(pictures, "picture", "pictures"),
-                        count(notes, "note", "notes"),
-                    );
-                    if skipped > 0 {
-                        msg.push_str(&format!(", {skipped} skipped"));
-                    }
-                    self.toast = Some((msg, Instant::now()));
-                }
-                Err(e) if e == "cancelled" => {
-                    self.toast = Some((format!("Stopped opening {name}"), Instant::now()));
-                }
-                Err(e) => {
-                    log::warn!("opening {name} failed: {e}");
-                    self.toast = Some((format!("Couldn't open {name}: {e}"), Instant::now()));
-                }
-            }
-        }
-    }
-
-    /// Start reading a PureRef board; it becomes a new slide once read.
-    /// The board file is only read, never written.
-    pub(crate) fn start_pureref_open(&mut self, path: std::path::PathBuf) {
-        self.pureref_jobs.push(crate::media::pureref::OpenJob::start(path));
-    }
-
-    /// A card at the bottom of the screen for each board being opened:
-    /// what it is doing, a progress bar, and a button to stop it.
-    fn show_pureref_progress(&mut self, ctx: &egui::Context) {
-        use crate::media::pureref::Stage;
-        if self.pureref_jobs.is_empty() {
-            return;
-        }
-        let mut cancel = Vec::new();
-        egui::Area::new(egui::Id::new("osn_pureref_progress"))
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
-            .show(ctx, |ui| {
-                ui::theme::card_frame().inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
-                    for (i, job) in self.pureref_jobs.iter().enumerate() {
-                        let (stage, done, total) = job.progress();
-                        let fraction = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
-                        let name = job.file_name();
-                        let text = match stage {
-                            Stage::Reading if total > 0 => {
-                                format!("Reading {name} — {} of {} MB", done >> 20, total >> 20)
-                            }
-                            Stage::Reading => format!("Reading {name}…"),
-                            Stage::Pictures => format!("Opening {name} — picture {} of {total}", done.min(total)),
-                        };
-                        if i > 0 {
-                            ui.add_space(6.0);
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label(text);
-                            if job.cancelling() {
-                                ui.label("Stopping…");
-                            } else if ui.button("Cancel").clicked() {
-                                cancel.push(i);
-                            }
-                        });
-                        ui.add(egui::ProgressBar::new(fraction).desired_width(360.0).show_percentage());
-                    }
-                });
-            });
-        for i in cancel {
-            self.pureref_jobs[i].cancel();
-            crate::platform::reclaim_foreground(self.osn_hwnd);
-        }
-    }
-
-    /// Place an imported picture / video / GIF on the active layer at its
-    /// natural on-screen size (shrunk to fit the view), centred on `at` or
-    /// on the view, and select it (a video's playback bar then shows).
-    fn insert_media(
-        &mut self,
-        imported: crate::media::import::Imported,
-        at: Option<egui::Pos2>,
-        canvas_rect: egui::Rect,
-        pixels_per_point: f32,
-    ) {
-        let (pan, zoom) = {
-            let c = self.canvases.active();
-            (c.pan, c.zoom.max(1e-3))
-        };
-        let ppp = pixels_per_point.max(0.01);
-        let [w, h] = imported.size;
-        let mut size = [w.max(1) as f32 / ppp / zoom, h.max(1) as f32 / ppp / zoom];
-        let view = [canvas_rect.width() / zoom, canvas_rect.height() / zoom];
-        let fit = (view[0] * 0.9 / size[0]).min(view[1] * 0.9 / size[1]).min(1.0);
-        if fit > 0.0 {
-            size = [size[0] * fit, size[1] * fit];
-        }
-        let screen = at.unwrap_or(canvas_rect.center()) - canvas_rect.min;
-        let center = [(screen.x - pan[0]) / zoom, (screen.y - pan[1]) / zoom];
-        let shape = crate::canvas::shape::Shape::Raster {
-            pos: [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
-            size,
-            png: std::sync::Arc::new(imported.png),
-            px_size: imported.png_size,
-            color: [0, 0, 0, 0],
-            rotation: 0.0,
-            kind: crate::canvas::shape::RasterKind::Image,
-            media: imported.media.map(Box::new),
-            picture: None,
-        };
-        self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
-    }
-
-    /// Carry out what the playback bars and the FFmpeg window asked for.
-    fn apply_media_out(&mut self, out: ui::media_controls::MediaUiOut) {
-        for (id, cmd) in out.commands {
-            self.media.command(id, cmd);
-        }
-        if out.clicked {
-            crate::platform::reclaim_foreground(self.osn_hwnd);
-        }
-        if let Some(p) = out.located {
-            self.config.ffmpeg_path = Some(p);
-        }
-        if out.ffmpeg_ready {
-            self.ffmpeg_available = true;
-            self.media.ffmpeg_changed();
-            for (path, at) in std::mem::take(&mut self.media_waiting) {
-                self.start_media_import(path, at);
-            }
-        } else if !self.media_ui.ffmpeg_window {
-            // Set-up window closed without FFmpeg: give up on those.
-            self.media_waiting.clear();
-        }
-        if let Some(t) = out.toast {
-            self.toast = Some((t, Instant::now()));
-        }
-    }
-
-    /// Apply a toolbar colour / size change to the selected objects.
-    /// `prev_*` are the tool's values before the toolbar ran this frame.
-    fn restyle_selection(&mut self, prev_color: [u8; 4], prev_size: f32) {
-        if self.tool.kind != crate::tools::ToolKind::Select || self.tool.select.sel.is_empty() {
-            return;
-        }
-        let color = (self.tool.color != prev_color).then_some(self.tool.color);
-        let width = ((self.tool.size - prev_size).abs() > 1e-4).then_some(self.tool.size);
-        if color.is_none() && width.is_none() { return; }
-        let idx = self.canvases.active_index();
-        let sel = self.tool.select.sel.clone();
-        let c = self.canvases.active_mut();
-        let li = c.active_layer;
-        // Fold a run of size ticks into the entry the first one made.
-        let merge = color.is_none() && self.restyle_run == Some((idx, c.undo_log.len()));
-        c.restyle_objects(li, &sel.strokes, &sel.shapes, color, width, merge);
-        self.restyle_run = (width.is_some() && color.is_none()).then_some((idx, c.undo_log.len()));
-    }
-
-    /// Start or stop screen recording. Hides the floating UI on
-    /// start so the toolbar and status badge don't end up in the
-    /// saved GIF; restores the user's previous UI visibility on
-    /// stop. The actual capture + encode lives in `crate::recording`.
-    fn toggle_record(&mut self) {
-        if self.recorder.is_recording() {
-            // Stop: finalise encoder (writes GIF trailer) + clipboard
-            // copy, then restore UI.
-            self.recorder.stop_and_encode();
-            self.ui_visible = self.ui_visible_before_record;
-        } else {
-            // Start: snapshot UI state, hide chrome, kick off
-            // recorder with the destination dir captured up front.
-            self.ui_visible_before_record = self.ui_visible;
-            self.ui_visible = false;
-            let dir = self
-                .config
-                .screenshot_dir
-                .clone()
-                .or_else(|| crate::persistence::paths::default_screenshot_dir().ok())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let use_mp4 = matches!(
-                self.config.recording_format,
-                crate::config::RecordingFormat::Mp4IfAvailable
-            ) && self.ffmpeg_available;
-            self.recorder.start(dir, self.osn_hwnd, use_mp4);
-        }
-    }
 }
 
 impl eframe::App for OnScreenNotesApp {
     /// We want *clear color* to be fully transparent so the window stays
     /// see-through. eframe queries this once per frame.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Alpha drives the window's see-through level: 0 = fully
-        // transparent, 1 = fully opaque. RGB comes from `config.bg_color`
-        // so the user can tint the overlay (e.g. paper-cream for a
-        // notebook feel, deep navy for low-light work). Pre-multiply RGB
-        // by alpha — wgpu's clear path expects pre-multiplied output.
-        let a = self.config.bg_opacity.clamp(0.0, 1.0);
-        let r = self.config.bg_color[0] as f32 / 255.0 * a;
-        let g = self.config.bg_color[1] as f32 / 255.0 * a;
-        let b = self.config.bg_color[2] as f32 / 255.0 * a;
-        [r, g, b, a]
+        // Fully clear: the overlay's tint (`config.bg_color` at
+        // `bg_opacity`) is painted in `update` as a rectangle with
+        // Windows 11's rounded corners, which a clear colour cannot have
+        // (`theme::paint_window`). Corners outside it stay see-through.
+        [0.0; 4]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1642,327 +708,63 @@ impl eframe::App for OnScreenNotesApp {
                 fill * 100.0,
             )
         });
+        // ---- Window background ------------------------------------------
+        // The tint lets the desktop show through: 0 opacity is clear, 1
+        // opaque; its colour can be paper-cream, deep navy… Painted with
+        // Windows 11's rounded corners (square while maximized), under
+        // everything else drawn this frame.
+        {
+            let square = ctx.input(|i| i.viewport().maximized == Some(true) || i.viewport().fullscreen == Some(true));
+            let tint = ui::slide_window::Look::background(self.config.bg_color, self.config.bg_opacity);
+            ui::theme::paint_window(&ctx.layer_painter(egui::LayerId::background()), ctx.screen_rect(), tint, square);
+        }
+
         // ---- First-frame init -------------------------------------------
         // On startup, explicitly tell the OS: "we want input by default".
-        // This synchronises our `modifiers.alt_held = false` model with
-        // the actual OS window flag, in case the previous session left the
-        // window in passthrough mode.
+        // Only pin-picking makes the window pass clicks through, and only
+        // while it runs.
         if self.first_frame {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
             // Open focused, like any app. (The window used to be made
             // `WS_EX_NOACTIVATE` here, so it opened unfocused and clicks
             // on the toolbar or a popup never focused it; a press on the
-            // canvas still reclaims the foreground after a click-through.)
+            // canvas still reclaims the foreground from another app.)
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            // Rounded corners, like any Windows 11 window (DWM squares
+            // a window without a title bar unless asked).
+            crate::platform::round_corners(self.osn_hwnd);
             self.idle_frame = refresh_period(self.osn_hwnd);
             self.first_frame = false;
             log::info!("on-screen-notes started: overlay visible, input enabled");
         }
 
-        // ---- Slides still loading ---------------------------------------
-        // Take in what the background loader finished. A slide that failed
-        // to load is the user's work in a state we could not read — say
-        // so on screen rather than only in the log (reported once every
-        // slide is in).
-        self.canvases.poll_loads();
-        let errs = self.canvases.take_load_errors();
-        if !errs.is_empty() {
-            let msg = match errs.len() {
-                1 => errs[0].clone(),
-                n => format!("{n} slides could not be read — originals kept beside them (*.unreadable-…)"),
-            };
-            self.toast = Some((msg, std::time::Instant::now()));
-        }
+        self.take_in_slides(ctx);
 
-        // ---- Always-on subsystems ----------------------------------------
-        // 1) Click-through edge detection (Alt key).
-        let click_through_now = click_through::update(ctx, &mut self.modifiers);
+        self.advance_captures(ctx);
 
-        // 2) Global hotkey events.
-        if let Some(h) = self.hotkeys.as_ref() {
-            for ev in h.poll() {
-                match ev {
-                    HotkeyId::ToggleOverlay => self.overlay_visible = !self.overlay_visible,
-                    // Screenshot: enter interactive region-select; the grab
-                    // is deferred until the user drags out a rectangle.
-                    HotkeyId::Screenshot   => self.begin_region_select(),
-                    HotkeyId::ToggleRecord => self.toggle_record(),
-                    HotkeyId::TogglePauseRecord => self.recorder.toggle_pause(),
-                }
-            }
-        }
+        let (pen_events, client_origin) = self.smoothed_pen_events(ctx);
 
-        // Drive the deferred screenshot state machine. Two frames of
-        // wait lets the OS compositor repaint OSN without its chrome
-        // before xcap snapshots the desktop. When the counter hits
-        // zero, we capture, then restore the chrome the next pass.
-        let do_capture = if let Some(ps) = self.pending_screenshot.as_mut() {
-            if ps.frames_to_wait > 0 {
-                ps.frames_to_wait -= 1;
-                ctx.request_repaint();
-                false
-            } else {
-                true
-            }
-        } else {
-            false
-        };
-        if do_capture {
-            if let Some(ps) = self.pending_screenshot.take() {
-                self.do_screenshot(&ps);
-                self.ui_visible = ps.ui_visible_before;
-                self.config.bg_opacity = ps.bg_opacity_before;
-            }
-        }
+        self.follow_pinned_window(ctx);
 
-        // Same state machine for the freeze-frame-to-layer action.
-        let do_freeze = if let Some(ps) = self.pending_freeze.as_mut() {
-            if ps.frames_to_wait > 0 {
-                ps.frames_to_wait -= 1;
-                ctx.request_repaint();
-                None
-            } else {
-                Some((ps.pixels_per_point, ps.ui_visible_before, ps.bg_opacity_before))
-            }
-        } else {
-            None
-        };
-        if let Some((ppp, ui_prev, bg_prev)) = do_freeze {
-            self.do_freeze(ppp);
-            self.ui_visible = ui_prev;
-            self.config.bg_opacity = bg_prev;
-            self.pending_freeze = None;
-        }
+        self.update_loupe(ctx);
 
-        // Same state machine for the lasso-select capture. The polygon
-        // is owned (not Copy), so we `take()` the whole pending struct
-        // once the countdown elapses rather than copying fields out.
-        let do_lasso = self
-            .pending_lasso
-            .as_mut()
-            .map(|ps| {
-                if ps.frames_to_wait > 0 {
-                    ps.frames_to_wait -= 1;
-                    false
-                } else {
-                    true
-                }
-            })
-            .unwrap_or(false);
-        if self.pending_lasso.is_some() && !do_lasso {
-            ctx.request_repaint();
-        }
-        if do_lasso {
-            if let Some(ps) = self.pending_lasso.take() {
-                self.do_lasso_capture(ps.pixels_per_point, ps.pan, ps.zoom, &ps.polygon);
-                self.ui_visible = ps.ui_visible_before;
-                self.config.bg_opacity = ps.bg_opacity_before;
-            }
-        }
+        // ---- Zoom to fit / selection: glide and peek ----------------------
+        self.update_peek(ctx);
+        self.step_view_glide(ctx);
 
-        // Recording capture+encode runs on a dedicated worker thread
-        // spawned in `Recorder::start()`. The UI thread does nothing
-        // per-frame except poll for the final result below.
-        // Surface the last encode result as a toast (one-shot).
-        if let Some(res) = self.recorder.take_result() {
-            self.toast = Some((
-                format!(
-                    "Recording saved: {} ({} frame{}{})",
-                    res.path.display(),
-                    res.frame_count,
-                    if res.frame_count == 1 { "" } else { "s" },
-                    if res.copied_to_clipboard { ", clipboard ✓" } else { "" }
-                ),
-                std::time::Instant::now(),
-            ));
-        }
-
-        // 3) Pen events (no-op when tablet missing).
-        //    * `client_origin` = screen-pixel coordinate of our window's
-        //      client area's top-left. The Wintab backend reports packets
-        //      in screen pixels; subtracting `client_origin` converts to
-        //      window-client coordinates.
-        //    * After polling, we transform each sample from window-client
-        //      to canvas-local (subtract canvas rect, pan, divide zoom),
-        //      then dispatch to tools.
-        let client_origin = ctx.input(|i| {
-            i.viewport()
-                .inner_rect
-                .map(|r| [r.min.x as i32, r.min.y as i32])
-                .unwrap_or([0, 0])
-        });
-        let raw_pen_events = self.pen.poll(client_origin);
-
-        // ---- Smooth raw pen samples --------------------------------------
-        // Wintab packets carry digitizer noise; at low pen speed the noise
-        // dominates and the Catmull-Rom subdivision amplifies it into
-        // visible jagged wobble. Run each sample through a One Euro filter
-        // (speed-adaptive low-pass: tight at rest, near-passthrough at
-        // speed) and drop near-duplicate samples.
-        //
-        //   * `Down` resets the filter and force-accepts the sample so the
-        //     stroke starts exactly where the user pressed.
-        //   * `Move` is filtered + min-distance gated; samples that don't
-        //     move enough are dropped.
-        //   * `Up` is force-accepted so pen-up lands exactly.
-        // Sync the active tool's smoothing snapshot from the live
-        // config. A new stroke begun this frame will lock-in the
-        // current options at pen-down; an in-progress stroke keeps the
-        // snapshot it was started with.
-        self.tool.smoothing = self.config.smoothing;
-        // Push the render-side fan-corner toggle so the ribbon mesh
-        // builder can read it lock-free on the hot path.
-        crate::canvas::render::set_fan_corners(
-            self.config.smoothing.fan_corners,
-            self.config.smoothing.fan_corners_step,
-        );
-
-        use crate::input::pen::PenEvent;
-        let mut pen_events: Vec<PenEvent> = Vec::with_capacity(raw_pen_events.len());
-        // Krita modes (Stabilizer / Weighted / Simple / None) run their
-        // own algorithm on raw input — the upstream PenFilter would be
-        // a second-stage smoother the user did not ask for. Only
-        // Adaptive mode keeps it.
-        let use_pen_filter = self.config.smoothing.use_upstream_pen_filter();
-        for ev in raw_pen_events {
-            match ev {
-                PenEvent::Down(s) => {
-                    self.pen_filter.reset();
-                    if use_pen_filter {
-                        if let Some(fs) = self.pen_filter.filter(s, true) {
-                            pen_events.push(PenEvent::Down(fs));
-                        }
-                    } else {
-                        pen_events.push(PenEvent::Down(s));
-                    }
-                }
-                PenEvent::Move(s) => {
-                    if use_pen_filter {
-                        if let Some(fs) = self.pen_filter.filter(s, false) {
-                            pen_events.push(PenEvent::Move(fs));
-                        }
-                    } else {
-                        pen_events.push(PenEvent::Move(s));
-                    }
-                }
-                PenEvent::Up(s) => {
-                    if use_pen_filter {
-                        if let Some(fs) = self.pen_filter.filter(s, true) {
-                            pen_events.push(PenEvent::Up(fs));
-                        }
-                    } else {
-                        pen_events.push(PenEvent::Up(s));
-                    }
-                }
-            }
-        }
-
-        // ---- Pin-to-window follow ---------------------------------------
-        // Two phases:
-        //   (a) `pin_picking` — overlay is click-through so the user
-        //       can target a window; the next external LMB-down
-        //       captures the top-level HWND under the cursor.
-        //   (b) `pinned_hwnd` is Some — each frame we read the
-        //       target's rect and reposition the overlay to match.
-        //       If the rect query fails (window minimised or
-        //       destroyed), we drop the pin and toast the user.
-        if self.pin_picking {
-            // Esc cancels pin-picking without locking us into
-            // click-through mode forever.
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.pin_picking = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
-            }
-        }
-        // Esc also closes the layer-preview popup.
-        if self.show_layer_preview && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.show_layer_preview = false;
-        }
-        if self.pin_picking {
-            // Force click-through so the visible click lands on the
-            // target window, not on OSN.
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-            let lmb_now = crate::platform::lmb_down();
-            if lmb_now && !self.pin_prev_lmb {
-                if let Some((cx, cy)) = crate::platform::cursor_pos() {
-                    let hwnd = crate::platform::top_level_window_at(cx, cy);
-                    if hwnd != 0 && hwnd != self.osn_hwnd {
-                        self.pinned_hwnd = Some(hwnd);
-                        self.pinned_last_rect = None;
-                        self.toast = Some((
-                            "Pinned to window".to_string(),
-                            std::time::Instant::now(),
-                        ));
-                    }
-                }
-                self.pin_picking = false;
-                // Restore normal click handling.
-                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
-            }
-            self.pin_prev_lmb = lmb_now;
-        } else {
-            self.pin_prev_lmb = false;
-        }
-
-        if let Some(hwnd) = self.pinned_hwnd {
-            match crate::platform::window_rect(hwnd) {
-                None => {
-                    self.pinned_hwnd = None;
-                    self.pinned_last_rect = None;
-                    self.toast = Some((
-                        "Pin lost: target window minimised or closed".to_string(),
-                        std::time::Instant::now(),
-                    ));
-                }
-                Some(rect) => {
-                    if Some(rect) != self.pinned_last_rect {
-                        let ppp = ctx.pixels_per_point().max(0.01);
-                        let (l, t, r, b) = rect;
-                        let w = (r - l).max(1) as f32 / ppp;
-                        let h = (b - t).max(1) as f32 / ppp;
-                        let pos = egui::pos2(l as f32 / ppp, t as f32 / ppp);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
-                        self.pinned_last_rect = Some(rect);
-                    }
-                }
-            }
-        }
-
-        // ---- Magnifier loupe (Z-held modal) -----------------------------
-        // Rising edge → start the live loupe, which captures the screen
-        // under the window on a worker thread and uploads each frame as
-        // a texture. Falling edge → drop the state so the GPU memory
-        // is reclaimed. Captures cost ~30 ms; keeping them off the UI
-        // thread keeps the loupe at full overlay refresh while held.
-        //
-        // Gated on !ctrl so Ctrl+Z (undo) and Ctrl+Shift+Z (redo) do
-        // not accidentally arm the loupe.
-        {
-            let z_held = ctx.input(|i| i.key_down(egui::Key::Z));
-            let z_ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
-            let z_modal = z_held && !z_ctrl;
-            if z_modal && self.loupe.is_none() {
-                match ui::loupe::LoupeState::start_live(ctx, self.osn_hwnd) {
-                    Ok(l) => self.loupe = Some(l),
-                    Err(e) => log::warn!("loupe capture failed: {e}"),
-                }
-            }
-            if !z_modal && self.loupe.is_some() {
-                self.loupe = None;
-            }
-            // Drain any new frame the worker has produced and push
-            // it into the GPU texture for this frame's paint.
-            if let Some(l) = self.loupe.as_mut() {
-                l.poll_and_update();
-            }
+        // ---- Shape snap: time a held pen, run the morph --------------------
+        // A pen held still sends nothing, so the frame it is due is asked for.
+        if let Some(wait) = self.tool.tick_snap(Instant::now()) {
+            ctx.request_repaint_after(wait);
         }
 
         // ---- Space-hold pan check ---------------------------------------
         // We treat Space as a *modal* pan key: while it is held, all pen +
         // mouse drags pan the active canvas instead of drawing. This is the
         // same convention used by Photoshop, Figma, Rnote, etc.
-        let space_held = ctx.input(|i| i.key_down(egui::Key::Space));
+        // Not while a text field has the keys: a space typed there is
+        // not a pan.
+        let space_held = ctx.input(|i| i.key_down(egui::Key::Space)) && !self.slide_panel.is_renaming() && !ctx.wants_keyboard_input();
 
         // ---- Main overlay ------------------------------------------------
         if self.overlay_visible {
@@ -1974,16 +776,30 @@ impl eframe::App for OnScreenNotesApp {
             // this frame reads it: it is dropped the moment the tool,
             // the slide, the layer or the layer's object count changes
             // underneath it.
+            // A locked slide, or one still opening, keeps no selection.
             self.tool.select.sync(
-                self.tool.kind == crate::tools::ToolKind::Select,
+                self.tool.kind == crate::tools::ToolKind::Select && self.canvases.active_editable(),
                 self.canvases.active_index(),
                 self.canvases.active(),
             );
             self.tool.lasso.sync(self.tool.kind, self.canvases.active_index());
+            // Pins are picked with the Select tool: leaving it lets go of
+            // the pin, and so does unpinning it some other way (an undo).
+            if self.tool.kind != crate::tools::ToolKind::Select || !self.canvases.active_editable() {
+                self.pin_tool.clear();
+            } else if let Some(id) = self.pin_tool.selected {
+                if !self.canvases.pinned().iter().any(|p| p.pin.id == id) {
+                    self.pin_tool.clear();
+                }
+            }
             let (prev_color, prev_size) = (self.tool.color, self.tool.size);
+            let prev_text_box = self.tool.text_box;
+            let text_selected = !self.selected_text().is_empty();
             let mut insert_media = false;
             let mut select_filtered = false;
             let media_counts = ui::media_filter::counts(self.canvases.active());
+            let mut pins_hidden = self.canvases.pins_hidden();
+            let has_pins = self.canvases.has_pins();
             let toolbar_clicked = if self.ui_visible {
                 ui::toolbar::show(
                     ctx,
@@ -1994,48 +810,129 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.config.smoothing_level,
                     &mut self.config.smoothing,
                     &mut self.config.pressure_curve,
+                    (&mut self.config.shape_snap, &mut self.config.smart_guides),
+                    (&mut self.config.beside_fit, &mut self.config.beside_side),
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
                     &mut insert_media,
                     &mut self.media_filter,
-                    media_counts,
+                    &media_counts,
                     &mut select_filtered,
+                    has_pins.then_some(&mut pins_hidden),
+                    text_selected,
+                    &self.hotkeys_cfg,
                 )
             } else {
                 false
             };
-            if select_filtered {
+            self.set_pins_hidden(pins_hidden);
+            self.tool.shape_snap = self.config.shape_snap;
+            self.tool.select.guides_on = self.config.smart_guides;
+            if self.tool.text_box != prev_text_box {
+                self.apply_text_box_to_selection();
+            }
+            // Recently-used slide history: the active slide counts as
+            // visited, and letting go of Ctrl ends a Ctrl+Tab walk.
+            if !ctx.input(|i| interaction::slide_walk_held(i.modifiers, &self.hotkeys_cfg)) {
+                self.canvases.end_recent_walk();
+            }
+            self.canvases.note_visit();
+            // Slide panel. Going to a slide waits until after this frame's
+            // keys, where the arrow keys switch slides too: everything
+            // drawn before then still belongs to the current slide.
+            let mut slides = if self.ui_visible {
+                // No higher than the REC badge (top-left) while it shows.
+                let top = if self.recorder.is_recording() { 44.0 } else { 10.0 };
+                ui::slide_panel::show(ctx, &mut self.slide_panel, &mut self.config, top, &self.canvases)
+            } else {
+                Default::default()
+            };
+            if let Some(a) = slides.tag_action.take() {
+                self.apply_tag_action(a);
+            }
+            if let Some(tags) = slides.highlight_tags.take() {
+                self.media_filter.tags = tags;
+            }
+            if select_filtered && self.may_edit() {
                 self.select_media_matches();
             }
-            // Arrange bar for a selection of two or more objects; hidden
-            // mid-gesture so it doesn't flicker over a drag.
+            // Arrange bar for a selection (only its copy and pin buttons
+            // for a single object); hidden mid-gesture so it doesn't
+            // flicker over a drag. A selected pin gets its own bar there.
             let selected_count = self.tool.select.sel.strokes.len() + self.tool.select.sel.shapes.len();
+            // A picture's colours belong to that picture: another
+            // selection puts them away.
+            let picture = self.selected_picture();
+            if self.picture_colours.as_ref().is_some_and(|p| Some(p.at) != picture) {
+                self.picture_colours = None;
+            }
+            let mut use_colour = None;
             if self.ui_visible
                 && self.tool.kind == crate::tools::ToolKind::Select
-                && selected_count >= 2
+                && selected_count >= 1
                 && self.tool.select.gesture.is_none()
             {
-                match ui::arrange_bar::show(ctx, selected_count) {
-                    Some(ui::arrange_bar::BarAction::Arrange(op)) => self.arrange_selection(op),
-                    Some(ui::arrange_bar::BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
+                use ui::arrange_bar::BarAction;
+                let pinned = self.selection_pinned();
+                let grouped = self.selection_grouped();
+                let open_move = std::mem::take(&mut self.move_picker_pending);
+                let keys = &self.hotkeys_cfg;
+                let row = picture.map(|_| ui::arrange_bar::ColourRow {
+                    shown: self.picture_colours.as_ref().map(|p| p.colours.as_slice()),
+                    can_restore: self.palette_before.is_some(),
+                });
+                let tags = self.selection_tags();
+                if let Some(e) = self.tag_edit.as_mut() {
+                    let (index, _) = self.canvases.tag_index();
+                    e.known = index.into_iter().map(|t| (t.tag, t.objects)).collect();
+                }
+                match ui::arrange_bar::show(
+                    ctx,
+                    selected_count,
+                    pinned,
+                    &self.canvases,
+                    &mut self.config.arrange_apart,
+                    &mut self.config.pack_mode,
+                    keys,
+                    open_move,
+                    row,
+                    grouped,
+                    &tags,
+                    &mut self.tag_edit,
+                ) {
+                    Some(BarAction::Group(on)) => self.group_selection(on),
+                    Some(BarAction::Arrange(op)) => self.arrange_selection(op, ctx),
+                    Some(BarAction::Match(m)) => self.match_selection_size(m),
+                    Some(BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
+                    Some(BarAction::MoveToSlide(to)) => self.move_selection_to(to),
+                    Some(BarAction::TogglePin) => self.toggle_pin_selection(),
+                    Some(BarAction::Flip(vertical)) => self.flip_selection(vertical),
+                    Some(BarAction::Rotate(right)) => self.rotate_selection(right),
+                    Some(BarAction::ZoomToSelection) => self.zoom_to_selection(ctx),
+                    Some(BarAction::PictureColours) => self.toggle_picture_colours(),
+                    // Set after the restyle below, so the picture is
+                    // not "recoloured" into an empty undo step.
+                    Some(BarAction::UseColour(c)) => use_colour = Some(c),
+                    Some(BarAction::KeepColours) => self.keep_picture_colours(),
+                    Some(BarAction::RestorePalette) => self.restore_palette(),
+                    Some(BarAction::SetTags(tags)) => self.tag_selection(tags),
                     None => {}
                 }
+            } else {
+                // No bar, no tag row.
+                self.tag_edit = None;
             }
-            if insert_media && self.media_dialog.is_none() {
-                let mut exts = vec!["gif"];
-                exts.extend_from_slice(crate::media::import::VIDEO_EXTS);
-                exts.extend_from_slice(crate::media::import::IMAGE_EXTS);
-                exts.push("pur");
-                self.media_dialog = Some(ui::media_controls::pick_files(
-                    self.osn_hwnd,
-                    "Insert picture, video, GIF or PureRef board",
-                    &[("Pictures, videos, GIFs and PureRef boards", &exts), ("PureRef boards", &["pur"])],
-                    true,
-                ));
+            self.show_pin_bar(ctx);
+            if insert_media {
+                self.open_media_dialog();
             }
             // A colour or size picked in the toolbar while objects are
             // selected restyles those objects.
             self.restyle_selection(prev_color, prev_size);
+            if let Some(c) = use_colour {
+                self.tool.color = c;
+                self.toast = Some((format!("Drawing colour #{:02X}{:02X}{:02X}", c[0], c[1], c[2]), Instant::now()));
+            }
             // If the user switched smoothing levels via the toolbar, push
             // the new value through the input filter, the tool's pass
             // budget, and rebuild every stroke cache so existing strokes
@@ -2068,7 +965,14 @@ impl eframe::App for OnScreenNotesApp {
             // Advance video / GIF playback and upload new frames before
             // the canvas paints them.
             let view = self.overlay_cache.canvas_rect(ctx);
-            self.media.sync(ctx, self.canvases.active(), ctx.pixels_per_point(), view);
+            // Pinned videos play wherever their pins are, the slide
+            // window included. Its pins count as placed on the canvas.
+            let mut pins = self.canvases.pinned();
+            if self.slide_window.as_ref().is_some_and(|w| w.shows_pins()) {
+                pins.extend(self.canvases.global_pins());
+            }
+            self.media.sync(ctx, self.canvases.active(), &pins, ctx.pixels_per_point(), view);
+            drop(pins);
             // Selection handles must stay out of anything that grabs the
             // screen.
             let show_selection = self.pending_screenshot.is_none()
@@ -2086,7 +990,11 @@ impl eframe::App for OnScreenNotesApp {
                 layer_xform,
                 show_selection,
                 &self.media,
-                self.media_filter,
+                &self.media_filter,
+                ui::overlay::PinMarks {
+                    selected: self.pin_tool.selected,
+                    outlines: self.ui_visible && self.tool.kind == crate::tools::ToolKind::Select,
+                },
             );
 
             // ---- Videos & GIFs ------------------------------------------
@@ -2094,22 +1002,52 @@ impl eframe::App for OnScreenNotesApp {
             // then the playback bars. Drawn before the pen dispatch below
             // so a tap on a bar counts as UI, never as ink.
             self.poll_media_inputs(ctx, canvas_rect);
-            let media_objs = ui::media_controls::media_on_screen(self.canvases.active(), canvas_rect);
+            let mut media_objs = ui::media_controls::media_on_screen(self.canvases.active(), canvas_rect);
+            let pinned = self.canvases.pinned();
+            media_objs.extend(ui::media_controls::pinned_media_on_screen(&pinned, canvas_rect));
             let media_selected = if self.tool.kind == crate::tools::ToolKind::Select {
                 ui::media_controls::selected_media(self.canvases.active(), &self.tool.select.sel)
+                    .or_else(|| self.pin_tool.selected.and_then(|id| ui::media_controls::pinned_media(&pinned, id)))
             } else {
                 None
             };
+            drop(pinned);
             let show_media_bars = self.ui_visible
                 && show_selection
-                && !click_through_now
                 && !self.recorder.is_recording()
                 && self.tool.in_progress_stroke.is_none()
-                && self.tool.select.gesture.is_none();
+                && self.tool.select.gesture.is_none()
+                && !self.pin_tool.dragging();
             let mut media_out =
                 self.media_ui.show(ctx, &self.media, &media_objs, media_selected, canvas_rect, show_media_bars);
             self.media_ui.ffmpeg_window(ctx, self.osn_hwnd, &mut media_out);
             self.apply_media_out(media_out);
+            self.show_delete_confirm(ctx);
+            if self.commands.is_open() {
+                let picked = {
+                    let cx = ui::command_palette::Context {
+                        keys: &self.hotkeys_cfg,
+                        selected: if self.tool.kind == crate::tools::ToolKind::Select {
+                            self.tool.select.sel.strokes.len() + self.tool.select.sel.shapes.len()
+                        } else {
+                            0
+                        },
+                        picture: self.selected_picture().is_some(),
+                        grouped: self.selection_grouped(),
+                        pin: self.pin_tool.selected.is_some() && self.tool.kind == crate::tools::ToolKind::Select,
+                        palette: &self.config.palette,
+                        slides: (0..self.canvases.count()).map(|i| self.canvases.name(i).to_string()).collect(),
+                        active_slide: self.canvases.active_index(),
+                    };
+                    let all = ui::command_palette::entries(&cx);
+                    self.commands.show(ctx, &all)
+                };
+                if let Some(cmd) = picked {
+                    self.run_command(cmd, ctx, canvas_rect);
+                }
+            }
+            self.show_find_bar(ctx);
+            self.show_find_flash(ctx, canvas_rect);
 
             // ---- Screenshot region selection --------------------------------
             // Draws the dimmed rubber-band over the canvas and, on release,
@@ -2131,877 +1069,32 @@ impl eframe::App for OnScreenNotesApp {
             //      via the polled Wintab queue. So we route them explicitly.
             //   2. Mouse / trackpad via egui's pointer state. Used when
             //      there is no tablet (mouse fallback path).
-            if space_held {
-                // Holding Shift as well retargets the drag from the
-                // viewport to the *active layer*: its ink slides while
-                // every other layer stays nailed down. The mode is
-                // latched at pointer-down by `begin_pan_gesture`, so
-                // this per-frame read only drives the cursor hint.
-                let layer_mode = ctx.input(|i| i.modifiers.shift);
-                ctx.set_cursor_icon(if layer_mode || self.layer_xform.is_some() {
-                    egui::CursorIcon::Move
-                } else {
-                    egui::CursorIcon::Grabbing
-                });
-
-                use crate::input::pen::PenEvent;
-                let mut had_pen = false;
-                for ev in &pen_events {
-                    had_pen = true;
-                    let s = match ev {
-                        PenEvent::Down(s) | PenEvent::Move(s) | PenEvent::Up(s) => s,
-                    };
-                    // Pen samples are already in window-client logical
-                    // pixels, same space as `canvas.pan`. No offset needed.
-                    let here = egui::pos2(s.pos[0], s.pos[1]);
-                    match ev {
-                        PenEvent::Down(_) => {
-                            self.begin_pan_gesture(layer_mode);
-                            self.pan_drag_anchor = Some(here);
-                        }
-                        PenEvent::Move(_) => {
-                            if let Some(anchor) = self.pan_drag_anchor {
-                                self.apply_pan_delta(here.x - anchor.x, here.y - anchor.y);
-                            }
-                            self.pan_drag_anchor = Some(here);
-                        }
-                        PenEvent::Up(_) => {
-                            // Only a real drag ends here. A wheel-only
-                            // layer zoom stays open until Space is
-                            // released, so a stray pen tap mid-zoom
-                            // doesn't chop the gesture into two undo
-                            // steps.
-                            if self.pan_drag_anchor.take().is_some() {
-                                self.commit_layer_xform();
-                            }
-                        }
-                    }
-                }
-
-                // Mouse path — only run when no pen events fired this frame
-                // so the two sources don't double-add motion. The pointer
-                // state is read out of `ctx.input` first and acted on
-                // afterwards, so no canvas mutation happens while egui's
-                // input lock is held.
-                if !had_pen {
-                    let (primary, cursor) = ctx.input(|i| {
-                        (
-                            i.pointer.primary_down(),
-                            i.pointer
-                                .hover_pos()
-                                .or(i.pointer.interact_pos())
-                                .or(i.pointer.latest_pos()),
-                        )
-                    });
-                    if primary {
-                        if let Some(p) = cursor {
-                            match self.pan_drag_anchor {
-                                Some(anchor) => self.apply_pan_delta(p.x - anchor.x, p.y - anchor.y),
-                                // No anchor yet: the button just went
-                                // down, so this is the gesture start.
-                                None => self.begin_pan_gesture(layer_mode),
-                            }
-                            self.pan_drag_anchor = Some(p);
-                        }
-                    } else if self.pan_drag_anchor.take().is_some() {
-                        // Button-up ends a drag; same reasoning as the
-                        // pen path — a wheel-only zoom keeps going
-                        // until Space is released.
-                        self.commit_layer_xform();
-                    }
-                }
-            } else {
-                // Pan released — drop anchor, restore default cursor.
-                self.pan_drag_anchor = None;
-                // Letting go of Space mid-gesture still ends it, so bake
-                // any pending layer move / zoom rather than losing it.
-                // This is also the only end-point a wheel-only layer
-                // zoom has.
-                self.commit_layer_xform();
-
-                // Hide the OS cursor while the Pen / FreehandArrow tools
-                // are active so it doesn't sit on top of the pen tip and
-                // distract from the drawn line. Skip the hide when the
-                // pointer is over a floating UI layer (toolbar, popup)
-                // so the user can still see what they're about to click.
-                let tool_hides_cursor = matches!(
-                    self.tool.kind,
-                    crate::tools::ToolKind::Pen
-                        | crate::tools::ToolKind::FreehandArrow
-                        | crate::tools::ToolKind::Laser,
-                );
-                // The Fill tool needs a visible pointer because the user
-                // has to land the stroke's starting point precisely on
-                // the edge of the area they want to enclose. Showing the
-                // crosshair instead of the regular arrow matches what
-                // the user gets while picking a colour with Shift — a
-                // "precision aim" cue rather than a generic arrow.
-                let tool_wants_crosshair = matches!(
-                    self.tool.kind,
-                    crate::tools::ToolKind::Fill
-                        | crate::tools::ToolKind::LassoErase
-                        | crate::tools::ToolKind::LassoSelect,
-                );
-                let hover = ctx.input(|i| i.pointer.hover_pos());
-                let on_ui = hover
-                    .and_then(|p| ctx.layer_id_at(p))
-                    .map(|l| l.order > egui::Order::Background)
-                    .unwrap_or(false);
-                if tool_hides_cursor && !on_ui {
-                    ctx.set_cursor_icon(egui::CursorIcon::None);
-                } else if tool_wants_crosshair && !on_ui {
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-                } else if self.tool.kind == crate::tools::ToolKind::Select && !on_ui {
-                    // Say what a press here would do: grab a handle,
-                    // move the selection, or pick the object underneath.
-                    if let Some(p) = hover {
-                        let c = self.canvases.active();
-                        let local = [
-                            ((p.x - canvas_rect.min.x) - c.pan[0]) / c.zoom,
-                            ((p.y - canvas_rect.min.y) - c.pan[1]) / c.zoom,
-                        ];
-                        if let Some(icon) = select_cursor(&self.tool.select, local, c) {
-                            ctx.set_cursor_icon(icon);
-                        }
-                    }
-                }
-            }
-
-            // ---- Dispatch pen events (window-client → canvas-local) -----
-            // Apply the canvas's pan + zoom + the canvas-rect offset to each
-            // sample, then dispatch into the active tool. Suppressed when
-            // Space is held so a pan gesture doesn't leave ink behind.
             //
-            // Also block dispatch when the pen is touching a floating UI
-            // layer (toolbar, settings popup, color picker). Wintab does
-            // not flow through the egui pointer, so the usual
-            // "click-through ignored on widgets" behaviour does not kick
-            // in automatically — we have to compare the pen position
-            // against `ctx.layer_id_at` ourselves. Block on a UI Down
-            // and stay blocked until the next Up so the gesture cannot
-            // accidentally start a stroke half-way through tapping a
-            // menu item.
-            // The tablet driver's synthetic mouse press can reach us a frame
-            // before the pen's own packet does. If the mouse path began a
-            // gesture for it, drop that now — the pen events below are the
-            // real thing, and the stroke must not be drawn twice.
-            if !pen_events.is_empty() && self.mouse_gesture {
-                self.tool.cancel();
-                self.eraser_override.cancel();
-                self.mouse_gesture = false;
-                self.pen_using_eraser = false;
-            }
-            if !space_held && self.loupe.is_none() && self.region_select.is_none() {
-                // Mirror the current tool's size onto the eraser
-                // override so the temporary erase uses the same brush
-                // size as the active pen — feels natural while letting
-                // the user keep their pen tool selected.
-                self.eraser_override.size  = self.tool.size;
-                self.eraser_override.color = self.tool.color;
-
-                let ctrl_held  = ctx.input(|i| i.modifiers.ctrl);
-                let shift_held = ctx.input(|i| i.modifiers.shift);
-                // In the Select tool Shift means "add to / remove from
-                // the selection" (and "snap rotation"), and Ctrl is left
-                // for the copy / duplicate chords — so neither the
-                // Shift colour-pick nor the Ctrl eraser applies there.
-                // The `I` eyedropper still works.
-                let select_active = self.tool.kind == crate::tools::ToolKind::Select;
-                self.tool.select.shift = shift_held;
-
-                // Shift-pick: while Shift is held over the canvas, give the
-                // user a crosshair so they know the next tap will sample a
-                // pixel instead of drawing ink. Toolbar / popups stay
-                // visible — `set_cursor_icon` does not affect drawing
-                // dispatch on its own, only the OS cursor glyph.
-                if shift_held && !select_active && !self.pen_blocked {
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-                }
-
-                for ev in &pen_events {
-                    let s = match ev {
-                        PenEvent::Down(s) | PenEvent::Move(s) | PenEvent::Up(s) => *s,
-                    };
-                    let pen_pos = egui::pos2(s.pos[0], s.pos[1]);
-                    let on_ui = ctx.layer_id_at(pen_pos)
-                        .map(|l| l.order > egui::Order::Background)
-                        .unwrap_or(false);
-                    match ev {
-                        PenEvent::Down(_) => {
-                            if on_ui {
-                                self.pen_blocked = true;
-                                continue;
-                            }
-                            // Wintab runs a *system* context, so it hands
-                            // us pen-down packets even when the tip is over
-                            // another app's window — OSN is not
-                            // always-on-top, so another window may sit
-                            // above it (or we may be in Alt-passthrough).
-                            // Without this guard every such tap falls
-                            // through to `reclaim_foreground` below and
-                            // yanks focus back to OSN: the user clicks a
-                            // different app with the pen and OSN keeps
-                            // stealing focus. Compare the top-level window
-                            // under the pen tip against our own HWND; if
-                            // it's a real, different window the user is
-                            // drawing/clicking *there*, so swallow the
-                            // whole gesture (Move + Up too, via
-                            // `pen_blocked`) and don't reclaim.
-                            let sx = client_origin[0] + s.pos[0] as i32;
-                            let sy = client_origin[1] + s.pos[1] as i32;
-                            let win_under = crate::platform::top_level_window_at(sx, sy);
-                            if win_under != 0 && win_under != self.osn_hwnd {
-                                self.pen_blocked = true;
-                                continue;
-                            }
-                            self.pen_blocked = false;
-                            // Pen landed on the canvas — the user wants
-                            // to draw in OSN. If a prior click-through
-                            // had handed the foreground to another app,
-                            // reclaim it so keyboard shortcuts (P, B,
-                            // T…) keep flowing here. No-op on non-Win
-                            // targets and when OSN is already foreground.
-                            crate::platform::reclaim_foreground(self.osn_hwnd);
-                            // Shift-pick wins over the eraser modifier:
-                            // sample the pixel at the pen tip on Down,
-                            // set the pen colour, and lock the rest of
-                            // the gesture out of dispatch.
-                            if (shift_held && !select_active) || self.tool.eyedropper_pending {
-                                self.pen_picking = true;
-                                let sx = client_origin[0] + s.pos[0] as i32;
-                                let sy = client_origin[1] + s.pos[1] as i32;
-                                if let Some(c) = crate::input::picker::pick_screen_color(sx, sy) {
-                                    self.tool.color = c;
-                                }
-                                // One-shot eyedropper: clear the pending
-                                // flag so the next click draws normally.
-                                self.tool.eyedropper_pending = false;
-                                continue;
-                            }
-                            self.pen_picking = false;
-                            // Lock the dispatch target for the rest of
-                            // this gesture: if Ctrl was held at Down,
-                            // route every Move + Up to the eraser
-                            // override regardless of Ctrl state later.
-                            self.pen_using_eraser = ctrl_held && !select_active;
-                        }
-                        PenEvent::Move(_) => {
-                            if self.pen_blocked || self.pen_picking { continue; }
-                        }
-                        PenEvent::Up(_) => {
-                            if self.pen_blocked {
-                                self.pen_blocked = false;
-                                continue;
-                            }
-                            if self.pen_picking {
-                                self.pen_picking = false;
-                                continue;
-                            }
-                        }
-                    }
-                    let dispatched = transform_pen_event(*ev, canvas_rect, self.canvases.active());
-                    let target_tool: &mut ActiveTool = if self.pen_using_eraser {
-                        &mut self.eraser_override
-                    } else {
-                        &mut self.tool
-                    };
-                    self.canvases.edit_active(|c| crate::input::pen::dispatch(dispatched, target_tool, c));
-                    if matches!(ev, PenEvent::Up(_)) {
-                        // Gesture done — release the lock so the next
-                        // Down can re-evaluate Ctrl state.
-                        self.pen_using_eraser = false;
-                    }
-                }
-            }
-
-            // ---- Mouse ----------------------------------------------------
-            // The mouse draws whenever the pen is not the one driving the
-            // pointer. A tablet driver moves the system cursor and presses
-            // the left button on the pen's behalf, so while the pen is
-            // down, or was used a moment ago, those synthetic mouse
-            // events must be ignored or every pen stroke would be drawn
-            // twice. With the pen out of range — or no tablet at all —
-            // the mouse has the canvas to itself.
+            // On a slide that takes no edits (locked, or still opening) a
+            // plain drag pans too. The laser and the spotlight still work
+            // on a locked slide: they never change it.
+            let editable = self.canvases.active_editable();
+            let passive_tool = matches!(self.tool.kind, crate::tools::ToolKind::Laser | crate::tools::ToolKind::Spotlight);
+            let tool_works_here = editable || (passive_tool && self.canvases.opening().is_none());
+            let drag_pans = space_held || !tool_works_here;
             let pen_owns_pointer = !pen_events.is_empty()
                 || self.pen.is_down()
                 || self.pen.used_within(PEN_OWNS_POINTER);
-            if !space_held && !pen_owns_pointer && !click_through_now
-                && self.region_select.is_none() && self.loupe.is_none()
-            {
-                let (shift_held, ctrl_held, primary_now, cursor) = ctx.input(|i| {
-                    (
-                        i.modifiers.shift,
-                        i.modifiers.ctrl || i.modifiers.command,
-                        i.pointer.primary_down(),
-                        i.pointer.hover_pos().or(i.pointer.interact_pos()),
-                    )
-                });
-                // Same rule as the pen path: Shift belongs to the Select
-                // tool while it is active.
-                let select_active = self.tool.kind == crate::tools::ToolKind::Select;
-                self.tool.select.shift = shift_held;
-                // Shift + click = colour pick. Resolve here so the
-                // sampling click does not also start a stroke.
-                let picking = (shift_held && !select_active) || self.tool.eyedropper_pending;
-                if picking {
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-                }
-                if picking && primary_now && !self.mouse_was_down {
-                    if let Some(p) = cursor {
-                        let ppp = ctx.pixels_per_point();
-                        let sx = client_origin[0] + (p.x * ppp) as i32;
-                        let sy = client_origin[1] + (p.y * ppp) as i32;
-                        if let Some(c) = crate::input::picker::pick_screen_color(sx, sy) {
-                            self.tool.color = c;
-                        }
-                    }
-                    // One-shot eyedropper: clear after a successful pick.
-                    self.tool.eyedropper_pending = false;
-                    // Mark down so the next frame's still-held click
-                    // does not trigger a stroke or a second pick.
-                    self.mouse_was_down = true;
-                }
-                if !primary_now && !self.mouse_gesture {
-                    self.mouse_was_down = false;
-                }
-                if picking {
-                    // Skip the rest of the mouse-drawing path entirely
-                    // while picking; otherwise a release would synthesise
-                    // a pen-up event over the freshly picked colour.
-                } else if let Some(p) = cursor {
-                    let cursor_screen = [
-                        (p.x - canvas_rect.min.x).max(0.0),
-                        (p.y - canvas_rect.min.y).max(0.0),
-                    ];
-                    if let Some(ev) = interaction::mouse_to_pen_event(
-                        primary_now,
-                        &mut self.mouse_was_down,
-                        cursor_screen,
-                        self.canvases.active(),
-                    ) {
-                        if matches!(ev, PenEvent::Down(_)) {
-                            // A press on the toolbar, the layer panel or a
-                            // popup is a click on that widget, not ink on
-                            // the canvas underneath it. Decided once at
-                            // press; the rest of the drag follows it.
-                            let on_ui = toolbar_clicked
-                                || ctx
-                                    .layer_id_at(p)
-                                    .map(|l| l.order > egui::Order::Background)
-                                    .unwrap_or(false);
-                            self.mouse_gesture = !on_ui;
-                            if self.mouse_gesture {
-                                // Same reasons as the pen path: keep
-                                // keyboard shortcuts flowing here, and
-                                // let Ctrl turn this drag into an erase.
-                                crate::platform::reclaim_foreground(self.osn_hwnd);
-                                self.pen_using_eraser = ctrl_held && !select_active;
-                            }
-                        }
-                        if self.mouse_gesture {
-                            let target_tool: &mut ActiveTool = if self.pen_using_eraser {
-                                &mut self.eraser_override
-                            } else {
-                                &mut self.tool
-                            };
-                            self.canvases.edit_active(|c| crate::input::pen::dispatch(ev, target_tool, c));
-                            if matches!(ev, PenEvent::Up(_)) {
-                                self.mouse_gesture = false;
-                                self.pen_using_eraser = false;
-                            }
-                        }
-                    }
-                }
-            } else if !self.mouse_gesture {
-                // Someone else has the pointer. Follow the button so that
-                // when the mouse gets it back, drawing needs a fresh
-                // press rather than picking up one that was never its
-                // own (the pen's synthetic press, a pan drag…). A mouse
-                // drag that is merely paused — Space held mid-stroke —
-                // keeps its state so its release still ends the stroke.
-                self.mouse_was_down = ctx.input(|i| i.pointer.primary_down());
-            }
+            self.drag_pan(ctx, &pen_events, client_origin, drag_pans, space_held, editable, pen_owns_pointer, toolbar_clicked, canvas_rect);
 
-            // ---- Middle-button pan ----------------------------------------
-            // Middle drag pans the viewport without touching the keyboard.
-            // Drawing only reads the primary button, so the two never
-            // compete. Runs after the tool cursors above so the grab hand
-            // wins. Space owns the pan while held; a press on the toolbar
-            // or a popup is not a pan.
-            let (middle_down, middle_pressed, cursor) = ctx.input(|i| {
-                (
-                    i.pointer.middle_down(),
-                    i.pointer.button_pressed(egui::PointerButton::Middle),
-                    i.pointer
-                        .hover_pos()
-                        .or(i.pointer.interact_pos())
-                        .or(i.pointer.latest_pos()),
-                )
-            });
-            if !middle_down || space_held || click_through_now
-                || self.loupe.is_some() || self.region_select.is_some()
-            {
-                self.middle_pan_anchor = None;
-            } else if let Some(p) = cursor {
-                match self.middle_pan_anchor {
-                    Some(anchor) => self.apply_pan_delta(p.x - anchor.x, p.y - anchor.y),
-                    None if middle_pressed => {
-                        let on_ui = ctx
-                            .layer_id_at(p)
-                            .map(|l| l.order > egui::Order::Background)
-                            .unwrap_or(false);
-                        if !on_ui {
-                            self.begin_pan_gesture(false);
-                            self.middle_pan_anchor = Some(p);
-                        }
-                    }
-                    None => {}
-                }
-                if self.middle_pan_anchor.is_some() {
-                    self.middle_pan_anchor = Some(p);
-                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                }
-            }
+            self.dispatch_pen(ctx, &pen_events, client_origin, drag_pans, editable, canvas_rect);
 
-            // ---- Deferred flood-fill --------------------------------------
-            // The Fill tool's pen-down arms `tool.pending_fill_at`; we
-            // run the actual flood here so it has access to the
-            // viewport size + DPI.
-            if let Some(p) = self.tool.pending_fill_at.take() {
-                let viewport = [canvas_rect.width(), canvas_rect.height()];
-                let ppp = ctx.pixels_per_point();
-                let result = crate::flood_fill::flood_fill_active(
-                    self.canvases.active(),
-                    p,
-                    self.tool.color,
-                    viewport,
-                    ppp,
-                );
-                match result {
-                    crate::flood_fill::FillResult::Filled(shape) => {
-                        self.canvases.active_mut().add_shape(shape);
-                    }
-                    crate::flood_fill::FillResult::OpenRegion => {
-                        self.toast = Some((
-                            "Fill cancelled: no closed region under cursor".to_string(),
-                            std::time::Instant::now(),
-                        ));
-                    }
-                    crate::flood_fill::FillResult::Empty => {}
-                }
-            }
+            self.dispatch_mouse(ctx, client_origin, drag_pans, pen_owns_pointer, editable, toolbar_clicked, canvas_rect);
 
-            // ---- Deferred lasso-select capture ----------------------------
-            // The Lasso-Select tool stashes the closed polygon on pen-up;
-            // run the (chrome-hidden) screen capture here where the HWND +
-            // DPI are available, then insert the masked region as a bottom
-            // image layer.
-            if let Some(poly) = self.tool.pending_lasso_capture.take() {
-                self.queue_lasso_capture(poly, ctx.pixels_per_point());
-            }
+            self.middle_button_pan(ctx, space_held);
 
-            // ---- Keyboard shortcuts --------------------------------------
-            // Both Ctrl+0 (reset view) and Ctrl+Shift+F (freeze frame)
-            // used to be matched via `ctx.input_mut(consume_shortcut)`
-            // with hardcoded `KeyboardShortcut::new` values. They now
-            // come from `HotkeysConfig`, so we build the shortcut from
-            // the parsed binding and feed it to the same consumer —
-            // egui still does the atomic modifier+key match for us.
-            //
-            // `reset_layer_pos` (Ctrl+Shift+0) is tested *before*
-            // `reset_view` (Ctrl+0) and deliberately so: `consume_shortcut`
-            // matches modifiers logically, i.e. a held Shift does not
-            // disqualify a Ctrl-only pattern. Checking Ctrl+0 first would
-            // let it swallow Ctrl+Shift+0 and reset the view instead.
-            //
-            // Layer pans are baked into the geometry, so "reset" is just
-            // a move by the negated running total — which also means it
-            // lands in the undo history like any other move.
-            if let Some(b) = self.hotkeys_cfg.canvas.reset_layer_pos {
-                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
-                    let c = self.canvases.active_mut();
-                    let li = c.active_layer;
-                    if let Some(m) = c.layers.get(li).map(|l| l.moved_by) {
-                        c.move_layer_by(li, [-m[0], -m[1]]);
-                    }
-                }
-            }
-            // Layer zooms bake into the geometry the same way pans do,
-            // so "reset" divides the running total back out. The pivot
-            // is the layer's own bounding-box centre, which keeps the
-            // layer where the user can see it — scaling about the
-            // canvas origin instead would fling a far-from-origin layer
-            // off-screen. `moved_by` is rewritten by the same maths, so
-            // a later `reset_layer_pos` still lands on the layer's
-            // original coordinates exactly.
-            if let Some(b) = self.hotkeys_cfg.canvas.reset_layer_zoom {
-                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
-                    let c = self.canvases.active_mut();
-                    let li = c.active_layer;
-                    if let Some(layer) = c.layers.get(li) {
-                        let a = layer.scaled_by;
-                        if a > 1e-6 && (a - 1.0).abs() > 1e-6 {
-                            let pivot = layer
-                                .content_bounds()
-                                .map(|bb| [(bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5])
-                                .unwrap_or([0.0, 0.0]);
-                            c.scale_layer_about(li, 1.0 / a, pivot);
-                        }
-                    }
-                }
-            }
-            if let Some(b) = self.hotkeys_cfg.canvas.reset_view {
-                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
-                    let (pan, zoom) = self.canvases.active_view_mut();
-                    *zoom = 1.0;
-                    *pan  = [0.0, 0.0];
-                }
-            }
-            if let Some(b) = self.hotkeys_cfg.canvas.freeze_frame {
-                let sc = egui::KeyboardShortcut::new(b.to_modifiers(), b.key);
-                if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
-                    self.queue_freeze(ctx.pixels_per_point());
-                }
-            }
+            self.run_deferred_tools(ctx, canvas_rect);
 
-            // Text tool steals keyboard input while a caret is open.
-            // Returns true when the events were consumed — in that
-            // case we skip the tool-shortcut / undo / canvas-nav
-            // dispatcher so typing "t" / "Ctrl+Z" lands in the label,
-            // not as a tool change or an undo.
-            let text_consumed = interaction::route_text_input(ctx, &mut self.tool, &mut self.canvases);
+            let keys = self.take_keys(ctx, &slides, space_held, canvas_rect);
 
-            // Select-tool commands found in this frame's events. They
-            // are only collected inside the input closure and run after
-            // it, because several of them need `&mut self` as a whole.
-            let mut sel_actions: Vec<SelAction> = Vec::new();
-            // Play / step keys, applied after the input closure. Not while
-            // a text field has the keyboard.
-            let mut media_keys: Vec<crate::media::Cmd> = Vec::new();
-            let media_keys_live = !ctx.wants_keyboard_input();
+            self.run_keys(ctx, keys, slides, canvas_rect, &media_objs, media_selected);
 
-            ctx.input(|i| {
-                let mods = i.modifiers;
-                // Locals retained for the scroll handler below, which
-                // takes raw bools (not Modifiers).
-                let ctrl  = mods.ctrl || mods.command;
-                let shift = mods.shift;
-                if text_consumed {
-                    // Still allow scroll-wheel events (handled below
-                    // outside this for-loop) but drop key events.
-                    // Falling through to the wheel block below means
-                    // we skip the per-event match by emptying the
-                    // iterator.
-                    return;
-                }
-                let keys = &self.hotkeys_cfg;
-                for ev in &i.events {
-                    match ev {
-                        // egui-winit swallows the Ctrl+C / X / V key
-                        // presses and hands us these instead.
-                        egui::Event::Copy => sel_actions.push(SelAction::Copy),
-                        egui::Event::Cut => sel_actions.push(SelAction::Cut),
-                        egui::Event::Paste(text) if text == CLIP_MARKER => {
-                            sel_actions.push(SelAction::PasteObjects);
-                        }
-                        // Elsewhere there is no key-state fallback (see
-                        // `platform::paste_chord_down`), so a paste of
-                        // anything that is not our own marker is the
-                        // only cue to look for an image.
-                        #[cfg(not(target_os = "windows"))]
-                        egui::Event::Paste(_) => sel_actions.push(SelAction::PasteImage),
-                        egui::Event::Key { key, pressed: true, .. } => {
-                            let c = &keys.canvas;
-                            let hit = |b: Option<crate::input::hotkeys_config::Binding>| {
-                                b.is_some_and(|b| b.matches(*key, mods))
-                            };
-                            // Plain Backspace doubles as Delete: on a
-                            // tablet-side keyboard it is the nearer key.
-                            let bare_backspace = *key == egui::Key::Backspace
-                                && !(mods.ctrl || mods.command || mods.shift || mods.alt);
-                            if hit(c.delete_selection) || bare_backspace {
-                                sel_actions.push(SelAction::Delete);
-                            } else if hit(c.duplicate) {
-                                sel_actions.push(SelAction::Duplicate);
-                            } else if hit(c.copy_to_new_slide) {
-                                sel_actions.push(SelAction::CopyToNewSlide);
-                            } else if hit(c.bring_front) {
-                                sel_actions.push(SelAction::ToFront);
-                            } else if hit(c.send_back) {
-                                sel_actions.push(SelAction::ToBack);
-                            }
-                            if media_keys_live {
-                                if hit(c.media_play_pause) {
-                                    media_keys.push(crate::media::Cmd::TogglePlay);
-                                } else if hit(c.media_prev_frame) {
-                                    media_keys.push(crate::media::Cmd::Step(-1));
-                                } else if hit(c.media_next_frame) {
-                                    media_keys.push(crate::media::Cmd::Step(1));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    if let egui::Event::Key { key, pressed: true, .. } = ev {
-                        // Tool switch shortcuts.
-                        interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
-                        // Every key passes through here: only an edit may
-                        // flag the slide for the autosave.
-                        self.canvases.edit_active(|c| interaction::react_lasso_keys(*key, mods, &mut self.tool, c));
-                        // Canvas + layer navigation.
-                        interaction::react_canvas_nav(*key, mods, &mut self.canvases, keys);
-                        interaction::react_layer_nav (*key, mods, &mut self.canvases, keys);
-                        // Toggle floating UI chrome.
-                        if let Some(b) = keys.canvas.toggle_ui {
-                            if b.matches(*key, mods) {
-                                self.ui_visible = !self.ui_visible;
-                            }
-                        }
-                        // Undo / redo / clear / delete-canvas.
-                        if let Some(b) = keys.canvas.undo {
-                            if b.matches(*key, mods) {
-                                self.canvases.active_mut().undo();
-                                // The entry a size-slider run was being
-                                // folded into may be gone now.
-                                self.restyle_run = None;
-                            }
-                        }
-                        if let Some(b) = keys.canvas.redo {
-                            if b.matches(*key, mods) {
-                                self.canvases.active_mut().redo();
-                                self.restyle_run = None;
-                            }
-                        }
-                        if let Some(b) = keys.canvas.clear_layer {
-                            if b.matches(*key, mods) { self.canvases.active_mut().clear(); }
-                        }
-                        if let Some(b) = keys.canvas.delete_canvas {
-                            if b.matches(*key, mods) { self.canvases.delete_active(); }
-                        }
-                        // Layer opacity: 1..9 set absolute N·10 %,
-                        // 0 sets 0 %. `-` / `=` step ±10 %. All
-                        // clamped to [0, 1]. Default bindings live in
-                        // `HotkeysConfig::CanvasSection::opacity_*`.
-                        for (n, b) in keys.canvas.opacity.iter().enumerate() {
-                            if let Some(b) = b {
-                                if b.matches(*key, mods) {
-                                    let v = (n as f32) * 0.10;
-                                    let c = self.canvases.active_mut();
-                                    c.active_layer_mut().opacity = v;
-                                    c.mark_dirty();
-                                }
-                            }
-                        }
-                        if let Some(b) = keys.canvas.opacity_dec {
-                            if b.matches(*key, mods) {
-                                let c = self.canvases.active_mut();
-                                let l = c.active_layer_mut();
-                                l.opacity = (l.opacity - 0.10).clamp(0.0, 1.0);
-                                c.mark_dirty();
-                            }
-                        }
-                        if let Some(b) = keys.canvas.opacity_inc {
-                            if b.matches(*key, mods) {
-                                let c = self.canvases.active_mut();
-                                let l = c.active_layer_mut();
-                                l.opacity = (l.opacity + 0.10).clamp(0.0, 1.0);
-                                c.mark_dirty();
-                            }
-                        }
-                        if let Some(b) = keys.canvas.preview_layer {
-                            if b.matches(*key, mods) {
-                                self.show_layer_preview = !self.show_layer_preview;
-                            }
-                        }
-                    }
-                }
-                // Scroll wheel — count discrete notches per frame.
-                //
-                // We must NOT use `smooth_scroll_delta` or `zoom_delta`
-                // here: both accumulate across frames during egui's
-                // smooth-scroll animation, so a single wheel click
-                // ends up firing the handler 10-30 times → the user
-                // sees one click jump bg_opacity from 0 to 1.
-                //
-                // `Event::MouseWheel` is fired exactly once per real
-                // wheel event by the windowing backend, with the
-                // user's actual modifier state attached. Summing the
-                // *signs* gives an integer notch count immune to
-                // platform-specific unit/magnitude differences (Line
-                // vs Point, ±1 vs ±120).
-                let mut notches: i32 = 0;
-                let mut raw_delta_y: f32 = 0.0;
-                for ev in &i.events {
-                    if let egui::Event::MouseWheel { delta, modifiers, .. } = ev {
-                        raw_delta_y += delta.y;
-                        if delta.y > 0.0 { notches += 1; }
-                        else if delta.y < 0.0 { notches -= 1; }
-                        let _ = modifiers; // documented use
-                    }
-                }
-                // Also pull egui's accumulated zoom-delta. Trackpad
-                // pinches and `Ctrl+wheel` smooth-scroll feed this
-                // each frame even when no discrete MouseWheel
-                // event fires — including it keeps zoom truly
-                // realtime on hi-res input devices.
-                let zoom_delta_extra = i.zoom_delta();
-                if (zoom_delta_extra - 1.0).abs() > 1e-4 {
-                    // Convert multiplicative zoom factor into a
-                    // wheel-delta equivalent matching the 1.10× /
-                    // unit mapping used inside `handle_scroll`.
-                    raw_delta_y += zoom_delta_extra.ln() / 1.10_f32.ln();
-                }
-                if notches != 0 || raw_delta_y.abs() > 1e-4 {
-                    if let Some(l) = self.loupe.as_mut() {
-                        if notches != 0 {
-                            l.zoom = (l.zoom + notches as f32 * 0.25).clamp(1.5, 12.0);
-                        }
-                    } else if space_held && shift {
-                        // Shift+Space + wheel zooms the *active layer*
-                        // about the cursor — the wheel counterpart of
-                        // the Shift+Space drag that pans it. Same
-                        // 1.10×-per-raw-unit feel as the canvas zoom so
-                        // one notch is ≈ ±10 % either way.
-                        if raw_delta_y.abs() >= 0.001 {
-                            let c = self.canvases.active();
-                            let cursor = i.pointer.hover_pos().unwrap_or_default();
-                            let pivot = [
-                                ((cursor.x - canvas_rect.min.x) - c.pan[0]) / c.zoom,
-                                ((cursor.y - canvas_rect.min.y) - c.pan[1]) / c.zoom,
-                            ];
-                            self.apply_layer_zoom(1.10_f32.powf(raw_delta_y), pivot);
-                        }
-                    } else {
-                        let cursor = i.pointer.hover_pos().unwrap_or_default();
-                        let cursor_screen = [
-                            (cursor.x - canvas_rect.min.x).max(0.0),
-                            (cursor.y - canvas_rect.min.y).max(0.0),
-                        ];
-                        interaction::zoom_pan::handle_scroll(
-                            notches,
-                            raw_delta_y,
-                            cursor_screen,
-                            ctrl,
-                            shift,
-                            &mut self.tool,
-                            &mut self.canvases,
-                            &mut self.config.bg_opacity,
-                        );
-                    }
-                }
-            });
-
-            // ---- Select-tool commands -----------------------------------
-            // Ctrl+V with only an image on the clipboard produces no egui
-            // event at all, so watch the physical chord for that case.
-            // When the clipboard holds our own marker text this fires
-            // alongside `PasteObjects` and finds no image — harmless.
-            let chord = crate::platform::paste_chord_down() && ctx.input(|i| i.focused);
-            if chord && !self.paste_chord_prev && !text_consumed {
-                sel_actions.push(SelAction::PasteImage);
-            }
-            self.paste_chord_prev = chord;
-            if !sel_actions.is_empty() {
-                let ppp = ctx.pixels_per_point();
-                for action in sel_actions {
-                    self.apply_sel_action(action, canvas_rect, ppp);
-                }
-            }
-            if !media_keys.is_empty() {
-                let pointer = ctx.input(|i| i.pointer.hover_pos());
-                if let Some(id) = ui::media_controls::hotkey_target(&media_objs, media_selected, pointer) {
-                    for cmd in media_keys {
-                        self.media.command(id, cmd);
-                    }
-                }
-            }
-
-            // ---- Status badge + layer panel ------------------------------
-            // Both hide when the master UI toggle is off.
-            if self.ui_visible {
-                ui::status::show(
-                    ctx,
-                    self.canvases.active_index(),
-                    self.canvases.count(),
-                    click_through_now,
-                    self.pen.is_active(),
-                );
-                let canvas_idx = self.canvases.active_index();
-                // Pass the manager, not `active_mut()`: taking the mutable
-                // canvas borrow every frame just to paint would flag it
-                // dirty ~60×/s and put the autosave back into a permanent
-                // rewrite loop. The panel takes it only on a real click.
-                ui::layer_panel::show(
-                    ctx,
-                    &mut self.overlay_cache,
-                    canvas_idx,
-                    &mut self.canvases,
-                );
-            }
-            // Layer preview popup — large centred thumbnail of the
-            // active layer. Toggled by the `canvas.preview_layer`
-            // hotkey (`q` by default). Esc closes (handled earlier in
-            // this frame).
-            if self.show_layer_preview {
-                let canvas_idx = self.canvases.active_index();
-                let active_li = self.canvases.active().active_layer;
-                let layer_clone = self.canvases.active().layers[active_li].clone();
-                let tex = self.overlay_cache.ensure_layer_thumb(
-                    ctx, canvas_idx, active_li, &layer_clone,
-                );
-                let screen = ctx.screen_rect();
-                egui::Area::new(egui::Id::new("osn_layer_preview_popup"))
-                    .fixed_pos(egui::pos2(
-                        screen.center().x - 260.0,
-                        screen.center().y - 220.0,
-                    ))
-                    .show(ctx, |ui| {
-                        egui::Frame {
-                            inner_margin: egui::Margin::same(12.0),
-                            outer_margin: egui::Margin::ZERO,
-                            rounding: egui::Rounding::same(12.0),
-                            shadow: ui::theme::card_shadow(),
-                            fill: ui::theme::GLASS_FILL,
-                            stroke: egui::Stroke::NONE,
-                        }
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Layer {} — {} strokes · {} shapes",
-                                    active_li + 1,
-                                    layer_clone.strokes.len(),
-                                    layer_clone.shapes.len(),
-                                ))
-                                .color(ui::theme::TEXT_PRIMARY),
-                            );
-                            ui.add_space(6.0);
-                            match tex {
-                                Some(tex_id) => {
-                                    let size = egui::Vec2::new(480.0, 360.0);
-                                    ui.add(
-                                        egui::Image::new((tex_id, size))
-                                            .fit_to_exact_size(size),
-                                    );
-                                }
-                                None => {
-                                    ui.label(
-                                        egui::RichText::new("(empty layer)")
-                                            .color(ui::theme::TEXT_MUTED),
-                                    );
-                                }
-                            }
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("Esc or hotkey to close")
-                                    .small()
-                                    .color(ui::theme::TEXT_MUTED),
-                            );
-                        });
-                    });
-            }
+            self.show_layer_panel(ctx);
         }
 
         // ---- Sync last-used tool state into persistent config ------------
@@ -3012,61 +1105,11 @@ impl eframe::App for OnScreenNotesApp {
         self.config.default_pen_size  = self.tool.size;
         self.config.default_stroke_style = self.tool.style;
 
-        // ---- Recording indicator + toast ---------------------------------
-        // REC dot painted while capturing. We use a tiny floating
-        // Area in the top-left so the user always knows the recorder
-        // is on, even with `ui_visible = false`. Pen events pass
-        // through it (the area is render-only).
-        if self.recorder.is_recording() {
-            let elapsed = self.recorder.elapsed().as_secs();
-            egui::Area::new(egui::Id::new("osn_rec_indicator"))
-                .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
-                .interactable(false)
-                .show(ctx, |ui| {
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140))
-                        .rounding(6.0)
-                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                // Pulsing red dot — alpha modulated by
-                                // the system clock so it reads as "live".
-                                let pulse = {
-                                    let ms = ctx.input(|i| i.time);
-                                    (((ms * 2.0).sin() * 0.5 + 0.5) * 255.0) as u8
-                                };
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(10.0, 10.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().circle_filled(
-                                    rect.center(),
-                                    4.5,
-                                    egui::Color32::from_rgba_unmultiplied(232, 71, 71, pulse),
-                                );
-                                ui.label(format!("REC  {elapsed:02}s  · Ctrl+Shift+R stop"));
-                            });
-                        });
-                });
-        }
-        // Toast — clears after 5 s.
-        if let Some((msg, t)) = self.toast.clone() {
-            if t.elapsed() > Duration::from_secs(5) {
-                self.toast = None;
-            } else {
-                egui::Area::new(egui::Id::new("osn_toast"))
-                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
-                    .interactable(false)
-                    .show(ctx, |ui| {
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220))
-                            .rounding(8.0)
-                            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                            .show(ui, |ui| {
-                                ui.label(msg);
-                            });
-                    });
-            }
+        self.show_rec_and_toast(ctx);
+
+        // ---- Slide loading bar + lock badge ------------------------------
+        if self.overlay_visible {
+            self.show_slide_status(ctx);
         }
 
         // ---- Laser-stroke pruning ----------------------------------------
@@ -3080,61 +1123,11 @@ impl eframe::App for OnScreenNotesApp {
                 .retain(|(_, up_at)| up_at.elapsed().as_secs_f32() < fade);
         }
 
-        // ---- Auto-save (debounced) ---------------------------------------
-        // Bumped from 1500 ms to 5000 ms because the save itself is
-        // now (a) background-threaded, (b) dirty-gated so most ticks
-        // are no-ops, and (c) using compact RON. Worst-case data loss
-        // on a crash is now 5 s instead of 1.5 s — acceptable for an
-        // annotation tool, and the UI stays smooth even with 9+
-        // PNG-bearing canvases.
-        if self.last_save_at.elapsed() > Duration::from_millis(5000) {
-            // Media the in-app clipboard holds must survive a slide
-            // delete; while an import or a board is being opened (its
-            // pictures may be files a deleted slide also used), media
-            // cleanup waits.
-            let clipboard_media: std::collections::HashSet<String> = self
-                .obj_clipboard
-                .1
-                .iter()
-                .filter_map(|s| s.media_file().map(str::to_string))
-                .collect();
-            let media_in_use = (self.media_imports.is_empty() && self.pureref_jobs.is_empty()).then_some(&clipboard_media);
-            self.canvases.save_all(media_in_use);
-            if let Err(e) = crate::persistence::save_config(&self.config) {
-                log::warn!("config save failed: {e}");
-            }
-            // The overlay may have moved to another monitor.
-            self.idle_frame = refresh_period(self.osn_hwnd);
-            self.last_save_at = Instant::now();
-        }
+        self.show_slide_window(ctx, space_held);
 
-        // Always request the next frame: pen events come from a polled
-        // Wintab queue and global hotkeys are polled too, so frames have
-        // to keep coming even when nothing on screen changes.
-        //   * While the pen is in range or anything is in motion, at
-        //     once. `request_repaint()` with no delay is what minimises
-        //     pen-to-pixel latency — with Mailbox present mode each
-        //     refresh shows the newest frame.
-        //   * Otherwise as `next_frame_in` paces them: per refresh while
-        //     the pen is in range or something moves, at a GIF's or
-        //     video's own frame times, else a slow idle tick. Uncapped,
-        //     an idle overlay drew 1000+ fps; at the refresh rate it
-        //     still kept the GPU a quarter busy redrawing an unchanged
-        //     window. The slow pace still drains Wintab well before a pen
-        //     coming into range touches down (its driver moves the mouse
-        //     too, which wakes egui at once), runs toasts and other
-        //     timers, and input events still repaint immediately.
-        match self.next_frame_in(ctx) {
-            None => ctx.request_repaint(),
-            Some(wait) => {
-                // egui takes `predicted_dt` (1/60 s unless set) off every
-                // delay to aim for the frame *before* the deadline, which
-                // turns a one-refresh delay into no delay at all. Add it
-                // back.
-                let predicted = Duration::try_from_secs_f32(ctx.input(|i| i.predicted_dt)).unwrap_or_default();
-                ctx.request_repaint_after(wait + predicted);
-            }
-        }
+        self.autosave();
+
+        self.request_next_frame(ctx);
     }
 
     /// Save state on graceful exit so nothing is lost.
@@ -3148,6 +1141,15 @@ impl eframe::App for OnScreenNotesApp {
         if let Err(e) = crate::persistence::save_config(&self.config) {
             log::warn!("config save on exit failed: {e}");
         }
+    }
+}
+
+/// A file size for the user: "1.3 GB", "540 MB".
+fn size_label(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 10 << 20 => format!("{} MB", b >> 20),
+        b => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
     }
 }
 
@@ -3184,6 +1186,49 @@ fn transform_pen_event(
 }
 
 
+/// Nearest of the four resize cursors to the on-screen direction
+/// (radians, y down) a handle pulls in, which follows a turned frame.
+fn resize_cursor(direction: f32) -> egui::CursorIcon {
+    use egui::CursorIcon as C;
+    let deg = direction.to_degrees().rem_euclid(180.0);
+    if !(22.5..157.5).contains(&deg) {
+        C::ResizeHorizontal
+    } else if deg < 67.5 {
+        C::ResizeNwSe
+    } else if deg < 112.5 {
+        C::ResizeVertical
+    } else {
+        C::ResizeNeSw
+    }
+}
+
+/// Cursor for the Select tool over pins: what a press at `q` (points
+/// from the canvas area's top-left) would grab, or what the pin gesture
+/// in flight is doing. `None` when the pointer is over no pin.
+pub(crate) fn pin_cursor(
+    tool: &crate::canvas::pins::PinTool,
+    q: [f32; 2],
+    pins: &[crate::canvas::pins::Pinned],
+) -> Option<egui::CursorIcon> {
+    use crate::canvas::pins::PinHandle;
+    use egui::CursorIcon as C;
+    let corner = |x: i8, y: i8| {
+        let frame = tool.selected.and_then(|id| pins.iter().find(|p| p.pin.id == id)).map(|p| p.frame());
+        resize_cursor(frame.map_or(0.0, |f| (y as f32 * f.half[1]).atan2(x as f32 * f.half[0]) + f.angle))
+    };
+    if tool.busy() {
+        return Some(match tool.active_handle() {
+            Some(PinHandle::Corner { x, y }) => corner(x, y),
+            _ => C::Grabbing,
+        });
+    }
+    match tool.hover(q, pins)? {
+        Some(PinHandle::Corner { x, y }) => Some(corner(x, y)),
+        Some(PinHandle::Rotate) => Some(C::Grab),
+        None => Some(C::Move),
+    }
+}
+
 /// Cursor for the Select tool with the pointer at canvas point `p`: it
 /// previews what a press there would do (or shows what the gesture in
 /// flight is doing). `None` leaves the default arrow.
@@ -3194,20 +1239,7 @@ fn select_cursor(
 ) -> Option<egui::CursorIcon> {
     use crate::tools::select_tool::{Gesture, Handle, Hover};
     use egui::CursorIcon as C;
-    // Nearest of the four resize cursors to the direction the handle
-    // actually pulls in, which follows the frame when it is turned.
-    let resize = |x: i8, y: i8| {
-        let deg = state.handle_direction(x, y, canvas).to_degrees().rem_euclid(180.0);
-        if !(22.5..157.5).contains(&deg) {
-            C::ResizeHorizontal
-        } else if deg < 67.5 {
-            C::ResizeNwSe
-        } else if deg < 112.5 {
-            C::ResizeVertical
-        } else {
-            C::ResizeNeSw
-        }
-    };
+    let resize = |x: i8, y: i8| resize_cursor(state.handle_direction(x, y, canvas));
     match state.gesture {
         Some(Gesture::Move { .. }) | Some(Gesture::Rotate { .. }) => Some(C::Grabbing),
         Some(Gesture::Resize { x, y, .. }) => Some(resize(x, y)),

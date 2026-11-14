@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas::smoothing::SmoothingOptions;
 use crate::canvas::stroke::StrokeStyle;
+use crate::tools::arrange::PackMode;
+use crate::tools::beside::{BesideFit, BesideSide};
 
 /// Pen-input smoothing preset.
 ///
@@ -65,6 +67,17 @@ pub enum RecordingFormat {
     #[default]
     GifOnly,
     Mp4IfAvailable,
+}
+
+/// What Ctrl+Tab / Ctrl+Shift+Tab step through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SlideTabOrder {
+    /// Next / previous slide by number, wrapping round.
+    #[default]
+    Sequential,
+    /// Slides in the order they were last visited, like Alt+Tab: a tap
+    /// flips back to the previous slide, holding Ctrl goes further back.
+    RecentlyUsed,
 }
 
 /// Persistent user preferences. Changing fields here is a breaking change to
@@ -145,7 +158,51 @@ pub struct AppConfig {
     /// `media::ffmpeg`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ffmpeg_path: Option<std::path::PathBuf>,
+
+    /// The slide panel (bottom-left) is open rather than folded down to its
+    /// slide-count tab.
+    #[serde(default = "default_slide_panel_open")]
+    pub slide_panel_open: bool,
+
+    /// What Ctrl+Tab / Ctrl+Shift+Tab step through; switched from the
+    /// slide panel.
+    #[serde(default)]
+    pub slide_tab_order: SlideTabOrder,
+
+    /// The arrange bar's "keep apart" switch: aligning slides objects
+    /// until they touch instead of piling them on top of each other.
+    #[serde(default = "default_arrange_apart")]
+    pub arrange_apart: bool,
+
+    /// Shape snap: holding the pen still at the end of a stroke turns it
+    /// into the line, polygon or ellipse it was meant to be. On unless
+    /// turned off in the settings.
+    #[serde(default = "default_shape_snap")]
+    pub shape_snap: bool,
+    /// Smart guides: a selection being moved lines up with the objects
+    /// around it. On unless turned off in the settings.
+    #[serde(default = "default_shape_snap")]
+    pub smart_guides: bool,
+
+    /// How the arrange bar's Pack lays objects out: the tightest block,
+    /// rows or columns. Picked from the arrow beside it.
+    #[serde(default)]
+    pub pack_mode: PackMode,
+
+    /// A picture, GIF or video dropped, pasted or inserted while one is
+    /// selected takes its height or width (or keeps its own size, off)…
+    #[serde(default)]
+    pub beside_fit: BesideFit,
+
+    /// …and lands on this side of it.
+    #[serde(default)]
+    pub beside_side: BesideSide,
 }
+
+fn default_slide_panel_open() -> bool { true }
+
+fn default_arrange_apart() -> bool { true }
+fn default_shape_snap() -> bool { true }
 
 fn default_pressure_curve() -> f32 { 1.0 }
 
@@ -188,6 +245,14 @@ impl Default for AppConfig {
             recording_format: RecordingFormat::default(),
             smoothing: SmoothingOptions::default(),
             ffmpeg_path: None,
+            slide_panel_open: true,
+            slide_tab_order: SlideTabOrder::default(),
+            arrange_apart: true,
+            shape_snap: true,
+            smart_guides: true,
+            pack_mode: PackMode::default(),
+            beside_fit: BesideFit::default(),
+            beside_side: BesideSide::default(),
         }
     }
 }

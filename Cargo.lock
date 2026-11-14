@@ -2791,6 +2791,7 @@ dependencies = [
  "log",
  "lyon_path",
  "lyon_tessellation",
+ "memchr",
  "raw-window-handle",
  "rfd",
  "ron",

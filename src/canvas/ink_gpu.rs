@@ -200,6 +200,7 @@ fn stroke_key(s: &Stroke) -> u64 {
     h = mix(h, s.style as u64);
     h = mix(h, s.filled as u64);
     h = mix(h, s.base_width.to_bits() as u64);
+    h = mix(h, s.px.to_bits() as u64);
     h = mix(h, s.samples.len() as u64);
     if let Some(p) = s.samples.first() {
         h = mix(h, p.pos[0].to_bits() as u64 | (p.pos[1].to_bits() as u64) << 32);
@@ -300,7 +301,11 @@ pub(crate) fn enabled() -> bool {
 /// Split `strokes` into chunks and make sure each is stored, building
 /// the ones that are not. `opacity` is the layer's.
 pub(crate) fn plan_layer(ctx: &egui::Context, strokes: &[Stroke], opacity: f32) -> Vec<ChunkPlan> {
-    let frame = ctx.cumulative_pass_nr();
+    // The main window's frame count, whichever window draws: each window
+    // counts its own frames, and the store keeps one clock. The slide
+    // window draws inside the main window's frame, so the two share a
+    // number and a chunk either one drew this frame is in use.
+    let frame = ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT);
     let (fan_on, fan_step) = render::fan_corners();
     let seed = mix(mix(mix(1, opacity.to_bits() as u64), fan_on as u64), fan_step.to_bits() as u64);
     let mut st = store();
@@ -908,9 +913,18 @@ mod tests {
         assert!(!drawable(&live));
         let ctx = egui::Context::default();
         let plans = plan_layer(&ctx, &[stroke(10, StrokeStyle::Marker), filled, live], 0.5);
-        let p = &plans[0];
-        assert!(!p.all);
-        assert_eq!(p.starts[2], p.starts[1]);
-        assert_eq!(p.starts[3], p.starts[2]);
+        // Where chunks end depends on a hash of the strokes (and their
+        // cache revisions, which every test bumps), so a boundary may
+        // fall anywhere: look each stroke up in whichever chunk has it.
+        let items = |i: usize| {
+            let p = plans.iter().find(|p| p.first <= i && i < p.first + p.len).expect("every stroke is in a chunk");
+            (p.all, p.starts[i - p.first + 1] - p.starts[i - p.first])
+        };
+        assert!(items(0).1 > 0, "the marker is drawn on the GPU");
+        for i in [1, 2] {
+            let (all, n) = items(i);
+            assert_eq!(n, 0, "stroke {i} stays on egui");
+            assert!(!all, "its chunk is not all GPU");
+        }
     }
 }
