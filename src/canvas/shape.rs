@@ -55,13 +55,14 @@ pub(crate) mod tests_support {
     }
 }
 
-/// Tags as typed: separated by commas, a leading `#` dropped, inner
-/// runs of spaces made one, empty ones left out, and each once (case
-/// aside), the first spelling kept, in the order given.
+/// Tags as typed: separated by spaces or commas (a tag is one word;
+/// `walk-cycle` joins two), a leading `#` dropped, empty ones left out,
+/// and each once (case aside), the first spelling kept, in the order
+/// given.
 pub fn parse_tags(typed: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for raw in typed.split(',') {
-        let tag = raw.trim().trim_start_matches('#').split_whitespace().collect::<Vec<_>>().join(" ");
+    for raw in typed.split(|c: char| c == ',' || c.is_whitespace()) {
+        let tag = raw.trim_start_matches('#').to_string();
         if !tag.is_empty() && !out.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
             out.push(tag);
         }

@@ -64,6 +64,8 @@ pub enum KeyAction {
     TextBox,
     /// Move the active slide one place toward the first (−1) or last (+1).
     MoveSlide(i8),
+    /// Open the list of every tag.
+    TagList,
     /// Make the selection one group (`true`), or take it out of its groups.
     Group(bool),
     /// Onion skin on / off for every GIF and video.
@@ -136,6 +138,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.group, KeyAction::Group(true)),
         (c.ungroup, KeyAction::Group(false)),
         (c.move_slide_up, KeyAction::MoveSlide(-1)),
+        (c.tag_list, KeyAction::TagList),
         (c.move_slide_down, KeyAction::MoveSlide(1)),
         (c.new_slide, KeyAction::NewSlide),
         (c.toggle_slide_panel, KeyAction::ToggleSlidePanel),

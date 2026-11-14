@@ -475,7 +475,8 @@ mod tests {
     #[test]
     fn tags_are_read_as_typed() {
         use crate::canvas::shape::parse_tags;
-        assert_eq!(parse_tags(" #pose, walk   cycle,,Pose , ref "), vec!["pose", "walk cycle", "ref"]);
+        // Spaces or commas between; one word each.
+        assert_eq!(parse_tags(" #pose, walk   cycle,,Pose , ref walk-cycle"), vec!["pose", "walk", "cycle", "ref", "walk-cycle"]);
         assert!(parse_tags(" , ,").is_empty());
     }
 

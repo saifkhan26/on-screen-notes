@@ -390,6 +390,9 @@ pub struct CanvasSection {
     /// the slide panel's menu does. Unbound until set.
     #[serde(default)] pub move_slide_up: String,
     #[serde(default)] pub move_slide_down: String,
+    /// Open the list of every tag (see, filter by, rename, remove). Unbound
+    /// until set.
+    #[serde(default)] pub tag_list: String,
     #[serde(default = "d_prev_layer")]    pub prev_layer: String,
     #[serde(default = "d_next_layer")]    pub next_layer: String,
     #[serde(default = "d_toggle_ui")]     pub toggle_ui: String,
@@ -576,6 +579,7 @@ impl Default for CanvasSection {
             rename_slide: d_rename_slide(),
             lock_slide: d_lock_slide(),
             move_slide_up: String::new(), move_slide_down: String::new(),
+            tag_list: String::new(),
             prev_layer: d_prev_layer(), next_layer: d_next_layer(),
             toggle_ui: d_toggle_ui(),
             opacity_0: d_op_0(), opacity_1: d_op_1(),
@@ -814,6 +818,7 @@ pub struct CanvasBindings {
     pub lock_slide: Option<Binding>,
     pub move_slide_up: Option<Binding>,
     pub move_slide_down: Option<Binding>,
+    pub tag_list: Option<Binding>,
     pub prev_layer: Option<Binding>,
     pub next_layer: Option<Binding>,
     pub toggle_ui: Option<Binding>,
@@ -994,6 +999,7 @@ impl HotkeysConfig {
                 lock_slide:    p("canvas.lock_slide",    &self.canvas.lock_slide),
                 move_slide_up:   p("canvas.move_slide_up",   &cv.move_slide_up),
                 move_slide_down: p("canvas.move_slide_down", &cv.move_slide_down),
+                tag_list:        p("canvas.tag_list",        &cv.tag_list),
                 prev_layer:    p("canvas.prev_layer",    &self.canvas.prev_layer),
                 next_layer:    p("canvas.next_layer",    &self.canvas.next_layer),
                 toggle_ui:     p("canvas.toggle_ui",     &self.canvas.toggle_ui),
@@ -1351,6 +1357,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "lock_slide")           => "Lock / unlock the slide against edits",
         ("canvas", "move_slide_up")        => "Move the slide one place toward the first",
         ("canvas", "move_slide_down")      => "Move the slide one place toward the last",
+        ("canvas", "tag_list")             => "Every tag in the app: see, filter the slides by, rename, remove",
         ("canvas", "prev_layer")           => "Layer below",
         ("canvas", "next_layer")           => "Layer above",
         ("canvas", "toggle_ui")            => "Hide / show the toolbar and panels",

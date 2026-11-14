@@ -188,6 +188,11 @@ impl OnScreenNotesApp {
                     self.group_selection(on);
                 }
             }
+            K::TagList => {
+                self.commands.close();
+                self.ui_visible = true;
+                self.slide_panel.open_tags();
+            }
             K::MoveSlide(step) => {
                 let from = self.canvases.active_index();
                 if let Some(to) = from.checked_add_signed(isize::from(step)).filter(|&to| to < self.canvases.count()) {

@@ -131,7 +131,7 @@ impl OnScreenNotesApp {
             let shift = mods.shift;
             // "Delete this slide?", the command palette, the find bar
             // and the tag row take the keys while they are up.
-            if text_consumed || self.confirm_delete.is_some() || self.commands.is_open() || self.find.is_open() || self.tag_edit.is_some() {
+            if text_consumed || self.confirm_delete.is_some() || self.commands.is_open() || self.find.is_open() || self.tag_edit.is_some() || self.slide_panel.tags_open() {
                 // Still allow scroll-wheel events (handled below
                 // outside this for-loop) but drop key events.
                 // Falling through to the wheel block below means

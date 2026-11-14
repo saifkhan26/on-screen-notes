@@ -32,9 +32,15 @@ layers.
   `rotate_right` in hotkeys.toml for keys
 - **Tags** — select anything (a picture, a video, a group, strokes) and
   the tag button on the arrange bar takes words for it, separated by
-  commas: `pose, walk cycle`. A group is found as one by the tags of any
-  of its members. Tags show only on the arrange bar while selected; set
-  `arrange.tag` in hotkeys.toml for a key that opens them
+  spaces or commas: `pose ref walk-cycle`. Tags already used are offered
+  as you type (click one, or `Tab` for the first). A group counts as one
+  when every member has the tag. Tags show on the arrange bar while
+  selected; set `arrange.tag` in hotkeys.toml for a key that opens them.
+  The slide panel's tag button (or "Every tag" in the command palette)
+  opens a list of every tag in the app, in the middle of the screen, with
+  its counts: pick some to see only the slides with any of them (going to
+  one lights them up there), or rename / remove a tag everywhere
+  (locked slides are left alone)
 - **Shape snap** — finish a stroke and hold the pen still for half a
   second: it springs into the straight line, triangle, rectangle, other
   polygon (up to six sides), circle or ellipse it was meant to be. See

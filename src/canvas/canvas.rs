@@ -1093,6 +1093,19 @@ impl Canvas {
         self.edit_objects(li, &strokes, &shapes, |_, s| s.group = id, |_, s| s.set_group(id))
     }
 
+    /// Give each chosen object its own new tags, all in one undo step —
+    /// what renaming or removing a tag everywhere does. Laid out like
+    /// `move_objects_each`, ascending by index. Returns false when
+    /// nothing changed.
+    pub fn set_tags_each(&mut self, li: usize, strokes: &[(usize, Vec<String>)], shapes: &[(usize, Vec<String>)]) -> bool {
+        let tags_of = |list: &[(usize, Vec<String>)], i: usize| {
+            list.binary_search_by_key(&i, |e| e.0).map(|k| list[k].1.clone()).unwrap_or_default()
+        };
+        let stroke_ix: Vec<usize> = strokes.iter().map(|e| e.0).collect();
+        let shape_ix: Vec<usize> = shapes.iter().map(|e| e.0).collect();
+        self.edit_objects(li, &stroke_ix, &shape_ix, |i, s| s.tags = tags_of(strokes, i), |i, s| s.set_tags(&tags_of(shapes, i)))
+    }
+
     /// Give the chosen objects these tags in place of their own (see
     /// `shape::parse_tags`). One undo step; objects that have them
     /// already are left out of it. Returns false when nothing changed.

@@ -198,6 +198,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Freeze the screen into a new layer", sl, c.freeze_frame, C::FreezeFrame);
     add("Open the slide window / close it", sl, c.slide_window, C::Key(K::SlideWindow));
     add("Fold / unfold the slide panel", sl, c.toggle_slide_panel, C::Key(K::ToggleSlidePanel));
+    add("Every tag (filter slides, rename, remove)", sl, c.tag_list, C::Key(K::TagList));
     add("Ctrl+Tab: slides in order / recently used", sl, c.toggle_slide_order, C::Key(K::ToggleSlideOrder));
 
     let l = "Layer";

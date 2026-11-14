@@ -273,4 +273,38 @@ impl OnScreenNotesApp {
             self.toggle_lock();
         }
     }
+
+    /// A tag renamed or removed everywhere from the slide panel's tag
+    /// list: done on every slide read but locked ones, and said in a
+    /// toast. The highlight's picked tags follow.
+    pub(super) fn apply_tag_action(&mut self, a: ui::slide_panel::TagAction) {
+        use crate::canvas::units::same_tag;
+        let tags_text = |tags: &[String]| tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
+        let (what, (n, locked)) = match &a {
+            ui::slide_panel::TagAction::Rename(from, to) => {
+                (format!("#{from} is now {}", tags_text(to)), self.canvases.rename_tag(from, to))
+            }
+            ui::slide_panel::TagAction::Remove(tag) => (format!("#{tag} removed"), self.canvases.remove_tag(tag)),
+        };
+        let picked = &mut self.media_filter.tags;
+        match a {
+            ui::slide_panel::TagAction::Rename(from, to) if picked.iter().any(|t| same_tag(t, &from)) => {
+                picked.retain(|t| !same_tag(t, &from));
+                for t in to {
+                    if !picked.iter().any(|p| same_tag(p, &t)) {
+                        picked.push(t);
+                    }
+                }
+            }
+            ui::slide_panel::TagAction::Remove(tag) => picked.retain(|t| !same_tag(t, &tag)),
+            _ => {}
+        }
+        let things = if n == 1 { "object" } else { "objects" };
+        let mut msg = format!("{what} on {n} {things}");
+        if locked > 0 {
+            let s = if locked == 1 { "slide was" } else { "slides were" };
+            msg.push_str(&format!(" — {locked} locked {s} left as they were"));
+        }
+        self.toast = Some((msg, Instant::now()));
+    }
 }

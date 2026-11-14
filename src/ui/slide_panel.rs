@@ -8,8 +8,17 @@
 //! switches what Ctrl+Tab steps through (slide order or recently used),
 //! jumps to the last slide, adds a slide after it, and folds the panel
 //! down to a small "n/N" tab.
+//!
+//! Its tag button opens a list of every tag in the app (a modal in the
+//! middle of the screen; also from the command palette), with how many slides and
+//! objects carry each. Picking tags shows only the slides with any of
+//! them (going to one lights those tags up there); each tag can be
+//! renamed or removed everywhere from the list.
 
-use crate::canvas::CanvasManager;
+use crate::canvas::shape::parse_tags;
+use crate::canvas::units::same_tag;
+use crate::canvas::{CanvasManager, TagCount};
+use crate::ui::media_filter::TAG_COLOUR;
 use crate::config::{AppConfig, SlideTabOrder};
 use crate::ui::theme;
 use egui::{Color32, Rounding, Vec2};
@@ -33,6 +42,23 @@ pub struct SlidePanel {
     shown_active: Option<usize>,
     /// The slide whose row is being dragged to a new place.
     dragging: Option<usize>,
+    /// Only slides with any of these tags show (none: every slide).
+    tag_filter: Vec<String>,
+    /// The tag being renamed in the tag list, and the name typed so far.
+    tag_renaming: Option<(String, String)>,
+    /// The rename field has yet to take the keyboard.
+    tag_focus: bool,
+    /// The tag whose removal waits for a yes.
+    tag_removing: Option<String>,
+    /// The list of every tag is open.
+    tags_open: bool,
+}
+
+/// A tag changed everywhere from the tag list, for the app to do.
+pub enum TagAction {
+    /// Put these tags in place of this one.
+    Rename(String, Vec<String>),
+    Remove(String),
 }
 
 pub enum SlideAction {
@@ -54,6 +80,11 @@ pub struct Shown {
     pub hovered: bool,
     /// A name was being typed this frame: keys are text, not shortcuts.
     pub typing: bool,
+    /// A tag renamed or removed in the tag list.
+    pub tag_action: Option<TagAction>,
+    /// A slide was picked from the tag-filtered list: light these tags
+    /// up on it.
+    pub highlight_tags: Option<Vec<String>>,
 }
 
 impl SlidePanel {
@@ -65,6 +96,16 @@ impl SlidePanel {
 
     pub fn is_renaming(&self) -> bool {
         self.renaming.is_some()
+    }
+
+    /// Open the list of every tag.
+    pub fn open_tags(&mut self) {
+        self.tags_open = true;
+    }
+
+    /// The list of every tag is open: it takes the keys and the pointer.
+    pub fn tags_open(&self) -> bool {
+        self.tags_open
     }
 }
 
@@ -78,7 +119,9 @@ pub fn show(ctx: &egui::Context, state: &mut SlidePanel, cfg: &mut AppConfig, to
     if state.renaming.as_ref().is_some_and(|(i, _)| *i >= count) {
         state.renaming = None;
     }
-    let typing = state.renaming.is_some();
+    let typing = state.renaming.is_some() || state.tag_renaming.is_some();
+    let mut tag_action = None;
+    let mut highlight_tags = None;
     if state.dragging.is_some_and(|i| i >= count) {
         state.dragging = None;
     }
@@ -116,9 +159,13 @@ pub fn show(ctx: &egui::Context, state: &mut SlidePanel, cfg: &mut AppConfig, to
                     return;
                 }
                 ui.set_width(WIDTH);
+                // Slides a tag filter leaves showing.
+                let filtering = !state.tag_filter.is_empty();
+                let visible: Vec<usize> = (0..count).filter(|&i| !filtering || manager.slide_has_any_tag(i, &state.tag_filter)).collect();
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new(format!("Slides · {count}")).small().color(theme::TEXT_MUTED));
+                    let heading = if filtering { format!("Slides · {} of {count}", visible.len()) } else { format!("Slides · {count}") };
+                    ui.label(egui::RichText::new(heading).small().color(theme::TEXT_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         let fold = egui::Image::new(egui::include_image!("../../assets/icons/chevron-left.svg"));
@@ -145,37 +192,64 @@ pub fn show(ctx: &egui::Context, state: &mut SlidePanel, cfg: &mut AppConfig, to
                         if icon_btn(ui, history, tip, true, recent) {
                             *tab_order = if recent { SlideTabOrder::Sequential } else { SlideTabOrder::RecentlyUsed };
                         }
+                        let tags = egui::Image::new(egui::include_image!("../../assets/icons/tag.svg"));
+                        let tip = "Every tag: show only the slides with some, rename or remove them everywhere";
+                        if icon_btn(ui, tags, tip, true, filtering || state.tags_open) {
+                            state.tags_open = !state.tags_open;
+                        }
                     });
                 });
+                if filtering {
+                    tag_chips(ui, state);
+                }
                 // The list's height comes from its rows, not the space
                 // left: an Area only offers last frame's size, so a list
                 // sized by that could never grow (more slides, unfolding).
-                let rows_h = count as f32 * (ROW_H + 2.0) - 2.0;
+                let rows_h = (visible.len().max(1)) as f32 * (ROW_H + 2.0) - 2.0;
                 let list_h = rows_h.min(room.max(ROW_H * 3.0));
                 egui::ScrollArea::vertical()
                     .max_height(list_h)
                     .min_scrolled_height(list_h)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        let mut rows = Vec::with_capacity(count);
-                        for i in 0..count {
-                            let (a, rect) = slide_row(ui, state, manager, i, active);
+                        if visible.is_empty() {
+                            ui.label(egui::RichText::new("  No slide has these tags").small().color(theme::TEXT_MUTED));
+                        }
+                        let mut rows = Vec::with_capacity(visible.len());
+                        for &i in &visible {
+                            let (a, rect, clicked) = slide_row(ui, state, manager, i, active, filtering);
                             if let Some(a) = a {
                                 action = Some(a);
                             }
+                            // Picked from the filtered list: its tags light up there.
+                            if clicked && filtering {
+                                highlight_tags = Some(state.tag_filter.clone());
+                            }
                             rows.push(rect);
                         }
-                        if let Some(m) = drag_rows(ui, state, &rows) {
-                            action = Some(m);
+                        // Moving needs every slide in the list.
+                        if !filtering {
+                            if let Some(m) = drag_rows(ui, state, &rows) {
+                                action = Some(m);
+                            }
                         }
                     });
             });
         });
+    if state.tags_open {
+        tag_action = tag_modal(ctx, state, manager);
+    } else {
+        // Closed: nothing left half typed or half asked.
+        state.tag_renaming = None;
+        state.tag_removing = None;
+    }
     // Folded, nothing was shown: unfolding scrolls to the active slide.
     state.shown_active = (*open).then_some(active);
 
-    let hovered = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| area.response.rect.contains(p));
-    Shown { action, hovered, typing }
+    // Over the panel, or anywhere while the tag list is up: the wheel is
+    // not the canvas's.
+    let hovered = state.tags_open || ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| area.response.rect.contains(p));
+    Shown { action, hovered, typing, tag_action, highlight_tags }
 }
 
 /// A row being dragged: the line where it would land, the list scrolling
@@ -216,10 +290,18 @@ fn drag_rows(ui: &mut egui::Ui, state: &mut SlidePanel, rows: &[egui::Rect]) -> 
 }
 
 /// One row: the slide's number, then its name — or the name field while
-/// it is being named. Also returns where the row is, for dragging.
-fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager, i: usize, active: usize) -> (Option<SlideAction>, egui::Rect) {
+/// it is being named. Also returns where the row is, for dragging, and
+/// whether it was clicked. While `filtering`, rows do not drag.
+fn slide_row(
+    ui: &mut egui::Ui,
+    state: &mut SlidePanel,
+    manager: &CanvasManager,
+    i: usize,
+    active: usize,
+    filtering: bool,
+) -> (Option<SlideAction>, egui::Rect, bool) {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(WIDTH, ROW_H), egui::Sense::click_and_drag());
-    if response.drag_started() && state.renaming.is_none() {
+    if response.drag_started() && state.renaming.is_none() && !filtering {
         state.dragging = Some(i);
     }
     let is_active = i == active;
@@ -281,7 +363,7 @@ fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager,
             }
             state.renaming = None;
         }
-        return (action, rect);
+        return (action, rect, false);
     }
 
     let name = manager.name(i);
@@ -295,7 +377,7 @@ fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager,
     ui.painter().galley(pos, galley, colour);
 
     let mut tip = if name.is_empty() { "Double-click to name".to_string() } else { format!("{name}\nDouble-click to rename") };
-    tip.push_str("\nDrag to move it\nRight-click to open in a window or move it");
+    tip.push_str(if filtering { "\nRight-click to open in a window or move it" } else { "\nDrag to move it\nRight-click to open in a window or move it" });
     if locked {
         tip.push_str("\nLocked: pans and zooms, takes no edits");
     }
@@ -324,7 +406,186 @@ fn slide_row(ui: &mut egui::Ui, state: &mut SlidePanel, manager: &CanvasManager,
     } else if response.clicked() && !is_active {
         action = Some(SlideAction::GoTo(i));
     }
-    (action, rect)
+    (action, rect, response.clicked())
+}
+
+/// The tags the list is filtered by, under the header: a click on one
+/// stops filtering by it.
+fn tag_chips(ui: &mut egui::Ui, state: &mut SlidePanel) {
+    let mut drop = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(6.0);
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for (k, t) in state.tag_filter.iter().enumerate() {
+            let chip = egui::Label::new(egui::RichText::new(format!("#{t} ×")).small().color(TAG_COLOUR)).sense(egui::Sense::click());
+            if ui.add(chip).on_hover_text("Stop filtering by this tag").clicked() {
+                drop = Some(k);
+            }
+        }
+    });
+    if let Some(k) = drop {
+        state.tag_filter.remove(k);
+    }
+}
+
+/// The list of every tag as a modal in the middle of the screen, over a
+/// dimmed slide: Close, Esc (when not leaving a rename) or a click on the
+/// dimmed part closes it.
+fn tag_modal(ctx: &egui::Context, state: &mut SlidePanel, manager: &CanvasManager) -> Option<TagAction> {
+    const W: f32 = 400.0;
+    if state.tag_renaming.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        state.tags_open = false;
+        return None;
+    }
+    let screen = ctx.screen_rect();
+    let dimmed = egui::Area::new(egui::Id::new("osn_tag_modal_dim"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let r = ui.allocate_rect(screen, egui::Sense::click());
+            ui.painter().rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(140));
+            r.clicked()
+        })
+        .inner;
+    let (index, unread) = manager.tag_index();
+    let card = egui::Id::new("osn_tag_modal");
+    let mut close = dimmed;
+    let out = egui::Area::new(card)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            theme::card_frame()
+                .inner_margin(egui::Margin::same(14.0))
+                .show(ui, |ui| {
+                    ui.set_width(W);
+                    ui.horizontal(|ui| {
+                        let title = egui::RichText::new(format!("Every tag · {}", index.len())).size(15.0).color(theme::TEXT_PRIMARY);
+                        ui.label(title);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Close").on_hover_text("Esc").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                    let help = "Pick tags to see only the slides with any of them; going to one lights them up there. \
+                                The pen renames a tag everywhere, the bin removes it.";
+                    ui.label(egui::RichText::new(help).small().color(theme::TEXT_MUTED));
+                    ui.add_space(6.0);
+                    tag_list(ui, state, &index, unread, (screen.height() * 0.6).min(480.0))
+                })
+                .inner
+        })
+        .inner;
+    // The card above its dimmed backdrop.
+    let card_layer = egui::LayerId::new(egui::Order::Foreground, card);
+    ctx.move_to_top(card_layer);
+    // The keys stay in here: a widget behind the backdrop that took the
+    // keyboard (Tab moves it before any of this runs) lets go at once,
+    // so Space or Enter has nothing back there to press.
+    if let Some(id) = ctx.memory(|m| m.focused()) {
+        if ctx.read_response(id).map_or(true, |r| r.layer_id != card_layer) {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+    }
+    if close {
+        state.tags_open = false;
+    }
+    out
+}
+
+/// The tag list: every tag in `index`, a click showing only the slides
+/// with it (or any other picked), and beside each its counts, a rename
+/// and a remove (which asks first). `unread` slides are still opening;
+/// the list scrolls past `height`.
+fn tag_list(ui: &mut egui::Ui, state: &mut SlidePanel, index: &[TagCount], unread: usize, height: f32) -> Option<TagAction> {
+    let mut out = None;
+    if index.is_empty() {
+        ui.label(egui::RichText::new("None yet: select something, then the arrange bar's tag button").small().color(theme::TEXT_MUTED));
+    }
+    if unread > 0 {
+        let s = if unread == 1 { "slide is" } else { "slides are" };
+        ui.label(egui::RichText::new(format!("{unread} {s} still opening; their tags come in when they do")).small().color(theme::TEXT_MUTED));
+    }
+    egui::ScrollArea::vertical().max_height(height).auto_shrink([false, true]).show(ui, |ui| {
+        for t in index {
+            ui.horizontal(|ui| {
+                let renaming = state.tag_renaming.as_ref().is_some_and(|(from, _)| same_tag(from, &t.tag));
+                if renaming {
+                    let Some((from, text)) = state.tag_renaming.as_mut() else { return };
+                    let r = ui.add(egui::TextEdit::singleline(text).desired_width(240.0).hint_text("new name (spaces: several)"));
+                    if std::mem::take(&mut state.tag_focus) {
+                        r.request_focus();
+                        if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), r.id) {
+                            let end = egui::text::CCursor::new(text.chars().count());
+                            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), end)));
+                            st.store(ui.ctx(), r.id);
+                        }
+                    } else if r.lost_focus() {
+                        // Enter renames; Esc or a click elsewhere leaves it.
+                        let to = parse_tags(text);
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !to.is_empty() && to != [from.clone()] {
+                            let from = from.clone();
+                            // The filter follows the new name.
+                            if state.tag_filter.iter().any(|f| same_tag(f, &from)) {
+                                state.tag_filter.retain(|f| !same_tag(f, &from));
+                                for n in &to {
+                                    if !state.tag_filter.iter().any(|f| same_tag(f, n)) {
+                                        state.tag_filter.push(n.clone());
+                                    }
+                                }
+                            }
+                            out = Some(TagAction::Rename(from, to));
+                        }
+                        state.tag_renaming = None;
+                    }
+                    return;
+                }
+                if state.tag_removing.as_deref().is_some_and(|r| same_tag(r, &t.tag)) {
+                    let things = if t.objects == 1 { "object" } else { "objects" };
+                    ui.label(egui::RichText::new(format!("Take #{} off {} {things}?", t.tag, t.objects)).small());
+                    if ui.small_button("Remove").clicked() {
+                        state.tag_filter.retain(|f| !same_tag(f, &t.tag));
+                        out = Some(TagAction::Remove(t.tag.clone()));
+                        state.tag_removing = None;
+                    }
+                    if ui.small_button("Keep").clicked() {
+                        state.tag_removing = None;
+                    }
+                    return;
+                }
+                let mut on = state.tag_filter.iter().any(|f| same_tag(f, &t.tag));
+                let label = egui::RichText::new(format!("#{}", t.tag)).color(TAG_COLOUR);
+                if ui.toggle_value(&mut on, label).on_hover_text("Show only the slides with this tag (or another picked)").clicked() {
+                    if on {
+                        state.tag_filter.push(t.tag.clone());
+                    } else {
+                        state.tag_filter.retain(|f| !same_tag(f, &t.tag));
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let trash = egui::Image::new(egui::include_image!("../../assets/icons/trash.svg"));
+                    if icon_btn(ui, trash, "Remove this tag from every object (on unlocked slides)", true, false) {
+                        state.tag_removing = Some(t.tag.clone());
+                        state.tag_renaming = None;
+                    }
+                    let pen = egui::Image::new(egui::include_image!("../../assets/icons/pen.svg"));
+                    if icon_btn(ui, pen, "Rename this tag everywhere; to a tag that exists, they merge", true, false) {
+                        state.tag_renaming = Some((t.tag.clone(), t.tag.clone()));
+                        state.tag_focus = true;
+                        state.tag_removing = None;
+                    }
+                    let slides = if t.slides == 1 { "slide" } else { "slides" };
+                    ui.label(egui::RichText::new(format!("{} {slides} · {}", t.slides, t.objects)).small().color(theme::TEXT_MUTED))
+                        .on_hover_text(format!("On {} {slides}, {} objects", t.slides, t.objects));
+                });
+            });
+        }
+    });
+    if !state.tag_filter.is_empty() && ui.button("Show every slide").clicked() {
+        state.tag_filter.clear();
+    }
+    out
 }
 
 /// The folded panel: "n/N" and an unfold arrow.
@@ -349,6 +610,10 @@ fn folded_tab(ui: &mut egui::Ui, active: usize, count: usize) -> egui::Response 
 /// A bare icon button, lit while `selected`; true when clicked while
 /// enabled.
 fn icon_btn(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str, enabled: bool, selected: bool) -> bool {
+    icon_btn_response(ui, img, tooltip, enabled, selected).clicked() && enabled
+}
+
+fn icon_btn_response(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str, enabled: bool, selected: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON + 4.0), egui::Sense::click());
     if selected {
         ui.painter().rect_filled(rect, Rounding::same(5.0), theme::ACCENT);
@@ -357,7 +622,7 @@ fn icon_btn(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str, enabled: boo
     }
     let tint = if enabled { theme::TEXT_PRIMARY } else { Color32::from_white_alpha(60) };
     paint_svg(ui, rect.shrink(4.0), img, tint);
-    response.on_hover_text(tooltip).clicked() && enabled
+    response.on_hover_text(tooltip)
 }
 
 fn paint_svg(ui: &mut egui::Ui, rect: egui::Rect, img: egui::Image<'_>, tint: Color32) {

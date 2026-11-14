@@ -25,12 +25,21 @@ pub mod stroke;
 pub mod units;
 
 use crate::canvas::canvas::Canvas;
+use crate::canvas::units::same_tag;
 use crate::config::AppConfig;
 use crate::persistence::{LoadProgress, SlideView};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
+
+/// One tag across the slides read: how many slides and objects carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagCount {
+    pub tag: String,
+    pub slides: usize,
+    pub objects: usize,
+}
 
 /// Top-level holder for all canvases.
 pub struct CanvasManager {
@@ -1000,6 +1009,107 @@ impl CanvasManager {
 
     /// Some pin has objects to show on the active slide, whether or not
     /// pins are hidden.
+    /// Every tag on the slides read so far, each once (case aside, the
+    /// first spelling met), in name order, with how many slides and
+    /// objects carry it; and how many slides are still being read, whose
+    /// tags are not in yet.
+    pub fn tag_index(&self) -> (Vec<TagCount>, usize) {
+        let mut out: Vec<TagCount> = Vec::new();
+        let mut unread = 0;
+        for slot in &self.canvases {
+            let Some(c) = slot else {
+                unread += 1;
+                continue;
+            };
+            let mut on_this: Vec<usize> = Vec::new();
+            for l in &c.layers {
+                let tags = l.strokes.iter().flat_map(|s| s.tags.iter()).chain(l.shapes.iter().flat_map(|s| s.tags().iter()));
+                for t in tags {
+                    let k = match out.iter().position(|e| same_tag(&e.tag, t)) {
+                        Some(k) => k,
+                        None => {
+                            out.push(TagCount { tag: t.clone(), slides: 0, objects: 0 });
+                            out.len() - 1
+                        }
+                    };
+                    out[k].objects += 1;
+                    if !on_this.contains(&k) {
+                        on_this.push(k);
+                        out[k].slides += 1;
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()));
+        (out, unread)
+    }
+
+    /// Slide `idx` is read and carries any of `tags`.
+    pub fn slide_has_any_tag(&self, idx: usize, tags: &[String]) -> bool {
+        let Some(c) = self.slide(idx) else { return false };
+        let wanted = |own: &[String]| own.iter().any(|t| tags.iter().any(|w| same_tag(t, w)));
+        c.layers.iter().any(|l| l.strokes.iter().any(|s| wanted(&s.tags)) || l.shapes.iter().any(|s| wanted(s.tags())))
+    }
+
+    /// Put `to` in place of tag `from` on every object of every slide
+    /// read (merging with tags it has already). See `retag`.
+    pub fn rename_tag(&mut self, from: &str, to: &[String]) -> (usize, usize) {
+        self.retag(|tags| {
+            if !tags.iter().any(|t| same_tag(t, from)) {
+                return None;
+            }
+            let mut out: Vec<String> = Vec::new();
+            let mut put = |t: &String| {
+                if !out.iter().any(|o| same_tag(o, t)) {
+                    out.push(t.clone());
+                }
+            };
+            for t in tags {
+                if same_tag(t, from) {
+                    to.iter().for_each(&mut put);
+                } else {
+                    put(t);
+                }
+            }
+            (out != tags).then_some(out)
+        })
+    }
+
+    /// Take tag `tag` off every object of every slide read. See `retag`.
+    pub fn remove_tag(&mut self, tag: &str) -> (usize, usize) {
+        self.retag(|tags| tags.iter().any(|t| same_tag(t, tag)).then(|| tags.iter().filter(|t| !same_tag(t, tag)).cloned().collect()))
+    }
+
+    /// Retag objects on every slide read: `f` gives an object's new tags,
+    /// or `None` to leave it. A locked slide is left as it is. One undo
+    /// step per layer changed, on its own slide. Returns how many objects
+    /// changed, and how many locked slides had some that did not.
+    fn retag(&mut self, f: impl Fn(&[String]) -> Option<Vec<String>>) -> (usize, usize) {
+        let (mut changed, mut locked) = (0, 0);
+        for idx in 0..self.canvases.len() {
+            let is_locked = self.is_locked(idx);
+            let Some(c) = self.canvases[idx].as_mut() else { continue };
+            let mut touched = false;
+            for li in 0..c.layers.len() {
+                let l = &c.layers[li];
+                let strokes: Vec<(usize, Vec<String>)> = l.strokes.iter().enumerate().filter_map(|(i, s)| Some((i, f(&s.tags)?))).collect();
+                let shapes: Vec<(usize, Vec<String>)> = l.shapes.iter().enumerate().filter_map(|(i, s)| Some((i, f(s.tags())?))).collect();
+                if strokes.is_empty() && shapes.is_empty() {
+                    continue;
+                }
+                touched = true;
+                if !is_locked {
+                    changed += strokes.len() + shapes.len();
+                    c.set_tags_each(li, &strokes, &shapes);
+                }
+            }
+            if touched && is_locked {
+                locked += 1;
+            }
+        }
+        (changed, locked)
+    }
+
     pub fn has_pins(&self) -> bool {
         self.pins.any(self.active)
     }
@@ -2192,5 +2302,60 @@ mod pin_tests {
         assert_eq!(pinned.pixel(50, 50).unwrap().alpha(), 255);
         let mut tool = crate::canvas::pins::PinTool::default();
         assert_eq!(tool.press([50.0, 50.0], &m.pinned()), crate::canvas::pins::Press::Took);
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+    use crate::canvas::shape::{tests_support::rect, Shape};
+
+    fn tagged(tags: &[&str]) -> Shape {
+        let mut s = rect([0.0, 0.0], [10.0, 10.0]);
+        s.set_tags(&tags.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+        s
+    }
+
+    fn slide(shapes: Vec<Shape>) -> Canvas {
+        let mut c = Canvas::default();
+        c.layers[0].shapes = shapes;
+        c
+    }
+
+    fn tags_of(m: &CanvasManager, idx: usize, shape: usize) -> Vec<String> {
+        m.slide(idx).unwrap().layers[0].shapes[shape].tags().to_vec()
+    }
+
+    #[test]
+    fn every_tag_is_counted_renamed_and_removed_but_locked_slides_are_left() {
+        let mut m = CanvasManager::for_tests(vec![
+            slide(vec![tagged(&["pose", "ref"]), tagged(&["Pose"])]),
+            slide(vec![tagged(&["poses"])]),
+            slide(vec![tagged(&["pose"])]),
+        ]);
+        m.set_locked(2, true);
+        let (index, unread) = m.tag_index();
+        assert_eq!(unread, 0);
+        let count = |tag: &str, slides, objects| TagCount { tag: tag.into(), slides, objects };
+        assert_eq!(index, vec![count("pose", 2, 3), count("poses", 1, 1), count("ref", 1, 1)]);
+        assert!(m.slide_has_any_tag(1, &["POSES".into(), "x".into()]));
+        assert!(!m.slide_has_any_tag(1, &["ref".into()]));
+
+        // Renamed to a tag that exists, they merge.
+        assert_eq!(m.rename_tag("poses", &["pose".into()]), (1, 0));
+        assert_eq!(tags_of(&m, 1, 0), vec!["pose"]);
+        assert_eq!(m.rename_tag("ref", &["pose".into(), "reference".into()]), (1, 0));
+        assert_eq!(tags_of(&m, 0, 0), vec!["pose", "reference"]);
+
+        // Removed everywhere, case aside — but the locked slide keeps it.
+        assert_eq!(m.remove_tag("POSE"), (3, 1));
+        assert_eq!(tags_of(&m, 0, 0), vec!["reference"]);
+        assert!(tags_of(&m, 0, 1).is_empty() && tags_of(&m, 1, 0).is_empty());
+        assert_eq!(tags_of(&m, 2, 0), vec!["pose"]);
+
+        // Each slide undoes its own change in one step.
+        m.active_mut().undo();
+        assert_eq!(tags_of(&m, 0, 0), vec!["pose", "reference"]);
+        assert_eq!(tags_of(&m, 0, 1), vec!["Pose"]);
     }
 }

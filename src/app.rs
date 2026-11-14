@@ -839,13 +839,19 @@ impl eframe::App for OnScreenNotesApp {
             // Slide panel. Going to a slide waits until after this frame's
             // keys, where the arrow keys switch slides too: everything
             // drawn before then still belongs to the current slide.
-            let slides = if self.ui_visible {
+            let mut slides = if self.ui_visible {
                 // No higher than the REC badge (top-left) while it shows.
                 let top = if self.recorder.is_recording() { 44.0 } else { 10.0 };
                 ui::slide_panel::show(ctx, &mut self.slide_panel, &mut self.config, top, &self.canvases)
             } else {
                 Default::default()
             };
+            if let Some(a) = slides.tag_action.take() {
+                self.apply_tag_action(a);
+            }
+            if let Some(tags) = slides.highlight_tags.take() {
+                self.media_filter.tags = tags;
+            }
             if select_filtered && self.may_edit() {
                 self.select_media_matches();
             }
@@ -875,6 +881,10 @@ impl eframe::App for OnScreenNotesApp {
                     can_restore: self.palette_before.is_some(),
                 });
                 let tags = self.selection_tags();
+                if let Some(e) = self.tag_edit.as_mut() {
+                    let (index, _) = self.canvases.tag_index();
+                    e.known = index.into_iter().map(|t| (t.tag, t.objects)).collect();
+                }
                 match ui::arrange_bar::show(
                     ctx,
                     selected_count,

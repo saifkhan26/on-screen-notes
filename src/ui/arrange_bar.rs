@@ -56,14 +56,50 @@ pub enum BarAction {
 /// The tags being typed for the selection, while the tag row is open.
 pub struct TagEdit {
     pub text: String,
-    /// The field has yet to take the keyboard.
+    /// The field has yet to take the keyboard (and its caret goes to
+    /// the end).
     pub focus: bool,
+    /// Every tag in the app with how many objects carry it, most used
+    /// first: what the row suggests. The app fills it in.
+    pub known: Vec<(String, usize)>,
 }
 
 impl TagEdit {
-    /// Start from the selection's tags, `current`.
+    /// Start from the selection's tags, `current`, ready for one more.
     pub fn new(current: &[String]) -> Self {
-        TagEdit { text: current.join(", "), focus: true }
+        let mut text = current.join(" ");
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        TagEdit { text, focus: true, known: Vec::new() }
+    }
+
+    /// Where the tag being typed starts: after the last space or comma.
+    fn word_start(&self) -> usize {
+        self.text.rfind(|c: char| c == ',' || c.is_whitespace()).map_or(0, |i| i + 1)
+    }
+
+    /// Known tags that fit what is being typed and are not typed yet:
+    /// those starting with it first, then those holding it, each group
+    /// most used first. With nothing typed, the most used.
+    pub fn suggestions(&self, most: usize) -> Vec<String> {
+        use crate::canvas::units::same_tag;
+        let start = self.word_start();
+        let have = crate::canvas::shape::parse_tags(&self.text[..start]);
+        let word = self.text[start..].trim_start_matches('#').to_lowercase();
+        let fresh = self.known.iter().filter(|(t, _)| !have.iter().any(|h| same_tag(h, t)));
+        let (mut first, mut then): (Vec<_>, Vec<_>) = fresh.filter(|(t, _)| t.to_lowercase().contains(&word)).partition(|(t, _)| t.to_lowercase().starts_with(&word));
+        first.sort_by(|a, b| b.1.cmp(&a.1));
+        then.sort_by(|a, b| b.1.cmp(&a.1));
+        first.into_iter().chain(then).take(most).map(|(t, _)| t.clone()).collect()
+    }
+
+    /// Put `tag` in place of the tag being typed, ready for the next.
+    pub fn accept(&mut self, tag: &str) {
+        let start = self.word_start();
+        self.text.truncate(start);
+        self.text.push_str(tag);
+        self.text.push(' ');
     }
 }
 
@@ -234,28 +270,81 @@ fn tag_chips(ui: &mut egui::Ui, tags: &[String]) -> bool {
     ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(format!("{all} — click to change")).clicked()
 }
 
-/// The row for typing the selection's tags. `Some(Some(text))` once
-/// `Enter` saves them, `Some(None)` when `Esc` or a click elsewhere
-/// leaves them as they were.
+/// The row for typing the selection's tags, with the tags already used
+/// in the app offered under it: a click, or `Tab` for the first, puts
+/// one in. `Some(Some(text))` once `Enter` saves them, `Some(None)` when
+/// `Esc` or a click elsewhere leaves them as they were.
 fn tag_row(ui: &mut egui::Ui, edit: &mut TagEdit) -> Option<Option<String>> {
+    const SUGGESTED: usize = 8;
+    let id = egui::Id::new("osn_tag_field");
     ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Tags").small().color(theme::TEXT_MUTED));
-        let field = egui::TextEdit::singleline(&mut edit.text)
-            .hint_text("pose, walk cycle — commas between, Enter saves")
-            .desired_width(300.0);
-        let r = ui.add(field);
-        if std::mem::take(&mut edit.focus) {
-            r.request_focus();
+    // Tab takes the first suggestion, before the field could take it to
+    // move the keyboard on.
+    let first = edit.suggestions(1).into_iter().next();
+    if let Some(tag) = first.filter(|_| ui.memory(|m| m.has_focus(id))) {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
+            edit.accept(&tag);
+            edit.focus = true;
+        }
+    }
+    let mut picked = None;
+    let row = ui.vertical(|ui| {
+        let r = ui
+            .horizontal(|ui| {
+                ui.label(egui::RichText::new("Tags").small().color(theme::TEXT_MUTED));
+                let field = egui::TextEdit::singleline(&mut edit.text)
+                    .id(id)
+                    .hint_text("pose ref walk-cycle — spaces or commas between, Enter saves")
+                    .desired_width(300.0);
+                ui.add(field)
+            })
+            .inner;
+        let offered = edit.suggestions(SUGGESTED);
+        if !offered.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new("Used").small().color(theme::TEXT_MUTED));
+                for (k, tag) in offered.iter().enumerate() {
+                    let text = egui::RichText::new(format!("#{tag}")).small().color(crate::ui::media_filter::TAG_COLOUR);
+                    let tip = if k == 0 { "Click, or Tab, to add it" } else { "Click to add it" };
+                    if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
+                        picked = Some(tag.clone());
+                    }
+                }
+            });
+        }
+        r
+    });
+    let r = row.inner;
+    if let Some(tag) = picked {
+        edit.accept(&tag);
+        edit.focus = true;
+        return None;
+    }
+    if std::mem::take(&mut edit.focus) {
+        r.request_focus();
+        // The caret goes to the end, after what is there.
+        if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
+            let end = egui::text::CCursor::new(edit.text.chars().count());
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+            st.store(ui.ctx(), id);
+        }
+        return None;
+    }
+    if r.lost_focus() {
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            return Some(Some(edit.text.clone()));
+        }
+        // A press on the row itself (a suggestion) keeps it open: the
+        // click lands when the button comes up.
+        let on_row = ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| row.response.rect.contains(p));
+        if on_row && !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            edit.focus = true;
             return None;
         }
-        if r.lost_focus() {
-            let saved = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            return Some(saved.then(|| edit.text.clone()));
-        }
-        None
-    })
-    .inner
+        return Some(None);
+    }
+    None
 }
 
 /// The picture's colours under the bar's buttons: click one to draw
@@ -525,4 +614,37 @@ fn icon_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, enabled: bool, t
     let icon = rect.shrink(rect.width() * 0.24);
     egui::Image::new(img).tint(tint).fit_to_exact_size(icon.size()).paint_at(ui, icon);
     resp.on_hover_text(tooltip).clicked()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edit(text: &str) -> TagEdit {
+        let known = [("pose", 9), ("ref", 4), ("portrait", 6), ("prop", 1), ("hands", 2)];
+        TagEdit { text: text.into(), focus: false, known: known.iter().map(|(t, n)| (t.to_string(), *n)).collect() }
+    }
+
+    #[test]
+    fn suggestions_fit_the_word_being_typed_and_skip_typed_tags() {
+        // Nothing typed: the most used.
+        assert_eq!(edit("").suggestions(3), vec!["pose", "portrait", "ref"]);
+        // Starting with it first, then holding it; most used within each.
+        assert_eq!(edit("po").suggestions(8), vec!["pose", "portrait"]);
+        assert_eq!(edit("r").suggestions(8), vec!["ref", "portrait", "prop"]);
+        // Tags typed already are not offered again, case aside.
+        assert_eq!(edit("POSE ref ").suggestions(2), vec!["portrait", "hands"]);
+        assert_eq!(edit("ref,#po").suggestions(8), vec!["pose", "portrait"]);
+    }
+
+    #[test]
+    fn accepting_replaces_the_word_being_typed() {
+        let mut e = edit("ref po");
+        e.accept("pose");
+        assert_eq!(e.text, "ref pose ");
+        let mut e = edit("");
+        e.accept("hands");
+        assert_eq!(e.text, "hands ");
+        assert_eq!(TagEdit::new(&["a".into(), "b".into()]).text, "a b ");
+    }
 }
