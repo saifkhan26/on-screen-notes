@@ -17,6 +17,10 @@ layers.
   Windows, XInput2 on X11, tablet-v2 on Wayland)
 - **Krita-parity stroke smoothing** — five algorithms, per-mode knobs (see
   [Stroke smoothing](#stroke-smoothing))
+- **Shape snap** — finish a stroke and hold the pen still for half a
+  second: it springs into the straight line, triangle, rectangle, other
+  polygon (up to six sides), circle or ellipse it was meant to be. See
+  [Shape snap](#shape-snap)
 - **Brush styles**: Pen, Pencil (translucent graphite stamp), Marker
   (highlighter), Airbrush (soft-cloud spray)
 - **Shapes**: rectangle, ellipse, straight line, straight arrow, freehand
@@ -175,6 +179,25 @@ the binary on first launch.
 | Straight line | toolbar only | |
 | Insert picture / video / GIF | toolbar film button, or drag & drop | See [Videos & GIFs](#videos--gifs) |
 | Open a PureRef board | toolbar film button, or drag & drop a `.pur` | Opens as a new slide; see [PureRef boards](#pureref-boards) |
+
+### Shape snap
+
+With the pen (any brush style), finish a stroke and keep the tip
+pressed and still for about half a second. If the stroke was clearly
+meant as a shape, it morphs onto it, with a little springy overshoot:
+
+- **Open** strokes become a straight line, if they were near one.
+- **Closed** strokes (ending near where they began) become a
+  triangle, a rectangle (level when drawn nearly level, turned when
+  drawn turned), another polygon of up to six sides, a circle (when
+  nearly round) or an ellipse — whichever fits the stroke best, if one
+  fits well. Scribbles, curves and handwriting snap to nothing.
+
+The snapped shape is still a stroke: it keeps its brush (pencil grain,
+marker, airbrush), colour and width, at the stroke's average pressure,
+and is one undo step like any other. Once it has snapped, moving the pen
+before lifting it changes nothing. Turn it off with **Shape snap** in the
+settings (gear button).
 
 The pen, pencil, marker, airbrush and eraser work at the chosen size as
 it looks on screen, whatever the zoom: zoomed in 4×, a new line is a

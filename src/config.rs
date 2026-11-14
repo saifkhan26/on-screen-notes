@@ -174,6 +174,12 @@ pub struct AppConfig {
     #[serde(default = "default_arrange_apart")]
     pub arrange_apart: bool,
 
+    /// Shape snap: holding the pen still at the end of a stroke turns it
+    /// into the line, polygon or ellipse it was meant to be. On unless
+    /// turned off in the settings.
+    #[serde(default = "default_shape_snap")]
+    pub shape_snap: bool,
+
     /// How the arrange bar's Pack lays objects out: the tightest block,
     /// rows or columns. Picked from the arrow beside it.
     #[serde(default)]
@@ -192,6 +198,7 @@ pub struct AppConfig {
 fn default_slide_panel_open() -> bool { true }
 
 fn default_arrange_apart() -> bool { true }
+fn default_shape_snap() -> bool { true }
 
 fn default_pressure_curve() -> f32 { 1.0 }
 
@@ -237,6 +244,7 @@ impl Default for AppConfig {
             slide_panel_open: true,
             slide_tab_order: SlideTabOrder::default(),
             arrange_apart: true,
+            shape_snap: true,
             pack_mode: PackMode::default(),
             beside_fit: BesideFit::default(),
             beside_side: BesideSide::default(),

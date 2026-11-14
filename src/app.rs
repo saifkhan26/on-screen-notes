@@ -3207,6 +3207,12 @@ impl eframe::App for OnScreenNotesApp {
         self.update_peek(ctx);
         self.step_view_glide(ctx);
 
+        // ---- Shape snap: time a held pen, run the morph --------------------
+        // A pen held still sends nothing, so the frame it is due is asked for.
+        if let Some(wait) = self.tool.tick_snap(Instant::now()) {
+            ctx.request_repaint_after(wait);
+        }
+
         // ---- Space-hold pan check ---------------------------------------
         // We treat Space as a *modal* pan key: while it is held, all pen +
         // mouse drags pan the active canvas instead of drawing. This is the
@@ -3257,6 +3263,7 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.config.smoothing_level,
                     &mut self.config.smoothing,
                     &mut self.config.pressure_curve,
+                    &mut self.config.shape_snap,
                     (&mut self.config.beside_fit, &mut self.config.beside_side),
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
@@ -3272,6 +3279,7 @@ impl eframe::App for OnScreenNotesApp {
                 false
             };
             self.set_pins_hidden(pins_hidden);
+            self.tool.shape_snap = self.config.shape_snap;
             if self.tool.text_box != prev_text_box {
                 self.apply_text_box_to_selection();
             }

@@ -17,6 +17,7 @@ pub mod lasso_tool;
 pub mod pen_tool;
 pub mod picture_colours;
 pub mod select_tool;
+pub mod shape_snap;
 pub mod shape_tool;
 
 use crate::canvas::canvas::Canvas;
@@ -215,7 +216,35 @@ pub struct ActiveTool {
     /// retro-apply to ink already laid down. The app loop keeps this
     /// in sync with `config.smoothing`.
     pub smoothing: SmoothingOptions,
+
+    /// Shape snap is on (`config.shape_snap`): holding the pen still at
+    /// the end of a Pen stroke turns it into the shape it was meant to be.
+    pub shape_snap: bool,
+    /// The hold being timed, or the morph onto a snapped shape.
+    snap: SnapState,
 }
+
+/// Shape snap's progress through the stroke being drawn.
+#[derive(Default)]
+struct SnapState {
+    /// When and where the pen last moved more than `SNAP_SLOP_PX`.
+    still: Option<(std::time::Instant, [f32; 2])>,
+    /// This hold was looked at and snapped to nothing; not again until
+    /// the pen moves.
+    tried: bool,
+    /// Snapped: the stroke morphing from as drawn (`from`) onto its shape
+    /// (`to`), point for point, since `start`.
+    morph: Option<(Vec<PenSample>, Vec<PenSample>, std::time::Instant)>,
+}
+
+/// How long the pen must stay still for a stroke to snap.
+pub const SNAP_HOLD: std::time::Duration = std::time::Duration::from_millis(450);
+/// How far (screen px) the pen may drift and still count as still.
+const SNAP_SLOP_PX: f32 = 3.0;
+/// Strokes shorter than this (screen px) never snap.
+const SNAP_MIN_PX: f32 = 24.0;
+/// How long the morph onto the shape takes.
+const SNAP_MORPH_SECS: f32 = 0.24;
 
 impl ActiveTool {
     pub fn from_config(cfg: &AppConfig) -> Self {
@@ -240,7 +269,78 @@ impl ActiveTool {
             pending_lasso_capture: None,
             select: select_tool::SelectState::default(),
             smoothing: cfg.smoothing,
+            shape_snap: cfg.shape_snap,
+            snap: SnapState::default(),
         }
+    }
+
+    /// Shape snap, once a frame while a stroke is being drawn: times the
+    /// hold, and once the pen has stayed still `SNAP_HOLD`, snaps the
+    /// stroke to its shape (`shape_snap::recognise`) and morphs it there
+    /// with a little overshoot. Returns how soon to look again — a pen
+    /// held still sends nothing, so the app must wake for it — or `None`
+    /// when nothing is pending.
+    pub fn tick_snap(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        use crate::tools::shape_snap::{drawn_clockwise, outline, recognise, resample, spring};
+        if self.kind != ToolKind::Pen || !self.shape_snap {
+            return None;
+        }
+        let s = self.in_progress_stroke.as_mut()?;
+        if let Some((from, to, start)) = &self.snap.morph {
+            let t = now.saturating_duration_since(*start).as_secs_f32() / SNAP_MORPH_SECS;
+            let k = spring(t);
+            s.samples = from
+                .iter()
+                .zip(to)
+                .map(|(a, b)| PenSample {
+                    pos: [a.pos[0] + (b.pos[0] - a.pos[0]) * k, a.pos[1] + (b.pos[1] - a.pos[1]) * k],
+                    pressure: (a.pressure + (b.pressure - a.pressure) * k.min(1.0)).clamp(0.05, 1.0),
+                    tilt: [0.0, 0.0],
+                })
+                .collect();
+            s.cache = None;
+            return (t < 1.0).then_some(std::time::Duration::from_millis(8));
+        }
+        let (since, _) = self.snap.still?;
+        if self.snap.tried {
+            return None;
+        }
+        let held = now.saturating_duration_since(since);
+        if held < SNAP_HOLD {
+            return Some(SNAP_HOLD - held);
+        }
+        self.snap.tried = true;
+        let pts: Vec<[f32; 2]> = s.samples.iter().map(|p| p.pos).collect();
+        let shape = recognise(&pts, SNAP_MIN_PX * s.px)?;
+        // The shape is drawn at the stroke's average pressure, in points
+        // close enough that smoothing cannot round its corners off.
+        let pressure = (s.samples.iter().map(|p| p.pressure).sum::<f32>() / s.samples.len().max(1) as f32).clamp(0.3, 1.0);
+        let spacing = (s.base_width * 0.4).clamp(s.px, 6.0 * s.px);
+        let clockwise = drawn_clockwise(&pts);
+        let mut ring = outline(&shape, pts[0], clockwise, spacing);
+        // A closed shape runs on a little past where it started, about a
+        // line's width, so its two ends overlap rather than meet in a
+        // notch.
+        if !matches!(shape, crate::tools::shape_snap::Snapped::Line(..)) && ring.len() > 8 {
+            let extra = ((s.base_width / spacing).ceil() as usize).clamp(1, ring.len() / 4);
+            ring.extend_from_within(1..=extra);
+        }
+        let to: Vec<PenSample> = ring.into_iter().map(|pos| PenSample { pos, pressure, tilt: [0.0, 0.0] }).collect();
+        if to.len() < 2 {
+            return None;
+        }
+        let from_pos = resample(&pts, to.len());
+        let last = s.samples.len().saturating_sub(1).max(1) as f32;
+        let from: Vec<PenSample> = from_pos
+            .into_iter()
+            .enumerate()
+            .map(|(i, pos)| {
+                let at = ((i as f32 / (to.len() - 1).max(1) as f32) * last).round() as usize;
+                PenSample { pos, pressure: s.samples.get(at).map_or(pressure, |p| p.pressure), tilt: [0.0, 0.0] }
+            })
+            .collect();
+        self.snap.morph = Some((from, to, now));
+        Some(std::time::Duration::ZERO)
     }
 
     /// Canvas units per screen pixel for what this tool draws or rubs
@@ -295,6 +395,7 @@ impl ActiveTool {
                 s.px = px;
                 s.push(sample);
                 self.in_progress_stroke = Some(s);
+                self.snap = SnapState { still: Some((std::time::Instant::now(), sample.pos)), ..SnapState::default() };
             }
             ToolKind::Fill => {
                 // Flood-fill: arm a deferred flood action at the
@@ -362,8 +463,22 @@ impl ActiveTool {
         match self.kind {
             ToolKind::Select => self.select.drag(sample.pos),
             ToolKind::Pen | ToolKind::FreehandArrow => {
+                // Snapped: the shape is set, and the pen moving on until
+                // it lifts changes nothing.
+                if self.snap.morph.is_some() {
+                    return;
+                }
                 if let Some(s) = self.in_progress_stroke.as_mut() {
                     s.push(sample);
+                    let slop = SNAP_SLOP_PX * s.px;
+                    let moved = self.snap.still.map_or(true, |(_, at)| {
+                        let d = [sample.pos[0] - at[0], sample.pos[1] - at[1]];
+                        d[0] * d[0] + d[1] * d[1] > slop * slop
+                    });
+                    if moved {
+                        self.snap.still = Some((std::time::Instant::now(), sample.pos));
+                        self.snap.tried = false;
+                    }
                 }
             }
             ToolKind::Fill => {
@@ -407,12 +522,23 @@ impl ActiveTool {
             ToolKind::Select => self.select.end(sample.pos, canvas),
             ToolKind::Pen => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
-                    s.push(sample);
-                    // Stabilizer mode keeps a rope-pull queue between
-                    // cursor and committed ink; on pen-up we drain the
-                    // queue so the trailing samples catch up to the
-                    // cursor. No-op for every other mode.
-                    s.finish();
+                    match std::mem::take(&mut self.snap).morph {
+                        // Snapped: it lands on its shape however far the
+                        // morph had got.
+                        Some((_, to, _)) => {
+                            s.samples = to;
+                            s.cache = None;
+                        }
+                        None => {
+                            s.push(sample);
+                            // Stabilizer mode keeps a rope-pull queue
+                            // between cursor and committed ink; on pen-up
+                            // we drain the queue so the trailing samples
+                            // catch up to the cursor. No-op for every
+                            // other mode.
+                            s.finish();
+                        }
+                    }
                     // Pre-build the cache with the user's current
                     // smoothing budget; `Canvas::add_stroke` will
                     // happily skip its own default build because the
@@ -596,6 +722,7 @@ impl ActiveTool {
     #[allow(dead_code)]
     pub fn cancel(&mut self) {
         self.in_progress_stroke = None;
+        self.snap = SnapState::default();
         self.in_progress_shape  = None;
         self.lasso.cancel_press();
         self.select.gesture     = None;
@@ -727,5 +854,79 @@ mod tests {
         }
         assert_eq!(strokes(&canvas), 1, "the click on the first corner erased the ink inside");
         assert!(tool.lasso.points().is_empty());
+    }
+    /// A pen stroke round a wobbly rectangle, ending back at its start.
+    fn draw_rectangle(tool: &mut ActiveTool, canvas: &mut Canvas) {
+        let corners = [[0.0, 0.0], [200.0, 4.0], [197.0, 120.0], [-3.0, 117.0], [0.0, 0.0]];
+        tool.begin(PenSample::from_pos(corners[0]), canvas);
+        for w in corners.windows(2) {
+            for k in 1..=25 {
+                let t = k as f32 / 25.0;
+                let wob = ((k as f32) * 1.3).sin() * 1.5;
+                let p = [w[0][0] + (w[1][0] - w[0][0]) * t + wob, w[0][1] + (w[1][1] - w[0][1]) * t - wob];
+                tool.update(PenSample::from_pos(p), canvas);
+            }
+        }
+    }
+
+    fn pen() -> ActiveTool {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = ToolKind::Pen;
+        tool.smoothing.kind = crate::canvas::smoothing::SmoothingType::None;
+        tool
+    }
+
+    #[test]
+    fn holding_the_pen_still_snaps_the_stroke_to_its_shape() {
+        let (mut tool, mut canvas) = (pen(), Canvas::default());
+        draw_rectangle(&mut tool, &mut canvas);
+        let now = std::time::Instant::now();
+        // Not held long enough yet: wake up when it will be.
+        let wait = tool.tick_snap(now).expect("a hold is being timed");
+        assert!(wait <= SNAP_HOLD);
+        // Held: it snaps and starts to morph, overshooting on the way.
+        assert!(tool.tick_snap(now + SNAP_HOLD).is_some());
+        assert!(tool.tick_snap(now + SNAP_HOLD + std::time::Duration::from_millis(100)).is_some(), "still morphing");
+        assert!(tool.tick_snap(now + SNAP_HOLD + std::time::Duration::from_secs(1)).is_none(), "settled");
+        // The pen moving on after the snap changes nothing; lifting it
+        // commits the shape with the brush it was drawn with.
+        tool.update(PenSample::from_pos([500.0, 500.0]), &mut canvas);
+        tool.end(PenSample::from_pos([500.0, 500.0]), &mut canvas);
+        let s = &canvas.layers[0].strokes[0];
+        let pts: Vec<[f32; 2]> = s.samples.iter().map(|p| p.pos).collect();
+        assert!(pts.iter().all(|p| p[0] < 300.0 && p[1] < 300.0), "the drift after the snap is not in it");
+        // Straight, level sides: every point on one of the rectangle's lines.
+        let (xs, ys): (Vec<f32>, Vec<f32>) = pts.iter().map(|p| (p[0], p[1])).unzip();
+        let (x0, x1) = (xs.iter().cloned().fold(f32::INFINITY, f32::min), xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+        let (y0, y1) = (ys.iter().cloned().fold(f32::INFINITY, f32::min), ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+        let on_side = |p: &[f32; 2]| [p[0] - x0, x1 - p[0], p[1] - y0, y1 - p[1]].iter().any(|d| d.abs() < 0.01);
+        assert!(pts.iter().all(on_side), "a rectangle, not the wobbly stroke");
+        // Closed, its end running a line's width on past its start.
+        let back = pts[1..].iter().position(|p| dist2(*p, pts[0]) < 1e-6).expect("it comes back round to its start");
+        let past: f32 = pts[back + 1..].windows(2).map(|w| dist2(w[0], w[1]).sqrt()).sum();
+        assert!(past > 0.0 && past <= s.base_width + 6.0, "{past}");
+        assert_eq!(canvas.undo_log.len(), 1, "one stroke, one undo step");
+    }
+
+    fn dist2(a: [f32; 2], b: [f32; 2]) -> f32 {
+        (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
+    }
+
+    #[test]
+    fn no_snap_when_turned_off_or_when_the_pen_keeps_moving() {
+        let (mut tool, mut canvas) = (pen(), Canvas::default());
+        tool.shape_snap = false;
+        draw_rectangle(&mut tool, &mut canvas);
+        assert!(tool.tick_snap(std::time::Instant::now() + SNAP_HOLD * 2).is_none());
+        tool.end(PenSample::from_pos([0.0, 0.0]), &mut canvas);
+        assert!(canvas.layers[0].strokes[0].samples.len() > 100, "kept as drawn");
+
+        // Lifted before the hold is up: kept as drawn.
+        let (mut tool, mut canvas) = (pen(), Canvas::default());
+        draw_rectangle(&mut tool, &mut canvas);
+        tool.tick_snap(std::time::Instant::now());
+        tool.end(PenSample::from_pos([0.0, 0.0]), &mut canvas);
+        let n = canvas.layers[0].strokes[0].samples.len();
+        assert!(n > 100, "{n}");
     }
 }
