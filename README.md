@@ -41,6 +41,10 @@ layers.
   its counts: pick some to see only the slides with any of them (going to
   one lights them up there), or rename / remove a tag everywhere
   (locked slides are left alone)
+- **Smart guides** — while a selection is moved, its edges and middle
+  line up with those of the objects around it (any shown layer, a group
+  as one), and a thin line shows each. Hold `Alt` to move freely; turn
+  them off with **Smart guides** in the settings
 - **Shape snap** — finish a stroke and hold the pen still for half a
   second: it springs into the straight line, triangle, rectangle, other
   polygon (up to six sides), circle or ellipse it was meant to be. See

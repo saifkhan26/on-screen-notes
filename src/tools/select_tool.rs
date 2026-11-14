@@ -7,6 +7,9 @@
 //! `Canvas::transform_objects` call (one undo step). That is the same
 //! preview-then-commit split the Shift+Space layer gesture uses.
 //!
+//! A selection being moved lines up with the objects around it (smart
+//! guides, `tools::guides`) unless Alt is held or they are switched off.
+//!
 //! Coordinates are canvas-local throughout. Sizes that should look the
 //! same at any zoom (handle size, click slop) are given in screen pixels
 //! and divided by the canvas zoom where they are used.
@@ -15,6 +18,8 @@ use crate::canvas::affine::Affine;
 use crate::canvas::canvas::{shape_bounds, shape_bounds_turned, Canvas, Layer};
 use crate::canvas::hit::{self, CanvasHit, ObjRef, Selection};
 use crate::canvas::shape::{Obb, Shape};
+use crate::tools::guides::{Bounds, Guides};
+use std::collections::HashSet;
 
 /// How close (screen px) a click must land to an object to pick it.
 const CLICK_SLOP_PX: f32 = 6.0;
@@ -32,6 +37,9 @@ pub const ROTATE_STEM_PX: f32 = 28.0;
 /// Smallest factor a resize may shrink to. Stops a drag through the
 /// anchor from collapsing or mirroring the selection.
 const MIN_SCALE: f32 = 0.02;
+/// How close (screen px) a moved selection's edge or middle comes to
+/// another object's before the smart guides line them up.
+const GUIDE_REACH_PX: f32 = 6.0;
 /// Rotation snap while Shift is held.
 const ROTATE_SNAP: f32 = std::f32::consts::PI / 12.0;
 
@@ -83,6 +91,9 @@ pub struct Chrome {
     /// Corners of the box around each group in the selection, when the
     /// selection is more than one group: groups show inside the frame.
     pub groups: Vec<[[f32; 2]; 4]>,
+    /// Smart guides the moving selection lines up on: each from one end
+    /// to the other.
+    pub guides: Vec<[[f32; 2]; 2]>,
 }
 
 #[derive(Default)]
@@ -93,8 +104,14 @@ pub struct SelectState {
     /// / removes from the selection on click, snaps rotation.
     pub shift: bool,
     /// Alt state, likewise: a click takes just the object under the
-    /// pointer, not the group it is in.
+    /// pointer, not the group it is in; held while moving, the smart
+    /// guides let go.
     pub alt: bool,
+    /// Smart guides on (the settings' switch), pushed in by the app.
+    pub guides_on: bool,
+    /// What the selection being moved can line up with, taken when the
+    /// move began.
+    guides: Option<Guides>,
     /// Which canvas / layer / object counts `sel` was made against. Its
     /// indices mean nothing once any of these change.
     bound: (usize, usize, usize, usize),
@@ -166,6 +183,7 @@ impl SelectState {
     /// Cancel an in-flight gesture, or — if there is none — drop the
     /// selection. One `Esc` backs out one level.
     pub fn cancel(&mut self) {
+        self.guides = None;
         if self.gesture.take().is_none() {
             self.sel.clear();
         }
@@ -278,7 +296,10 @@ impl SelectState {
             Gesture::Move { start, cur } => {
                 let d = [cur[0] - start[0], cur[1] - start[1]];
                 if (d[0] * d[0] + d[1] * d[1]).sqrt() < DRAG_SLOP_PX / zoom { return None; }
-                Affine::translate(d)
+                match self.live_guides() {
+                    Some(g) => Affine::translate(g.snap(d, GUIDE_REACH_PX / zoom).d),
+                    None => Affine::translate(d),
+                }
             }
             Gesture::Rotate { frame, start, cur } => {
                 let c = frame.center;
@@ -329,7 +350,7 @@ impl SelectState {
     /// Frame, handles and marquee as they should be drawn right now —
     /// i.e. with the in-flight gesture applied.
     pub fn chrome(&self, canvas: &Canvas) -> Chrome {
-        let mut out = Chrome { frame: None, handles: Vec::new(), rotate_stem: None, marquee: None, groups: Vec::new() };
+        let mut out = Chrome { frame: None, handles: Vec::new(), rotate_stem: None, marquee: None, groups: Vec::new(), guides: Vec::new() };
         if let Some(Gesture::Marquee { start, cur, .. }) = self.gesture {
             out.marquee = Some([
                 start[0].min(cur[0]), start[1].min(cur[1]),
@@ -346,6 +367,11 @@ impl SelectState {
         };
         let Some(base) = base else { return out };
         let m = self.preview_affine(zoom).unwrap_or(Affine::IDENTITY);
+        if let (Some(Gesture::Move { start, cur }), Some(g)) = (self.gesture, self.live_guides()) {
+            if !m.is_identity() {
+                out.guides = g.snap([cur[0] - start[0], cur[1] - start[1]], GUIDE_REACH_PX / zoom).lines;
+            }
+        }
         let c = base.corners().map(|p| m.apply(p));
         out.frame = Some(c);
         out.groups = self.group_boxes(layer).into_iter().map(|b| aabb_frame(b).corners().map(|p| m.apply(p))).collect();
@@ -469,7 +495,51 @@ impl SelectState {
     /// something on another layer makes that layer the active one (a
     /// selection lives on a single layer). The canvas is only written
     /// to here to make that switch; no object is touched until `end`.
+    /// Pen-down at `p`: start a move, resize, rotate or marquee (see
+    /// `begin_gesture`), and for a move take what it can line up with.
     pub fn begin(&mut self, p: [f32; 2], canvas: &mut Canvas) {
+        self.begin_gesture(p, canvas);
+        self.guides = match self.gesture {
+            Some(Gesture::Move { .. }) if self.guides_on => self.make_guides(canvas),
+            _ => None,
+        };
+    }
+
+    /// The guides while they apply: switched on, and Alt not held.
+    fn live_guides(&self) -> Option<&Guides> {
+        self.guides.as_ref().filter(|_| !self.alt)
+    }
+
+    /// Smart guides for a move of the selection: its box, and the box of
+    /// every other object on the shown layers and of each group there
+    /// (one the selection is in counts only if it is not moving).
+    fn make_guides(&self, canvas: &Canvas) -> Option<Guides> {
+        let li = canvas.active_layer;
+        let layer = canvas.layers.get(li)?;
+        let strokes: HashSet<usize> = self.sel.strokes.iter().copied().collect();
+        let shapes: HashSet<usize> = self.sel.shapes.iter().copied().collect();
+        let start = crate::canvas::units::bounds_of(layer, &self.sel.strokes, &self.sel.shapes)?;
+        let mut targets: Vec<Bounds> = Vec::new();
+        for (i, l) in canvas.layers.iter().enumerate() {
+            if !l.visible || l.opacity <= 0.0 {
+                continue;
+            }
+            let here = i == li;
+            let moving_stroke = |k: usize| here && strokes.contains(&k);
+            let moving_shape = |k: usize| here && shapes.contains(&k);
+            targets.extend(l.strokes.iter().enumerate().filter(|(k, _)| !moving_stroke(*k)).filter_map(|(_, s)| s.bounds()));
+            targets.extend(l.shapes.iter().enumerate().filter(|(k, _)| !moving_shape(*k)).map(|(_, s)| shape_bounds(s)));
+            for g in crate::canvas::units::groups(l) {
+                if g.strokes.iter().any(|&k| moving_stroke(k)) || g.shapes.iter().any(|&k| moving_shape(k)) {
+                    continue;
+                }
+                targets.extend(crate::canvas::units::bounds_of(l, &g.strokes, &g.shapes));
+            }
+        }
+        Some(Guides::new(start, targets))
+    }
+
+    fn begin_gesture(&mut self, p: [f32; 2], canvas: &mut Canvas) {
         self.gesture = None;
         let active = canvas.active_layer;
         let Some(layer) = canvas.layers.get(active) else { return };
@@ -654,6 +724,7 @@ impl SelectState {
             None => {}
         }
         self.gesture = None;
+        self.guides = None;
     }
 }
 
@@ -738,6 +809,35 @@ mod tests {
     fn click(t: &mut SelectState, c: &mut Canvas, p: [f32; 2]) {
         t.begin(p, c);
         t.end(p, c);
+    }
+
+    #[test]
+    fn a_moved_selection_lines_up_with_its_neighbours_unless_alt_is_held() {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(image([0.0, 0.0], [100.0, 50.0])); // dragged
+        c.layers[0].shapes.push(image([300.0, 200.0], [100.0, 50.0])); // stays
+        let left_after = |guides_on: bool, alt: bool| {
+            let mut c = c.clone();
+            let mut t = tool(&c);
+            t.guides_on = guides_on;
+            click(&mut t, &mut c, [50.0, 25.0]);
+            t.alt = alt;
+            t.begin([50.0, 25.0], &mut c);
+            assert!(matches!(t.gesture, Some(Gesture::Move { .. })));
+            // Its left edge lands 3 short of the other's (zoom 1: within reach).
+            let to = [50.0 + 297.0, 25.0 + 100.0];
+            t.drag(to);
+            let lines = t.chrome(&c).guides.len();
+            t.end(to, &mut c);
+            let x = match &c.layers[0].shapes[0] {
+                Shape::Raster { pos, .. } => pos[0],
+                other => panic!("{other:?}"),
+            };
+            (x, lines)
+        };
+        assert_eq!(left_after(true, false), (300.0, 1), "lined up, one guide");
+        assert_eq!(left_after(true, true), (297.0, 0), "Alt: where it was let go");
+        assert_eq!(left_after(false, false), (297.0, 0), "switched off");
     }
 
     #[test]

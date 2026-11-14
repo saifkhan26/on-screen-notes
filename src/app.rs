@@ -810,7 +810,7 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.config.smoothing_level,
                     &mut self.config.smoothing,
                     &mut self.config.pressure_curve,
-                    &mut self.config.shape_snap,
+                    (&mut self.config.shape_snap, &mut self.config.smart_guides),
                     (&mut self.config.beside_fit, &mut self.config.beside_side),
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
@@ -827,6 +827,7 @@ impl eframe::App for OnScreenNotesApp {
             };
             self.set_pins_hidden(pins_hidden);
             self.tool.shape_snap = self.config.shape_snap;
+            self.tool.select.guides_on = self.config.smart_guides;
             if self.tool.text_box != prev_text_box {
                 self.apply_text_box_to_selection();
             }

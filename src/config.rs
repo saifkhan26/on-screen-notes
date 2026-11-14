@@ -179,6 +179,10 @@ pub struct AppConfig {
     /// turned off in the settings.
     #[serde(default = "default_shape_snap")]
     pub shape_snap: bool,
+    /// Smart guides: a selection being moved lines up with the objects
+    /// around it. On unless turned off in the settings.
+    #[serde(default = "default_shape_snap")]
+    pub smart_guides: bool,
 
     /// How the arrange bar's Pack lays objects out: the tightest block,
     /// rows or columns. Picked from the arrow beside it.
@@ -245,6 +249,7 @@ impl Default for AppConfig {
             slide_tab_order: SlideTabOrder::default(),
             arrange_apart: true,
             shape_snap: true,
+            smart_guides: true,
             pack_mode: PackMode::default(),
             beside_fit: BesideFit::default(),
             beside_side: BesideSide::default(),

@@ -823,6 +823,9 @@ pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos
 /// grab at any zoom. The canvas sits on arbitrary desktop content, so
 /// every line is a light stroke over a dark one: it reads on both bright
 /// and dark backgrounds.
+/// Smart guides' colour: apart from the selection's blue.
+const GUIDE: egui::Color32 = egui::Color32::from_rgb(255, 72, 150);
+
 pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f32, chrome: &crate::tools::select_tool::Chrome) {
     let to_screen = |p: [f32; 2]| egui::pos2(origin.x + p[0] * zoom, origin.y + p[1] * zoom);
     let line = egui::Color32::from_rgb(86, 160, 255);
@@ -832,6 +835,13 @@ pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f3
         let r = egui::Rect::from_two_pos(to_screen([m[0], m[1]]), to_screen([m[2], m[3]]));
         painter.rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 28));
         painter.rect_stroke(r, egui::Rounding::ZERO, egui::Stroke::new(1.0, line));
+    }
+    // Smart guides the moving selection lined up on.
+    for g in &chrome.guides {
+        painter.line_segment([to_screen(g[0]), to_screen(g[1])], egui::Stroke::new(1.0, GUIDE));
+        for p in g {
+            painter.circle_filled(to_screen(*p), 2.0, GUIDE);
+        }
     }
     // Groups inside the selection: a light dashed box each.
     for g in &chrome.groups {

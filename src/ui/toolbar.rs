@@ -28,8 +28,8 @@ pub fn show(
     smoothing: &mut SmoothingLevel,
     smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
-    // Shape snap on / off, in the settings popup.
-    shape_snap: &mut bool,
+    // Shape snap and smart guides on / off, in the settings popup.
+    snaps: (&mut bool, &mut bool),
     // New media beside the selected picture: what it matches and which
     // side, in the settings popup.
     beside: (&mut BesideFit, &mut BesideSide),
@@ -120,7 +120,7 @@ pub fn show(
                         interacted |= pins_btn(ui, hidden);
                     }
                     interacted |= pin_btn(ui, pinned_hwnd, pin_picking);
-                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve, shape_snap, (&mut *beside.0, &mut *beside.1));
+                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve, (&mut *snaps.0, &mut *snaps.1), (&mut *beside.0, &mut *beside.1));
                     interacted |= help_btn(ui, keys);
                 });
             });
@@ -1044,7 +1044,7 @@ fn settings_btn(
     smoothing: &mut SmoothingLevel,
     smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
-    shape_snap: &mut bool,
+    (shape_snap, smart_guides): (&mut bool, &mut bool),
     (beside_fit, beside_side): (&mut BesideFit, &mut BesideSide),
 ) -> bool {
     let size = Vec2::splat(BTN_SIZE);
@@ -1261,6 +1261,10 @@ fn settings_btn(
             ui.checkbox(shape_snap, "Shape snap").on_hover_text(
                 "Hold the pen still at the end of a stroke and it snaps to the line, \
                  triangle, rectangle, polygon, circle or ellipse it was meant to be",
+            );
+            ui.checkbox(smart_guides, "Smart guides").on_hover_text(
+                "While a selection is moved, its edges and middle line up with those of the \
+                 objects around it, and a line shows each. Hold Alt to move it freely",
             );
             ui.add_space(6.0);
             // Pills, not a ComboBox: see the smoothing mode row.

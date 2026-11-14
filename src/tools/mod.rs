@@ -13,6 +13,7 @@ pub mod arrange;
 pub mod arrow_tool;
 pub mod beside;
 pub mod eraser_tool;
+pub mod guides;
 pub mod lasso_tool;
 pub mod pen_tool;
 pub mod picture_colours;
