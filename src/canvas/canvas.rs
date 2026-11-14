@@ -456,9 +456,11 @@ impl Canvas {
     /// the rest of the code can assume `layers` is non-empty.
     pub fn ensure_migrated(&mut self) {
         if self.layers.is_empty() {
-            let mut l = Layer::default();
-            l.strokes = std::mem::take(&mut self.legacy_strokes);
-            l.shapes  = std::mem::take(&mut self.legacy_shapes);
+            let l = Layer {
+                strokes: std::mem::take(&mut self.legacy_strokes),
+                shapes: std::mem::take(&mut self.legacy_shapes),
+                ..Layer::default()
+            };
             self.layers.push(l);
             self.active_layer = 0;
             // The in-memory shape no longer matches the legacy file, so

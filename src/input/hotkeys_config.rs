@@ -78,7 +78,7 @@ impl Binding {
 
     /// Build the `egui::Modifiers` flag set for this binding so callers
     /// can hand it to `KeyboardShortcut::new` / `consume_shortcut`.
-    pub fn to_modifiers(&self) -> egui::Modifiers {
+    pub fn to_modifiers(self) -> egui::Modifiers {
         egui::Modifiers {
             alt:      self.alt,
             ctrl:     self.ctrl,
@@ -106,7 +106,7 @@ pub fn parse(s: &str) -> Option<Binding> {
     };
     let mut key: Option<egui::Key> = minus.then_some(egui::Key::Minus);
 
-    for raw in s.split(|c: char| c == '+' || c == '-') {
+    for raw in s.split(['+', '-']) {
         let tok = raw.trim().to_ascii_lowercase();
         if tok.is_empty() { continue; }
         match tok.as_str() {
@@ -118,8 +118,7 @@ pub fn parse(s: &str) -> Option<Binding> {
                     // Two key tokens — definitely malformed.
                     return None;
                 }
-                key = key_from_name(other);
-                if key.is_none() { return None; }
+                key = Some(key_from_name(other)?);
             }
         }
     }
@@ -249,7 +248,7 @@ fn same_global_combo(a: &str, b: &str) -> bool {
 pub fn to_global_hotkey_format(s: &str) -> Option<String> {
     let mut out = String::with_capacity(s.len() + 8);
     let mut first = true;
-    for raw in s.split(|c: char| c == '+' || c == '-') {
+    for raw in s.split(['+', '-']) {
         let tok = raw.trim();
         if tok.is_empty() { continue; }
         let lower = tok.to_ascii_lowercase();

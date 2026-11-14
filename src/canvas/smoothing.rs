@@ -25,11 +25,12 @@ use std::collections::VecDeque;
 use crate::canvas::stroke::PenSample;
 
 /// Which smoothing algorithm runs while a stroke is being recorded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SmoothingType {
     /// Existing PenFilter (wobble + One Euro) plus causal EMA on cache
     /// build. Default — chosen so an unchanged config behaves exactly
     /// like before this feature landed.
+    #[default]
     Adaptive,
     /// Krita NO_SMOOTHING. Raw samples straight to the polyline.
     None,
@@ -43,10 +44,6 @@ pub enum SmoothingType {
     /// running-mean, gated by a delay-distance radius so ink lags
     /// behind the cursor like a rope pull.
     Stabilizer,
-}
-
-impl Default for SmoothingType {
-    fn default() -> Self { SmoothingType::Adaptive }
 }
 
 impl SmoothingType {
@@ -284,7 +281,7 @@ pub fn weighted_step(state: &mut WeightedState, raw: PenSample, opts: &Smoothing
 
     for i in (0..n).rev() {
         let next = state.history[i];
-        let mut d = state.distance_history[i] as f32;
+        let mut d = state.distance_history[i];
 
         if i < n - 1 {
             let pressure_grad = next.pressure - state.history[i + 1].pressure;

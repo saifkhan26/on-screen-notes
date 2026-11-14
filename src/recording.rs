@@ -637,6 +637,7 @@ fn cursor_in_frame(cursor: [i32; 2], origin: [i32; 2], scale: u32, size: [u16; 2
 /// width `w`, height `h`). Clipped at the buffer bounds — no panic
 /// if the disc would partially overflow. Used by the recording
 /// pipeline to make the cursor visible in saved GIFs.
+#[allow(clippy::too_many_arguments)]
 fn draw_cursor_marker(
     buf: &mut [u8],
     w: i32,

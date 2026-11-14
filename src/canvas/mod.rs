@@ -10,6 +10,9 @@
 //! which one is "active" (visible + accepting input).
 
 pub mod affine;
+// `canvas::canvas::Canvas`: one slide, in its own file beside the manager.
+// Renaming it would touch every import for nothing.
+#[allow(clippy::module_inception)]
 pub mod canvas;
 pub mod hit;
 pub mod ink_gpu;
@@ -114,9 +117,7 @@ pub struct CanvasManager {
 /// false`) so it is only written to disk if the user actually draws on
 /// it.
 fn placeholder_canvas() -> Canvas {
-    let mut c = Canvas::default();
-    c.dirty = false;
-    c
+    Canvas { dirty: false, ..Canvas::default() }
 }
 
 /// What reading one slot produced, with an unreadable file already
@@ -1510,9 +1511,7 @@ mod view_tests {
     use super::*;
 
     fn clean() -> Canvas {
-        let mut c = Canvas::default();
-        c.dirty = false;
-        c
+        Canvas { dirty: false, ..Canvas::default() }
     }
 
     #[test]
@@ -1847,8 +1846,7 @@ mod loader_tests {
             std::fs::remove_file(e.unwrap().path()).unwrap();
         }
         for i in 0..3 {
-            let mut c = Canvas::default();
-            c.pan = [i as f32, 0.0];
+            let c = Canvas { pan: [i as f32, 0.0], ..Canvas::default() };
             std::fs::write(dir.join(format!("canvas_{i}.ron")), crate::persistence::serialize_canvas(&c).unwrap()).unwrap();
         }
         let modified = |i: usize| std::fs::metadata(dir.join(format!("canvas_{i}.ron"))).unwrap().modified().unwrap();
@@ -1882,8 +1880,7 @@ mod loader_tests {
             std::fs::remove_file(e.unwrap().path()).unwrap();
         }
         let slide = |x: f32| {
-            let mut c = Canvas::default();
-            c.pan = [x, 0.0];
+            let c = Canvas { pan: [x, 0.0], ..Canvas::default() };
             crate::persistence::serialize_canvas(&c).unwrap()
         };
         std::fs::write(dir.join("canvas_0.ron"), slide(10.0)).unwrap();

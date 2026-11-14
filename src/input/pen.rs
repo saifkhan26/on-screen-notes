@@ -53,9 +53,9 @@ impl RawHandleHolder {
     /// (in practice `&eframe::CreationContext`).
     pub fn capture(
         src: &(impl raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle),
-    ) -> crate::error::Result<std::sync::Arc<Self>> {
+    ) -> crate::error::Result<Self> {
         let raw_window = src.window_handle().ok().map(|w| w.as_raw());
-        Ok(std::sync::Arc::new(Self { raw_window }))
+        Ok(Self { raw_window })
     }
 }
 
@@ -79,7 +79,7 @@ enum Backend {
 impl PenInput {
     /// Try to bring up the platform pen backend. Failures degrade to
     /// `Disabled` (mouse fallback still works).
-    pub fn new(_holder: std::sync::Arc<RawHandleHolder>) -> Self {
+    pub fn new(_holder: RawHandleHolder) -> Self {
         #[cfg(target_os = "windows")]
         {
             match windows_backend::Wintab::try_init(&_holder) {
@@ -210,7 +210,7 @@ mod windows_backend {
             Self { out_org: org, out_ext: ext, screen_org: org, screen_ext: ext }
         }
 
-        pub(super) fn to_screen(&self, x: i32, y: i32) -> [f64; 2] {
+        pub(super) fn to_screen(self, x: i32, y: i32) -> [f64; 2] {
             let f = |i: usize, v: i32| {
                 self.screen_org[i] + (v as f64 - self.out_org[i]) * self.screen_ext[i] / self.out_ext[i]
             };

@@ -370,8 +370,7 @@ mod tests {
         let media = TempDir::new("big");
         let (big, other, small) = (noise_png(200, 1), noise_png(160, 2), noise_png(40, 3));
         assert!(big.len() >= MIN_BYTES && other.len() >= MIN_BYTES && small.len() < MIN_BYTES);
-        let mut c = Canvas::default();
-        c.dirty = false;
+        let mut c = Canvas { dirty: false, ..Canvas::default() };
         c.layers[0].shapes.push(picture(&big, RasterKind::Image));
         c.layers[0].shapes.push(picture(&small, RasterKind::Image));
         c.layers[0].shapes.push(picture(&big, RasterKind::Fill));

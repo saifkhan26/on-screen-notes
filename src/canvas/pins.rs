@@ -532,8 +532,8 @@ pub fn handles(frame: &Obb) -> Vec<([f32; 2], PinHandle)> {
 
 /// `(top-edge midpoint, knob centre)` of the rotate handle.
 pub fn rotate_knob(frame: &Obb) -> ([f32; 2], [f32; 2]) {
-    let top = frame.from_local([0.0, -frame.half[1]]);
-    let knob = frame.from_local([0.0, -frame.half[1] - ROTATE_STEM_PX]);
+    let top = frame.to_canvas([0.0, -frame.half[1]]);
+    let knob = frame.to_canvas([0.0, -frame.half[1] - ROTATE_STEM_PX]);
     (top, knob)
 }
 
@@ -694,7 +694,7 @@ impl PinTool {
                 let s = s.max(8.0 / (2.0 * hw.min(hh)).max(1e-3)).max(0.02);
                 if let Some(pin) = board.get_mut(*id) {
                     pin.scale = (*scale * s).clamp(MIN_SCALE, MAX_SCALE);
-                    pin.center = frame.from_local([anchor[0] * (1.0 - s), anchor[1] * (1.0 - s)]);
+                    pin.center = frame.to_canvas([anchor[0] * (1.0 - s), anchor[1] * (1.0 - s)]);
                 }
             }
             Gesture::Rotate { id, start, angle } => {
@@ -747,9 +747,7 @@ mod tests {
 
     #[test]
     fn new_tags_get_a_place_where_they_show_and_untagged_slides_none() {
-        let mut c = Canvas::default();
-        c.pan = [50.0, 0.0];
-        c.zoom = 2.0;
+        let mut c = Canvas { pan: [50.0, 0.0], zoom: 2.0, ..Canvas::default() };
         c.layers[0].shapes.push(rect([0.0, 0.0], [10.0, 10.0], 0));
         c.layers[0].shapes.push(rect([20.0, 0.0], [30.0, 10.0], 7));
         let slides = vec![Some(Canvas::default()), Some(c)];

@@ -18,12 +18,13 @@ use egui::{Color32, Rounding, Stroke, Vec2};
 
 /// Render the toolbar. Returns `true` if the user interacted with any
 /// element this frame.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
     tool: &mut ActiveTool,
     bg_opacity: &mut f32,
     bg_color: &mut [u8; 3],
-    palette: &mut Vec<[u8; 4]>,
+    palette: &mut [[u8; 4]],
     smoothing: &mut SmoothingLevel,
     smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
@@ -101,10 +102,9 @@ pub fn show(
                     spacer(ui);
 
                     // Group 3: colours
-                    for i in 0..palette.len() {
-                        let slot = palette[i];
-                        let (new_slot, hit) = colour_swatch(ui, tool, slot, i);
-                        palette[i] = new_slot;
+                    for (i, slot) in palette.iter_mut().enumerate() {
+                        let (new_slot, hit) = colour_swatch(ui, tool, *slot, i);
+                        *slot = new_slot;
                         interacted |= hit;
                     }
                     spacer(ui);
@@ -704,7 +704,7 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
                 let prefix = &full[..full.len() - bare(first).len()];
                 format!("{prefix}{}", bs.map(|b| b.map_or_else(String::new, bare)).join(" "))
             }
-            _ => bs.map(|b| k(b)).join(" "),
+            _ => bs.map(&k).join(" "),
         }
     };
     let (t, c, g) = (&keys.tool, &keys.canvas, &keys.global);
@@ -946,6 +946,7 @@ fn text_box_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, key: Option<Binding>) 
 ///   * No pin set, no picking → idle outline.
 ///   * Pin picking armed → accent fill + crosshair tooltip.
 ///   * Pinned to a window → accent fill + "unpin" tooltip.
+///
 /// Click semantics: idle → arm picking; picking → cancel; pinned →
 /// unpin. The actual pick-and-follow logic lives in `app.rs`.
 fn pin_btn(

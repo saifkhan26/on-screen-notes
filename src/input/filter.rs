@@ -233,9 +233,8 @@ impl<const N: usize> OneEuro<N> {
 ///
 ///   * `min_cutoff = 1.0 Hz`  — heavy smoothing of a still pen.
 ///   * `beta       = 0.05`     — opens up quickly with motion; at typical
-///                              writing speeds (~500 px/s) the effective
-///                              cutoff is well above 25 Hz so the filter
-///                              behaves almost like a passthrough.
+///     writing speeds (~500 px/s) the effective cutoff is well above
+///     25 Hz, so the filter behaves almost like a passthrough.
 ///   * `d_cutoff   = 1.0 Hz`  — canonical Casiez value.
 pub struct PenFilter {
     fpos: OneEuro<2>,

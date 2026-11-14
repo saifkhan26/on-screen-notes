@@ -569,7 +569,7 @@ impl OnScreenNotesApp {
             match cc.window_handle() {
                 Ok(h) => match h.as_raw() {
                     #[cfg(target_os = "windows")]
-                    RawWindowHandle::Win32(w) => w.hwnd.get() as isize,
+                    RawWindowHandle::Win32(w) => w.hwnd.get(),
                     _ => 0,
                 },
                 Err(e) => {
@@ -1040,7 +1040,8 @@ impl eframe::App for OnScreenNotesApp {
             // on a locked slide: they never change it.
             let editable = self.canvases.active_editable();
             let passive_tool = matches!(self.tool.kind, crate::tools::ToolKind::Laser | crate::tools::ToolKind::Spotlight);
-            let drag_pans = space_held || (!editable && !(passive_tool && self.canvases.opening().is_none()));
+            let tool_works_here = editable || (passive_tool && self.canvases.opening().is_none());
+            let drag_pans = space_held || !tool_works_here;
             let pen_owns_pointer = !pen_events.is_empty()
                 || self.pen.is_down()
                 || self.pen.used_within(PEN_OWNS_POINTER);

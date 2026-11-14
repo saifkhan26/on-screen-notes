@@ -19,6 +19,9 @@ use crate::ui::loupe::LoupeState;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// What a layer thumbnail was drawn from: `(strokes, shapes, image bytes, rev)`.
+type ThumbPrint = (usize, usize, usize, u64);
+
 /// Per-frame state retained across frames. Holds GPU texture handles
 /// for image-backed layers (frozen frames) keyed by
 /// `(canvas_idx, layer_idx)`; the cached PNG length is a cheap
@@ -36,7 +39,7 @@ pub struct OverlayCache {
     /// layer.rev)` and is cheap to recompute every frame; mismatch
     /// triggers a re-render + re-upload. `rev` covers edits that move
     /// or restyle objects without changing how many there are.
-    layer_thumbs: HashMap<(usize, usize), ((usize, usize, usize, u64), egui::TextureHandle)>,
+    layer_thumbs: HashMap<(usize, usize), (ThumbPrint, egui::TextureHandle)>,
     /// Pixels of pictures, loaded at the size shown: stored ones, ones
     /// kept in the slide, and video posters.
     pictures: crate::ui::picture_cache::PictureCache,
@@ -348,6 +351,7 @@ pub struct PinMarks {
 
 /// Render the central canvas area. Returns the rect we drew into so callers
 /// (mouse-fallback logic, scroll handling) can convert cursor coords.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
     cache: &mut OverlayCache,

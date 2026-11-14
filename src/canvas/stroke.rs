@@ -41,9 +41,10 @@ impl PenSample {
 /// Visual style for a stroke. Picked at the moment the user pen-downs and
 /// then frozen into the stroke for the rest of its life — switching the
 /// active style later does not retro-recolour earlier strokes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum StrokeStyle {
     /// Smooth opaque ribbon (existing pen look).
+    #[default]
     Default,
     /// Translucent, grainy line meant to read as a graphite pencil mark.
     Pencil,
@@ -58,10 +59,6 @@ pub enum StrokeStyle {
     /// solid colour — same idle-density build users expect from
     /// Photoshop's airbrush.
     Airbrush,
-}
-
-impl Default for StrokeStyle {
-    fn default() -> Self { StrokeStyle::Default }
 }
 
 fn default_stroke_style() -> StrokeStyle { StrokeStyle::Default }
@@ -319,7 +316,7 @@ pub(crate) fn gaussian_smooth_positions_bidir(pts: &mut [[f32; 2]], sigma: f32) 
     for w in kernel.iter_mut() { *w /= sum; }
 
     let mut out: Vec<[f32; 2]> = vec![[0.0; 2]; n];
-    for i in 0..n {
+    for (i, o) in out.iter_mut().enumerate() {
         let mut ax = 0.0_f32;
         let mut ay = 0.0_f32;
         for k in -radius..=radius {
@@ -329,7 +326,7 @@ pub(crate) fn gaussian_smooth_positions_bidir(pts: &mut [[f32; 2]], sigma: f32) 
             ax += pts[idx][0] * w;
             ay += pts[idx][1] * w;
         }
-        out[i] = [ax, ay];
+        *o = [ax, ay];
     }
     pts.copy_from_slice(&out);
 }
@@ -358,14 +355,14 @@ pub(crate) fn gaussian_smooth_widths_bidir(widths: &mut [f32], sigma: f32) {
     for w in kernel.iter_mut() { *w /= sum; }
 
     let mut out = vec![0.0_f32; n];
-    for i in 0..n {
+    for (i, o) in out.iter_mut().enumerate() {
         let mut a = 0.0_f32;
         for k in -radius..=radius {
             let idx = (i as isize + k).clamp(0, (n - 1) as isize) as usize;
             let w = kernel[(k + radius) as usize];
             a += widths[idx] * w;
         }
-        out[i] = a;
+        *o = a;
     }
     widths.copy_from_slice(&out);
 }
@@ -710,7 +707,7 @@ impl Stroke {
     /// Krita SIMPLE_SMOOTHING: average against the previous raw sample.
     fn push_simple(&mut self, sample: PenSample) {
         let state = self.mode_state
-            .get_or_insert_with(|| ModeState::Simple { prev: None });
+            .get_or_insert(ModeState::Simple { prev: None });
         let out = if let ModeState::Simple { prev } = state {
             smoothing::simple_step(prev, sample)
         } else {
@@ -869,7 +866,7 @@ pub fn apply_curve(raw: f32, curve: f32) -> f32 {
 
 /// Emit a spine node when the tangent has turned more than this since the
 /// last node, regardless of arc length. `cos(10°)`.
-const ANGLE_COS: f32 = 0.984_807_75;
+const ANGLE_COS: f32 = 0.984_807_7;
 
 /// Build the ribbon spine for a stroke: centripetal Catmull-Rom through the
 /// pre-smoothed sample positions, adaptively decimated into

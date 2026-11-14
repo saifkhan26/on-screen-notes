@@ -42,6 +42,7 @@ pub const MAX_ZOOM: f32 = 1000.0;
 /// Apply `notches` wheel steps (signed integer — positive = wheel up).
 /// Step sizes are tuned for gradual, fine-grained control: one notch
 /// nudges the value just enough to feel responsive without overshooting.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_scroll(
     notches: i32,
     raw_delta_y: f32,
@@ -234,8 +235,7 @@ mod tests {
     fn wheel_zoom_is_not_an_edit_but_layer_opacity_is() {
         let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
         tool.kind = ToolKind::Select;
-        let mut canvas = Canvas::default();
-        canvas.dirty = false;
+        let canvas = Canvas { dirty: false, ..Canvas::default() };
         let mut m = CanvasManager::for_tests(vec![canvas]);
         let mut bg = 0.5;
         handle_scroll(1, 1.0, [100.0, 100.0], false, false, false, &mut tool, &mut m, &mut bg);
@@ -250,8 +250,7 @@ mod tests {
         let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
         tool.kind = ToolKind::Pen;
         let size = tool.size;
-        let mut canvas = Canvas::default();
-        canvas.dirty = false;
+        let canvas = Canvas { dirty: false, ..Canvas::default() };
         let mut m = CanvasManager::for_tests(vec![canvas]);
         m.set_locked(0, true);
         let mut bg = 0.5;

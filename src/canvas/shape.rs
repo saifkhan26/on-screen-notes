@@ -191,14 +191,14 @@ pub struct Obb {
 impl Obb {
     /// Canvas point → this box's own frame (origin at the centre, axes
     /// along its sides).
-    pub fn to_local(&self, p: [f32; 2]) -> [f32; 2] {
+    pub fn to_local(self, p: [f32; 2]) -> [f32; 2] {
         let (s, c) = self.angle.sin_cos();
         let d = [p[0] - self.center[0], p[1] - self.center[1]];
         [c * d[0] + s * d[1], -s * d[0] + c * d[1]]
     }
 
-    /// Inverse of `to_local`.
-    pub fn from_local(&self, q: [f32; 2]) -> [f32; 2] {
+    /// Inverse of `to_local`: a point in this box's own frame → canvas.
+    pub fn to_canvas(self, q: [f32; 2]) -> [f32; 2] {
         let (s, c) = self.angle.sin_cos();
         [
             self.center[0] + c * q[0] - s * q[1],
@@ -211,10 +211,10 @@ impl Obb {
     pub fn corners(&self) -> [[f32; 2]; 4] {
         let [hw, hh] = self.half;
         [
-            self.from_local([-hw, -hh]),
-            self.from_local([hw, -hh]),
-            self.from_local([hw, hh]),
-            self.from_local([-hw, hh]),
+            self.to_canvas([-hw, -hh]),
+            self.to_canvas([hw, -hh]),
+            self.to_canvas([hw, hh]),
+            self.to_canvas([-hw, hh]),
         ]
     }
 
@@ -1000,7 +1000,7 @@ mod tests {
     fn first_pixel(s: &Shape) -> [f32; 2] {
         let Shape::Raster { flip, .. } = s else { panic!() };
         let o = s.obb();
-        o.from_local([if *flip { o.half[0] } else { -o.half[0] }, -o.half[1]])
+        o.to_canvas([if *flip { o.half[0] } else { -o.half[0] }, -o.half[1]])
     }
 
     #[test]

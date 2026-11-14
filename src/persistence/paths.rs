@@ -61,7 +61,7 @@ pub fn default_screenshot_dir() -> Result<PathBuf> {
     let pics = user
         .picture_dir()
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
     let dir = pics.join("on-screen-notes");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)

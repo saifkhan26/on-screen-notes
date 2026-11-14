@@ -146,9 +146,12 @@ fn join_groups(units: Vec<Unit>, groups: &[u64]) -> Vec<Unit> {
     out
 }
 
+/// Values split by kind, `(strokes, shapes)`, each as `(index, value)`.
+type ByKind<T> = (Vec<(usize, T)>, Vec<(usize, T)>);
+
 /// Hand each unit's value to every object in it, split into strokes and
 /// shapes, each ascending by index.
-fn per_object<T: Copy>(units: &[Unit], owners: &[(bool, usize)], values: &[T]) -> (Vec<(usize, T)>, Vec<(usize, T)>) {
+fn per_object<T: Copy>(units: &[Unit], owners: &[(bool, usize)], values: &[T]) -> ByKind<T> {
     let (mut strokes, mut shapes) = (Vec::new(), Vec::new());
     for (u, &v) in units.iter().zip(values) {
         for &m in &u.members {
@@ -339,9 +342,8 @@ pub fn units(objects: &[(Bounds, Option<u8>)], tol: f32) -> Vec<Unit> {
         }
     }
     let mut cluster_of_root = vec![usize::MAX; loose.len()];
-    for k in 0..loose.len() {
+    for (k, &i) in loose.iter().enumerate() {
         let r = root(&mut parent, k);
-        let i = loose[k];
         if cluster_of_root[r] == usize::MAX {
             cluster_of_root[r] = out.len();
             out.push(Unit { item: Item { bounds: objects[i].0, group: u8::MAX }, members: vec![i] });

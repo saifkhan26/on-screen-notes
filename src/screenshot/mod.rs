@@ -128,7 +128,7 @@ fn paste_monitor(out: &mut RgbaImage, origin: [i32; 2], mon: [i32; 2], img: &Rgb
 /// the outer rect made the captured image start a few pixels
 /// up-and-left of the visible content — strokes (in client coords)
 /// ended up offset bottom-right of the frozen content. `GetClientRect`
-/// + `ClientToScreen((0,0))` returns the actual content rectangle
+/// plus `ClientToScreen((0,0))` returns the actual content rectangle
 /// the user draws into.
 ///
 /// The pixels come from whichever monitors the window is on; a part of
@@ -379,6 +379,7 @@ pub fn capture_and_save(
 /// deferred capture drops the real window opacity to 0 so xcap grabs a
 /// clean desktop; we re-apply the tint here in software so the saved image
 /// matches what the user sees *through* the semi-transparent overlay.
+#[allow(clippy::too_many_arguments)]
 pub fn capture_region_and_save(
     canvas: &Canvas,
     pins: &[crate::canvas::pins::Pinned],
@@ -515,6 +516,21 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+/// Convert premultiplied RGBA → straight RGBA, in place. tiny-skia outputs
+/// premultiplied pixels (RGB already scaled by alpha); the `image` crate's
+/// blend logic assumes straight alpha.
+fn unpremultiply(img: &mut RgbaImage) {
+    for px in img.pixels_mut() {
+        let a = px.0[3];
+        if a == 0 || a == 255 { continue; }
+        let af = a as f32 / 255.0;
+        for c in 0..3 {
+            let v = (px.0[c] as f32 / af).min(255.0);
+            px.0[c] = v as u8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,20 +580,5 @@ mod tests {
         // Right of and below the monitor stays transparent.
         assert_eq!(out.get_pixel(20, 0).0[3], 0);
         assert_eq!(out.get_pixel(0, 15).0[3], 0);
-    }
-}
-
-/// Convert premultiplied RGBA → straight RGBA, in place. tiny-skia outputs
-/// premultiplied pixels (RGB already scaled by alpha); the `image` crate's
-/// blend logic assumes straight alpha.
-fn unpremultiply(img: &mut RgbaImage) {
-    for px in img.pixels_mut() {
-        let a = px.0[3];
-        if a == 0 || a == 255 { continue; }
-        let af = a as f32 / 255.0;
-        for c in 0..3 {
-            let v = (px.0[c] as f32 / af).min(255.0);
-            px.0[c] = v as u8;
-        }
     }
 }

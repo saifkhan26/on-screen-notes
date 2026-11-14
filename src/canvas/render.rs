@@ -88,6 +88,7 @@ fn dash_phase() -> f32 {
 /// `origin` is where the canvas's `(0, 0)` lives on screen, in egui logical
 /// coordinates. The caller passes in `canvas_rect.min`. We add the canvas's
 /// own `pan` on top of that and scale by `zoom`.
+#[allow(clippy::too_many_arguments)]
 pub fn paint_canvas_egui(
     painter: &egui::Painter,
     origin: egui::Pos2,
@@ -332,6 +333,7 @@ pub fn paint_canvas_egui(
 /// or fading a layer on its slide leaves its pinned objects showing as
 /// they are. `textures[k]` is the picture of `members[k]` when that is
 /// a raster.
+#[allow(clippy::too_many_arguments)]
 pub fn paint_pinned(
     painter: &egui::Painter,
     origin: egui::Pos2,
@@ -543,12 +545,12 @@ fn paint_shape(
                     let corner = (*stroke_width * 2.5).max(0.0).min((min_side * 0.45).max(0.0));
                     let pts: Vec<egui::Pos2> = rounded_box_outline(o.half, corner)
                         .into_iter()
-                        .map(|q| to_screen(o.from_local(q)))
+                        .map(|q| to_screen(o.to_canvas(q)))
                         .collect();
                     painter.add(egui::Shape::closed_line(pts, stroke));
                 }
                 BorderStyle::DashedAnimated => {
-                    let c = o.corners().map(|p| to_screen(p));
+                    let c = o.corners().map(to_screen);
                     paint_dashed_polyline(painter, &[c[0], c[1], c[2], c[3], c[0]], stroke, zoom);
                 }
             }
@@ -670,7 +672,7 @@ fn paint_shape(
                 let a = (layer_opacity * 255.0).clamp(0.0, 255.0) / 255.0;
                 let fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, (18.0 * a) as u8);
                 let edge = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (48.0 * a) as u8));
-                let corners: Vec<egui::Pos2> = shape.obb().corners().into_iter().map(|p| to_screen(p)).collect();
+                let corners: Vec<egui::Pos2> = shape.obb().corners().into_iter().map(to_screen).collect();
                 painter.add(egui::Shape::convex_polygon(corners, fill, edge));
             }
         }
@@ -1165,8 +1167,8 @@ impl<F: Fn([f32; 2]) -> egui::Pos2> InkSink for PainterSink<'_, F> {
             let base = (i * 4)       as u32;
             let next = ((i + 1) * 4) as u32;
             // Left feather strip (outer_l ↔ inner_l).
-            mesh.add_triangle(base + 0, base + 1, next + 0);
-            mesh.add_triangle(base + 1, next + 1, next + 0);
+            mesh.add_triangle(base, base + 1, next);
+            mesh.add_triangle(base + 1, next + 1, next);
             // Interior (inner_l ↔ inner_r).
             mesh.add_triangle(base + 1, base + 2, next + 1);
             mesh.add_triangle(base + 2, next + 2, next + 1);
@@ -2022,8 +2024,7 @@ fn draw_shape(
             pb.close();
             if let Some(path) = pb.finish() {
                 let paint = rgba_paint(*color);
-                let mut sk = TsStroke::default();
-                sk.width = *stroke_width;
+                let mut sk = TsStroke { width: *stroke_width, ..TsStroke::default() };
                 if let BorderStyle::DashedAnimated = border {
                     // Same on/off pattern + phase the egui side uses,
                     // so a screenshot taken at frame N matches the
@@ -2047,8 +2048,7 @@ fn draw_shape(
                 pb.push_oval(rect);
                 if let Some(path) = pb.finish() {
                     let paint = rgba_paint(*color);
-                    let mut sk = TsStroke::default();
-                    sk.width = *stroke_width;
+                    let mut sk = TsStroke { width: *stroke_width, ..TsStroke::default() };
                     if let BorderStyle::DashedAnimated = border {
                         if let Some(d) = StrokeDash::new(vec![DASH_ON, DASH_OFF], dash_phase()) {
                             sk.dash = Some(d);
@@ -2069,8 +2069,7 @@ fn draw_shape(
                     pb.line_to(b[0], b[1]);
                     if let Some(path) = pb.finish() {
                         let paint = rgba_paint(*color);
-                        let mut sk = TsStroke::default();
-                        sk.width = *stroke_width;
+                        let mut sk = TsStroke { width: *stroke_width, ..TsStroke::default() };
                         if let Some(d) = StrokeDash::new(vec![DASH_ON, DASH_OFF], dash_phase()) {
                             sk.dash = Some(d);
                         }
@@ -2091,8 +2090,7 @@ fn draw_shape(
                     pb.line_to(b[0], b[1]);
                     if let Some(path) = pb.finish() {
                         let paint = rgba_paint(*color);
-                        let mut sk = TsStroke::default();
-                        sk.width = *stroke_width;
+                        let mut sk = TsStroke { width: *stroke_width, ..TsStroke::default() };
                         if let Some(d) = StrokeDash::new(vec![DASH_ON, DASH_OFF], dash_phase()) {
                             sk.dash = Some(d);
                         }
@@ -2217,10 +2215,12 @@ fn draw_line(
     pb.line_to(b[0], b[1]);
     if let Some(path) = pb.finish() {
         let paint = rgba_paint(color);
-        let mut sk = TsStroke::default();
-        sk.width = width;
-        sk.line_cap = tiny_skia::LineCap::Round;
-        sk.line_join = tiny_skia::LineJoin::Round;
+        let sk = TsStroke {
+            width,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..TsStroke::default()
+        };
         pixmap.stroke_path(&path, &paint, &sk, t, None);
     }
 }
@@ -2359,8 +2359,8 @@ mod rotation_tests {
         };
         // Where `Obb` says the red (left) and blue (right) halves went.
         let o = shape.obb();
-        let red_at = o.from_local([-10.0, 0.0]);
-        let blue_at = o.from_local([10.0, 0.0]);
+        let red_at = o.to_canvas([-10.0, 0.0]);
+        let blue_at = o.to_canvas([10.0, 0.0]);
         assert!(red_at[1] < blue_at[1], "a clockwise quarter turn puts the left half on top");
 
         let mut pixmap = tiny_skia::Pixmap::new(100, 100).unwrap();
