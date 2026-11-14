@@ -451,8 +451,9 @@ impl WindowEdit {
         true
     }
 
-    /// Take the toolbar's choices: kind, colour, size, style, smoothing.
-    /// Switching tools drops what was in progress, as on the canvas.
+    /// Take the toolbar's choices: kind, colour, size, style, smoothing,
+    /// shape snap. Switching tools drops what was in progress, as on the
+    /// canvas.
     pub fn follow(&mut self, main: &ActiveTool) {
         if self.tool.kind != main.kind {
             self.tool.cancel();
@@ -465,6 +466,7 @@ impl WindowEdit {
         self.tool.smoothing = main.smoothing;
         self.tool.position_passes = main.position_passes;
         self.tool.border_style = main.border_style;
+        self.tool.shape_snap = main.shape_snap;
         // The held eraser is as big as the pen, as on the canvas.
         self.eraser.size = main.size;
         self.eraser.color = main.color;
@@ -554,6 +556,14 @@ impl WindowEdit {
                     self.pen = None;
                 }
             }
+        }
+
+        // ---- shape snap --------------------------------------------------
+        // A pen held still sends nothing, so the frame the hold (or the
+        // next step of the morph) is due in is asked for — the root
+        // window's, which draws this one too.
+        if let Some(wait) = self.tool.tick_snap(std::time::Instant::now()) {
+            ctx.request_repaint_after_for(wait, egui::ViewportId::ROOT);
         }
 
         // ---- mouse -----------------------------------------------------
