@@ -844,6 +844,7 @@ mod tests {
             border: Default::default(),
             rotation: 0.0,
             pin: 0,
+            group: 0,
         });
         fit(&mut w, &slide, Vec2::new(448.0, 448.0), 0.0);
         let to_screen = |p: [f32; 2]| [w.pan[0] + p[0] * w.zoom, w.pan[1] + p[1] * w.zoom];

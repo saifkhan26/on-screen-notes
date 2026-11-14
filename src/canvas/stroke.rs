@@ -99,6 +99,9 @@ pub struct Stroke {
     /// its old on-disk form.
     #[serde(default, skip_serializing_if = "crate::canvas::shape::is_unpinned")]
     pub pin: u64,
+    /// Group the stroke is in, or 0; see `Shape::group`.
+    #[serde(default, skip_serializing_if = "crate::canvas::shape::is_ungrouped")]
+    pub group: u64,
 
     /// Canvas units per screen pixel at the zoom the stroke was drawn at
     /// (1 / zoom). The pen draws at the toolbar size as it looks on
@@ -473,6 +476,7 @@ impl Stroke {
             filter: None,
             smoothing: SmoothingOptions::default(),
             mode_state: None,
+            group: 0,
         }
     }
 
@@ -497,6 +501,7 @@ impl Stroke {
             filter: None,
             smoothing,
             mode_state: None,
+            group: 0,
         }
     }
 
@@ -519,6 +524,7 @@ impl Stroke {
             filter: None,
             smoothing: SmoothingOptions::default(),
             mode_state: None,
+            group: 0,
         }
     }
 

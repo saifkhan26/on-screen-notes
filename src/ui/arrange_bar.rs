@@ -44,6 +44,8 @@ pub enum BarAction {
     KeepColours,
     /// The palette from before `KeepColours` comes back.
     RestorePalette,
+    /// Make the selection one group (`true`), or take it out of its groups.
+    Group(bool),
 }
 
 /// The palette button's part, for a selection that is one picture.
@@ -75,8 +77,9 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 /// objects until they touch rather than piling them up; the bar flips
 /// it when clicked. `keys` label the buttons' tooltips; `open_move`
 /// opens "Move to slide…" as its key asks; `picture` is set when the
-/// selection is one picture, for its palette button. Returns what was
-/// clicked this frame, if anything.
+/// selection is one picture, for its palette button; `grouped` when some
+/// of it is in a group, for the ungroup button. Returns what was clicked
+/// this frame, if anything.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
@@ -87,6 +90,7 @@ pub fn show(
     keys: &ParsedHotkeys,
     open_move: bool,
     picture: Option<ColourRow<'_>>,
+    grouped: bool,
 ) -> Option<BarAction> {
     let pos = bar_pos(ctx);
     let mut picked = None;
@@ -106,6 +110,21 @@ pub fn show(
                         divider(ui);
                     }
                     let k = &keys.arrange;
+                    if count >= 2 {
+                        let tip = with_key("Group — the selection selects, moves and arranges as one (Alt+click takes a single object)", keys.canvas.group);
+                        if icon_btn(ui, egui::include_image!("../../assets/icons/group.svg"), true, &tip) {
+                            picked = Some(BarAction::Group(true));
+                        }
+                    }
+                    if grouped {
+                        let tip = with_key("Ungroup — the objects select and move on their own again", keys.canvas.ungroup);
+                        if icon_btn(ui, egui::include_image!("../../assets/icons/ungroup.svg"), true, &tip) {
+                            picked = Some(BarAction::Group(false));
+                        }
+                    }
+                    if count >= 2 || grouped {
+                        divider(ui);
+                    }
                     let tip = with_key("Flip left to right — about the selection's middle", k.flip_horizontal);
                     if icon_btn(ui, egui::include_image!("../../assets/icons/flip-horizontal.svg"), true, &tip) {
                         picked = Some(BarAction::Flip(false));

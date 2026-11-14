@@ -51,16 +51,21 @@ pub fn plan_sizes(layer: &Layer, sel: &Selection, m: Match, zoom: f32) -> (Trans
 }
 
 /// The selected objects gathered into units, and which stroke (`true`)
-/// or shape each object `units` refers to is.
+/// or shape each object `units` refers to is. Objects grouped together
+/// (`Canvas::set_group`) are one unit whatever else they touch.
 fn gather(layer: &Layer, sel: &Selection, zoom: f32) -> (Vec<Unit>, Vec<(bool, usize)>) {
-    // Every selected object as (box, media group), plus which it is.
+    // Every selected object as (box, media group), plus which it is and
+    // the group it is in.
     let mut objects: Vec<(Bounds, Option<u8>)> = Vec::new();
     let mut owners: Vec<(bool, usize)> = Vec::new();
+    let mut groups: Vec<u64> = Vec::new();
     for &i in &sel.strokes {
-        let Some(b) = layer.strokes.get(i).and_then(|s| s.bounds().map(|b| (b, s.base_width * 0.5))) else { continue };
-        let (b, pad) = b;
+        let Some(s) = layer.strokes.get(i) else { continue };
+        let Some(b) = s.bounds() else { continue };
+        let pad = s.base_width * 0.5;
         objects.push(([b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad], None));
         owners.push((true, i));
+        groups.push(s.group);
     }
     for &i in &sel.shapes {
         let Some(s) = layer.shapes.get(i) else { continue };
@@ -71,8 +76,59 @@ fn gather(layer: &Layer, sel: &Selection, zoom: f32) -> (Vec<Unit>, Vec<(bool, u
         });
         objects.push((shape_bounds(s), group));
         owners.push((false, i));
+        groups.push(s.group());
     }
-    (units(&objects, 8.0 / zoom), owners)
+    (join_groups(units(&objects, 8.0 / zoom), &groups), owners)
+}
+
+/// Merge the units holding objects of one group into one unit, boxed
+/// around all of them. `groups` has each object's group (0: none). Its
+/// `GroupByType` cluster is the lowest of its parts', so a group with a
+/// picture in it goes with the pictures.
+fn join_groups(units: Vec<Unit>, groups: &[u64]) -> Vec<Unit> {
+    let mut parent: Vec<usize> = (0..units.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut first: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for (u, unit) in units.iter().enumerate() {
+        for &m in &unit.members {
+            let g = groups.get(m).copied().unwrap_or(0);
+            if g == 0 {
+                continue;
+            }
+            match first.get(&g) {
+                Some(&v) => {
+                    let (a, b) = (root(&mut parent, u), root(&mut parent, v));
+                    if a != b {
+                        parent[a] = b;
+                    }
+                }
+                None => {
+                    first.insert(g, u);
+                }
+            }
+        }
+    }
+    let mut out: Vec<Unit> = Vec::new();
+    let mut slot = vec![usize::MAX; units.len()];
+    for (u, unit) in units.into_iter().enumerate() {
+        let r = root(&mut parent, u);
+        if slot[r] == usize::MAX {
+            slot[r] = out.len();
+            out.push(unit);
+        } else {
+            let into = &mut out[slot[r]];
+            into.item.bounds = union([into.item.bounds, unit.item.bounds].into_iter());
+            into.item.group = into.item.group.min(unit.item.group);
+            into.members.extend(unit.members);
+        }
+    }
+    out
 }
 
 /// Hand each unit's value to every object in it, split into strokes and
@@ -803,6 +859,21 @@ mod tests {
                 assert_eq!((b.bounds[oth], b.bounds[oth + 2]), (a[oth], a[oth + 2]));
             }
         }
+    }
+
+    #[test]
+    fn a_group_arranges_as_one_unit() {
+        // Two far-apart strokes in one group and a third on its own: two
+        // units, the group boxed around both of its strokes.
+        let objects = [([0.0, 0.0, 10.0, 10.0], None), ([100.0, 0.0, 110.0, 10.0], None), ([300.0, 0.0, 310.0, 10.0], None)];
+        let joined = join_groups(units(&objects, 1.0), &[7, 7, 0]);
+        assert_eq!(joined.len(), 2);
+        let g = joined.iter().find(|u| u.members.len() == 2).unwrap();
+        assert_eq!(g.item.bounds, [0.0, 0.0, 110.0, 10.0]);
+        // A grouped picture keeps the picture cluster for group-by-type.
+        let objects = [([0.0, 0.0, 10.0, 10.0], Some(0)), ([50.0, 0.0, 60.0, 10.0], None)];
+        let joined = join_groups(units(&objects, 1.0), &[3, 3]);
+        assert_eq!((joined.len(), joined[0].item.group), (1, 0));
     }
 
     #[test]

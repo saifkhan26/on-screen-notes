@@ -231,6 +231,48 @@ impl Layer {
         if !min_x.is_finite() { return None; }
         Some([min_x, min_y, max_x, max_y])
     }
+
+    /// Every object on this layer in group `id` (none for 0).
+    pub fn group_members(&self, id: u64) -> hit::Selection {
+        let mut out = hit::Selection::default();
+        if id == 0 {
+            return out;
+        }
+        out.strokes = self.strokes.iter().enumerate().filter(|(_, s)| s.group == id).map(|(i, _)| i).collect();
+        out.shapes = self.shapes.iter().enumerate().filter(|(_, s)| s.group() == id).map(|(i, _)| i).collect();
+        out
+    }
+
+    /// The group `obj` is in; 0 when none (or no such object).
+    pub fn group_of(&self, obj: hit::ObjRef) -> u64 {
+        match obj {
+            hit::ObjRef::Stroke(i) => self.strokes.get(i).map_or(0, |s| s.group),
+            hit::ObjRef::Shape(i) => self.shapes.get(i).map_or(0, Shape::group),
+        }
+    }
+
+    /// `obj` and everything grouped with it.
+    pub fn with_group(&self, obj: hit::ObjRef) -> Vec<hit::ObjRef> {
+        let g = self.group_members(self.group_of(obj));
+        if g.is_empty() {
+            return vec![obj];
+        }
+        g.strokes.into_iter().map(hit::ObjRef::Stroke).chain(g.shapes.into_iter().map(hit::ObjRef::Shape)).collect()
+    }
+}
+
+/// Give copies groups of their own: objects grouped together stay
+/// together under a new id, so a copy never joins its original's group.
+pub fn regroup_copies(strokes: &mut [Stroke], shapes: &mut [Shape]) {
+    let mut new: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut fresh = |g: u64| if g == 0 { 0 } else { *new.entry(g).or_insert_with(crate::canvas::shape::fresh_group_id) };
+    for s in strokes {
+        s.group = fresh(s.group);
+    }
+    for s in shapes {
+        let g = fresh(s.group());
+        s.set_group(g);
+    }
 }
 
 /// Canvas-local bounding box of one shape, padded by its stroke width
@@ -400,6 +442,7 @@ impl Canvas {
             }
             s.set_pin(0);
         }
+        regroup_copies(&mut strokes, &mut shapes);
         let sel = hit::Selection { strokes: (0..strokes.len()).collect(), shapes: (0..shapes.len()).collect() };
         let mut canvas = Self { pan, zoom, ..Self::default() };
         canvas.layers[0].strokes = strokes;
@@ -1010,6 +1053,16 @@ impl Canvas {
         self.edit_objects(li, &strokes, &shapes, |_, s| s.pin = id, |_, s| s.set_pin(id))
     }
 
+    /// Put the chosen objects in group `id`, or take them out of any
+    /// group with `id = 0`. One undo step; objects already so are left
+    /// out of it. Returns false when nothing changed.
+    pub fn set_group(&mut self, li: usize, strokes: &[usize], shapes: &[usize], id: u64) -> bool {
+        let Some(layer) = self.layers.get(li) else { return false };
+        let strokes: Vec<usize> = strokes.iter().copied().filter(|&i| layer.strokes.get(i).is_some_and(|s| s.group != id)).collect();
+        let shapes: Vec<usize> = shapes.iter().copied().filter(|&i| layer.shapes.get(i).is_some_and(|s| s.group() != id)).collect();
+        self.edit_objects(li, &strokes, &shapes, |_, s| s.group = id, |_, s| s.set_group(id))
+    }
+
     /// Put the chosen text labels in a box that keeps them readable
     /// (`shape::auto_text_box`), or take them out of any box. One undo
     /// step; other shapes, and labels already so, are left out of it.
@@ -1451,6 +1504,7 @@ fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
         picture: None,
         pin: 0,
         flip: false,
+        group: 0,
     });
     layer.rev += 1;
     Some(img.capture_zoom)
@@ -1733,6 +1787,7 @@ fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutco
         // What is left of a pinned fill stays in its pin.
         pin: shape.pin(),
         flip: false,
+        group: 0,
     })
 }
 
@@ -1780,8 +1835,8 @@ mod layer_xform_tests {
     #[test]
     fn boxing_labels_is_one_undo_step_and_skips_other_shapes() {
         let mut c = Canvas::default();
-        c.add_shape(Shape::Text { pos: [0.0, 0.0], content: "a".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None });
-        c.add_shape(Shape::Rect { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border: crate::canvas::shape::BorderStyle::Solid, rotation: 0.0, pin: 0 });
+        c.add_shape(Shape::Text { pos: [0.0, 0.0], content: "a".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0 });
+        c.add_shape(Shape::Rect { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border: crate::canvas::shape::BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0 });
         let steps = c.undo_log.len();
         assert!(c.set_text_box(0, &[0, 1], true));
         assert_eq!(c.undo_log.len(), steps + 1);
@@ -1876,6 +1931,7 @@ mod object_edit_tests {
             picture: None,
             pin: 0,
             flip: false,
+            group: 0,
         }
     }
 
@@ -2023,6 +2079,7 @@ mod object_edit_tests {
             a: [0.0, 0.0], b: [40.0, 20.0], color: [1, 2, 3, 255], stroke_width: 2.0,
             border: BorderStyle::Solid, rotation: 0.0,
             pin: 0,
+            group: 0,
         });
         c.transform_objects(0, &[], &[0], &Affine::rotate_about([20.0, 10.0], 0.5));
         c.restyle_objects(0, &[], &[0], Some([9, 9, 9, 255]), None, false);
@@ -2095,6 +2152,7 @@ mod object_edit_tests {
         let line = |x: f32| Shape::Line {
             a: [x, 0.0], b: [x, 50.0], color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid,
             pin: 0,
+            group: 0,
         };
         c.add_shape(line(1.0));
         c.add_shape(line(2.0));

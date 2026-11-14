@@ -1094,6 +1094,7 @@ impl OnScreenNotesApp {
                     picture: None,
                     pin: 0,
                     flip: false,
+                    group: 0,
                 };
                 let c = self.canvases.active_mut();
                 c.add_shape(shape);
@@ -1138,6 +1139,8 @@ impl OnScreenNotesApp {
         offset: [f32; 2],
     ) {
         if strokes.is_empty() && shapes.is_empty() { return; }
+        // Copies of grouped objects make groups of their own.
+        crate::canvas::canvas::regroup_copies(&mut strokes, &mut shapes);
         // Copies are in no pin: a pin shows its own objects only.
         for s in &mut strokes {
             s.translate(offset);
@@ -1823,6 +1826,11 @@ impl OnScreenNotesApp {
                 let msg = if self.tool.text_box { "Text in a box: on" } else { "Text in a box: off" };
                 say(self, msg.to_string());
             }
+            K::Group(on) => {
+                if selecting {
+                    self.group_selection(on);
+                }
+            }
             K::MoveSlide(step) => {
                 let from = self.canvases.active_index();
                 if let Some(to) = from.checked_add_signed(isize::from(step)).filter(|&to| to < self.canvases.count()) {
@@ -1882,6 +1890,39 @@ impl OnScreenNotesApp {
         if c.nudge_objects(li, &sel.strokes, &sel.shapes, [px[0] * per_px, px[1] * per_px], merge) {
             self.nudge_run = Some((idx, c.undo_log.len(), now));
         }
+    }
+
+    /// Some selected object is in a group.
+    fn selection_grouped(&self) -> bool {
+        let c = self.canvases.active();
+        let Some(layer) = c.layers.get(c.active_layer) else { return false };
+        let sel = &self.tool.select.sel;
+        sel.strokes.iter().any(|&i| layer.strokes.get(i).is_some_and(|s| s.group != 0))
+            || sel.shapes.iter().any(|&i| layer.shapes.get(i).is_some_and(|s| s.group() != 0))
+    }
+
+    /// Make the selection one group (`on`), or take it out of its groups:
+    /// one undo step. The selection stays as it is.
+    fn group_selection(&mut self, on: bool) {
+        let sel = self.tool.select.sel.clone();
+        let n = sel.strokes.len() + sel.shapes.len();
+        if on && n < 2 {
+            self.toast = Some(("Select two or more objects to group them".to_string(), Instant::now()));
+            return;
+        }
+        if n == 0 || !self.may_edit() {
+            return;
+        }
+        let id = if on { crate::canvas::shape::fresh_group_id() } else { 0 };
+        let c = self.canvases.active_mut();
+        let li = c.active_layer;
+        let changed = c.set_group(li, &sel.strokes, &sel.shapes, id);
+        let msg = match (on, changed) {
+            (true, _) => format!("Grouped {n} objects — Alt+click picks one of them"),
+            (false, true) => "Ungrouped".to_string(),
+            (false, false) => "Nothing here is grouped".to_string(),
+        };
+        self.toast = Some((msg, Instant::now()));
     }
 
     /// Every selected object is in a pin.
@@ -2221,6 +2262,7 @@ impl OnScreenNotesApp {
             picture: None,
             pin: 0,
             flip: false,
+            group: 0,
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
@@ -2464,6 +2506,7 @@ impl OnScreenNotesApp {
             picture: None,
             pin: 0,
             flip: false,
+            group: 0,
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
     }
@@ -3169,13 +3212,15 @@ impl eframe::App for OnScreenNotesApp {
             {
                 use ui::arrange_bar::BarAction;
                 let pinned = self.selection_pinned();
+                let grouped = self.selection_grouped();
                 let open_move = std::mem::take(&mut self.move_picker_pending);
                 let keys = &self.hotkeys_cfg;
                 let row = picture.map(|_| ui::arrange_bar::ColourRow {
                     shown: self.picture_colours.as_ref().map(|p| p.colours.as_slice()),
                     can_restore: self.palette_before.is_some(),
                 });
-                match ui::arrange_bar::show(ctx, selected_count, pinned, &self.canvases, &mut self.config.arrange_apart, keys, open_move, row) {
+                match ui::arrange_bar::show(ctx, selected_count, pinned, &self.canvases, &mut self.config.arrange_apart, keys, open_move, row, grouped) {
+                    Some(BarAction::Group(on)) => self.group_selection(on),
                     Some(BarAction::Arrange(op)) => self.arrange_selection(op),
                     Some(BarAction::Match(m)) => self.match_selection_size(m),
                     Some(BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
@@ -3545,6 +3590,7 @@ impl eframe::App for OnScreenNotesApp {
                 // The `I` eyedropper still works.
                 let select_active = self.tool.kind == crate::tools::ToolKind::Select;
                 self.tool.select.shift = shift_held;
+                self.tool.select.alt = ctx.input(|i| i.modifiers.alt);
 
                 // Shift-pick: while Shift is held over the canvas, give the
                 // user a crosshair so they know the next tap will sample a
@@ -3686,6 +3732,7 @@ impl eframe::App for OnScreenNotesApp {
                 // tool while it is active.
                 let select_active = self.tool.kind == crate::tools::ToolKind::Select;
                 self.tool.select.shift = shift_held;
+                self.tool.select.alt = ctx.input(|i| i.modifiers.alt);
                 // Shift + click = colour pick. Resolve here so the
                 // sampling click does not also start a stroke.
                 let picking = (shift_held && !select_active) || self.tool.eyedropper_pending;

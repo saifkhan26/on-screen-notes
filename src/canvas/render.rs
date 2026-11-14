@@ -2355,6 +2355,7 @@ mod rotation_tests {
             picture: None,
             pin: 0,
             flip: false,
+            group: 0,
         };
         // Where `Obb` says the red (left) and blue (right) halves went.
         let o = shape.obb();

@@ -525,6 +525,7 @@ impl WindowEdit {
         let pans = self.drag_pans(editable, input, ctx);
         let (ctrl, shift) = ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
         self.tool.select.shift = shift;
+        self.tool.select.alt = ctx.input(|i| i.modifiers.alt);
         if let Some(c) = manager.slide(view.slide) {
             self.tool.select.sync(self.tool.kind == ToolKind::Select, view.slide, c);
         }
@@ -814,6 +815,7 @@ mod tests {
             stroke_width: 4.0,
             border: Default::default(),
             pin: 0,
+            group: 0,
         });
         let mut m = CanvasManager::for_tests(vec![slide]);
         let id = m.pin_objects(0, &[], &[0], [0.0, 0.0], false).expect("pinned");

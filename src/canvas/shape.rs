@@ -43,6 +43,18 @@ fn is_zero(v: &f32) -> bool { *v == 0.0 }
 fn is_fill(k: &RasterKind) -> bool { *k == RasterKind::Fill }
 fn is_false(v: &bool) -> bool { !*v }
 pub(crate) fn is_unpinned(v: &u64) -> bool { *v == 0 }
+pub(crate) fn is_ungrouped(v: &u64) -> bool { *v == 0 }
+
+/// A group id no group has: time-seeded at the first call, then
+/// counting up, so ids made in different runs do not meet either.
+pub fn fresh_group_id() -> u64 {
+    static NEXT: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    let next = NEXT.get_or_init(|| {
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        std::sync::atomic::AtomicU64::new(seed.max(1))
+    });
+    next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// What a media picture plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +287,11 @@ pub enum Shape {
         /// `canvas::pins`. Like `rotation`, a zero is not written.
         #[serde(default, skip_serializing_if = "is_unpinned")]
         pin: u64,
+        /// Group the shape is in (`Canvas::set_group`), or 0: grouped
+        /// objects select, move and arrange as one. Like `pin`, a zero
+        /// is not written.
+        #[serde(default, skip_serializing_if = "is_ungrouped")]
+        group: u64,
     },
     /// Ellipse defined by its bounding rectangle (corners `a` and `b`).
     Ellipse {
@@ -292,6 +309,11 @@ pub enum Shape {
         /// Same as `Rect::pin`.
         #[serde(default, skip_serializing_if = "is_unpinned")]
         pin: u64,
+        /// Group the shape is in (`Canvas::set_group`), or 0: grouped
+        /// objects select, move and arrange as one. Like `pin`, a zero
+        /// is not written.
+        #[serde(default, skip_serializing_if = "is_ungrouped")]
+        group: u64,
     },
     /// Straight line from `a` to `b`.
     Line {
@@ -308,6 +330,11 @@ pub enum Shape {
         /// Same as `Rect::pin`.
         #[serde(default, skip_serializing_if = "is_unpinned")]
         pin: u64,
+        /// Group the shape is in (`Canvas::set_group`), or 0: grouped
+        /// objects select, move and arrange as one. Like `pin`, a zero
+        /// is not written.
+        #[serde(default, skip_serializing_if = "is_ungrouped")]
+        group: u64,
     },
     /// Arrow from `a` to `b`. Arrowhead is drawn at `b`. Only the
     /// shaft honours `border`; the head stays solid so the
@@ -322,6 +349,11 @@ pub enum Shape {
         /// Same as `Rect::pin`.
         #[serde(default, skip_serializing_if = "is_unpinned")]
         pin: u64,
+        /// Group the shape is in (`Canvas::set_group`), or 0: grouped
+        /// objects select, move and arrange as one. Like `pin`, a zero
+        /// is not written.
+        #[serde(default, skip_serializing_if = "is_ungrouped")]
+        group: u64,
     },
     /// Free-floating text label anchored at `pos` (top-left of the
     /// first line's baseline box). Lines are split on `\n`. Rendered
@@ -343,6 +375,11 @@ pub enum Shape {
         /// Same as `Rect::pin`.
         #[serde(default, skip_serializing_if = "is_unpinned")]
         pin: u64,
+        /// Group the shape is in (`Canvas::set_group`), or 0: grouped
+        /// objects select, move and arrange as one. Like `pin`, a zero
+        /// is not written.
+        #[serde(default, skip_serializing_if = "is_ungrouped")]
+        group: u64,
         /// Colour of the rounded box drawn behind the text, if it has
         /// one (`text_box_pad` around it). Not written when unset, so a
         /// plain label keeps its old on-disk form.
@@ -400,6 +437,11 @@ pub enum Shape {
         /// Same as `Rect::pin`.
         #[serde(default, skip_serializing_if = "is_unpinned")]
         pin: u64,
+        /// Group the shape is in (`Canvas::set_group`), or 0: grouped
+        /// objects select, move and arrange as one. Like `pin`, a zero
+        /// is not written.
+        #[serde(default, skip_serializing_if = "is_ungrouped")]
+        group: u64,
     },
 }
 
@@ -437,6 +479,29 @@ impl Shape {
             | Shape::Arrow   { pin, .. }
             | Shape::Text    { pin, .. }
             | Shape::Raster  { pin, .. } => *pin = id,
+        }
+    }
+
+    /// Id of the group this shape is in; 0 when it is in none.
+    pub fn group(&self) -> u64 {
+        match self {
+            Shape::Rect    { group, .. }
+            | Shape::Ellipse { group, .. }
+            | Shape::Line    { group, .. }
+            | Shape::Arrow   { group, .. }
+            | Shape::Text    { group, .. }
+            | Shape::Raster  { group, .. } => *group,
+        }
+    }
+
+    pub fn set_group(&mut self, id: u64) {
+        match self {
+            Shape::Rect    { group, .. }
+            | Shape::Ellipse { group, .. }
+            | Shape::Line    { group, .. }
+            | Shape::Arrow   { group, .. }
+            | Shape::Text    { group, .. }
+            | Shape::Raster  { group, .. } => *group = id,
         }
     }
 
@@ -706,7 +771,7 @@ mod tests {
     use super::*;
 
     fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0 }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0 }
     }
 
     #[test]
@@ -742,6 +807,7 @@ mod tests {
             picture: None,
             pin: 0,
             flip: false,
+            group: 0,
         };
         let text = ron::to_string(&raster).unwrap();
         assert!(!text.contains("rotation") && !text.contains("kind") && !text.contains("media"), "{text}");
@@ -755,6 +821,7 @@ mod tests {
             picture: None,
             pin: 0,
             flip: false,
+            group: 0,
         };
         let back: Shape = ron::from_str(&ron::to_string(&raster).unwrap()).unwrap();
         assert!(matches!(back, Shape::Raster { rotation, kind: RasterKind::Image, .. } if (rotation - 0.5).abs() < 1e-6));
@@ -774,6 +841,7 @@ mod tests {
             picture: None,
             pin: 0,
             flip: false,
+            group: 0,
         }
     }
 
@@ -822,6 +890,7 @@ mod tests {
             picture: Some(Box::new(PictureRef { file: "0123456789abcdef.jpg".into(), size: [400, 300], crop, mirror })),
             pin: 0,
             flip: false,
+            group: 0,
         }
     }
 
@@ -917,7 +986,7 @@ mod tests {
 
     #[test]
     fn text_turns_about_its_anchor() {
-        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0, pin: 0, background: None };
+        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0, pin: 0, background: None, group: 0 };
         t.apply_affine(&Affine::rotate_about([10.0, 10.0], 0.3).then(Affine::scale_about([10.0, 10.0], 2.0, 2.0)));
         assert!(matches!(t, Shape::Text { pos, font_size, rotation, .. }
             if (pos[0] - 10.0).abs() < 1e-3 && (font_size - 40.0).abs() < 1e-2 && (rotation - 0.3).abs() < 1e-4));
@@ -969,7 +1038,7 @@ mod tests {
         assert!((rotation + 0.2).abs() < 1e-4, "mirrored turn, not half a turn off: {rotation}");
         assert!(near(*a, [0.0, 0.0]) && near(*b, [40.0, 20.0]));
 
-        let mut t = Shape::Text { pos: [100.0, 50.0], content: "abc".into(), font_size: 20.0, color: [0; 4], rotation: 0.1, pin: 0, background: None };
+        let mut t = Shape::Text { pos: [100.0, 50.0], content: "abc".into(), font_size: 20.0, color: [0; 4], rotation: 0.1, pin: 0, background: None, group: 0 };
         let centre = t.obb().center;
         t.apply_affine(&Affine::scale_about([0.0, 0.0], 1.0, -1.0));
         let Shape::Text { rotation, font_size, .. } = &t else { panic!() };
@@ -979,7 +1048,7 @@ mod tests {
 
     #[test]
     fn a_text_box_widens_the_frame_and_follows_a_recolour() {
-        let plain = Shape::Text { pos: [0.0, 0.0], content: "ab".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None };
+        let plain = Shape::Text { pos: [0.0, 0.0], content: "ab".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0 };
         let mut boxed = plain.clone();
         if let Shape::Text { background, .. } = &mut boxed { *background = Some(auto_text_box([255; 4])); }
         let (a, b) = (plain.obb(), boxed.obb());

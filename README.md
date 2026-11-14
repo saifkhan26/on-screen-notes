@@ -203,6 +203,8 @@ layer makes that layer the active one.
 |---|---|
 | Click an object | Select it |
 | `Shift` + click | Add it to / remove it from the selection |
+| `Ctrl+G` / `Ctrl+Shift+G` (or the bar's group buttons) | Group the selection / ungroup it. A group selects, moves, resizes and arranges as one |
+| `Alt` + click | Select just that object, not the group it is in |
 | Drag from empty space | Box-select everything fully inside the box (on the active layer; if nothing there is inside, on the topmost layer that has something) |
 | Drag inside the frame | Move the selection |
 | Drag a corner handle | Resize, keeping proportions |
@@ -269,6 +271,13 @@ Every action is one undo step. Things worth knowing:
 - While the Select tool is active, `Shift` + click selects rather than
   picking a colour, and `Ctrl` does not erase. `I` still picks a colour.
 - Objects on different layers cannot be in one selection.
+- **Groups.** Clicking, Shift+clicking or box-selecting any object of a
+  group takes the whole group; `Alt`+click takes one object of it. A
+  selection holding groups among other things shows each group as a
+  dashed box inside the frame. Arrange packs, aligns and spaces a group
+  as one block. Duplicates and pastes of a group make a group of their
+  own. Grouping and ungrouping are undo steps. Groups in groups are not
+  kept: grouping again makes one flat group.
 - Pasting an image-only clipboard works on Windows; elsewhere the
   clipboard must also carry text for the paste to be noticed.
 - **Copying into other apps (Windows).** `Ctrl+C` / `Ctrl+X` also put
@@ -438,6 +447,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Cancel pending (eyedropper / lasso / text / selection) | `Esc` |
 | Selection: delete / duplicate | `Delete` / `Ctrl+D` |
 | Selection: copy to a new slide | `Ctrl+Shift+D` |
+| Selection: group / ungroup (`Alt`+click picks one object of a group) | `Ctrl+G` / `Ctrl+Shift+G` |
 | Selection: pin to every slide / unpin | `Ctrl+P` |
 | Hide / show all pins | `Shift+P` |
 | Selection: copy / cut / paste | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` |
@@ -475,7 +485,7 @@ one shortcut goes dead, the rest still work. Look at `RUST_LOG=warn`
 output for the offending line.
 
 ```toml
-version = 6
+version = 7
 
 [global]
 toggle_overlay = "ctrl+alt+shift+n"
@@ -675,6 +685,9 @@ by PureRef 2 (including 2's "save as legacy") both work.
 - **Animated GIFs** come in as GIFs you can play, like a dropped one
   (paused until you start them), unless the board crops or mirrors
   them: those come in as a still of the first frame.
+- **Groups** come over: what moves together in PureRef — a group's
+  contents, a picture and the notes on it — is one group on the slide.
+  A group inside a group becomes part of the outer one.
 - **Notes** become text labels with their colour and rotation, wrapped
   to the note's width when it has a fixed one. A note's background
   becomes the label's box, in the note's colour; rich-text styling is

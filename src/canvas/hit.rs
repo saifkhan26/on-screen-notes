@@ -368,6 +368,7 @@ mod tests {
             a: [0.0, 0.0], b: [100.0, 60.0], color: [0; 4], stroke_width: 2.0,
             border: BorderStyle::Solid, rotation: 0.0,
             pin: 0,
+            group: 0,
         };
         assert!(shape_hit(&r, [50.0, 0.5], 2.0));
         assert!(shape_hit(&r, [100.0, 30.0], 2.0));
@@ -381,6 +382,7 @@ mod tests {
             a: [0.0, 0.0], b: [100.0, 20.0], color: [0; 4], stroke_width: 2.0,
             border: BorderStyle::Solid, rotation: 0.0,
             pin: 0,
+            group: 0,
         };
         // Quarter turn about the centre (50, 10): the long side now runs
         // vertically through x = 40 and x = 60.
@@ -397,6 +399,7 @@ mod tests {
             a: [0.0, 0.0], b: [100.0, 50.0], color: [0; 4], stroke_width: 2.0,
             border: BorderStyle::Solid, rotation: 0.0,
             pin: 0,
+            group: 0,
         };
         assert!(shape_hit(&e, [100.0, 25.0], 2.0));
         assert!(shape_hit(&e, [50.0, 0.0], 2.0));
@@ -420,6 +423,7 @@ mod tests {
             picture: None,
             pin: 0,
             flip: false,
+            group: 0,
         }
     }
 
@@ -430,6 +434,7 @@ mod tests {
             a: [0.0, 0.0], b: [100.0, 100.0], color: [0; 4], stroke_width: 4.0,
             border: BorderStyle::Solid,
             pin: 0,
+            group: 0,
         });
         assert_eq!(pick(&c, [50.0, 50.0], 2.0, true), Some(CanvasHit::Object(0, ObjRef::Shape(0))));
         c.layers[0].strokes.push(diagonal());

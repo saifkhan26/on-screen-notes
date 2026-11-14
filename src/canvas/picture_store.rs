@@ -341,6 +341,7 @@ mod tests {
             picture: None,
             pin: 7,
             flip: false,
+            group: 0,
         }
     }
 

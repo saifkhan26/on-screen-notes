@@ -214,5 +214,6 @@ pub fn flood_fill_active(
         picture: None,
         pin: 0,
         flip: false,
+        group: 0,
     })
 }

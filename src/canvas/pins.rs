@@ -723,7 +723,7 @@ mod tests {
     use crate::canvas::shape::{BorderStyle, Shape};
 
     fn rect(a: [f32; 2], b: [f32; 2], pin: u64) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin, group: 0 }
     }
 
     fn close(p: [f32; 2], q: [f32; 2]) -> bool {

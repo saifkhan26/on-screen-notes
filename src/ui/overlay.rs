@@ -829,6 +829,13 @@ pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f3
         painter.rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 28));
         painter.rect_stroke(r, egui::Rounding::ZERO, egui::Stroke::new(1.0, line));
     }
+    // Groups inside the selection: a light dashed box each.
+    for g in &chrome.groups {
+        let mut pts: Vec<egui::Pos2> = g.iter().map(|p| to_screen(*p)).collect();
+        pts.push(pts[0]);
+        let dash = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(160, 205, 255, 200));
+        painter.extend(egui::Shape::dashed_line(&pts, dash, 4.0, 3.0));
+    }
     if let Some(frame) = chrome.frame {
         let pts: Vec<egui::Pos2> = frame.iter().map(|p| to_screen(*p)).collect();
         painter.add(egui::Shape::closed_line(pts.clone(), egui::Stroke::new(3.0, under)));

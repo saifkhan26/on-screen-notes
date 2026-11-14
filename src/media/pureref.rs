@@ -10,9 +10,11 @@
 //!
 //! The layouts are reverse-engineered (FyorDev/PureRef-format and
 //! wolfexplode/obsidian-excalidraw-pureref). Only what is needed to place
-//! pictures and notes is read; groups only contribute their transforms,
-//! and drawings and opacity are left out. A note's background becomes
-//! its label's box (`Shape::Text::background`).
+//! pictures and notes is read; drawings and opacity are left out. A
+//! note's background becomes its label's box (`Shape::Text::background`).
+//! Items that move together in PureRef — a group's contents, a picture
+//! and the notes on it — become one group (`Shape::group`); groups in
+//! groups become one.
 //!
 //! Boards can be gigabytes, so nothing holds the whole file: 1.x
 //! pictures are read one at a time from their byte ranges, and a 2.x
@@ -29,7 +31,7 @@
 
 use super::import::{encode_png, fit_side, shrink, store_bytes_into, IMAGE_SIDE};
 use crate::canvas::canvas::Canvas;
-use crate::canvas::shape::{fresh_media_id, text_extent, MediaKind, MediaMeta, MediaRef, PictureRef, RasterKind, Shape};
+use crate::canvas::shape::{fresh_group_id, fresh_media_id, text_extent, MediaKind, MediaMeta, MediaRef, PictureRef, RasterKind, Shape};
 use crate::error::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -84,6 +86,8 @@ pub enum BoardItem {
         half: [f64; 2],
         /// Radians, clockwise on screen, about `center`.
         rotation: f64,
+        /// The board item this one moves with (`RawPlacement::root`).
+        group: i64,
     },
     Note {
         text: String,
@@ -95,6 +99,8 @@ pub enum BoardItem {
         /// The note's box colour; `None` when it has none (or it is
         /// fully clear).
         background: Option<[u8; 4]>,
+        /// The board item this one moves with (`RawPlacement::root`).
+        group: i64,
     },
 }
 
@@ -107,6 +113,12 @@ impl Board {
 }
 
 impl BoardItem {
+    fn group(&self) -> i64 {
+        match self {
+            BoardItem::Picture { group, .. } | BoardItem::Note { group, .. } => *group,
+        }
+    }
+
     fn corners(&self) -> [[f64; 2]; 4] {
         let (origin, ext, rotation) = match self {
             BoardItem::Picture { center, half, rotation, .. } => {
@@ -257,11 +269,22 @@ pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &s
     }
     let map = |p: [f64; 2]| [((p[0] - mid[0]) * s + view[0] * 0.5) as f32, ((p[1] - mid[1]) * s + view[1] * 0.5) as f32];
 
+    // Items that move together on the board are a group on the slide; a
+    // lone item stays out of any.
+    let mut members: HashMap<i64, usize> = HashMap::new();
+    for item in &board.items {
+        *members.entry(item.group()).or_default() += 1;
+    }
+    let mut ids: HashMap<i64, u64> = HashMap::new();
+    let mut group_of = |key: i64| {
+        if members.get(&key).copied().unwrap_or(0) < 2 { 0 } else { *ids.entry(key).or_insert_with(fresh_group_id) }
+    };
+
     let shapes = board
         .items
         .into_iter()
         .map(|item| match item {
-            BoardItem::Picture { png, px_size, picture, media, center, half, rotation } => {
+            BoardItem::Picture { png, px_size, picture, media, center, half, rotation, group } => {
                 let c = map(center);
                 let half = [(half[0] * s) as f32, (half[1] * s) as f32];
                 Shape::Raster {
@@ -276,9 +299,10 @@ pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &s
                     picture: picture.map(Box::new),
                     pin: 0,
                     flip: false,
+                    group: group_of(group),
                 }
             }
-            BoardItem::Note { text, pos, font_size, color, rotation, background } => Shape::Text {
+            BoardItem::Note { text, pos, font_size, color, rotation, background, group } => Shape::Text {
                 pos: map(pos),
                 content: text,
                 font_size: (font_size * s) as f32,
@@ -286,6 +310,7 @@ pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &s
                 rotation: rotation as f32,
                 pin: 0,
                 background,
+                group: group_of(group),
             },
         })
         .collect();
@@ -403,6 +428,9 @@ struct RawPlacement {
     /// z of each ancestor then the item itself: groups and their
     /// children stack as a unit.
     order: Vec<f64>,
+    /// The outermost item this one moves with: its top PureRef group,
+    /// or the picture or note it hangs on, else itself.
+    root: i64,
 }
 
 struct RawNote {
@@ -420,6 +448,8 @@ struct RawNote {
     /// a fixed width; otherwise each paragraph is one line.
     width: Option<f64>,
     order: Vec<f64>,
+    /// See `RawPlacement::root`.
+    root: i64,
 }
 
 fn open_from<R: Read + Seek>(mut src: R, len: u64, media_dir: &Path, progress: &Progress, db_in_memory_max: u64) -> Result<Board> {
@@ -714,13 +744,15 @@ fn parse_v1<R: Read + Seek>(src: &mut R, len: u64) -> Result<RawBoard> {
     let mut out = RawBoard::default();
     let mut r = Reader::new(&records, items_start);
     for _ in 0..root_count {
-        read_v1_item(&mut r, table, Xf::IDENTITY, &[], &mut pictures, &mut out, 0)?;
+        read_v1_item(&mut r, table, Xf::IDENTITY, &[], &mut pictures, &mut out, 0, None)?;
     }
     Ok(out)
 }
 
 /// One item record and, after it, its children. `parent` maps the
-/// parent's space to the scene.
+/// parent's space to the scene; `root` is the top item of the tree it
+/// is in (`None` for a top item itself), which its children follow.
+#[allow(clippy::too_many_arguments)]
 fn read_v1_item(
     r: &mut Reader,
     limit: usize,
@@ -729,6 +761,7 @@ fn read_v1_item(
     pictures: &mut V1Pictures,
     out: &mut RawBoard,
     depth: usize,
+    root: Option<i64>,
 ) -> Result<()> {
     if depth > MAX_DEPTH {
         bail!("the board is damaged (items nested too deeply)");
@@ -739,7 +772,7 @@ fn read_v1_item(
     if end <= r.pos || end > limit {
         bail!("the board is damaged (bad item at byte {start})");
     }
-    let (to_scene, order, children) = match kind.as_str() {
+    let (to_scene, order, children, top) = match kind.as_str() {
         V1_IMAGE => {
             // Source path and name; a "BruteForceLoaded" picture has an
             // empty path and that word where the name goes.
@@ -767,21 +800,24 @@ fn read_v1_item(
             let to_scene = item.then(parent);
             let mut order = parent_order.to_vec();
             order.push(z);
+            let top = root.unwrap_or(i64::from(id));
             match (pictures.picture_for(id, out), image.inverse()) {
                 (Some(picture), Some(inv)) if to_scene.is_finite() => out.placements.push(RawPlacement {
                     picture,
                     to_scene: image.then(to_scene),
                     crop: outline.iter().map(|p| inv.apply(*p)).collect(),
                     order: order.clone(),
+                    root: top,
                 }),
                 _ => out.skipped += 1,
             }
-            (to_scene, order, children)
+            (to_scene, order, children, top)
         }
         V1_TEXT => {
             let text = r.qstring()?.unwrap_or_default();
             let item = Xf::from_qt(r.doubles()?);
-            r.u32()?; // id
+            let id = r.u32()?;
+            let top = root.unwrap_or(i64::from(id));
             let z = r.f64()?;
             let fg = r.qcolor()?;
             let background = r.qcolor()?.filter(|c| c[3] > 0);
@@ -799,9 +835,10 @@ fn read_v1_item(
                     centred: false,
                     width: None,
                     order: order.clone(),
+                    root: top,
                 });
             }
-            (to_scene, order, children)
+            (to_scene, order, children, top)
         }
         other => bail!("the board holds an item of an unknown kind ({other:?})"),
     };
@@ -811,7 +848,7 @@ fn read_v1_item(
     // Later PureRef versions append fields past the ones read here.
     r.seek(end)?;
     for _ in 0..children {
-        read_v1_item(r, limit, to_scene, &order, pictures, out, depth + 1)?;
+        read_v1_item(r, limit, to_scene, &order, pictures, out, depth + 1, Some(top))?;
     }
     Ok(())
 }
@@ -1031,6 +1068,36 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
         zs
     };
 
+    // What an item moves with: its outermost ancestor that is a PureRef
+    // group, or a picture or note (children follow those). A plain
+    // container is passed over, so a board kept under one does not
+    // become one big group.
+    let ids_in = |table: &str| -> rusqlite::Result<HashSet<i64>> {
+        if !tables.contains(table) {
+            return Ok(HashSet::new());
+        }
+        let mut st = conn.prepare(&format!("SELECT id FROM {table}"))?;
+        let ids = st.query_map([], |row| row.get(0))?.collect();
+        ids
+    };
+    let mut holders = ids_in("items_groups")?;
+    holders.extend(ids_in("items_images")?);
+    holders.extend(ids_in("items_notes")?);
+    let root_of = |id: i64| -> i64 {
+        let (mut best, mut cur) = (id, id);
+        for _ in 0..MAX_DEPTH {
+            let Some(item) = items.get(&cur) else { break };
+            if !items.contains_key(&item.parent) {
+                break;
+            }
+            cur = item.parent;
+            if holders.contains(&cur) {
+                best = cur;
+            }
+        }
+        best
+    };
+
     let mut out = RawBoard::default();
     let mut picture_index: HashMap<i64, usize> = HashMap::new();
     let mut stmt = conn.prepare("SELECT id, width, height FROM images WHERE typeof(data) = 'blob' AND length(data) > 0")?;
@@ -1062,7 +1129,7 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
                     Some(inv) => outline.iter().map(|p| inv.apply(*p)).collect(),
                     None => Vec::new(),
                 };
-                out.placements.push(RawPlacement { picture, to_scene: image_xf.then(to_scene), crop, order: order_of(id) });
+                out.placements.push(RawPlacement { picture, to_scene: image_xf.then(to_scene), crop, order: order_of(id), root: root_of(id) });
             }
             _ => out.skipped += 1,
         }
@@ -1105,6 +1172,7 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
                 centred: true,
                 width,
                 order: order_of(id),
+                root: root_of(id),
             });
         }
     }
@@ -1554,6 +1622,7 @@ fn place_picture(bytes: &[u8], shown: Option<[u32; 2]>, placements: &[RawPlaceme
                     center: cut.center,
                     half: cut.half,
                     rotation: cut.rotation,
+                    group: p.root,
                 }
             }
             _ => {
@@ -1576,6 +1645,7 @@ fn place_picture(bytes: &[u8], shown: Option<[u32; 2]>, placements: &[RawPlaceme
                     center: cut.center,
                     half: cut.half,
                     rotation: cut.rotation,
+                    group: p.root,
                 }
             }
         };
@@ -1697,7 +1767,7 @@ fn place_note(n: &RawNote) -> Option<BoardItem> {
     if !(pos.iter().all(|v| v.is_finite()) && font_size > 0.0 && font_size.is_finite()) {
         return None;
     }
-    Some(BoardItem::Note { text, pos, font_size, color: n.color, rotation: u[1].atan2(u[0]), background: n.background })
+    Some(BoardItem::Note { text, pos, font_size, color: n.color, rotation: u[1].atan2(u[0]), background: n.background, group: n.root })
 }
 
 /// Word-wrap `text` to lines about `width` note units long at
@@ -2091,6 +2161,11 @@ mod tests {
         assert!(close(font_size, NOTE_FONT_PX * 2.0));
         assert_eq!(color, [255, 0, 0, 255]);
         assert!(close(rotation, 0.0));
+        // A note on a picture moves with it: one group on the slide.
+        assert_eq!(board.items[0].group(), board.items[1].group());
+        let slide = into_canvas(board, [800.0, 600.0], 1.0, "");
+        let shapes = &slide.layers[0].shapes;
+        assert!(shapes[0].group() != 0 && shapes[0].group() == shapes[1].group());
     }
 
     // -----------------------------------------------------------------
@@ -2217,6 +2292,8 @@ mod tests {
         assert_eq!(color, [0, 255, 0, 255]);
         // Its background (#AARRGGBB) becomes the label's box.
         assert!(matches!(board.items[1], BoardItem::Note { background: Some([255, 255, 255, 0xd9]), .. }));
+        // The picture moves with its group; the note, on its own, alone.
+        assert_eq!((board.items[0].group(), board.items[1].group()), (10, 2));
         // A 2.x note is centred on its origin.
         let [w, h] = text_extent(text, 30.0).map(f64::from);
         assert_close(pos, [-w / 2.0, -h / 2.0]);
@@ -2333,7 +2410,7 @@ mod tests {
     fn lone_picture(center: [f64; 2], half: [f64; 2]) -> Board {
         let picture = Some(PictureRef { file: "x.png".into(), size: [1, 1], crop: None, mirror: false });
         Board {
-            items: vec![BoardItem::Picture { png: Arc::new(Vec::new()), px_size: [1, 1], picture, media: None, center, half, rotation: 0.0 }],
+            items: vec![BoardItem::Picture { png: Arc::new(Vec::new()), px_size: [1, 1], picture, media: None, center, half, rotation: 0.0, group: 0 }],
             skipped: 0,
         }
     }
@@ -2417,6 +2494,10 @@ mod tests {
             println!("{}: {pictures} pictures ({gifs} playing GIFs), {notes} notes, {} skipped, {:?}", path.display(), board.skipped, t.elapsed());
             let name = path.file_stem().unwrap().to_string_lossy().into_owned();
             let canvas = into_canvas(board, [1920.0, 1080.0], 1.0, &name);
+            let shapes = &canvas.layers[0].shapes;
+            let groups: HashSet<u64> = shapes.iter().map(Shape::group).filter(|&g| g != 0).collect();
+            let grouped = shapes.iter().filter(|s| s.group() != 0).count();
+            println!("  {} groups holding {grouped} of {} items", groups.len(), shapes.len());
             let mut used = HashSet::new();
             canvas.media_files(&mut used);
             let stored: u64 = used.iter().map(|f| std::fs::metadata(media_dir.join(f)).map_or(0, |m| m.len())).sum();
