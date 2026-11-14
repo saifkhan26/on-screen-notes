@@ -566,6 +566,11 @@ fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
             .size(13.0),
     );
     ui.add_space(4.0);
+    // Taller than the screen allows, the columns scroll: a scroll bar
+    // makes the tooltip one the pointer can move onto, so it stays open
+    // to be scrolled.
+    let room = (ui.ctx().screen_rect().height() - 150.0).max(200.0);
+    egui::ScrollArea::vertical().max_height(room).auto_shrink([true, true]).show(ui, |ui| {
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 24.0;
         for (ci, column) in columns.iter().enumerate() {
@@ -592,6 +597,7 @@ fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
                 }
             });
         }
+    });
     });
     ui.add_space(6.0);
     ui.label(
@@ -1281,8 +1287,9 @@ mod tests {
 
     #[test]
     fn help_panel_fits_the_screen() {
-        // 1080p at 100 % and 150 % scaling, and a 768-tall laptop.
-        for (w, h) in [(1920.0, 1080.0), (1280.0, 720.0), (1366.0, 768.0)] {
+        // 1080p at 100 % and 150 % scaling, a 768-tall laptop, and a
+        // short window, where the columns scroll.
+        for (w, h) in [(1920.0, 1080.0), (1280.0, 720.0), (1366.0, 768.0), (1280.0, 560.0)] {
             let size = help_panel_size(w, h);
             assert!(size.x < w && size.y < h - 60.0, "{size:?} on {w}x{h}");
         }
