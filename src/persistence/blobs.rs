@@ -250,6 +250,8 @@ mod tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -262,7 +264,7 @@ mod tests {
         let mut l = Layer::default();
         l.shapes.push(picture(big(1)));
         // A label that reads like a list must stay a label.
-        l.shapes.push(Shape::Text { pos: [0.0, 0.0], content: "png: [1, 2, 3] and \"png: [4]\"".into(), font_size: 12.0, color: [1, 2, 3, 4], rotation: 0.0, pin: 0, background: None, group: 0 });
+        l.shapes.push(Shape::Text { pos: [0.0, 0.0], content: "png: [1, 2, 3] and \"png: [4]\"".into(), font_size: 12.0, color: [1, 2, 3, 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 });
         l.shapes.push(picture(vec![]));
         l.image = Some(LayerImage { png: big(2), size: [1, 1], logical_size: [1.0, 1.0], canvas_origin: [0.0, 0.0], capture_zoom: 1.0 });
         c.layers = vec![l, Layer::default()];

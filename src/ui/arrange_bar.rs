@@ -4,7 +4,8 @@
 //! there are two or more; flips it and zooms to it; shows a lone
 //! picture's colours (`tools::picture_colours`) in a row of its own;
 //! copies it to a new slide, moves it to another slide, and pins it
-//! (see `canvas::pins`). A selected pin gets a bar of its own in the
+//! (see `canvas::pins`), and tags it for find (Ctrl+F) to know it by.
+//! A selected pin gets a bar of its own in the
 //! same place, which also shows it on one slide or every slide.
 
 use crate::canvas::CanvasManager;
@@ -35,6 +36,8 @@ pub enum BarAction {
     TogglePin,
     /// Mirror the selection left to right (`false`) or top to bottom.
     Flip(bool),
+    /// Turn the selection a quarter turn right (`true`, clockwise) or left.
+    Rotate(bool),
     ZoomToSelection,
     /// Show the selected picture's colours, or hide them.
     PictureColours,
@@ -46,6 +49,22 @@ pub enum BarAction {
     RestorePalette,
     /// Make the selection one group (`true`), or take it out of its groups.
     Group(bool),
+    /// Give every selected object these tags in place of its own.
+    SetTags(Vec<String>),
+}
+
+/// The tags being typed for the selection, while the tag row is open.
+pub struct TagEdit {
+    pub text: String,
+    /// The field has yet to take the keyboard.
+    pub focus: bool,
+}
+
+impl TagEdit {
+    /// Start from the selection's tags, `current`.
+    pub fn new(current: &[String]) -> Self {
+        TagEdit { text: current.join(", "), focus: true }
+    }
 }
 
 /// The palette button's part, for a selection that is one picture.
@@ -79,8 +98,10 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 /// arrow beside it. `keys` label the buttons' tooltips; `open_move`
 /// opens "Move to slide…" as its key asks; `picture` is set when the
 /// selection is one picture, for its palette button; `grouped` when some
-/// of it is in a group, for the ungroup button. Returns what was clicked
-/// this frame, if anything.
+/// of it is in a group, for the ungroup button. `tags` are the
+/// selection's, shown beside the tag button; `tag_edit` is the row
+/// for typing them while it is open. Returns what was clicked this
+/// frame, if anything.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
@@ -93,6 +114,8 @@ pub fn show(
     open_move: bool,
     picture: Option<ColourRow<'_>>,
     grouped: bool,
+    tags: &[String],
+    tag_edit: &mut Option<TagEdit>,
 ) -> Option<BarAction> {
     let pos = bar_pos(ctx);
     let mut picked = None;
@@ -135,6 +158,14 @@ pub fn show(
                     if icon_btn(ui, egui::include_image!("../../assets/icons/flip-vertical.svg"), true, &tip) {
                         picked = Some(BarAction::Flip(true));
                     }
+                    let tip = with_key("Turn left 90° — about the selection's middle", k.rotate_left);
+                    if icon_btn(ui, egui::include_image!("../../assets/icons/rotate-ccw.svg"), true, &tip) {
+                        picked = Some(BarAction::Rotate(false));
+                    }
+                    let tip = with_key("Turn right 90° — about the selection's middle", k.rotate_right);
+                    if icon_btn(ui, egui::include_image!("../../assets/icons/rotate-cw.svg"), true, &tip) {
+                        picked = Some(BarAction::Rotate(true));
+                    }
                     let tip = with_key("Zoom to the selection", keys.canvas.zoom_to_selection);
                     if icon_btn(ui, egui::include_image!("../../assets/icons/zoom-selection.svg"), true, &tip) {
                         picked = Some(BarAction::ZoomToSelection);
@@ -162,7 +193,28 @@ pub fn show(
                     if toggle_btn(ui, egui::include_image!("../../assets/icons/pin.svg"), pinned, &tip) {
                         picked = Some(BarAction::TogglePin);
                     }
+                    let tip = with_key("Tags — words find (Ctrl+F) knows the selection by", k.tag);
+                    let mut open = toggle_btn(ui, egui::include_image!("../../assets/icons/tag.svg"), tag_edit.is_some(), &tip);
+                    if !tags.is_empty() && tag_edit.is_none() {
+                        open |= tag_chips(ui, tags);
+                    }
+                    if open {
+                        *tag_edit = match tag_edit {
+                            Some(_) => None,
+                            None => Some(TagEdit::new(tags)),
+                        };
+                    }
                 });
+                if let Some(edit) = tag_edit.as_mut() {
+                    match tag_row(ui, edit) {
+                        Some(Some(typed)) => {
+                            picked = Some(BarAction::SetTags(crate::canvas::shape::parse_tags(&typed)));
+                            *tag_edit = None;
+                        }
+                        Some(None) => *tag_edit = None,
+                        None => {}
+                    }
+                }
                 if let Some(row) = &picture {
                     if let Some(colours) = row.shown {
                         colour_row(ui, colours, row.can_restore, &mut picked);
@@ -172,6 +224,38 @@ pub fn show(
             });
         });
     picked
+}
+
+/// The selection's tags beside the tag button, cut short if long; a
+/// click opens them for typing, as the button does.
+fn tag_chips(ui: &mut egui::Ui, tags: &[String]) -> bool {
+    let all = crate::ui::media_filter::tags_text(tags, usize::MAX);
+    let text = egui::RichText::new(crate::ui::media_filter::tags_text(tags, 32)).small().color(crate::ui::media_filter::TAG_COLOUR);
+    ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(format!("{all} — click to change")).clicked()
+}
+
+/// The row for typing the selection's tags. `Some(Some(text))` once
+/// `Enter` saves them, `Some(None)` when `Esc` or a click elsewhere
+/// leaves them as they were.
+fn tag_row(ui: &mut egui::Ui, edit: &mut TagEdit) -> Option<Option<String>> {
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Tags").small().color(theme::TEXT_MUTED));
+        let field = egui::TextEdit::singleline(&mut edit.text)
+            .hint_text("pose, walk cycle — commas between, Enter saves")
+            .desired_width(300.0);
+        let r = ui.add(field);
+        if std::mem::take(&mut edit.focus) {
+            r.request_focus();
+            return None;
+        }
+        if r.lost_focus() {
+            let saved = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            return Some(saved.then(|| edit.text.clone()));
+        }
+        None
+    })
+    .inner
 }
 
 /// The picture's colours under the bar's buttons: click one to draw

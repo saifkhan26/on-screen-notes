@@ -852,6 +852,47 @@ pub(crate) fn paint_text_box(
     painter.add(egui::Shape::convex_polygon(pts, fill, egui::Stroke::NONE));
 }
 
+/// A rounded box round `centre` (screen points), `half` its half
+/// size, turned by `angle`; `corner` its corners' radius.
+pub(crate) fn box_ring(centre: egui::Pos2, half: [f32; 2], angle: f32, corner: f32) -> Vec<egui::Pos2> {
+    let (s, c) = angle.sin_cos();
+    rounded_box_outline(half, corner)
+        .into_iter()
+        .map(|[x, y]| egui::pos2(centre.x + c * x - s * y, centre.y + s * x + c * y))
+        .collect()
+}
+
+/// The outline of the box a text label is drawn in, in screen points:
+/// its lines `size` points tall from `top_left` (the corner it turns
+/// about by `angle`), plus its background box's padding when `boxed`,
+/// grown by `extra` all round. The shape `paint_text_box` fills, measured
+/// the way `paint_text_line` lays the lines out.
+pub(crate) fn text_box_ring(
+    painter: &egui::Painter,
+    content: &str,
+    size: f32,
+    boxed: bool,
+    angle: f32,
+    top_left: egui::Pos2,
+    extra: f32,
+) -> Vec<egui::Pos2> {
+    let family = egui::FontFamily::Name("handwritten".into());
+    let widest = content.split('\n').map(|l| text_line_width(painter, l, size, &family)).fold(0.0_f32, f32::max);
+    let text = [widest, size * 1.25 * content.split('\n').count() as f32];
+    let pad = if boxed { crate::canvas::shape::text_box_pad(size) } else { [0.0, 0.0] };
+    let half = [text[0] * 0.5 + pad[0] + extra, text[1] * 0.5 + pad[1] + extra];
+    let corner = if boxed { size * 0.3 } else { 0.0 } + extra;
+    let centre = [text[0] * 0.5, text[1] * 0.5];
+    let (s, c) = angle.sin_cos();
+    rounded_box_outline(half, corner)
+        .into_iter()
+        .map(|q| {
+            let (x, y) = (centre[0] + q[0], centre[1] + q[1]);
+            egui::pos2(top_left.x + c * x - s * y, top_left.y + s * x + c * y)
+        })
+        .collect()
+}
+
 /// One line of a text label, `size` logical px tall, its top-left at
 /// `lp`, turned by `angle` about that corner.
 fn paint_text_line(
@@ -2356,6 +2397,8 @@ mod rotation_tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         };
         // Where `Obb` says the red (left) and blue (right) halves went.
         let o = shape.obb();

@@ -129,9 +129,9 @@ impl OnScreenNotesApp {
             // takes raw bools (not Modifiers).
             let ctrl  = mods.ctrl || mods.command;
             let shift = mods.shift;
-            // "Delete this slide?" and the command palette take the
-            // keys while they are up.
-            if text_consumed || self.confirm_delete.is_some() || self.commands.is_open() {
+            // "Delete this slide?", the command palette, the find bar
+            // and the tag row take the keys while they are up.
+            if text_consumed || self.confirm_delete.is_some() || self.commands.is_open() || self.find.is_open() || self.tag_edit.is_some() {
                 // Still allow scroll-wheel events (handled below
                 // outside this for-loop) but drop key events.
                 // Falling through to the wheel block below means
@@ -411,7 +411,9 @@ impl OnScreenNotesApp {
         // When the clipboard holds our own marker text this fires
         // alongside `PasteObjects` and finds no image — harmless.
         let chord = crate::platform::paste_chord_down() && ctx.input(|i| i.focused);
-        if chord && !self.paste_chord_prev && !text_consumed {
+        // Not into a text field (find, the tag row, …): Ctrl+V pastes
+        // text there.
+        if chord && !self.paste_chord_prev && !text_consumed && !ctx.wants_keyboard_input() {
             sel_actions.push(SelAction::PasteImage);
         }
         self.paste_chord_prev = chord;

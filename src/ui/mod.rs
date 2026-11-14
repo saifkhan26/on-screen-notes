@@ -5,6 +5,7 @@
 
 pub mod arrange_bar;
 pub mod command_palette;
+pub mod find_bar;
 pub mod layer_panel;
 pub mod loupe;
 pub mod media_controls;

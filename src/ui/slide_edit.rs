@@ -826,6 +826,8 @@ mod tests {
             border: Default::default(),
             pin: 0,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         });
         let mut m = CanvasManager::for_tests(vec![slide]);
         let id = m.pin_objects(0, &[], &[0], [0.0, 0.0], false).expect("pinned");

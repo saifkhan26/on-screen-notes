@@ -39,11 +39,35 @@ pub enum RasterKind {
     Image,
 }
 
-fn is_zero(v: &f32) -> bool { *v == 0.0 }
+pub(crate) fn is_zero(v: &f32) -> bool { *v == 0.0 }
 fn is_fill(k: &RasterKind) -> bool { *k == RasterKind::Fill }
 fn is_false(v: &bool) -> bool { !*v }
 pub(crate) fn is_unpinned(v: &u64) -> bool { *v == 0 }
 pub(crate) fn is_ungrouped(v: &u64) -> bool { *v == 0 }
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// A plain unrotated rectangle from `a` to `b`.
+    pub(crate) fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
+    }
+}
+
+/// Tags as typed: separated by commas, a leading `#` dropped, inner
+/// runs of spaces made one, empty ones left out, and each once (case
+/// aside), the first spelling kept, in the order given.
+pub fn parse_tags(typed: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in typed.split(',') {
+        let tag = raw.trim().trim_start_matches('#').split_whitespace().collect::<Vec<_>>().join(" ");
+        if !tag.is_empty() && !out.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+            out.push(tag);
+        }
+    }
+    out
+}
 
 /// A group id no group has: time-seeded at the first call, then
 /// counting up, so ids made in different runs do not meet either.
@@ -292,6 +316,16 @@ pub enum Shape {
         /// is not written.
         #[serde(default, skip_serializing_if = "is_ungrouped")]
         group: u64,
+        /// Words find (Ctrl+F) knows the shape by (`Canvas::set_tags`).
+        /// None are not written.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        /// How far the shape has been turned along with the rest of a
+        /// selection (radians, clockwise on screen): the selection frame
+        /// of objects that share a turn is turned by it (`Affine::turn`).
+        /// Like `rotation`, a zero is not written.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        turn: f32,
     },
     /// Ellipse defined by its bounding rectangle (corners `a` and `b`).
     Ellipse {
@@ -314,6 +348,16 @@ pub enum Shape {
         /// is not written.
         #[serde(default, skip_serializing_if = "is_ungrouped")]
         group: u64,
+        /// Words find (Ctrl+F) knows the shape by (`Canvas::set_tags`).
+        /// None are not written.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        /// How far the shape has been turned along with the rest of a
+        /// selection (radians, clockwise on screen): the selection frame
+        /// of objects that share a turn is turned by it (`Affine::turn`).
+        /// Like `rotation`, a zero is not written.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        turn: f32,
     },
     /// Straight line from `a` to `b`.
     Line {
@@ -335,6 +379,16 @@ pub enum Shape {
         /// is not written.
         #[serde(default, skip_serializing_if = "is_ungrouped")]
         group: u64,
+        /// Words find (Ctrl+F) knows the shape by (`Canvas::set_tags`).
+        /// None are not written.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        /// How far the shape has been turned along with the rest of a
+        /// selection (radians, clockwise on screen): the selection frame
+        /// of objects that share a turn is turned by it (`Affine::turn`).
+        /// Like `rotation`, a zero is not written.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        turn: f32,
     },
     /// Arrow from `a` to `b`. Arrowhead is drawn at `b`. Only the
     /// shaft honours `border`; the head stays solid so the
@@ -354,6 +408,16 @@ pub enum Shape {
         /// is not written.
         #[serde(default, skip_serializing_if = "is_ungrouped")]
         group: u64,
+        /// Words find (Ctrl+F) knows the shape by (`Canvas::set_tags`).
+        /// None are not written.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        /// How far the shape has been turned along with the rest of a
+        /// selection (radians, clockwise on screen): the selection frame
+        /// of objects that share a turn is turned by it (`Affine::turn`).
+        /// Like `rotation`, a zero is not written.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        turn: f32,
     },
     /// Free-floating text label anchored at `pos` (top-left of the
     /// first line's baseline box). Lines are split on `\n`. Rendered
@@ -380,6 +444,16 @@ pub enum Shape {
         /// is not written.
         #[serde(default, skip_serializing_if = "is_ungrouped")]
         group: u64,
+        /// Words find (Ctrl+F) knows the shape by (`Canvas::set_tags`).
+        /// None are not written.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        /// How far the shape has been turned along with the rest of a
+        /// selection (radians, clockwise on screen): the selection frame
+        /// of objects that share a turn is turned by it (`Affine::turn`).
+        /// Like `rotation`, a zero is not written.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        turn: f32,
         /// Colour of the rounded box drawn behind the text, if it has
         /// one (`text_box_pad` around it). Not written when unset, so a
         /// plain label keeps its old on-disk form.
@@ -442,6 +516,16 @@ pub enum Shape {
         /// is not written.
         #[serde(default, skip_serializing_if = "is_ungrouped")]
         group: u64,
+        /// Words find (Ctrl+F) knows the shape by (`Canvas::set_tags`).
+        /// None are not written.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        /// How far the shape has been turned along with the rest of a
+        /// selection (radians, clockwise on screen): the selection frame
+        /// of objects that share a turn is turned by it (`Affine::turn`).
+        /// Like `rotation`, a zero is not written.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        turn: f32,
     },
 }
 
@@ -502,6 +586,52 @@ impl Shape {
             | Shape::Arrow   { group, .. }
             | Shape::Text    { group, .. }
             | Shape::Raster  { group, .. } => *group = id,
+        }
+    }
+
+    /// The words find knows this shape by.
+    pub fn tags(&self) -> &[String] {
+        match self {
+            Shape::Rect    { tags, .. }
+            | Shape::Ellipse { tags, .. }
+            | Shape::Line    { tags, .. }
+            | Shape::Arrow   { tags, .. }
+            | Shape::Text    { tags, .. }
+            | Shape::Raster  { tags, .. } => tags,
+        }
+    }
+
+    pub fn set_tags(&mut self, to: &[String]) {
+        match self {
+            Shape::Rect    { tags, .. }
+            | Shape::Ellipse { tags, .. }
+            | Shape::Line    { tags, .. }
+            | Shape::Arrow   { tags, .. }
+            | Shape::Text    { tags, .. }
+            | Shape::Raster  { tags, .. } => *tags = to.to_vec(),
+        }
+    }
+
+    /// How far the shape has been turned with a selection; see `turn`.
+    pub fn turn(&self) -> f32 {
+        match self {
+            Shape::Rect    { turn, .. }
+            | Shape::Ellipse { turn, .. }
+            | Shape::Line    { turn, .. }
+            | Shape::Arrow   { turn, .. }
+            | Shape::Text    { turn, .. }
+            | Shape::Raster  { turn, .. } => *turn,
+        }
+    }
+
+    pub fn set_turn(&mut self, to: f32) {
+        match self {
+            Shape::Rect    { turn, .. }
+            | Shape::Ellipse { turn, .. }
+            | Shape::Line    { turn, .. }
+            | Shape::Arrow   { turn, .. }
+            | Shape::Text    { turn, .. }
+            | Shape::Raster  { turn, .. } => *turn = to,
         }
     }
 
@@ -690,6 +820,8 @@ impl Shape {
     ///
     /// Stroke widths and font sizes scale by `Affine::linear_scale`.
     pub fn apply_affine(&mut self, m: &Affine) {
+        let turn = m.turn(self.turn());
+        self.set_turn(turn);
         let s = m.linear_scale();
         let mirrored = m.a * m.d - m.b * m.c < 0.0;
         let len = |v: [f32; 2]| (v[0] * v[0] + v[1] * v[1]).sqrt();
@@ -771,7 +903,7 @@ mod tests {
     use super::*;
 
     fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0 }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
     }
 
     #[test]
@@ -808,6 +940,8 @@ mod tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         };
         let text = ron::to_string(&raster).unwrap();
         assert!(!text.contains("rotation") && !text.contains("kind") && !text.contains("media"), "{text}");
@@ -822,6 +956,8 @@ mod tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         };
         let back: Shape = ron::from_str(&ron::to_string(&raster).unwrap()).unwrap();
         assert!(matches!(back, Shape::Raster { rotation, kind: RasterKind::Image, .. } if (rotation - 0.5).abs() < 1e-6));
@@ -842,6 +978,8 @@ mod tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -891,6 +1029,8 @@ mod tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -986,7 +1126,7 @@ mod tests {
 
     #[test]
     fn text_turns_about_its_anchor() {
-        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0, pin: 0, background: None, group: 0 };
+        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 };
         t.apply_affine(&Affine::rotate_about([10.0, 10.0], 0.3).then(Affine::scale_about([10.0, 10.0], 2.0, 2.0)));
         assert!(matches!(t, Shape::Text { pos, font_size, rotation, .. }
             if (pos[0] - 10.0).abs() < 1e-3 && (font_size - 40.0).abs() < 1e-2 && (rotation - 0.3).abs() < 1e-4));
@@ -1038,7 +1178,7 @@ mod tests {
         assert!((rotation + 0.2).abs() < 1e-4, "mirrored turn, not half a turn off: {rotation}");
         assert!(near(*a, [0.0, 0.0]) && near(*b, [40.0, 20.0]));
 
-        let mut t = Shape::Text { pos: [100.0, 50.0], content: "abc".into(), font_size: 20.0, color: [0; 4], rotation: 0.1, pin: 0, background: None, group: 0 };
+        let mut t = Shape::Text { pos: [100.0, 50.0], content: "abc".into(), font_size: 20.0, color: [0; 4], rotation: 0.1, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 };
         let centre = t.obb().center;
         t.apply_affine(&Affine::scale_about([0.0, 0.0], 1.0, -1.0));
         let Shape::Text { rotation, font_size, .. } = &t else { panic!() };
@@ -1048,7 +1188,7 @@ mod tests {
 
     #[test]
     fn a_text_box_widens_the_frame_and_follows_a_recolour() {
-        let plain = Shape::Text { pos: [0.0, 0.0], content: "ab".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0 };
+        let plain = Shape::Text { pos: [0.0, 0.0], content: "ab".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 };
         let mut boxed = plain.clone();
         if let Shape::Text { background, .. } = &mut boxed { *background = Some(auto_text_box([255; 4])); }
         let (a, b) = (plain.obb(), boxed.obb());

@@ -16,12 +16,18 @@ impl OnScreenNotesApp {
         const MARGIN: f32 = 32.0;
         let r = self.overlay_cache.canvas_rect(ctx);
         let top = if self.ui_visible {
-            ["osn_toolbar", "osn_arrange_bar", "osn_pin_bar"]
+            // The find bar too: what it goes to should not land under it.
+            [
+                ("osn_toolbar", egui::Order::Middle),
+                ("osn_arrange_bar", egui::Order::Middle),
+                ("osn_pin_bar", egui::Order::Middle),
+                ("osn_find_bar", egui::Order::Foreground),
+            ]
                 .into_iter()
-                .filter_map(|id| {
+                .filter_map(|(id, order)| {
                     let id = egui::Id::new(id);
                     // A bar hidden now still has its old place on record.
-                    let shown = ctx.memory(|m| m.areas().visible_last_frame(&egui::LayerId::new(egui::Order::Middle, id)));
+                    let shown = ctx.memory(|m| m.areas().visible_last_frame(&egui::LayerId::new(order, id)));
                     shown.then(|| ctx.memory(|m| m.area_rect(id))).flatten()
                 })
                 .filter(|a| a.top() < r.top() + 200.0)

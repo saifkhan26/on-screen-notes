@@ -427,6 +427,8 @@ pub struct CanvasSection {
     #[serde(default = "d_copy_to_new_slide")] pub copy_to_new_slide: String,
     /// Open the command palette: find any command by name and run it.
     #[serde(default = "d_command_palette")] pub command_palette: String,
+    /// Open the find bar: text labels on every slide by what they say.
+    #[serde(default = "d_find")] pub find: String,
     /// Make the selection one group, or take it out of its groups.
     #[serde(default = "d_group")]   pub group: String,
     #[serde(default = "d_ungroup")] pub ungroup: String,
@@ -506,6 +508,9 @@ pub struct ToolbarSection {
     pub highlight_pictures: String,
     pub highlight_gifs: String,
     pub highlight_videos: String,
+    /// Highlight every group / everything tagged on the slide, or stop.
+    pub highlight_groups: String,
+    pub highlight_tagged: String,
     /// Select what is highlighted, ready to arrange.
     pub select_highlighted: String,
     /// Pin the overlay to a window (then click it), or unpin it.
@@ -546,8 +551,13 @@ pub struct ArrangeSection {
     /// Mirror the selection left to right / top to bottom.
     pub flip_horizontal: String,
     pub flip_vertical: String,
+    /// Turn the selection a quarter turn left / right.
+    pub rotate_left: String,
+    pub rotate_right: String,
     /// The selected picture's colours, to draw with or keep as the palette.
     pub picture_colours: String,
+    /// Type the selection's tags (what find knows it by).
+    pub tag: String,
 }
 
 impl Default for CanvasSection {
@@ -581,6 +591,7 @@ impl Default for CanvasSection {
             duplicate: d_duplicate(),
             copy_to_new_slide: d_copy_to_new_slide(),
             command_palette: d_command_palette(),
+            find: d_find(),
             group: d_group(),
             ungroup: d_ungroup(),
             pin_selection: d_pin_selection(),
@@ -655,6 +666,7 @@ fn d_delete_selection() -> String { "delete".into() }
 fn d_duplicate()   -> String { "ctrl+d".into() }
 fn d_copy_to_new_slide() -> String { "ctrl+shift+d".into() }
 fn d_command_palette() -> String { "ctrl+k".into() }
+fn d_find()        -> String { "ctrl+f".into() }
 fn d_group()       -> String { "ctrl+g".into() }
 fn d_ungroup()     -> String { "ctrl+shift+g".into() }
 fn d_pin_selection() -> String { "ctrl+p".into() }
@@ -677,8 +689,8 @@ fn d_media_next_frame() -> String { "period".into() }
 /// made every button bindable and lists each binding in the file; 4
 /// added the nudge keys; 5 zoom to fit / to the selection (and the held
 /// peek), flipping, the text box and a picture's colours; 6 moving
-/// slides; 7 groups; 8 onion skin; 9 the command palette.
-const FORMAT: u32 = 9;
+/// slides; 7 groups; 8 onion skin; 9 the command palette; 10 find and tags.
+const FORMAT: u32 = 10;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -743,6 +755,8 @@ pub struct ToolbarBindings {
     pub insert_media: Option<Binding>,
     /// Indexed like `MediaType::ALL`: pictures, GIFs, videos.
     pub highlight: [Option<Binding>; 3],
+    pub highlight_groups: Option<Binding>,
+    pub highlight_tagged: Option<Binding>,
     pub select_highlighted: Option<Binding>,
     pub pin_to_window: Option<Binding>,
     pub background_up: Option<Binding>,
@@ -771,7 +785,10 @@ pub struct ArrangeBindings {
     pub move_to_slide: Option<Binding>,
     pub flip_horizontal: Option<Binding>,
     pub flip_vertical: Option<Binding>,
+    pub rotate_left: Option<Binding>,
+    pub rotate_right: Option<Binding>,
     pub picture_colours: Option<Binding>,
+    pub tag: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -810,6 +827,7 @@ pub struct CanvasBindings {
     pub duplicate: Option<Binding>,
     pub copy_to_new_slide: Option<Binding>,
     pub command_palette: Option<Binding>,
+    pub find: Option<Binding>,
     pub group: Option<Binding>,
     pub ungroup: Option<Binding>,
     pub pin_selection: Option<Binding>,
@@ -921,6 +939,8 @@ impl HotkeysConfig {
                     p("toolbar.highlight_gifs",     &tb.highlight_gifs),
                     p("toolbar.highlight_videos",   &tb.highlight_videos),
                 ],
+                highlight_groups: p("toolbar.highlight_groups", &tb.highlight_groups),
+                highlight_tagged: p("toolbar.highlight_tagged", &tb.highlight_tagged),
                 select_highlighted: p("toolbar.select_highlighted", &tb.select_highlighted),
                 pin_to_window:      p("toolbar.pin_to_window",      &tb.pin_to_window),
                 background_up:      p("toolbar.background_up",      &tb.background_up),
@@ -947,7 +967,10 @@ impl HotkeysConfig {
                 move_to_slide:  p("arrange.move_to_slide",  &ar.move_to_slide),
                 flip_horizontal: p("arrange.flip_horizontal", &ar.flip_horizontal),
                 flip_vertical:   p("arrange.flip_vertical",   &ar.flip_vertical),
+                rotate_left:     p("arrange.rotate_left",     &ar.rotate_left),
+                rotate_right:    p("arrange.rotate_right",    &ar.rotate_right),
                 picture_colours: p("arrange.picture_colours", &ar.picture_colours),
+                tag: p("arrange.tag", &ar.tag),
             },
             canvas: CanvasBindings {
                 undo:          p("canvas.undo",          &self.canvas.undo),
@@ -994,6 +1017,7 @@ impl HotkeysConfig {
                 duplicate:   p("canvas.duplicate",   &self.canvas.duplicate),
                 copy_to_new_slide: p("canvas.copy_to_new_slide", &self.canvas.copy_to_new_slide),
                 command_palette: p("canvas.command_palette", &cv.command_palette),
+                find:        p("canvas.find",        &cv.find),
                 group:       p("canvas.group",       &cv.group),
                 ungroup:     p("canvas.ungroup",     &cv.ungroup),
                 pin_selection: p("canvas.pin_selection", &self.canvas.pin_selection),
@@ -1274,6 +1298,8 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("toolbar", "highlight_pictures") => "Highlight the slide's pictures, or stop",
         ("toolbar", "highlight_gifs")     => "Highlight the slide's GIFs, or stop",
         ("toolbar", "highlight_videos")   => "Highlight the slide's videos, or stop",
+        ("toolbar", "highlight_groups")   => "Highlight the slide's groups, or stop",
+        ("toolbar", "highlight_tagged")   => "Highlight everything tagged on the slide, or stop",
         ("toolbar", "select_highlighted") => "Select what is highlighted, ready to arrange",
         ("toolbar", "pin_to_window")      => "Pin the overlay to a window (then click it), or unpin it",
         ("toolbar", "background_up")      => "Background opacity +10 %",
@@ -1299,7 +1325,10 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("arrange", "move_to_slide")         => "Open \"Move to slide...\" for the selection",
         ("arrange", "flip_horizontal")       => "Mirror the selection left to right",
         ("arrange", "flip_vertical")         => "Mirror the selection top to bottom",
+        ("arrange", "rotate_left")           => "Turn the selection a quarter turn left",
+        ("arrange", "rotate_right")          => "Turn the selection a quarter turn right",
         ("arrange", "picture_colours")       => "The selected picture's colours, to draw with or keep as the palette",
+        ("arrange", "tag")                   => "Type the selection's tags: words find (Ctrl+F) knows it by",
 
         ("canvas", "undo")                 => "Undo",
         ("canvas", "redo")                 => "Redo",
@@ -1333,6 +1362,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "duplicate")            => "Duplicate the selection",
         ("canvas", "copy_to_new_slide")    => "Copy the selection to a new slide",
         ("canvas", "command_palette")      => "Command palette: find any command by a few letters and run it",
+        ("canvas", "find")                 => "Find text labels on every slide by what they say, and go to them",
         ("canvas", "group")                => "Make the selection one group (selects, moves and arranges as one)",
         ("canvas", "ungroup")              => "Take the selection out of its groups",
         ("canvas", "pin_selection")        => "Pin the selection to every slide, or unpin it",
@@ -1604,7 +1634,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 9"));
+        assert!(up.contains("version = 10"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1613,7 +1643,7 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 9\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 10\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
         assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
@@ -1650,7 +1680,7 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 9\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 10\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
@@ -1753,7 +1783,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 9\n\n\
+             version = 10\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1774,13 +1804,13 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 9\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 10\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 9");
-        assert_eq!(upgrade_text("", 0), "version = 9\n");
+        assert_eq!(new, "version = 10");
+        assert_eq!(upgrade_text("", 0), "version = 10\n");
     }
 
     #[test]

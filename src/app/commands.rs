@@ -60,6 +60,8 @@ impl OnScreenNotesApp {
                 let on = self.media_filter.flag(t);
                 *on = !*on;
             }
+            K::HighlightGroups => self.media_filter.groups = !self.media_filter.groups,
+            K::HighlightTagged => self.media_filter.tagged = !self.media_filter.tagged,
             K::SelectHighlighted => {
                 if self.may_edit() {
                     self.select_media_matches();
@@ -153,6 +155,17 @@ impl OnScreenNotesApp {
                     self.flip_selection(vertical);
                 }
             }
+            K::Rotate(right) => {
+                if selecting {
+                    self.rotate_selection(right);
+                }
+            }
+            K::Tag => {
+                if selecting {
+                    self.ui_visible = true;
+                    self.tag_edit = Some(ui::arrange_bar::TagEdit::new(&self.selection_tags()));
+                }
+            }
             K::PictureColours => {
                 if selecting {
                     self.toggle_picture_colours();
@@ -166,6 +179,10 @@ impl OnScreenNotesApp {
             }
             K::Onion => self.toggle_onion(),
             K::CommandPalette => self.commands.open(),
+            K::Find => {
+                self.commands.close();
+                self.find.open();
+            }
             K::Group(on) => {
                 if selecting {
                     self.group_selection(on);

@@ -67,15 +67,15 @@ impl OnScreenNotesApp {
         let found = std::iter::once(c.active_layer)
             .chain((0..c.layers.len()).rev().filter(|&li| li != c.active_layer))
             .filter(|&li| visible(li))
-            .map(|li| (li, ui::media_filter::matches_on(c, li, self.media_filter)))
-            .find(|(_, shapes)| !shapes.is_empty());
-        let Some((li, shapes)) = found else { return };
+            .map(|li| (li, ui::media_filter::matches_on(c, li, &self.media_filter)))
+            .find(|(_, (strokes, shapes))| !strokes.is_empty() || !shapes.is_empty());
+        let Some((li, (strokes, shapes))) = found else { return };
         if li != c.active_layer {
             self.canvases.active_mut().active_layer = li;
         }
         self.tool.kind = crate::tools::ToolKind::Select;
         self.tool.select.gesture = None;
-        self.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
+        self.tool.select.sel = crate::canvas::hit::Selection { strokes, shapes };
         self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
@@ -238,6 +238,23 @@ impl OnScreenNotesApp {
         c.transform_objects(li, &sel.strokes, &sel.shapes, &m);
     }
 
+    /// Turn the selection a quarter turn about its frame's middle: right
+    /// (clockwise on screen) or left. One undo step. The frame turns
+    /// with it and stays turned (`Shape::turn`).
+    pub(super) fn rotate_selection(&mut self, right: bool) {
+        let c = self.canvases.active();
+        let Some(frame) = c.layers.get(c.active_layer).and_then(|l| self.tool.select.frame(l, c.zoom)) else { return };
+        if !self.may_edit() {
+            return;
+        }
+        let quarter = if right { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
+        let m = crate::canvas::affine::Affine::rotate_about(frame.center, quarter);
+        let sel = self.tool.select.sel.clone();
+        let c = self.canvases.active_mut();
+        let li = c.active_layer;
+        c.transform_objects(li, &sel.strokes, &sel.shapes, &m);
+    }
+
     /// Selected text labels, with the Select tool.
     pub(super) fn selected_text(&self) -> Vec<usize> {
         if self.tool.kind != crate::tools::ToolKind::Select {
@@ -386,6 +403,42 @@ impl OnScreenNotesApp {
             (true, _) => format!("Grouped {n} objects — Alt+click picks one of them"),
             (false, true) => "Ungrouped".to_string(),
             (false, false) => "Nothing here is grouped".to_string(),
+        };
+        self.toast = Some((msg, Instant::now()));
+    }
+
+    /// The selected objects' tags, each once, in the order first met.
+    pub(super) fn selection_tags(&self) -> Vec<String> {
+        let c = self.canvases.active();
+        let Some(layer) = c.layers.get(c.active_layer) else { return Vec::new() };
+        let sel = &self.tool.select.sel;
+        let strokes = sel.strokes.iter().filter_map(|&i| layer.strokes.get(i)).flat_map(|s| s.tags.iter());
+        let shapes = sel.shapes.iter().filter_map(|&i| layer.shapes.get(i)).flat_map(|s| s.tags().iter());
+        let mut out: Vec<String> = Vec::new();
+        for t in strokes.chain(shapes) {
+            if !out.contains(t) {
+                out.push(t.clone());
+            }
+        }
+        out
+    }
+
+    /// Give every selected object `tags` in place of its own: one undo
+    /// step. Empty takes them all off.
+    pub(super) fn tag_selection(&mut self, tags: Vec<String>) {
+        let sel = self.tool.select.sel.clone();
+        if sel.is_empty() || !self.may_edit() {
+            return;
+        }
+        let c = self.canvases.active_mut();
+        let li = c.active_layer;
+        if !c.set_tags(li, &sel.strokes, &sel.shapes, &tags) {
+            return;
+        }
+        let msg = if tags.is_empty() {
+            "Tags taken off".to_string()
+        } else {
+            format!("Tagged {} — Ctrl+F finds it", tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "))
         };
         self.toast = Some((msg, Instant::now()));
     }

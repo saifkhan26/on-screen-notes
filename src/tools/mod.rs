@@ -610,6 +610,8 @@ impl ActiveTool {
                             pin: 0,
                             background: self.text_box.then(|| crate::canvas::shape::auto_text_box(prev.color)),
                             group: 0,
+                            tags: Vec::new(),
+                            turn: 0.0,
                         });
                     }
                 }
@@ -649,6 +651,8 @@ impl ActiveTool {
                         rotation: 0.0,
                         pin: 0,
                         group: 0,
+                        tags: Vec::new(),
+                        turn: 0.0,
                     });
                 }
             }
@@ -663,6 +667,8 @@ impl ActiveTool {
                         rotation: 0.0,
                         pin: 0,
                         group: 0,
+                        tags: Vec::new(),
+                        turn: 0.0,
                     });
                 }
             }
@@ -676,6 +682,8 @@ impl ActiveTool {
                         border: self.border_style,
                         pin: 0,
                         group: 0,
+                        tags: Vec::new(),
+                        turn: 0.0,
                     });
                 }
             }
@@ -689,6 +697,8 @@ impl ActiveTool {
                         border: self.border_style,
                         pin: 0,
                         group: 0,
+                        tags: Vec::new(),
+                        turn: 0.0,
                     });
                 }
             }
@@ -733,10 +743,10 @@ impl ActiveTool {
     pub fn preview_shape(&self) -> Option<Shape> {
         let (a, b) = self.in_progress_shape?;
         Some(match self.kind {
-            ToolKind::Rect    => Shape::Rect    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0, pin: 0, group: 0 },
-            ToolKind::Ellipse => Shape::Ellipse { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0, pin: 0, group: 0 },
-            ToolKind::Line    => Shape::Line    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, pin: 0, group: 0 },
-            ToolKind::Arrow   => Shape::Arrow   { a, b, color: self.color, stroke_width: self.size, border: self.border_style, pin: 0, group: 0 },
+            ToolKind::Rect    => Shape::Rect    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
+            ToolKind::Ellipse => Shape::Ellipse { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
+            ToolKind::Line    => Shape::Line    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
+            ToolKind::Arrow   => Shape::Arrow   { a, b, color: self.color, stroke_width: self.size, border: self.border_style, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
             _ => return None,
         })
     }

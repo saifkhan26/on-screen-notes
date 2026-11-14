@@ -49,5 +49,5 @@ pub fn arrowhead_for_freehand_end(
     } else {
         (anchor, tip)
     };
-    Some(Shape::Arrow { a, b, color, stroke_width, border: BorderStyle::Solid, pin: 0, group: 0 })
+    Some(Shape::Arrow { a, b, color, stroke_width, border: BorderStyle::Solid, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 })
 }

@@ -21,6 +21,20 @@ layers.
   of any command (a tool, an edit, a slide or layer command, any button,
   "go to" a slide by name), see its key, `Enter` runs it. Recently run
   commands come first; what needs a selection only shows with one
+- **Find** — `Ctrl+F` finds text labels on every slide by what they say
+  (case aside), and anything tagged by its tags; lists each with its
+  slide, and goes there: `Enter` walks the matches in turn, `↑` / `↓` or a
+  click picks one, and the view glides to it, which flashes
+- **Turn 90°** — the arrange bar's turn buttons (beside flip) turn the
+  selection a quarter turn left or right about its middle. A group, or
+  strokes, turned with these or with the knob keep a turned frame, also
+  the next time they are selected; set `arrange.rotate_left` /
+  `rotate_right` in hotkeys.toml for keys
+- **Tags** — select anything (a picture, a video, a group, strokes) and
+  the tag button on the arrange bar takes words for it, separated by
+  commas: `pose, walk cycle`. A group is found as one by the tags of any
+  of its members. Tags show only on the arrange bar while selected; set
+  `arrange.tag` in hotkeys.toml for a key that opens them
 - **Shape snap** — finish a stroke and hold the pen still for half a
   second: it springs into the straight line, triangle, rectangle, other
   polygon (up to six sides), circle or ellipse it was meant to be. See
@@ -289,8 +303,10 @@ Every action is one undo step. Things worth knowing:
   move, resize and turn there as on the canvas (Delete unpins,
   double-click goes to the pin's slide).
 - The **funnel** button highlights pictures, GIFs and/or videos on the
-  slide (each type outlined in its own colour, the rest dimmed), and
-  "Select these" selects them, ready to arrange or copy.
+  slide (each type outlined in its own colour, the rest dimmed), its
+  groups (each boxed whole), and what is tagged: everything tagged, or
+  just the tags picked from the slide's list, each labelled with its
+  tags. "Select these" selects them, ready to arrange or copy.
 - Captures made by older versions, and frozen frames, are stored as a
   layer's background rather than as objects. Clicking one turns it into
   an ordinary image object in place — nothing moves — and from then on
@@ -464,6 +480,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Previous / next layer | `↓` / `↑` |
 | Hide / show the active layer | `H` |
 | Command palette: find any command by name (`↑` / `↓`, `Enter` runs, `Esc` closes) | `Ctrl+K` |
+| Find text on the slides (`Enter` / `Shift+Enter` next / previous, `↑` / `↓` pick, `Esc` closes) | `Ctrl+F` |
 | Reset pan + zoom | `Ctrl+0` |
 | Zoom to fit everything on the slide | `Ctrl+1` |
 | Zoom to the selection (nothing selected: the whole slide) | `Ctrl+2` |
@@ -521,7 +538,7 @@ one shortcut goes dead, the rest still work. Look at `RUST_LOG=warn`
 output for the offending line.
 
 ```toml
-version = 9
+version = 10
 
 [global]
 toggle_overlay = "ctrl+alt+shift+n"

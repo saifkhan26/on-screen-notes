@@ -99,6 +99,13 @@ pub struct Stroke {
     /// Group the stroke is in, or 0; see `Shape::group`.
     #[serde(default, skip_serializing_if = "crate::canvas::shape::is_ungrouped")]
     pub group: u64,
+    /// Words find (Ctrl+F) knows the stroke by; see `Shape::tags`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// How far the stroke has been turned with a selection; see
+    /// `Shape::turn`. A zero is not written.
+    #[serde(default, skip_serializing_if = "crate::canvas::shape::is_zero")]
+    pub turn: f32,
 
     /// Canvas units per screen pixel at the zoom the stroke was drawn at
     /// (1 / zoom). The pen draws at the toolbar size as it looks on
@@ -474,6 +481,8 @@ impl Stroke {
             smoothing: SmoothingOptions::default(),
             mode_state: None,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -499,6 +508,8 @@ impl Stroke {
             smoothing,
             mode_state: None,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -522,6 +533,8 @@ impl Stroke {
             smoothing: SmoothingOptions::default(),
             mode_state: None,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -661,6 +674,7 @@ impl Stroke {
     /// cached polyline through this exact transform, so mapping the
     /// cache makes the committed stroke identical to what the user saw.
     pub fn apply_affine(&mut self, m: &crate::canvas::affine::Affine) {
+        self.turn = m.turn(self.turn);
         let s = m.linear_scale();
         for sample in &mut self.samples {
             sample.pos = m.apply(sample.pos);
@@ -793,6 +807,20 @@ impl Stroke {
 
     /// Bounding box (axis-aligned) of all samples. Used for hit-testing
     /// (eraser) and for clipping render work to dirty regions.
+    /// `bounds` along the axes of a frame turned by `angle` (see
+    /// `canvas::unturn`).
+    pub fn bounds_turned(&self, angle: f32) -> Option<[f32; 4]> {
+        let mut iter = self.samples.iter().map(|s| crate::canvas::canvas::unturn(s.pos, angle));
+        let first = iter.next()?;
+        let (mut min, mut max) = (first, first);
+        for p in iter {
+            min = [min[0].min(p[0]), min[1].min(p[1])];
+            max = [max[0].max(p[0]), max[1].max(p[1])];
+        }
+        let pad = self.base_width.max(0.5 * self.px);
+        Some([min[0] - pad, min[1] - pad, max[0] + pad, max[1] + pad])
+    }
+
     pub fn bounds(&self) -> Option<[f32; 4]> {
         let mut iter = self.samples.iter();
         let first = iter.next()?;

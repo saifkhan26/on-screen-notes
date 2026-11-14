@@ -117,7 +117,10 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         add("Send to back", s, c.send_back, C::ToBack);
         add("Flip left to right", s, a.flip_horizontal, C::Key(K::Flip(false)));
         add("Flip top to bottom", s, a.flip_vertical, C::Key(K::Flip(true)));
+        add("Turn left 90°", s, a.rotate_left, C::Key(K::Rotate(false)));
+        add("Turn right 90°", s, a.rotate_right, C::Key(K::Rotate(true)));
         add("Zoom to the selection", s, c.zoom_to_selection, C::Key(K::ZoomToSelection));
+        add("Tag the selection (find knows it by its tags)", s, a.tag, C::Key(K::Tag));
         if cx.selected >= 2 {
             add("Group", s, c.group, C::Key(K::Group(true)));
         }
@@ -168,6 +171,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     }
 
     let v = "View";
+    add("Find text on the slides", v, c.find, C::Key(K::Find));
     add("Zoom to fit the slide", v, c.zoom_to_fit, C::Key(K::ZoomToFit));
     add("Reset zoom and pan", v, c.reset_view, C::ResetView);
     add("Hide / show the toolbar and panels", v, c.toggle_ui, C::ToggleUi);
@@ -176,6 +180,8 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Highlight pictures", v, tb.highlight[0], C::Key(K::Highlight(crate::canvas::shape::MediaType::Picture)));
     add("Highlight GIFs", v, tb.highlight[1], C::Key(K::Highlight(crate::canvas::shape::MediaType::Gif)));
     add("Highlight videos", v, tb.highlight[2], C::Key(K::Highlight(crate::canvas::shape::MediaType::Video)));
+    add("Highlight groups", v, tb.highlight_groups, C::Key(K::HighlightGroups));
+    add("Highlight everything tagged", v, tb.highlight_tagged, C::Key(K::HighlightTagged));
     add("Select what is highlighted", v, tb.select_highlighted, C::Key(K::SelectHighlighted));
     add("Background opacity up", v, tb.background_up, C::Key(K::Background(1)));
     add("Background opacity down", v, tb.background_down, C::Key(K::Background(-1)));

@@ -300,6 +300,8 @@ pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &s
                     pin: 0,
                     flip: false,
                     group: group_of(group),
+                    tags: Vec::new(),
+                    turn: 0.0,
                 }
             }
             BoardItem::Note { text, pos, font_size, color, rotation, background, group } => Shape::Text {
@@ -311,6 +313,8 @@ pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &s
                 pin: 0,
                 background,
                 group: group_of(group),
+                tags: Vec::new(),
+                turn: 0.0,
             },
         })
         .collect();

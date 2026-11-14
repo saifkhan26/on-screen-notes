@@ -37,6 +37,7 @@ mod pins;
 mod pointer;
 mod media;
 mod commands;
+mod find;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
@@ -219,6 +220,14 @@ pub struct OnScreenNotesApp {
     palette_before: Option<Vec<[u8; 4]>>,
     /// The command palette (Ctrl+K). Keys go to it alone while it is up.
     commands: ui::command_palette::Palette,
+    /// Find (Ctrl+F): text labels on every slide. Keys go to it alone
+    /// while it is up.
+    find: ui::find_bar::FindBar,
+    /// The label find just went to, flashing.
+    find_flash: Option<find::FindFlash>,
+    /// The selection's tags being typed on the arrange bar. Keys go to
+    /// it alone while it is open.
+    tag_edit: Option<ui::arrange_bar::TagEdit>,
     /// Last rect applied via `ViewportCommand` so we can skip the
     /// re-emit when the target window hasn't moved.
     pinned_last_rect: Option<(i32, i32, i32, i32)>,
@@ -624,6 +633,9 @@ impl OnScreenNotesApp {
             picture_colours: None,
             palette_before: None,
             commands: Default::default(),
+            find: Default::default(),
+            find_flash: None,
+            tag_edit: None,
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),
             obj_clipboard: (Vec::new(), Vec::new()),
@@ -750,7 +762,9 @@ impl eframe::App for OnScreenNotesApp {
         // We treat Space as a *modal* pan key: while it is held, all pen +
         // mouse drags pan the active canvas instead of drawing. This is the
         // same convention used by Photoshop, Figma, Rnote, etc.
-        let space_held = ctx.input(|i| i.key_down(egui::Key::Space)) && !self.slide_panel.is_renaming();
+        // Not while a text field has the keys: a space typed there is
+        // not a pan.
+        let space_held = ctx.input(|i| i.key_down(egui::Key::Space)) && !self.slide_panel.is_renaming() && !ctx.wants_keyboard_input();
 
         // ---- Main overlay ------------------------------------------------
         if self.overlay_visible {
@@ -802,7 +816,7 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.pin_picking,
                     &mut insert_media,
                     &mut self.media_filter,
-                    media_counts,
+                    &media_counts,
                     &mut select_filtered,
                     has_pins.then_some(&mut pins_hidden),
                     text_selected,
@@ -860,6 +874,7 @@ impl eframe::App for OnScreenNotesApp {
                     shown: self.picture_colours.as_ref().map(|p| p.colours.as_slice()),
                     can_restore: self.palette_before.is_some(),
                 });
+                let tags = self.selection_tags();
                 match ui::arrange_bar::show(
                     ctx,
                     selected_count,
@@ -871,6 +886,8 @@ impl eframe::App for OnScreenNotesApp {
                     open_move,
                     row,
                     grouped,
+                    &tags,
+                    &mut self.tag_edit,
                 ) {
                     Some(BarAction::Group(on)) => self.group_selection(on),
                     Some(BarAction::Arrange(op)) => self.arrange_selection(op, ctx),
@@ -879,6 +896,7 @@ impl eframe::App for OnScreenNotesApp {
                     Some(BarAction::MoveToSlide(to)) => self.move_selection_to(to),
                     Some(BarAction::TogglePin) => self.toggle_pin_selection(),
                     Some(BarAction::Flip(vertical)) => self.flip_selection(vertical),
+                    Some(BarAction::Rotate(right)) => self.rotate_selection(right),
                     Some(BarAction::ZoomToSelection) => self.zoom_to_selection(ctx),
                     Some(BarAction::PictureColours) => self.toggle_picture_colours(),
                     // Set after the restyle below, so the picture is
@@ -886,8 +904,12 @@ impl eframe::App for OnScreenNotesApp {
                     Some(BarAction::UseColour(c)) => use_colour = Some(c),
                     Some(BarAction::KeepColours) => self.keep_picture_colours(),
                     Some(BarAction::RestorePalette) => self.restore_palette(),
+                    Some(BarAction::SetTags(tags)) => self.tag_selection(tags),
                     None => {}
                 }
+            } else {
+                // No bar, no tag row.
+                self.tag_edit = None;
             }
             self.show_pin_bar(ctx);
             if insert_media {
@@ -957,7 +979,7 @@ impl eframe::App for OnScreenNotesApp {
                 layer_xform,
                 show_selection,
                 &self.media,
-                self.media_filter,
+                &self.media_filter,
                 ui::overlay::PinMarks {
                     selected: self.pin_tool.selected,
                     outlines: self.ui_visible && self.tool.kind == crate::tools::ToolKind::Select,
@@ -1013,6 +1035,8 @@ impl eframe::App for OnScreenNotesApp {
                     self.run_command(cmd, ctx, canvas_rect);
                 }
             }
+            self.show_find_bar(ctx);
+            self.show_find_flash(ctx, canvas_rect);
 
             // ---- Screenshot region selection --------------------------------
             // Draws the dimmed rubber-band over the canvas and, on release,

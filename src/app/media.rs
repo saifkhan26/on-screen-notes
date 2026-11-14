@@ -267,6 +267,8 @@ impl OnScreenNotesApp {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         };
         if let Some((a, b)) = beside.then(|| self.beside_selection(crate::canvas::canvas::shape_bounds(&shape))).flatten() {
             shape.transform(a, b);

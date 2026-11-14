@@ -342,6 +342,8 @@ mod tests {
             pin: 7,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 

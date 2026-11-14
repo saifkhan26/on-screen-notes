@@ -373,7 +373,7 @@ pub fn show(
     // until a player has one.
     media: &crate::media::MediaHub,
     // Media types to highlight; the rest of the slide fades back.
-    media_filter: crate::ui::media_filter::MediaFilter,
+    media_filter: &crate::ui::media_filter::MediaFilter,
     pin_marks: PinMarks,
 ) -> egui::Rect {
     // Select-tool gesture in flight: the selected objects preview under

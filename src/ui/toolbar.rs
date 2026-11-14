@@ -39,7 +39,7 @@ pub fn show(
     insert_media: &mut bool,
     media_filter: &mut MediaFilter,
     // Pictures / GIFs / videos on the slide, for the filter popup.
-    media_counts: [usize; 3],
+    media_counts: &media_filter::Counts,
     // Set when the filter's "Select these" is clicked.
     select_filtered: &mut bool,
     // Whether pins are hidden; `None` when there are no pins, which
@@ -259,9 +259,9 @@ fn pins_btn(ui: &mut egui::Ui, hidden: &mut bool) -> bool {
     response.hovered() || response.is_pointer_button_down_on()
 }
 
-/// Media filter: highlights pictures, GIFs and / or videos on the slide.
-/// Lit while any type is on; the popup picks the types.
-fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: [usize; 3], select: &mut bool) -> bool {
+/// Media filter: highlights pictures, GIFs and / or videos on the slide,
+/// its groups, and what is tagged. Lit while any is on; the popup picks.
+fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: &media_filter::Counts, select: &mut bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
     let bg = if filter.any() {
         theme::ACCENT
@@ -276,7 +276,7 @@ fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: [usize; 3], s
         .tint(theme::TEXT_PRIMARY)
         .fit_to_exact_size(icon_rect.size())
         .paint_at(ui, icon_rect);
-    let response = response.on_hover_text("Highlight pictures, GIFs or videos");
+    let response = response.on_hover_text("Highlight pictures, GIFs, videos, groups or tags");
     let popup_id = ui.make_persistent_id("osn_media_filter_popup");
     let mut interacted = response.hovered() || response.is_pointer_button_down_on();
     if response.clicked() {
@@ -292,16 +292,51 @@ fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: [usize; 3], s
             ui.set_min_width(200.0);
             ui.label(egui::RichText::new("Highlight media").small().color(theme::TEXT_MUTED));
             ui.add_space(2.0);
-            for (t, n) in MediaType::ALL.into_iter().zip(counts) {
+            let dot_row = |ui: &mut egui::Ui, colour: Color32, on: &mut bool, text: String| {
                 ui.horizontal(|ui| {
                     let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 4.5, media_filter::color(t));
-                    ui.toggle_value(filter.flag(t), format!("{}  ({n})", media_filter::label(t)));
+                    ui.painter().circle_filled(dot.center(), 4.5, colour);
+                    ui.toggle_value(on, text);
+                });
+            };
+            for (t, n) in MediaType::ALL.into_iter().zip(counts.media) {
+                dot_row(ui, media_filter::color(t), filter.flag(t), format!("{}  ({n})", media_filter::label(t)));
+            }
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Groups and tags").small().color(theme::TEXT_MUTED));
+            ui.add_space(2.0);
+            dot_row(ui, media_filter::GROUP_COLOUR, &mut filter.groups, format!("Groups  ({})", counts.groups));
+            dot_row(ui, media_filter::TAG_COLOUR, &mut filter.tagged, format!("All tagged  ({})", counts.tagged));
+            // Each tag on this slide, and any picked that is not on it, so
+            // it can be put back.
+            let mut tags = counts.tags.clone();
+            for t in &filter.tags {
+                if !tags.iter().any(|(have, _)| crate::canvas::units::same_tag(have, t)) {
+                    tags.push((t.clone(), 0));
+                }
+            }
+            if tags.is_empty() {
+                ui.label(egui::RichText::new("Nothing here is tagged — select something, then the arrange bar's tag button").small().color(theme::TEXT_MUTED));
+            } else {
+                egui::ScrollArea::vertical().max_height(180.0).auto_shrink([true, true]).show(ui, |ui| {
+                    for (tag, n) in &tags {
+                        ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            let mut on = filter.has_tag(tag);
+                            if ui.toggle_value(&mut on, format!("#{tag}  ({n})")).clicked() {
+                                filter.toggle_tag(tag);
+                            }
+                        });
+                    }
                 });
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let matching: usize = MediaType::ALL.into_iter().zip(counts).filter(|(t, _)| filter.shows(*t)).map(|(_, n)| n).sum();
+                let media: usize = MediaType::ALL.into_iter().zip(counts.media).filter(|(t, _)| filter.shows(*t)).map(|(_, n)| n).sum();
+                let picked: usize = tags.iter().filter(|(t, _)| filter.has_tag(t)).map(|(_, n)| n).sum();
+                let matching = media
+                    + if filter.groups { counts.groups } else { 0 }
+                    + if filter.tagged { counts.tagged } else { picked };
                 if ui
                     .add_enabled(matching > 0, egui::Button::new("Select these"))
                     .on_hover_text("Select the highlighted objects, ready to arrange")
@@ -602,7 +637,11 @@ fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(match keys.canvas.command_palette {
-            Some(b) => format!("{}: find any command by name. Keys can be changed in hotkeys.toml, where every button can be given one too.", b.label()),
+            Some(b) => format!(
+                "{}: find any command by name.{} Keys can be changed in hotkeys.toml, where every button can be given one too.",
+                b.label(),
+                keys.canvas.find.map_or(String::new(), |f| format!(" {}: find text on the slides.", f.label())),
+            ),
             None => "Keys can be changed in hotkeys.toml, where every button can be given one too.".to_string(),
         })
             .small()

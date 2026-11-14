@@ -12,7 +12,7 @@
 //! and divided by the canvas zoom where they are used.
 
 use crate::canvas::affine::Affine;
-use crate::canvas::canvas::{shape_bounds, Canvas, Layer};
+use crate::canvas::canvas::{shape_bounds, shape_bounds_turned, Canvas, Layer};
 use crate::canvas::hit::{self, CanvasHit, ObjRef, Selection};
 use crate::canvas::shape::{Obb, Shape};
 
@@ -175,8 +175,11 @@ impl SelectState {
 
     /// The box the handles sit on. A lone rectangle, ellipse, image or
     /// text label keeps its own orientation, so its frame turns with
-    /// it. Anything else (strokes, lines, several objects) gets the
-    /// upright box around everything selected.
+    /// it. Anything else (strokes, lines, several objects) gets the box
+    /// around everything selected, turned by the turn they share (see
+    /// `Shape::turn`) — so a group, or strokes, turned with the knob or
+    /// the quarter-turn buttons keep a turned frame — and upright when
+    /// they share none.
     pub fn frame(&self, layer: &Layer, zoom: f32) -> Option<Obb> {
         if self.sel.is_empty() { return None; }
         let mut frame = match (self.sel.strokes.as_slice(), self.sel.shapes.as_slice()) {
@@ -188,8 +191,16 @@ impl SelectState {
                     o
                 }
                 s @ (Shape::Raster { .. } | Shape::Text { .. }) => s.obb(),
+                s if s.turn() != 0.0 => turned_frame(shape_bounds_turned(s, s.turn()), s.turn()),
                 s => aabb_frame(shape_bounds(s)),
             },
+            _ if self.shared_turn(layer) != 0.0 => {
+                let angle = self.shared_turn(layer);
+                let strokes = self.sel.strokes.iter().filter_map(|&i| layer.strokes.get(i)?.bounds_turned(angle));
+                let shapes = self.sel.shapes.iter().filter_map(|&i| Some(shape_bounds_turned(layer.shapes.get(i)?, angle)));
+                let b = strokes.chain(shapes).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])?;
+                turned_frame(b, angle)
+            }
             _ => {
                 let mut bb: Option<[f32; 4]> = None;
                 let mut grow = |b: [f32; 4]| {
@@ -230,13 +241,29 @@ impl SelectState {
         if self.sel.strokes.is_empty() && self.sel.shapes.len() == 1 {
             return !matches!(shape(&self.sel.shapes[0]), Some(Shape::Text { .. }) | None);
         }
+        // A box lined up with the frame (a quarter turn off is lined up
+        // too) stretches along its own sides.
+        let angle = self.shared_turn(layer);
+        let lined_up = |r: f32| {
+            let k = (r - angle) / std::f32::consts::FRAC_PI_2;
+            (k - k.round()).abs() < 1e-3
+        };
         self.sel.shapes.iter().all(|i| match shape(i) {
             Some(Shape::Rect { rotation, .. })
             | Some(Shape::Ellipse { rotation, .. })
-            | Some(Shape::Raster { rotation, .. }) => *rotation == 0.0,
+            | Some(Shape::Raster { rotation, .. }) => lined_up(*rotation),
             Some(Shape::Line { .. }) | Some(Shape::Arrow { .. }) => true,
             Some(Shape::Text { .. }) | None => false,
         })
+    }
+
+    /// The turn every selected object shares (`Shape::turn`), or 0 when
+    /// they share none.
+    fn shared_turn(&self, layer: &Layer) -> f32 {
+        let strokes = self.sel.strokes.iter().filter_map(|&i| layer.strokes.get(i)).map(|s| s.turn);
+        let mut turns = strokes.chain(self.sel.shapes.iter().filter_map(|&i| layer.shapes.get(i)).map(|s| s.turn()));
+        let Some(first) = turns.next() else { return 0.0 };
+        if turns.all(|t| (t - first).abs() < 1e-4) { first } else { 0.0 }
     }
 
     // ---- gesture → transform ----------------------------------------------
@@ -635,6 +662,18 @@ fn is_raster(canvas: &Canvas, li: usize, obj: ObjRef) -> bool {
         if matches!(canvas.layers.get(li).and_then(|l| l.shapes.get(i)), Some(Shape::Raster { .. })))
 }
 
+/// The frame turned by `angle` whose box along its own axes is `b`
+/// (see `canvas::unturn`).
+fn turned_frame(b: [f32; 4], angle: f32) -> Obb {
+    let local = [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5];
+    let (s, c) = angle.sin_cos();
+    Obb {
+        center: [c * local[0] - s * local[1], s * local[0] + c * local[1]],
+        half: [(b[2] - b[0]) * 0.5, (b[3] - b[1]) * 0.5],
+        angle,
+    }
+}
+
 fn aabb_frame(b: [f32; 4]) -> Obb {
     Obb {
         center: [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5],
@@ -665,7 +704,7 @@ mod tests {
     }
 
     fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0 }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
     }
 
     fn image(pos: [f32; 2], size: [f32; 2]) -> Shape {
@@ -676,6 +715,8 @@ mod tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -843,6 +884,40 @@ mod tests {
     }
 
     #[test]
+    fn a_turned_selection_keeps_its_frame_turned() {
+        use std::f32::consts::FRAC_PI_6;
+        let mut c = Canvas::default();
+        c.layers[0].strokes.push(stroke([0.0, 0.0], [100.0, 0.0]));
+        c.layers[0].strokes.push(stroke([0.0, 40.0], [100.0, 40.0]));
+        let mut t = tool(&c);
+        t.sel = Selection { strokes: vec![0, 1], shapes: vec![] };
+        assert_eq!(t.frame(&c.layers[0], 1.0).unwrap().angle, 0.0, "upright to start with");
+        // Turn both by 30° (what the knob or the buttons do).
+        let m = Affine::rotate_about([50.0, 20.0], FRAC_PI_6);
+        c.transform_objects(0, &[0, 1], &[], &m);
+        let f = t.frame(&c.layers[0], 1.0).unwrap();
+        assert!((f.angle - FRAC_PI_6).abs() < 1e-4, "{}", f.angle);
+        // Snug along its own axes: 100 long plus the pen's width each end,
+        // and every sample inside.
+        assert!(f.half[0] < 56.0 && f.half[1] < 26.0, "{:?}", f.half);
+        for s in c.layers[0].strokes.iter().flat_map(|s| s.samples.iter()) {
+            let q = crate::canvas::canvas::unturn([s.pos[0] - f.center[0], s.pos[1] - f.center[1]], f.angle);
+            assert!(q[0].abs() <= f.half[0] + 1e-3 && q[1].abs() <= f.half[1] + 1e-3);
+        }
+        // Selected again later, the same.
+        let mut again = tool(&c);
+        again.sel = Selection { strokes: vec![0, 1], shapes: vec![] };
+        assert!((again.frame(&c.layers[0], 1.0).unwrap().angle - FRAC_PI_6).abs() < 1e-4);
+        // Objects that do not share a turn get the upright box.
+        c.layers[0].strokes.push(stroke([0.0, 80.0], [100.0, 80.0]));
+        again.sel = Selection { strokes: vec![0, 1, 2], shapes: vec![] };
+        assert_eq!(again.frame(&c.layers[0], 1.0).unwrap().angle, 0.0);
+        // A saved slide keeps the turn; an untouched object writes none.
+        let saved = crate::persistence::serialize_canvas(&c).unwrap();
+        assert_eq!(saved.matches("turn:").count(), 2, "only the two turned strokes");
+    }
+
+    #[test]
     fn rotate_knob_turns_the_shape_and_its_frame() {
         let mut c = Canvas::default();
         c.layers[0].shapes.push(image([0.0, 0.0], [100.0, 50.0]));
@@ -937,6 +1012,8 @@ mod tests {
             pin: 0,
             background: None,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         });
         let mut t = tool(&c);
         t.sel = Selection { strokes: vec![0], shapes: vec![0] };

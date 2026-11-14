@@ -271,6 +271,8 @@ pub fn route_text_input(
                     pin: 0,
                     background: tool.text_box.then(|| crate::canvas::shape::auto_text_box(t.color)),
                     group: 0,
+                    tags: Vec::new(),
+                    turn: 0.0,
                 });
             }
         }

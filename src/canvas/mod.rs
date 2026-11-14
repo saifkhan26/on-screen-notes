@@ -22,6 +22,7 @@ pub mod render;
 pub mod shape;
 pub mod smoothing;
 pub mod stroke;
+pub mod units;
 
 use crate::canvas::canvas::Canvas;
 use crate::config::AppConfig;
@@ -1440,6 +1441,8 @@ mod media_cleanup_tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -1940,7 +1943,7 @@ mod pin_tests {
     use crate::canvas::stroke::{PenSample, Stroke};
 
     fn line(x: f32) -> Shape {
-        Shape::Line { a: [x, 0.0], b: [x + 10.0, 0.0], color: [255; 4], stroke_width: 4.0, border: BorderStyle::Solid, pin: 0, group: 0 }
+        Shape::Line { a: [x, 0.0], b: [x + 10.0, 0.0], color: [255; 4], stroke_width: 4.0, border: BorderStyle::Solid, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
     }
 
     fn stroke(x: f32) -> Stroke {
@@ -2163,6 +2166,8 @@ mod pin_tests {
             color: [0; 4], rotation: 0.0, kind: RasterKind::Image, media: None, picture: None, pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         });
         c.layers[0].opacity = 0.25;
         let mut m = CanvasManager::for_tests(vec![c]);

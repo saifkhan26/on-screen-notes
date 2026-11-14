@@ -292,6 +292,34 @@ pub fn shape_bounds(shape: &Shape) -> [f32; 4] {
     [bb[0] - pad, bb[1] - pad, bb[2] + pad, bb[3] + pad]
 }
 
+/// `p` in the axes of a frame turned by `angle`: turned back by it.
+pub fn unturn(p: [f32; 2], angle: f32) -> [f32; 2] {
+    let (s, c) = angle.sin_cos();
+    [c * p[0] + s * p[1], -s * p[0] + c * p[1]]
+}
+
+/// `shape_bounds` along the axes of a frame turned by `angle`: the box,
+/// in those axes (see `unturn`), round what the shape covers.
+pub fn shape_bounds_turned(shape: &Shape, angle: f32) -> [f32; 4] {
+    let points: Vec<[f32; 2]> = match shape {
+        Shape::Line { a, b, .. } | Shape::Arrow { a, b, .. } => vec![*a, *b],
+        s => s.obb().corners().to_vec(),
+    };
+    let pad = match shape {
+        Shape::Rect    { stroke_width, .. }
+        | Shape::Ellipse { stroke_width, .. }
+        | Shape::Line    { stroke_width, .. }
+        | Shape::Arrow   { stroke_width, .. } => *stroke_width,
+        Shape::Text { .. } | Shape::Raster { .. } => 0.0,
+    };
+    let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+    for p in points {
+        let q = unturn(p, angle);
+        b = [b[0].min(q[0]), b[1].min(q[1]), b[2].max(q[0]), b[3].max(q[1])];
+    }
+    [b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad]
+}
+
 /// `Canvas` owns a stack of layers and a view transform. The on-disk
 /// format keeps legacy `strokes` / `shapes` fields so canvases saved by
 /// older builds still load cleanly — `ensure_migrated` folds them into a
@@ -1065,6 +1093,16 @@ impl Canvas {
         self.edit_objects(li, &strokes, &shapes, |_, s| s.group = id, |_, s| s.set_group(id))
     }
 
+    /// Give the chosen objects these tags in place of their own (see
+    /// `shape::parse_tags`). One undo step; objects that have them
+    /// already are left out of it. Returns false when nothing changed.
+    pub fn set_tags(&mut self, li: usize, strokes: &[usize], shapes: &[usize], tags: &[String]) -> bool {
+        let Some(layer) = self.layers.get(li) else { return false };
+        let strokes: Vec<usize> = strokes.iter().copied().filter(|&i| layer.strokes.get(i).is_some_and(|s| s.tags != tags)).collect();
+        let shapes: Vec<usize> = shapes.iter().copied().filter(|&i| layer.shapes.get(i).is_some_and(|s| s.tags() != tags)).collect();
+        self.edit_objects(li, &strokes, &shapes, |_, s| s.tags = tags.to_vec(), |_, s| s.set_tags(tags))
+    }
+
     /// Put the chosen text labels in a box that keeps them readable
     /// (`shape::auto_text_box`), or take them out of any box. One undo
     /// step; other shapes, and labels already so, are left out of it.
@@ -1507,6 +1545,8 @@ fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
         pin: 0,
         flip: false,
         group: 0,
+        tags: Vec::new(),
+        turn: 0.0,
     });
     layer.rev += 1;
     Some(img.capture_zoom)
@@ -1790,6 +1830,8 @@ fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> RasterEraseOutco
         pin: shape.pin(),
         flip: false,
         group: 0,
+        tags: Vec::new(),
+        turn: 0.0,
     })
 }
 
@@ -1837,8 +1879,8 @@ mod layer_xform_tests {
     #[test]
     fn boxing_labels_is_one_undo_step_and_skips_other_shapes() {
         let mut c = Canvas::default();
-        c.add_shape(Shape::Text { pos: [0.0, 0.0], content: "a".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0 });
-        c.add_shape(Shape::Rect { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border: crate::canvas::shape::BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0 });
+        c.add_shape(Shape::Text { pos: [0.0, 0.0], content: "a".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 });
+        c.add_shape(Shape::Rect { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border: crate::canvas::shape::BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 });
         let steps = c.undo_log.len();
         assert!(c.set_text_box(0, &[0, 1], true));
         assert_eq!(c.undo_log.len(), steps + 1);
@@ -1934,6 +1976,8 @@ mod object_edit_tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -2082,6 +2126,8 @@ mod object_edit_tests {
             border: BorderStyle::Solid, rotation: 0.0,
             pin: 0,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         });
         c.transform_objects(0, &[], &[0], &Affine::rotate_about([20.0, 10.0], 0.5));
         c.restyle_objects(0, &[], &[0], Some([9, 9, 9, 255]), None, false);
@@ -2155,6 +2201,8 @@ mod object_edit_tests {
             a: [x, 0.0], b: [x, 50.0], color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid,
             pin: 0,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         };
         c.add_shape(line(1.0));
         c.add_shape(line(2.0));

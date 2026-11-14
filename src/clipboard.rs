@@ -118,6 +118,8 @@ mod tests {
             pin: 0,
             flip: false,
             group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
         }
     }
 
@@ -150,8 +152,8 @@ mod tests {
 
     #[test]
     fn drawn_objects_render_cropped_on_transparent_at_screen_resolution() {
-        let rect = Shape::Rect { a: [100.0, 100.0], b: [140.0, 120.0], color: [0, 255, 0, 255], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0 };
-        let label = Shape::Text { pos: [0.0, 0.0], content: "left out".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0 };
+        let rect = Shape::Rect { a: [100.0, 100.0], b: [140.0, 120.0], color: [0, 255, 0, 255], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 };
+        let label = Shape::Text { pos: [0.0, 0.0], content: "left out".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 };
         let img = image_of(Vec::new(), vec![rect, label], 2.0, 1.5, &MediaFrames::new(), None).unwrap();
         // 44 × 24 canvas units (outline padding included) at 2 × 1.5.
         assert_eq!(img.dimensions(), (132, 72), "the text label does not widen it");

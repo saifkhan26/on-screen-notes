@@ -27,6 +27,10 @@ pub enum KeyAction {
     Size(i8),
     InsertMedia,
     Highlight(MediaType),
+    /// Highlight every group, or stop.
+    HighlightGroups,
+    /// Highlight everything tagged, or stop.
+    HighlightTagged,
     SelectHighlighted,
     PinToWindow,
     /// Background opacity 10 % up (+1) or down (−1).
@@ -50,8 +54,12 @@ pub enum KeyAction {
     ZoomToSelection,
     /// Mirror the selection left to right (`false`) or top to bottom.
     Flip(bool),
+    /// Turn the selection a quarter turn right (`true`) or left.
+    Rotate(bool),
     /// Show the selected picture's colours.
     PictureColours,
+    /// Type the selection's tags.
+    Tag,
     /// Text labels in a box, or not.
     TextBox,
     /// Move the active slide one place toward the first (−1) or last (+1).
@@ -62,6 +70,8 @@ pub enum KeyAction {
     Onion,
     /// Open the command palette.
     CommandPalette,
+    /// Open the find bar.
+    Find,
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -90,7 +100,10 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (a.move_to_slide, KeyAction::MoveToSlide),
         (a.flip_horizontal, KeyAction::Flip(false)),
         (a.flip_vertical, KeyAction::Flip(true)),
+        (a.rotate_left, KeyAction::Rotate(false)),
+        (a.rotate_right, KeyAction::Rotate(true)),
         (a.picture_colours, KeyAction::PictureColours),
+        (a.tag, KeyAction::Tag),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));
     for (i, b) in t.colour.iter().enumerate() {
@@ -108,6 +121,8 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (t.size_down, KeyAction::Size(-1)),
         (t.insert_media, KeyAction::InsertMedia),
         (t.select_highlighted, KeyAction::SelectHighlighted),
+        (t.highlight_groups, KeyAction::HighlightGroups),
+        (t.highlight_tagged, KeyAction::HighlightTagged),
         (t.pin_to_window, KeyAction::PinToWindow),
         (t.background_up, KeyAction::Background(1)),
         (t.background_down, KeyAction::Background(-1)),
@@ -117,6 +132,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.zoom_to_selection, KeyAction::ZoomToSelection),
         (c.media_onion, KeyAction::Onion),
         (c.command_palette, KeyAction::CommandPalette),
+        (c.find, KeyAction::Find),
         (c.group, KeyAction::Group(true)),
         (c.ungroup, KeyAction::Group(false)),
         (c.move_slide_up, KeyAction::MoveSlide(-1)),
@@ -191,6 +207,8 @@ mod tests {
         assert_eq!(press(&keys, egui::Key::Num1, egui::Modifiers::NONE), vec![], "1 alone is the opacity key");
         assert_eq!(press(&keys, egui::Key::G, ctrl), vec![KeyAction::Group(true)]);
         assert_eq!(press(&keys, egui::Key::K, ctrl), vec![KeyAction::CommandPalette]);
+        assert_eq!(press(&keys, egui::Key::F, ctrl), vec![KeyAction::Find]);
+        assert_eq!(press(&keys, egui::Key::F, ctrl | egui::Modifiers::SHIFT), vec![], "Ctrl+Shift+F is the freeze");
         assert_eq!(press(&keys, egui::Key::G, ctrl | egui::Modifiers::SHIFT), vec![KeyAction::Group(false)]);
         let cfg: HotkeysConfig = toml::from_str("[canvas]\nmove_slide_up = \"alt+pageup\"\nmove_slide_down = \"alt+pagedown\"\n").unwrap();
         let keys = cfg.parsed();

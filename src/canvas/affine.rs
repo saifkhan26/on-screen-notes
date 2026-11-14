@@ -77,6 +77,23 @@ impl Affine {
     /// Factor by which lengths with no direction of their own (stroke
     /// widths, font sizes) should scale: the square root of the area
     /// scale. Equals the plain scale factor for a similarity.
+    /// Where a selection frame turned by `angle` (radians, clockwise on
+    /// screen) points once this transform is applied: its x-axis mapped,
+    /// or for a mirroring transform, of that and its opposite the one
+    /// pointing more to the right — as `Shape::apply_affine` turns a
+    /// box. Moves and even scales leave `angle` exactly as it was, and a
+    /// turn that comes back to upright is exactly 0.
+    pub fn turn(&self, angle: f32) -> f32 {
+        if self.b == 0.0 && self.c == 0.0 && self.a > 0.0 && self.d > 0.0 && (self.a == self.d || angle == 0.0) {
+            return angle;
+        }
+        let (s, c) = angle.sin_cos();
+        let u = self.apply_vec([c, s]);
+        let mirrored = self.a * self.d - self.b * self.c < 0.0;
+        let t = if mirrored && u[0] < 0.0 { (-u[1]).atan2(-u[0]) } else { u[1].atan2(u[0]) };
+        if t.abs() < 1e-5 { 0.0 } else { t }
+    }
+
     pub fn linear_scale(&self) -> f32 {
         (self.a * self.d - self.b * self.c).abs().sqrt()
     }
@@ -98,6 +115,27 @@ mod tests {
 
     fn close(p: [f32; 2], q: [f32; 2]) -> bool {
         (p[0] - q[0]).abs() < 1e-3 && (p[1] - q[1]).abs() < 1e-3
+    }
+
+    #[test]
+    fn turns_add_up_moves_keep_them_and_flips_stay_upright() {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_6};
+        let quarter = Affine::rotate_about([3.0, 4.0], FRAC_PI_2);
+        assert!((quarter.turn(FRAC_PI_6) - (FRAC_PI_6 + FRAC_PI_2)).abs() < 1e-5);
+        // Four quarter turns come back to exactly upright.
+        let mut t = 0.0;
+        for _ in 0..4 {
+            t = quarter.turn(t);
+        }
+        assert_eq!(t, 0.0);
+        // Moves and even scales leave a turn exactly as it was.
+        assert_eq!(Affine::translate([5.0, -2.0]).turn(0.3), 0.3);
+        assert_eq!(Affine::scale_about([1.0, 1.0], 2.0, 2.0).turn(0.3), 0.3);
+        assert_eq!(Affine::scale_about([1.0, 1.0], 2.0, 0.5).turn(0.0), 0.0);
+        // A flip mirrors the turn and keeps it pointing right.
+        let flip = Affine::scale_about([0.0, 0.0], -1.0, 1.0);
+        assert!((flip.turn(FRAC_PI_6) + FRAC_PI_6).abs() < 1e-5);
+        assert_eq!(flip.turn(0.0), 0.0);
     }
 
     #[test]
