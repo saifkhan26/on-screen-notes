@@ -83,22 +83,48 @@ impl Player {
             Player::Video(p) => p.is_playing(),
         }
     }
+
+    fn neighbour(&self, step: i8) -> Option<&Arc<ColorImage>> {
+        match self {
+            Player::Gif(p) => p.neighbour(isize::from(step)),
+            Player::Video(p) => p.neighbour(i64::from(step)),
+        }
+    }
 }
 
 struct Entry {
     player: Player,
     meta: Option<MediaMeta>,
     texture: Option<TextureHandle>,
-    /// The frame now in `texture`, to skip re-uploading it.
+    /// The frame now in `texture` (with the onion skin, if on).
     uploaded: Option<Arc<ColorImage>>,
+    /// Which frames `uploaded` was made from — the shown one and the two
+    /// onion-skin ones, by address — to skip remaking it.
+    made_from: [usize; 3],
     /// `MediaHub::tick` when the object was last seen on screen.
     seen: u64,
 }
 
 impl Entry {
-    fn upload(&mut self, ctx: &egui::Context, id: u64) {
+    /// Put the frame on show into the texture — with `onion` and paused,
+    /// its neighbours ghosted in (`onion_skin`).
+    fn upload(&mut self, ctx: &egui::Context, id: u64, onion: bool) {
         let Some(frame) = self.player.frame() else { return };
-        if self.uploaded.as_ref().is_some_and(|u| Arc::ptr_eq(u, frame)) { return; }
+        let ghosts = if onion && !self.player.is_playing() {
+            [self.player.neighbour(-1), self.player.neighbour(1)]
+        } else {
+            [None, None]
+        };
+        let addr = |f: Option<&Arc<ColorImage>>| f.map_or(0, |f| Arc::as_ptr(f) as usize);
+        let made_from = [addr(Some(frame)), addr(ghosts[0]), addr(ghosts[1])];
+        if self.uploaded.is_some() && self.made_from == made_from { return; }
+        let shown = if ghosts.iter().any(Option::is_some) {
+            Arc::new(onion_skin(frame, ghosts[0].map(|g| &**g), ghosts[1].map(|g| &**g)))
+        } else {
+            Arc::clone(frame)
+        };
+        self.made_from = made_from;
+        let frame = &shown;
         let image = ImageData::Color(Arc::clone(frame));
         let opts = TextureOptions::LINEAR;
         match &mut self.texture {
@@ -110,6 +136,46 @@ impl Entry {
         }
         self.uploaded = Some(Arc::clone(frame));
     }
+}
+
+/// How strongly a ghost shows where it differs most from the frame.
+const GHOST_MAX: f32 = 0.6;
+
+/// `frame` with the frame before it ghosted in red and the one after in
+/// green — only where they differ from it, so what stays still stays
+/// clean and what moves shows where it came from and where it goes. A
+/// ghost is its frame pulled toward the tint, so dark lines show in
+/// colour too; it is stronger where the neighbour is darker than the
+/// frame (ink that was or will be there) than where it is lighter, so
+/// the frame's own lines keep their weight. Neighbours of another size
+/// (decoded before a resize) are left out.
+pub fn onion_skin(frame: &ColorImage, before: Option<&ColorImage>, after: Option<&ColorImage>) -> ColorImage {
+    let mut out = frame.clone();
+    for (ghost, tint) in [(before, [1.0, 0.22, 0.22]), (after, [0.25, 1.0, 0.35])] {
+        let Some(g) = ghost.filter(|g| g.size == frame.size) else { continue };
+        for ((o, c), n) in out.pixels.iter_mut().zip(&frame.pixels).zip(&g.pixels) {
+            let ([cr, cg, cb, ca], [nr, ng, nb, _]) = (c.to_array(), n.to_array());
+            if ca == 0 {
+                continue;
+            }
+            let diff = f32::from(cr.abs_diff(nr)) + f32::from(cg.abs_diff(ng)) + f32::from(cb.abs_diff(nb));
+            // A little noise (compression, dithering) shows nothing.
+            let w = ((diff / (3.0 * 255.0) - 0.04) * 5.0).clamp(0.0, 1.0) * GHOST_MAX;
+            if w <= 0.0 {
+                continue;
+            }
+            let lum = |r: u8, g: u8, b: u8| 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+            let w = if lum(nr, ng, nb) < lum(cr, cg, cb) { w } else { w * 0.4 };
+            let [or, og, ob, oa] = o.to_array();
+            let mix = |was: u8, ghost: u8, t: f32| {
+                let ghost = f32::from(ghost) * 0.45 + t * 255.0 * 0.55;
+                let v = f32::from(was) * (1.0 - w) + ghost * w;
+                (v.round() as u8).min(oa)
+            };
+            *o = egui::Color32::from_rgba_premultiplied(mix(or, nr, tint[0]), mix(og, ng, tint[1]), mix(ob, nb, tint[2]), oa);
+        }
+    }
+    out
 }
 
 /// How long a decoded GIF nobody shows is kept, so flipping back to its
@@ -133,6 +199,9 @@ pub struct MediaHub {
     /// the screen (slide switch, hidden layer, undo), keyed by
     /// `MediaRef::id`, to pick up where it was.
     resume: HashMap<u64, (f64, bool)>,
+    /// Onion skin: a paused GIF or video shows the frames either side of
+    /// its own, ghosted in (`onion_skin`).
+    onion: bool,
     /// Decoded GIFs by file name, shared by every object showing the
     /// same file, with the time each was last used.
     gifs: HashMap<String, (Arc<GifData>, Instant)>,
@@ -238,12 +307,13 @@ impl MediaHub {
                         }
                         MediaKind::Video => Player::Video(Box::new(VideoPlayer::new(path, ffmpeg::tools(), resume, playing))),
                     };
-                    v.insert(Entry { player, meta: m.meta, texture: None, uploaded: None, seen: tick })
+                    v.insert(Entry { player, meta: m.meta, texture: None, uploaded: None, made_from: [0; 3], seen: tick })
                 }
             };
             entry.seen = tick;
             if let Player::Video(v) = &mut entry.player {
                 v.set_on_screen(on_screen);
+                v.set_onion(self.onion);
                 if v.is_dormant() && view.intersects(rect) {
                     let poster = match shape {
                         crate::canvas::shape::Shape::Raster { px_size, .. } => px_size[0].max(px_size[1]).max(1) as f32,
@@ -287,10 +357,20 @@ impl MediaHub {
             keep
         });
 
+        let onion = self.onion;
         for (id, e) in &mut self.entries {
             e.player.tick(now);
-            e.upload(ctx, *id);
+            e.upload(ctx, *id, onion);
         }
+    }
+
+    /// Onion skin on or off, for every GIF and video.
+    pub fn set_onion(&mut self, on: bool) {
+        self.onion = on;
+    }
+
+    pub fn onion(&self) -> bool {
+        self.onion
     }
 
     /// FFmpeg was just installed or located: restart the video players
@@ -323,6 +403,7 @@ impl MediaHub {
         for (id, e) in &self.entries {
             let next = match &e.player {
                 Player::Gif(p) => p.next_change_in(),
+                Player::Video(v) if v.onion_pending() => Some(0.05),
                 Player::Video(_) => self.status(*id).filter(|s| s.playing || s.loading).map(|s| {
                     let [num, den] = e.meta.map_or([30, 1], |m| m.frame_rate);
                     if s.loading || num == 0 { 0.05 } else { f64::from(den.max(1)) / f64::from(num) }
@@ -343,11 +424,44 @@ impl MediaHub {
         }
     }
 
-    /// Current frame of every playing object, for screenshots.
+    /// Current frame of every playing object, for screenshots. Never the
+    /// onion skin, which is a view of the frames, not one of them.
     pub fn current_frames(&self) -> HashMap<u64, Arc<ColorImage>> {
         self.entries
             .iter()
             .filter_map(|(id, e)| e.player.frame().map(|f| (*id, Arc::clone(f))))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::Color32;
+
+    /// A white 4×1 frame with a black dot at `x`.
+    fn dot_at(x: usize) -> ColorImage {
+        let mut img = ColorImage::new([4, 1], Color32::WHITE);
+        img.pixels[x] = Color32::BLACK;
+        img
+    }
+
+    #[test]
+    fn the_onion_skin_ghosts_only_what_moved() {
+        // The dot went 0 -> 1 -> 2.
+        let (before, now, after) = (dot_at(0), dot_at(1), dot_at(2));
+        let out = onion_skin(&now, Some(&before), Some(&after));
+        let [r, g, b, _] = out.pixels[0].to_array();
+        assert!(r > g && r > b && g < 200, "where it was: a red ghost, {:?}", out.pixels[0]);
+        let [r, g, b, _] = out.pixels[2].to_array();
+        assert!(g > r && g > b && r < 200, "where it goes: a green ghost, {:?}", out.pixels[2]);
+        assert_eq!(out.pixels[3], Color32::WHITE, "what never changed stays as it was");
+        let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+        assert!(lum(out.pixels[1]) < 300, "the dot itself stays dark: {:?}", out.pixels[1]);
+        // Without neighbours (the ends, or playing) the frame is untouched,
+        // and a neighbour of another size is left out.
+        assert_eq!(onion_skin(&now, None, None).pixels, now.pixels);
+        let other = ColorImage::new([2, 2], Color32::BLACK);
+        assert_eq!(onion_skin(&now, Some(&other), None).pixels, now.pixels);
     }
 }

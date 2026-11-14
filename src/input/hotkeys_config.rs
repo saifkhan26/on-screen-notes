@@ -456,6 +456,8 @@ pub struct CanvasSection {
     #[serde(default = "d_media_next_frame")] pub media_next_frame: String,
     /// Loop the video or GIF, or stop looping it (the media bar's button).
     #[serde(default)] pub media_loop: String,
+    /// Onion skin on / off for every GIF and video (the media bar's button).
+    #[serde(default)] pub media_onion: String,
 
     // The slide panel's, layer panel's, slide window's and pin bar's
     // buttons. Unbound until set.
@@ -595,6 +597,7 @@ impl Default for CanvasSection {
             media_prev_frame: d_media_prev_frame(),
             media_next_frame: d_media_next_frame(),
             media_loop: String::new(),
+            media_onion: String::new(),
             new_slide: String::new(),
             toggle_slide_panel: String::new(),
             toggle_slide_order: String::new(),
@@ -671,8 +674,8 @@ fn d_media_next_frame() -> String { "period".into() }
 /// made every button bindable and lists each binding in the file; 4
 /// added the nudge keys; 5 zoom to fit / to the selection (and the held
 /// peek), flipping, the text box and a picture's colours; 6 moving
-/// slides; 7 groups.
-const FORMAT: u32 = 7;
+/// slides; 7 groups; 8 onion skin.
+const FORMAT: u32 = 8;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -816,6 +819,7 @@ pub struct CanvasBindings {
     pub media_prev_frame: Option<Binding>,
     pub media_next_frame: Option<Binding>,
     pub media_loop: Option<Binding>,
+    pub media_onion: Option<Binding>,
     pub new_slide: Option<Binding>,
     pub toggle_slide_panel: Option<Binding>,
     pub toggle_slide_order: Option<Binding>,
@@ -1007,6 +1011,7 @@ impl HotkeysConfig {
                 media_prev_frame: p("canvas.media_prev_frame", &self.canvas.media_prev_frame),
                 media_next_frame: p("canvas.media_next_frame", &self.canvas.media_next_frame),
                 media_loop:       p("canvas.media_loop",       &cv.media_loop),
+                media_onion:      p("canvas.media_onion",      &cv.media_onion),
                 new_slide:          p("canvas.new_slide",          &cv.new_slide),
                 toggle_slide_panel: p("canvas.toggle_slide_panel", &cv.toggle_slide_panel),
                 toggle_slide_order: p("canvas.toggle_slide_order", &cv.toggle_slide_order),
@@ -1340,6 +1345,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "media_prev_frame")     => "Video or GIF: previous frame",
         ("canvas", "media_next_frame")     => "Video or GIF: next frame",
         ("canvas", "media_loop")           => "Loop the video or GIF, or stop looping",
+        ("canvas", "media_onion")          => "Onion skin on / off: a paused GIF or video shows the frames either side",
         ("canvas", "new_slide")            => "New slide after the last one",
         ("canvas", "toggle_slide_panel")   => "Fold / unfold the slide panel",
         ("canvas", "toggle_slide_order")   => "Ctrl+Tab: slides in order, or recently used first",
@@ -1592,7 +1598,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 7"));
+        assert!(up.contains("version = 8"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1601,7 +1607,7 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 7\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 8\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
         assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
@@ -1638,7 +1644,7 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 7\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 8\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
@@ -1741,7 +1747,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 7\n\n\
+             version = 8\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1762,13 +1768,13 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 7\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 8\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 7");
-        assert_eq!(upgrade_text("", 0), "version = 7\n");
+        assert_eq!(new, "version = 8");
+        assert_eq!(upgrade_text("", 0), "version = 8\n");
     }
 
     #[test]

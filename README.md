@@ -456,6 +456,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Text mode: commit | `Enter` |
 | Video / GIF: play / pause | `K` |
 | Video / GIF: previous / next frame | `,` / `.` (hold to repeat) |
+| Onion skin on / off (every GIF and video, while paused) | media bar's layers button; or set `media_onion` |
 
 ---
 
@@ -485,7 +486,7 @@ one shortcut goes dead, the rest still work. Look at `RUST_LOG=warn`
 output for the offending line.
 
 ```toml
-version = 7
+version = 8
 
 [global]
 toggle_overlay = "ctrl+alt+shift+n"
@@ -642,8 +643,15 @@ the slide.
 - **Playback bar** — appears just below the object while the pointer is
   over it (with any tool) and while it is selected:
   previous frame · play / pause · next frame · seek bar · time and
-  frame number · loop. Tapping the bar never draws ink. The bar is
-  never in screenshots or recordings.
+  frame number · loop · onion skin. Tapping the bar never draws ink.
+  The bar is never in screenshots or recordings.
+- **Onion skin** — the layers button on the bar (or `media_onion` in
+  `hotkeys.toml`, unbound until set) turns it on for every GIF and
+  video: while one is paused, the frame before shows in red and the
+  frame after in green, only where they differ from the frame shown, so
+  what moves stands out and what stays still stays clean. Step with
+  `,` / `.` to walk through a motion. A looping GIF wraps round at its
+  ends. Screenshots and copies keep the plain frame.
 - **Keys** — `K` play / pause, `,` / `.` previous / next frame (see
   [In-overlay shortcuts](#in-overlay-shortcuts)).
 - **Screenshots** include the frame each video / GIF is showing.

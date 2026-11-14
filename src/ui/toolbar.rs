@@ -661,6 +661,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Pin: go to its slide",     c.pin_go_to_slide),
             ("Pin: this slide only / every slide", c.pin_this_slide_only),
             ("Loop video / GIF",         c.media_loop),
+            ("Onion skin on / off",      c.media_onion),
         ])),
     ];
     // Both layer moves on one row, when either is bound.

@@ -231,6 +231,20 @@ impl GifPlayer {
         self.frames.get(self.index).map(|f| &f.image)
     }
 
+    /// The frame `step` frames from the one shown (−1 the one before),
+    /// for onion skinning. A looping GIF wraps round once fully decoded.
+    pub fn neighbour(&self, step: isize) -> Option<&Arc<ColorImage>> {
+        let n = self.frames.len() as isize;
+        let mut i = self.index as isize + step;
+        if self.looping && self.done() && n > 1 {
+            i = i.rem_euclid(n);
+        }
+        if i < 0 || i >= n || i == self.index as isize {
+            return None;
+        }
+        self.frames.get(i as usize).map(|f| &f.image)
+    }
+
     /// Seconds until the frame shown changes, while playing: the app
     /// paces its repaints by this instead of drawing flat out.
     pub fn next_change_in(&self) -> Option<f64> {

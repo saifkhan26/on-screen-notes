@@ -1826,6 +1826,7 @@ impl OnScreenNotesApp {
                 let msg = if self.tool.text_box { "Text in a box: on" } else { "Text in a box: off" };
                 say(self, msg.to_string());
             }
+            K::Onion => self.toggle_onion(),
             K::Group(on) => {
                 if selecting {
                     self.group_selection(on);
@@ -2535,6 +2536,21 @@ impl OnScreenNotesApp {
         if let Some(t) = out.toast {
             self.toast = Some((t, Instant::now()));
         }
+        if out.toggle_onion {
+            self.toggle_onion();
+        }
+    }
+
+    /// Onion skin on or off for every GIF and video, saying which.
+    fn toggle_onion(&mut self) {
+        let on = !self.media.onion();
+        self.media.set_onion(on);
+        let msg = if on {
+            "Onion skin on: a paused GIF or video shows the frame before in red, the one after in green"
+        } else {
+            "Onion skin off"
+        };
+        self.toast = Some((msg.to_string(), Instant::now()));
     }
 
     /// How the lock key reads, for messages ("Ctrl+R" unless rebound).

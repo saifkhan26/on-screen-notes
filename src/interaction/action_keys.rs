@@ -58,6 +58,8 @@ pub enum KeyAction {
     MoveSlide(i8),
     /// Make the selection one group (`true`), or take it out of its groups.
     Group(bool),
+    /// Onion skin on / off for every GIF and video.
+    Onion,
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -111,6 +113,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (t.text_box, KeyAction::TextBox),
         (c.zoom_to_fit, KeyAction::ZoomToFit),
         (c.zoom_to_selection, KeyAction::ZoomToSelection),
+        (c.media_onion, KeyAction::Onion),
         (c.group, KeyAction::Group(true)),
         (c.ungroup, KeyAction::Group(false)),
         (c.move_slide_up, KeyAction::MoveSlide(-1)),
