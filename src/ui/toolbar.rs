@@ -10,6 +10,7 @@ use crate::canvas::smoothing::{SmoothingOptions, SmoothingType};
 use crate::canvas::stroke::StrokeStyle;
 use crate::config::SmoothingLevel;
 use crate::input::hotkeys_config::{Binding, ParsedHotkeys};
+use crate::tools::beside::{BesideFit, BesideSide};
 use crate::tools::{ActiveTool, ToolKind};
 use crate::ui::media_filter::{self, MediaFilter};
 use crate::ui::theme;
@@ -26,6 +27,9 @@ pub fn show(
     smoothing: &mut SmoothingLevel,
     smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
+    // New media beside the selected picture: what it matches and which
+    // side, in the settings popup.
+    beside: (&mut BesideFit, &mut BesideSide),
     pinned_hwnd: &mut Option<isize>,
     pin_picking: &mut bool,
     // Set when the "Insert video / GIF" button is clicked.
@@ -114,7 +118,7 @@ pub fn show(
                         interacted |= pins_btn(ui, hidden);
                     }
                     interacted |= pin_btn(ui, pinned_hwnd, pin_picking);
-                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve);
+                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve, (&mut *beside.0, &mut *beside.1));
                     interacted |= help_btn(ui, keys);
                 });
             });
@@ -981,6 +985,7 @@ fn pin_btn(
 /// Combined settings button — opens a popup with background-opacity and
 /// smoothing-level controls. Folding these secondary controls behind a
 /// single button keeps the always-visible toolbar tight.
+#[allow(clippy::too_many_arguments)]
 fn settings_btn(
     ui: &mut egui::Ui,
     bg_opacity: &mut f32,
@@ -988,6 +993,7 @@ fn settings_btn(
     smoothing: &mut SmoothingLevel,
     smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
+    (beside_fit, beside_side): (&mut BesideFit, &mut BesideSide),
 ) -> bool {
     let size = Vec2::splat(BTN_SIZE);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -1197,6 +1203,32 @@ fn settings_btn(
                          1.0 = linear\n\
                          2.0 = heavier touch (low pressure thinner)",
                     );
+                }
+            });
+            ui.add_space(6.0);
+            // Pills, not a ComboBox: see the smoothing mode row.
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("New picture beside the selected one")
+                        .small()
+                        .color(theme::TEXT_MUTED),
+                );
+                let about = "With a picture, GIF or video selected, one you drop, paste or insert \
+                             comes in at its height (or width) and lands right beside it, past any \
+                             already there. With nothing like that selected, or Off, new ones come \
+                             in at their own size where they fall";
+                ui.horizontal(|ui| {
+                    for f in BesideFit::ALL {
+                        ui.selectable_value(beside_fit, f, f.label()).on_hover_text(about);
+                    }
+                });
+                if *beside_fit != BesideFit::Off {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("on the").small().color(theme::TEXT_MUTED));
+                        for s in BesideSide::ALL {
+                            ui.selectable_value(beside_side, s, s.label());
+                        }
+                    });
                 }
             });
         },

@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas::smoothing::SmoothingOptions;
 use crate::canvas::stroke::StrokeStyle;
+use crate::tools::arrange::PackMode;
+use crate::tools::beside::{BesideFit, BesideSide};
 
 /// Pen-input smoothing preset.
 ///
@@ -171,6 +173,20 @@ pub struct AppConfig {
     /// until they touch instead of piling them on top of each other.
     #[serde(default = "default_arrange_apart")]
     pub arrange_apart: bool,
+
+    /// How the arrange bar's Pack lays objects out: the tightest block,
+    /// rows or columns. Picked from the arrow beside it.
+    #[serde(default)]
+    pub pack_mode: PackMode,
+
+    /// A picture, GIF or video dropped, pasted or inserted while one is
+    /// selected takes its height or width (or keeps its own size, off)…
+    #[serde(default)]
+    pub beside_fit: BesideFit,
+
+    /// …and lands on this side of it.
+    #[serde(default)]
+    pub beside_side: BesideSide,
 }
 
 fn default_slide_panel_open() -> bool { true }
@@ -221,6 +237,9 @@ impl Default for AppConfig {
             slide_panel_open: true,
             slide_tab_order: SlideTabOrder::default(),
             arrange_apart: true,
+            pack_mode: PackMode::default(),
+            beside_fit: BesideFit::default(),
+            beside_side: BesideSide::default(),
         }
     }
 }

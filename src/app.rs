@@ -1267,12 +1267,45 @@ impl OnScreenNotesApp {
     }
 
     /// Pack, group, align or distribute the selection, as one undo step.
-    fn arrange_selection(&mut self, op: crate::tools::arrange::Arrange) {
+    fn arrange_selection(&mut self, op: crate::tools::arrange::Arrange, ctx: &egui::Context) {
+        if op == crate::tools::arrange::Arrange::Pack {
+            self.pack_selection(ctx);
+            return;
+        }
         let c = self.canvases.active();
         let li = c.active_layer;
         let Some(layer) = c.layers.get(li) else { return };
         let (strokes, shapes) = crate::tools::arrange::plan(layer, &self.tool.select.sel, op, c.zoom);
         if !self.canvases.active_mut().move_objects_each(li, &strokes, &shapes) {
+            self.toast = Some(("Nothing to move".to_string(), std::time::Instant::now()));
+        }
+    }
+
+    /// Pack the selection the way the arrange bar's arrow says, onto the
+    /// screen: inside the view when it fits there at its size, as near
+    /// where it was as it can be; else into a block shaped like the view,
+    /// which the view glides out to show whole. One undo step.
+    fn pack_selection(&mut self, ctx: &egui::Context) {
+        let area = self.fit_area(ctx);
+        let c = self.canvases.active();
+        let li = c.active_layer;
+        let Some(layer) = c.layers.get(li) else { return };
+        let (pan, zoom) = (c.pan, c.zoom.max(1e-3));
+        let view = [
+            (area[0] - pan[0]) / zoom,
+            (area[1] - pan[1]) / zoom,
+            (area[0] + area[2] - pan[0]) / zoom,
+            (area[1] + area[3] - pan[1]) / zoom,
+        ];
+        let (strokes, shapes, block) = crate::tools::arrange::plan_pack(layer, &self.tool.select.sel, self.config.pack_mode, view, zoom);
+        let moved = self.canvases.active_mut().move_objects_each(li, &strokes, &shapes);
+        // Half a screen pixel of slack for f32 rounding.
+        let slack = 0.5 / zoom;
+        let on_screen = block[0] >= view[0] - slack && block[1] >= view[1] - slack && block[2] <= view[2] + slack && block[3] <= view[3] + slack;
+        if !on_screen {
+            let to = self.view_fitting(block, zoom, ctx);
+            self.glide_view(to, ctx);
+        } else if !moved {
             self.toast = Some(("Nothing to move".to_string(), std::time::Instant::now()));
         }
     }
@@ -1678,12 +1711,12 @@ impl OnScreenNotesApp {
         match action {
             K::Arrange(op) => {
                 if selecting && self.may_edit() {
-                    self.arrange_selection(op);
+                    self.arrange_selection(op, ctx);
                 }
             }
             K::Align(a) => {
                 if selecting && self.may_edit() {
-                    self.arrange_selection(if self.config.arrange_apart { Arrange::Slide(a) } else { Arrange::Align(a) });
+                    self.arrange_selection(if self.config.arrange_apart { Arrange::Slide(a) } else { Arrange::Align(a) }, ctx);
                 }
             }
             K::Match(m) => {
@@ -2164,8 +2197,22 @@ impl OnScreenNotesApp {
     }
 
     /// Paste the in-app clipboard's objects, each paste a step further
-    /// along so repeated pastes fan out.
+    /// along so repeated pastes fan out. A copy holding pictures, GIFs
+    /// or videos goes beside a selected one instead, sized to match, as
+    /// the settings ask (`beside_selection`).
     fn paste_objects(&mut self, step: f32) {
+        let media = self.obj_clipboard.1
+            .iter()
+            .filter(|s| s.media_type().is_some())
+            .map(crate::canvas::canvas::shape_bounds)
+            .reduce(union_box);
+        if let Some((a, b)) = media.and_then(|m| self.beside_selection(m)) {
+            let (mut strokes, mut shapes) = self.obj_clipboard.clone();
+            strokes.iter_mut().for_each(|s| s.transform(a, b));
+            shapes.iter_mut().for_each(|s| s.transform(a, b));
+            self.insert_and_select(strokes, shapes, [0.0, 0.0]);
+            return;
+        }
         self.paste_count += 1;
         let d = step * self.paste_count as f32;
         let (strokes, shapes) = self.obj_clipboard.clone();
@@ -2212,11 +2259,33 @@ impl OnScreenNotesApp {
         }
     }
 
+    /// How new objects whose pictures, GIFs and videos span `incoming` (a
+    /// canvas box) are sized and placed beside the selected picture, GIF
+    /// or video, as the settings ask (`tools::beside`): the `(a, b)` that
+    /// `Shape::transform` / `Stroke::transform` take. `None` when that is
+    /// off or no such object is selected: new objects then come in as
+    /// they always did.
+    fn beside_selection(&self, incoming: [f32; 4]) -> Option<(f32, [f32; 2])> {
+        use crate::tools::beside;
+        if self.tool.kind != crate::tools::ToolKind::Select {
+            return None;
+        }
+        let c = self.canvases.active();
+        let layer = c.layers.get(c.active_layer)?;
+        let media = |i: usize| layer.shapes.get(i).filter(|s| s.media_type().is_some()).map(crate::canvas::canvas::shape_bounds);
+        let side = self.config.beside_side;
+        let anchor = beside::anchor(self.tool.select.sel.shapes.iter().filter_map(|&i| media(i)), side)?;
+        let others: Vec<[f32; 4]> = (0..layer.shapes.len()).filter_map(media).collect();
+        beside::place(incoming, anchor, self.config.beside_fit, side, &others, 1.0 / c.zoom.max(1e-3))
+    }
+
     /// Paste an image from the OS clipboard onto the active layer as an
     /// image object, centred in the view at its natural on-screen size
-    /// (shrunk to fit if it is larger than the view). Silently does
-    /// nothing when the clipboard holds no image. The picture of an
-    /// in-app copy pastes as the objects it was made from instead.
+    /// (shrunk to fit if it is larger than the view), or beside the
+    /// selected picture, GIF or video at its size (`beside_selection`).
+    /// Silently does nothing when the clipboard holds no image. The
+    /// picture of an in-app copy pastes as the objects it was made from
+    /// instead.
     fn paste_clipboard_image(&mut self, canvas_rect: egui::Rect, pixels_per_point: f32, step: f32) {
         let img = match arboard::Clipboard::new().and_then(|mut cb| cb.get_image()) {
             Ok(img) => img,
@@ -2251,7 +2320,7 @@ impl OnScreenNotesApp {
             (canvas_rect.width() * 0.5 - pan[0]) / zoom,
             (canvas_rect.height() * 0.5 - pan[1]) / zoom,
         ];
-        let shape = crate::canvas::shape::Shape::Raster {
+        let mut shape = crate::canvas::shape::Shape::Raster {
             pos: [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
             size,
             png: std::sync::Arc::new(png),
@@ -2265,6 +2334,9 @@ impl OnScreenNotesApp {
             flip: false,
             group: 0,
         };
+        if let Some((a, b)) = self.beside_selection(crate::canvas::canvas::shape_bounds(&shape)) {
+            shape.transform(a, b);
+        }
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
     }
@@ -2278,7 +2350,11 @@ impl OnScreenNotesApp {
             self.media_ui.ffmpeg_window = true;
             return;
         }
-        let job = crate::media::import::ImportJob::start(path, at);
+        let mut job = crate::media::import::ImportJob::start(path, at);
+        // Decided now, not when it lands: several files dropped with
+        // nothing selected must not line up behind the first one in
+        // (which is selected once in). Any box with a size asks.
+        job.beside = self.beside_selection([0.0, 0.0, 1.0, 1.0]).is_some();
         self.toast = Some((format!("Inserting {}…", job.file_name()), Instant::now()));
         self.media_imports.push(job);
     }
@@ -2348,19 +2424,19 @@ impl OnScreenNotesApp {
         let mut finished = Vec::new();
         self.media_imports.retain(|job| match job.take() {
             Some(r) => {
-                finished.push((job.path.clone(), job.at, job.file_name(), r));
+                finished.push((job.path.clone(), job.at, job.beside, job.file_name(), r));
                 false
             }
             None => true,
         });
-        for (path, at, name, result) in finished {
+        for (path, at, beside, name, result) in finished {
             use crate::media::import::ImportError;
             match result {
                 Ok(_) if self.canvases.is_locked(self.canvases.active_index()) => {
                     self.toast = Some((format!("Not inserted: this slide is locked — {} unlocks it", self.lock_key()), Instant::now()));
                 }
                 Ok(imported) => {
-                    self.insert_media(imported, at, canvas_rect, ctx.pixels_per_point());
+                    self.insert_media(imported, at, beside, canvas_rect, ctx.pixels_per_point());
                     self.toast = Some((format!("Inserted {name}"), Instant::now()));
                 }
                 Err(ImportError::NeedsFfmpeg) => {
@@ -2473,11 +2549,15 @@ impl OnScreenNotesApp {
 
     /// Place an imported picture / video / GIF on the active layer at its
     /// natural on-screen size (shrunk to fit the view), centred on `at` or
-    /// on the view, and select it (a video's playback bar then shows).
+    /// on the view — or, with `beside`, next to the selected picture, GIF
+    /// or video at its size (`beside_selection`) — and select it (a
+    /// video's playback bar then shows). Several dropped at once beside
+    /// one each go beside the one in before them.
     fn insert_media(
         &mut self,
         imported: crate::media::import::Imported,
         at: Option<egui::Pos2>,
+        beside: bool,
         canvas_rect: egui::Rect,
         pixels_per_point: f32,
     ) {
@@ -2495,7 +2575,7 @@ impl OnScreenNotesApp {
         }
         let screen = at.unwrap_or(canvas_rect.center()) - canvas_rect.min;
         let center = [(screen.x - pan[0]) / zoom, (screen.y - pan[1]) / zoom];
-        let shape = crate::canvas::shape::Shape::Raster {
+        let mut shape = crate::canvas::shape::Shape::Raster {
             pos: [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
             size,
             png: std::sync::Arc::new(imported.png),
@@ -2509,6 +2589,9 @@ impl OnScreenNotesApp {
             flip: false,
             group: 0,
         };
+        if let Some((a, b)) = beside.then(|| self.beside_selection(crate::canvas::canvas::shape_bounds(&shape))).flatten() {
+            shape.transform(a, b);
+        }
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
     }
 
@@ -3174,6 +3257,7 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.config.smoothing_level,
                     &mut self.config.smoothing,
                     &mut self.config.pressure_curve,
+                    (&mut self.config.beside_fit, &mut self.config.beside_side),
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
                     &mut insert_media,
@@ -3235,9 +3319,20 @@ impl eframe::App for OnScreenNotesApp {
                     shown: self.picture_colours.as_ref().map(|p| p.colours.as_slice()),
                     can_restore: self.palette_before.is_some(),
                 });
-                match ui::arrange_bar::show(ctx, selected_count, pinned, &self.canvases, &mut self.config.arrange_apart, keys, open_move, row, grouped) {
+                match ui::arrange_bar::show(
+                    ctx,
+                    selected_count,
+                    pinned,
+                    &self.canvases,
+                    &mut self.config.arrange_apart,
+                    &mut self.config.pack_mode,
+                    keys,
+                    open_move,
+                    row,
+                    grouped,
+                ) {
                     Some(BarAction::Group(on)) => self.group_selection(on),
-                    Some(BarAction::Arrange(op)) => self.arrange_selection(op),
+                    Some(BarAction::Arrange(op)) => self.arrange_selection(op, ctx),
                     Some(BarAction::Match(m)) => self.match_selection_size(m),
                     Some(BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
                     Some(BarAction::MoveToSlide(to)) => self.move_selection_to(to),

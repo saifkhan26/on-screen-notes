@@ -238,6 +238,13 @@ Every action is one undo step. Things worth knowing:
   GIFs and videos move one by one, taking the ink drawn on them along;
   other ink moves in touching clusters, so handwriting stays in one
   piece. Its last button copies the selection to a new slide.
+- **Pack** keeps every size and keeps the result on screen. The arrow
+  beside it picks how (remembered across restarts): **Optimal**, the
+  tightest block, shaped like the screen; **Horizontal**, rows left to
+  right in reading order, wrapping at the screen's edge; **Vertical**,
+  columns top to bottom, wrapping at its bottom. A block that fits stays
+  as near where the selection was as it can; one too big for the screen
+  is shaped like it, and the view glides out to show it whole.
 - **Copy to a new slide** (`Ctrl+Shift+D`, any selection) adds a slide
   after the last one holding copies of the selected objects, in the same
   spot and view, and goes there with them selected.
@@ -621,7 +628,14 @@ still, and draw with the mouse.
 Drop a video or animated GIF from Explorer onto the canvas, or click the
 **film** button in the toolbar and pick one or more files. The object
 lands where it was dropped (or mid-view), sized to its natural size or
-shrunk to fit, and selected. From there it is an ordinary picture:
+shrunk to fit, and selected. **With a picture, GIF or video selected**,
+one you drop, insert or paste (from another app, or an in-app copy)
+instead comes in at the selected one's height and lands right beside
+it, past any already there; several dropped at once line up one after
+another. Settings → *New picture beside the selected one* switches this
+between **Same height**, **Same width** and **Off**, and picks the
+**left** or **right** side (saved with the settings). From there it is
+an ordinary picture:
 move / resize / rotate it with the Select tool, draw over it, undo,
 duplicate (each copy plays on its own), put it on any layer.
 

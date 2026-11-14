@@ -9,7 +9,7 @@
 
 use crate::canvas::CanvasManager;
 use crate::input::hotkeys_config::{Binding, ParsedHotkeys};
-use crate::tools::arrange::{Align, Arrange, Match};
+use crate::tools::arrange::{Align, Arrange, Match, PackMode};
 use crate::ui::theme;
 use egui::{Color32, Rounding, Vec2};
 
@@ -75,7 +75,8 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 /// one of them is in a pin; `slides` for the list "Move to slide" opens.
 /// `apart` is the "keep apart" switch: on, the align buttons slide
 /// objects until they touch rather than piling them up; the bar flips
-/// it when clicked. `keys` label the buttons' tooltips; `open_move`
+/// it when clicked. `pack` is how Pack lays objects out, picked from the
+/// arrow beside it. `keys` label the buttons' tooltips; `open_move`
 /// opens "Move to slide…" as its key asks; `picture` is set when the
 /// selection is one picture, for its palette button; `grouped` when some
 /// of it is in a group, for the ungroup button. Returns what was clicked
@@ -87,6 +88,7 @@ pub fn show(
     pinned: bool,
     slides: &CanvasManager,
     apart: &mut bool,
+    pack: &mut PackMode,
     keys: &ParsedHotkeys,
     open_move: bool,
     picture: Option<ColourRow<'_>>,
@@ -106,7 +108,7 @@ pub fn show(
                     ui.label(egui::RichText::new(format!("{count} selected")).small().color(theme::TEXT_MUTED));
                     ui.add_space(6.0);
                     if count >= 2 {
-                        arrange_buttons(ui, count, apart, keys, &mut picked);
+                        arrange_buttons(ui, count, apart, pack, keys, &mut picked);
                         divider(ui);
                     }
                     let k = &keys.arrange;
@@ -296,17 +298,73 @@ fn move_btn(ui: &mut egui::Ui, slides: &CanvasManager, key: Option<Binding>, ope
     picked
 }
 
+/// Pack's icon for each way it packs.
+fn pack_icon(mode: PackMode) -> egui::ImageSource<'static> {
+    match mode {
+        PackMode::Optimal => egui::include_image!("../../assets/icons/pack.svg"),
+        PackMode::Horizontal => egui::include_image!("../../assets/icons/pack-rows.svg"),
+        PackMode::Vertical => egui::include_image!("../../assets/icons/pack-columns.svg"),
+    }
+}
+
+/// The arrow beside Pack: a list of the ways it can pack, the one in
+/// use marked. The pick stays until another is made (it is saved).
+fn pack_mode_menu(ui: &mut egui::Ui, mode: &mut PackMode) {
+    let popup = ui.make_persistent_id("osn_pack_mode");
+    let open = ui.memory(|m| m.is_popup_open(popup));
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(14.0, BTN), egui::Sense::click());
+    let bg = if open {
+        theme::ACCENT
+    } else if response.hovered() {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(5.0), bg);
+    let c = rect.center();
+    ui.painter().add(egui::Shape::line(
+        vec![c + Vec2::new(-3.5, -1.5), c + Vec2::new(0.0, 2.0), c + Vec2::new(3.5, -1.5)],
+        egui::Stroke::new(1.5, theme::TEXT_PRIMARY),
+    ));
+    let response = response.on_hover_text(format!("How Pack lays objects out — now {}", mode.label().to_lowercase()));
+    if response.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup));
+    }
+    let mut chosen = false;
+    egui::popup_below_widget(ui, popup, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+        ui.set_min_width(250.0);
+        ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+        ui.label(egui::RichText::new("Pack").small().color(theme::TEXT_MUTED));
+        for m in PackMode::ALL {
+            let img = egui::Image::new(pack_icon(m)).tint(theme::TEXT_PRIMARY).fit_to_exact_size(Vec2::splat(16.0));
+            let tip = format!("Pack {} — {}; sizes kept, on screen (zooming out if it must)", m.label().to_lowercase(), m.about());
+            if ui.add(egui::Button::image_and_text(img, m.label()).selected(*mode == m).frame(false)).on_hover_text(tip).clicked() {
+                *mode = m;
+                chosen = true;
+            }
+        }
+    });
+    if chosen {
+        ui.memory_mut(|m| m.close_popup());
+    }
+}
+
 /// Pack, group, align, distribute and match sizes, for two or more
 /// objects.
-fn arrange_buttons(ui: &mut egui::Ui, count: usize, apart: &mut bool, keys: &ParsedHotkeys, picked: &mut Option<BarAction>) {
+fn arrange_buttons(ui: &mut egui::Ui, count: usize, apart: &mut bool, pack: &mut PackMode, keys: &ParsedHotkeys, picked: &mut Option<BarAction>) {
     let k = &keys.arrange;
     let mut btn = |ui: &mut egui::Ui, op: Arrange, img: egui::ImageSource<'static>, tip: &str, key: Option<Binding>| {
         if icon_btn(ui, img, count >= op.min_items(), &with_key(tip, key)) {
             *picked = Some(BarAction::Arrange(op));
         }
     };
-    btn(ui, Arrange::Pack, egui::include_image!("../../assets/icons/pack.svg"),
-        "Pack — fit the selection into a tight block, sizes kept", k.pack);
+    let tip = format!(
+        "Pack {} — {}; sizes kept, kept on screen (zooming out if it must). The arrow picks another way",
+        pack.label().to_lowercase(),
+        pack.about()
+    );
+    btn(ui, Arrange::Pack, pack_icon(*pack), &tip, k.pack);
+    pack_mode_menu(ui, pack);
     btn(ui, Arrange::GroupByType, egui::include_image!("../../assets/icons/group-by-type.svg"),
         "Group by type — pictures, GIFs, videos and other objects each packed into their own cluster", k.group_by_type);
     divider(ui);

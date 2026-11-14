@@ -1,12 +1,15 @@
-//! Arrange: tidy a selection. Pack it into a compact block, line it up
-//! along an edge or centre (overlapping or not), space it evenly, sort it
-//! into clusters by media type, or give it one width or height.
+//! Arrange: tidy a selection. Pack it into a compact block, rows or
+//! columns that fit the screen, line it up along an edge or centre
+//! (overlapping or not), space it evenly, sort it into clusters by media
+//! type, or give it one width or height.
 //!
 //! Pure geometry: each operation takes the objects' boxes and returns
-//! how far to move each one (`offsets`) or how much to scale it
-//! (`scales`). The app applies the result as one undo step
+//! how far to move each one (`offsets`, `pack_offsets`) or how much to
+//! scale it (`scales`). The app applies the result as one undo step
 //! (`Canvas::move_objects_each` / `Canvas::transform_objects_each`).
 //! Nothing is rotated.
+
+use serde::{Deserialize, Serialize};
 
 use crate::canvas::affine::Affine;
 use crate::canvas::canvas::{shape_bounds, Layer};
@@ -33,6 +36,18 @@ pub fn plan(layer: &Layer, sel: &Selection, op: Arrange, zoom: f32) -> (Moves, M
     let items: Vec<Item> = units.iter().map(|u| u.item).collect();
     let offsets = offsets(&items, op, 1.0 / zoom);
     per_object(&units, &owners, &offsets)
+}
+
+/// The moves that pack the selected strokes and shapes on `layer` the
+/// way `mode` says into canvas box `view` (what the screen shows), and
+/// the box the packed block lands in. Objects move in units, as `plan`
+/// moves them. See `pack_offsets` for where the block goes.
+pub fn plan_pack(layer: &Layer, sel: &Selection, mode: PackMode, view: Bounds, zoom: f32) -> (Moves, Moves, Bounds) {
+    let (units, owners) = gather(layer, sel, zoom.max(1e-3));
+    let items: Vec<Item> = units.iter().map(|u| u.item).collect();
+    let (offsets, block) = pack_offsets(&items, mode, view);
+    let (strokes, shapes) = per_object(&units, &owners, &offsets);
+    (strokes, shapes, block)
 }
 
 /// The transforms that give the selected strokes and shapes on `layer`
@@ -176,6 +191,42 @@ pub enum Arrange {
     DistributeX,
     /// Equal gaps top to bottom; the outermost two stay put.
     DistributeY,
+}
+
+/// How Pack lays the selection out. Every way keeps each object's size
+/// and fits the screen when it can (see `pack_offsets`). Picked on the
+/// arrange bar and kept in the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PackMode {
+    /// The tightest block, shaped like the screen; order not kept.
+    #[default]
+    Optimal,
+    /// Rows: left to right in the objects' reading order, edge to edge,
+    /// a new row where the next object would cross the screen's edge.
+    Horizontal,
+    /// Columns: top to bottom, a new column at the screen's bottom.
+    Vertical,
+}
+
+impl PackMode {
+    pub const ALL: [PackMode; 3] = [PackMode::Optimal, PackMode::Horizontal, PackMode::Vertical];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PackMode::Optimal => "Optimal",
+            PackMode::Horizontal => "Horizontal",
+            PackMode::Vertical => "Vertical",
+        }
+    }
+
+    /// What packing this way does, for tooltips.
+    pub fn about(self) -> &'static str {
+        match self {
+            PackMode::Optimal => "the tightest block, shaped like the screen",
+            PackMode::Horizontal => "rows, left to right in reading order, wrapping at the screen's edge",
+            PackMode::Vertical => "columns, top to bottom in reading order, wrapping at the screen's bottom",
+        }
+    }
 }
 
 /// The width or height every object takes from the selection.
@@ -421,10 +472,149 @@ pub fn offsets(items: &[Item], op: Arrange, px: f32) -> Vec<[f32; 2]> {
 /// on that axis, whichever is more — boards laid out edge to edge, such
 /// as PureRef's, overlap their neighbours by that much — but never over
 /// a quarter of it, so a thin line still blocks.
-fn in_way(a: Bounds, b: Bounds, oth: usize, px: f32) -> bool {
+pub(crate) fn in_way(a: Bounds, b: Bounds, oth: usize, px: f32) -> bool {
     let shared = a[oth + 2].min(b[oth + 2]) - a[oth].max(b[oth]);
     let small = (a[oth + 2] - a[oth]).min(b[oth + 2] - b[oth]);
     shared > (4.0 * px).max(0.04 * small).min(0.25 * small)
+}
+
+/// How far to move each item to pack them the way `mode` says into
+/// canvas box `view`, in `items` order, and the box the packed block
+/// lands in. Sizes are kept.
+///
+/// A block that fits `view` stays as close to where the selection was
+/// as it can while staying inside it. One that cannot fit is shaped like
+/// `view` (for rows and columns: wrapping at `view`'s edge scaled up as
+/// little as needed) and centred on it, for the app to zoom out to.
+pub fn pack_offsets(items: &[Item], mode: PackMode, view: Bounds) -> (Vec<[f32; 2]>, Bounds) {
+    let all = union(items.iter().map(|it| it.bounds));
+    if items.len() < Arrange::Pack.min_items() {
+        return (vec![[0.0, 0.0]; items.len()], all);
+    }
+    let room = [(view[2] - view[0]).max(EPS), (view[3] - view[1]).max(EPS)];
+    let idx: Vec<usize> = (0..items.len()).collect();
+    let sz = sizes(items, &idx);
+    let (pos, extent) = match mode {
+        PackMode::Optimal => pack_shaped(&sz, room[0] / room[1], Some(room)),
+        PackMode::Horizontal => lines(&sz, &reading_order(items, 0), room, 0),
+        PackMode::Vertical => lines(&sz, &reading_order(items, 1), room, 1),
+    };
+    let fits = within(extent, room, 1.0);
+    let at = |a: usize| {
+        if fits {
+            all[a].min(view[a + 2] - extent[a]).max(view[a])
+        } else {
+            (view[a] + view[a + 2] - extent[a]) * 0.5
+        }
+    };
+    let top_left = [at(0), at(1)];
+    let out = idx.iter().map(|&i| to(items[i].bounds, [top_left[0] + pos[i][0], top_left[1] + pos[i][1]])).collect();
+    (out, [top_left[0], top_left[1], top_left[0] + extent[0], top_left[1] + extent[1]])
+}
+
+/// Whether a block of size `extent` fits in `room` scaled by `s`, give
+/// or take f32 rounding.
+fn within(extent: [f32; 2], room: [f32; 2], s: f32) -> bool {
+    (0..2).all(|a| extent[a] <= s * room[a] * (1.0 + 1e-4) + EPS)
+}
+
+/// `items` in reading order for lines along axis `ax` (0: rows, 1:
+/// columns): the first line first — the top row, or the left column —
+/// and along each line from its start. Two items share a line when they
+/// overlap across it by half the thinner one or more, so a row a hair
+/// into the next (PureRef boards) still reads as two.
+fn reading_order(items: &[Item], ax: usize) -> Vec<usize> {
+    let oth = 1 - ax;
+    let b = |i: usize| items[i].bounds;
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by(|&p, &q| b(p)[oth].total_cmp(&b(q)[oth]).then(b(p)[ax].total_cmp(&b(q)[ax])));
+    let mut out = Vec::with_capacity(items.len());
+    let mut line: Vec<usize> = Vec::new();
+    // The nearest far edge of the line so far, and its thinnest item:
+    // a newcomer must overlap every item already in it.
+    let (mut end, mut thin) = (0.0_f32, 0.0_f32);
+    let flush = |line: &mut Vec<usize>, out: &mut Vec<usize>| {
+        line.sort_by(|&p, &q| b(p)[ax].total_cmp(&b(q)[ax]));
+        out.append(line);
+    };
+    for i in order {
+        let (start, len) = (b(i)[oth], b(i)[oth + 2] - b(i)[oth]);
+        if !line.is_empty() && end - start < 0.5 * len.min(thin) {
+            flush(&mut line, &mut out);
+        }
+        if line.is_empty() {
+            (end, thin) = (b(i)[oth + 2], len);
+        } else {
+            (end, thin) = (end.min(b(i)[oth + 2]), thin.min(len));
+        }
+        line.push(i);
+    }
+    flush(&mut line, &mut out);
+    out
+}
+
+/// Lay boxes of `sizes` out in lines along axis `ax` (0: rows, left to
+/// right; 1: columns, top to bottom), in `order`, edge to edge. A line
+/// is as deep as its deepest box and wraps where the next box would
+/// reach past `room` along `ax` — scaled up as little as needed for the
+/// whole block to fit `room` scaled alike. Returns each box's top-left
+/// relative to the block's, and the block's size.
+fn lines(sizes: &[[f32; 2]], order: &[usize], room: [f32; 2], ax: usize) -> (Vec<[f32; 2]>, [f32; 2]) {
+    let oth = 1 - ax;
+    let fits = |s: f32| within(wrap(sizes, order, s * room[ax], ax).1, room, s);
+    let s = if fits(1.0) {
+        1.0
+    } else {
+        // All on one line fits at this scale.
+        let sum: f32 = sizes.iter().map(|s| s[ax]).sum();
+        let deepest = sizes.iter().map(|s| s[oth]).fold(0.0, f32::max);
+        let hi = (sum / room[ax]).max(deepest / room[oth]).max(1.0) * 1.001;
+        // The first of a run of scales from 1 to `hi` that fits, then
+        // narrowed down between it and the one before. Wrapping is not
+        // quite monotone, so this finds a small scale that fits rather
+        // than the smallest.
+        const STEPS: usize = 32;
+        let (mut lo, mut found) = (1.0_f32, hi);
+        for k in 1..=STEPS {
+            let s = hi.powf(k as f32 / STEPS as f32);
+            if fits(s) {
+                found = s;
+                break;
+            }
+            lo = s;
+        }
+        for _ in 0..24 {
+            let mid = (lo + found) * 0.5;
+            if fits(mid) { found = mid } else { lo = mid }
+        }
+        found
+    };
+    wrap(sizes, order, s * room[ax], ax)
+}
+
+/// `lines` at one wrap length `len`.
+fn wrap(sizes: &[[f32; 2]], order: &[usize], len: f32, ax: usize) -> (Vec<[f32; 2]>, [f32; 2]) {
+    let oth = 1 - ax;
+    let mut pos = vec![[0.0, 0.0]; sizes.len()];
+    let mut extent = [0.0_f32, 0.0_f32];
+    // Where the next box goes along the line, where the line starts
+    // across it, and how deep the line is so far.
+    let (mut along, mut line, mut depth) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for &i in order {
+        let s = sizes[i];
+        if along > 0.0 && along + s[ax] > len * (1.0 + 1e-5) + EPS {
+            line += depth;
+            along = 0.0;
+            depth = 0.0;
+        }
+        pos[i][ax] = along;
+        pos[i][oth] = line;
+        along += s[ax];
+        depth = depth.max(s[oth]);
+        extent[ax] = extent[ax].max(along);
+        extent[oth] = extent[oth].max(line + depth);
+    }
+    (pos, extent)
 }
 
 fn union(boxes: impl Iterator<Item = Bounds>) -> Bounds {
@@ -459,6 +649,15 @@ const EPS: f32 = 1e-3;
 /// Runs a skyline packer at a range of block widths and keeps the layout
 /// that wastes least space while staying near `TARGET_ASPECT`.
 pub fn pack(sizes: &[[f32; 2]]) -> (Vec<[f32; 2]>, [f32; 2]) {
+    pack_shaped(sizes, TARGET_ASPECT, None)
+}
+
+/// Each box's top-left relative to its block's, and the block's size.
+type Layout = (Vec<[f32; 2]>, [f32; 2]);
+
+/// `pack`, aiming for blocks `aspect` times as wide as tall. Given a
+/// `room`, a layout that fits inside it beats any that does not.
+fn pack_shaped(sizes: &[[f32; 2]], aspect: f32, room: Option<[f32; 2]>) -> Layout {
     if sizes.is_empty() { return (Vec::new(), [0.0, 0.0]); }
     // Tallest first, so each row starts with the boxes that set its
     // height and the shorter ones fill in beside them.
@@ -467,23 +666,27 @@ pub fn pack(sizes: &[[f32; 2]]) -> (Vec<[f32; 2]>, [f32; 2]) {
     let widest = sizes.iter().map(|s| s[0]).fold(0.0, f32::max);
     let sum_w: f32 = sizes.iter().map(|s| s[0]).sum();
     let area: f32 = sizes.iter().map(|s| s[0] * s[1]).sum();
-    let ideal = (area * TARGET_ASPECT).sqrt();
+    let ideal = (area * aspect).sqrt();
     const TRIES: usize = 24;
-    let mut best: Option<(f32, Vec<[f32; 2]>, [f32; 2])> = None;
-    for k in 0..TRIES {
-        // Widths from 0.6× to 2× the ideal, never narrower than the
-        // widest box nor wider than all of them side by side.
-        let f = 0.6 * (2.0_f32 / 0.6).powf(k as f32 / (TRIES - 1) as f32);
-        let width = (ideal * f).min(sum_w).max(widest);
+    // Widths from 0.6× to 2× the ideal, and the room's own width.
+    let widths = (0..TRIES)
+        .map(|k| ideal * 0.6 * (2.0_f32 / 0.6).powf(k as f32 / (TRIES - 1) as f32))
+        .chain(room.map(|r| r[0]));
+    // Whether it fits, its score, and the layout.
+    let mut best: Option<(bool, f32, Layout)> = None;
+    for width in widths {
+        // Never narrower than the widest box nor wider than all of them
+        // side by side.
+        let width = width.min(sum_w).max(widest);
         let (pos, extent) = skyline(sizes, &order, width);
-        let aspect = extent[0].max(EPS) / extent[1].max(EPS);
-        let score = (extent[0] * extent[1]).max(EPS) * (1.0 + 0.35 * (aspect / TARGET_ASPECT).ln().abs());
-        if best.as_ref().map_or(true, |b| score < b.0) {
-            best = Some((score, pos, extent));
+        let shape = extent[0].max(EPS) / extent[1].max(EPS);
+        let score = (extent[0] * extent[1]).max(EPS) * (1.0 + 0.35 * (shape / aspect).ln().abs());
+        let fits = room.map_or(true, |r| within(extent, r, 1.0));
+        if best.as_ref().map_or(true, |b| (fits && !b.0) || (fits == b.0 && score < b.1)) {
+            best = Some((fits, score, (pos, extent)));
         }
     }
-    let (_, pos, extent) = best.expect("at least one try");
-    (pos, extent)
+    best.expect("at least one try").2
 }
 
 /// Bottom-left skyline packing of the boxes in `order` into a strip
@@ -583,6 +786,105 @@ mod tests {
         assert!(used < area * 1.6, "block wastes too much: {used} for {area}");
         // It starts where the selection did.
         assert_eq!([block[0], block[1]], [0.0, 0.0]);
+    }
+
+    fn no_overlaps(after: &[Bounds]) {
+        for i in 0..after.len() {
+            for j in i + 1..after.len() {
+                assert!(!overlap(after[i], after[j]), "{i} {:?} and {j} {:?} overlap", after[i], after[j]);
+            }
+        }
+    }
+
+    fn inside(b: Bounds, view: Bounds) -> bool {
+        b[0] >= view[0] - 1e-3 && b[1] >= view[1] - 1e-3 && b[2] <= view[2] + 1e-3 && b[3] <= view[3] + 1e-3
+    }
+
+    #[test]
+    fn pack_rows_keep_reading_order_and_wrap_at_the_screen_edge() {
+        // Two rows of three, the second listed first; packed into a
+        // screen 250 wide: rows of two, in reading order.
+        let items = [
+            item(0.0, 500.0, 100.0, 50.0, 0),   // row 2, first
+            item(200.0, 500.0, 100.0, 50.0, 0), // row 2, second
+            item(400.0, 0.0, 100.0, 60.0, 0),   // row 1, third
+            item(0.0, 0.0, 100.0, 50.0, 0),     // row 1, first
+            item(200.0, 10.0, 100.0, 50.0, 0),  // row 1, second (a little lower)
+        ];
+        assert_eq!(reading_order(&items, 0), vec![3, 4, 2, 0, 1]);
+        let view = [0.0, 0.0, 250.0, 1000.0];
+        let (off, block) = pack_offsets(&items, PackMode::Horizontal, view);
+        let after = moved(&items, &off);
+        no_overlaps(&after);
+        let tl = |i: usize| [after[i][0], after[i][1]];
+        assert_eq!(tl(3), [0.0, 0.0]);
+        assert_eq!(tl(4), [100.0, 0.0]);
+        // A row is as tall as its tallest object.
+        assert_eq!(tl(2), [0.0, 50.0]);
+        assert_eq!(tl(0), [100.0, 50.0]);
+        assert_eq!(tl(1), [0.0, 110.0]);
+        assert_eq!(block, [0.0, 0.0, 200.0, 160.0]);
+    }
+
+    #[test]
+    fn pack_columns_wrap_at_the_screen_bottom() {
+        let items: Vec<Item> = (0..5).map(|i| item(i as f32 * 300.0, 0.0, 50.0, 100.0, 0)).collect();
+        let view = [0.0, 0.0, 1000.0, 250.0];
+        let (off, block) = pack_offsets(&items, PackMode::Vertical, view);
+        let after = moved(&items, &off);
+        no_overlaps(&after);
+        // Left to right becomes top to bottom, two to a column.
+        let tl: Vec<[f32; 2]> = after.iter().map(|b| [b[0], b[1]]).collect();
+        assert_eq!(tl, vec![[0.0, 0.0], [0.0, 100.0], [50.0, 0.0], [50.0, 100.0], [100.0, 0.0]]);
+        assert!(inside(block, view));
+    }
+
+    #[test]
+    fn a_pack_that_fits_stays_on_screen_near_where_it_was() {
+        let sizes = [(300.0, 200.0), (120.0, 400.0), (500.0, 280.0), (90.0, 90.0), (260.0, 180.0), (200.0, 340.0)];
+        // Scattered right of the screen and below it.
+        let items: Vec<Item> = sizes.iter().enumerate()
+            .map(|(i, &(w, h))| item(1500.0 + i as f32 * 400.0, 900.0 + (i % 2) as f32 * 500.0, w, h, 0))
+            .collect();
+        let view = [0.0, 0.0, 2000.0, 1200.0];
+        for mode in PackMode::ALL {
+            let (off, block) = pack_offsets(&items, mode, view);
+            let after = moved(&items, &off);
+            no_overlaps(&after);
+            assert!(inside(block, view), "{mode:?}: {block:?} is off screen");
+            for b in &after {
+                assert!(inside(*b, block), "{mode:?}: {b:?} outside its block {block:?}");
+            }
+            // Pulled in only as far as needed: against the right and
+            // bottom edges.
+            assert!((block[2] - view[2]).abs() < 1e-3 && (block[3] - view[3]).abs() < 1e-3, "{mode:?}: {block:?}");
+        }
+        // Already on screen: nothing moves the block's corner.
+        let items: Vec<Item> = sizes.iter().enumerate().map(|(i, &(w, h))| item(100.0 + i as f32 * 10.0, 50.0, w, h, 0)).collect();
+        let (_, block) = pack_offsets(&items, PackMode::Optimal, view);
+        assert_eq!([block[0], block[1]], [100.0, 50.0]);
+    }
+
+    #[test]
+    fn a_pack_too_big_for_the_screen_is_shaped_like_it_and_centred() {
+        // Twenty 100 × 100 squares on a 400 × 200 screen: room for eight.
+        let items: Vec<Item> = (0..20).map(|i| item(i as f32 * 150.0, 0.0, 100.0, 100.0, 0)).collect();
+        let view = [0.0, 0.0, 400.0, 200.0];
+        for mode in PackMode::ALL {
+            let (off, block) = pack_offsets(&items, mode, view);
+            let after = moved(&items, &off);
+            no_overlaps(&after);
+            let (w, h) = (block[2] - block[0], block[3] - block[1]);
+            // Zoomed out to fit, the block fills the screen well.
+            let s = (w / 400.0).max(h / 200.0);
+            assert!(s > 1.0, "{mode:?}");
+            assert!(w * h >= 0.6 * s * s * 400.0 * 200.0, "{mode:?}: {w} × {h} wastes the screen (scale {s})");
+            let c = [(block[0] + block[2]) * 0.5, (block[1] + block[3]) * 0.5];
+            assert!((c[0] - 200.0).abs() < 1e-3 && (c[1] - 100.0).abs() < 1e-3, "{mode:?}: centred at {c:?}");
+        }
+        // Rows of a screen twice as wide as tall: 7 × 3 holds twenty.
+        let (_, block) = pack_offsets(&items, PackMode::Horizontal, view);
+        assert_eq!((block[2] - block[0], block[3] - block[1]), (700.0, 300.0));
     }
 
     #[test]
