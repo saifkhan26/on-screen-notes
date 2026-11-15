@@ -60,12 +60,16 @@ pub enum KeyAction {
     PictureColours,
     /// Type the selection's tags.
     Tag,
+    /// Find pictures like the selected one, or else the copied one.
+    FindSimilar,
     /// Text labels in a box, or not.
     TextBox,
     /// Move the active slide one place toward the first (−1) or last (+1).
     MoveSlide(i8),
     /// Open the list of every tag.
     TagList,
+    /// List every set of duplicate pictures.
+    FindCopies,
     /// Make the selection one group (`true`), or take it out of its groups.
     Group(bool),
     /// Onion skin on / off for every GIF and video.
@@ -106,6 +110,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (a.rotate_right, KeyAction::Rotate(true)),
         (a.picture_colours, KeyAction::PictureColours),
         (a.tag, KeyAction::Tag),
+        (a.find_similar, KeyAction::FindSimilar),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));
     for (i, b) in t.colour.iter().enumerate() {
@@ -139,6 +144,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.ungroup, KeyAction::Group(false)),
         (c.move_slide_up, KeyAction::MoveSlide(-1)),
         (c.tag_list, KeyAction::TagList),
+        (c.find_duplicates, KeyAction::FindCopies),
         (c.move_slide_down, KeyAction::MoveSlide(1)),
         (c.new_slide, KeyAction::NewSlide),
         (c.toggle_slide_panel, KeyAction::ToggleSlidePanel),

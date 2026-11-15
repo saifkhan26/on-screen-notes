@@ -38,6 +38,7 @@ mod pointer;
 mod media;
 mod commands;
 mod find;
+mod similar;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
@@ -225,6 +226,15 @@ pub struct OnScreenNotesApp {
     find: ui::find_bar::FindBar,
     /// The label find just went to, flashing.
     find_flash: Option<find::FindFlash>,
+    /// The slides' pictures read for finding ones like a picture; read
+    /// only once find is given one.
+    picture_index: crate::canvas::picture_index::PictureIndex,
+    /// Ctrl+V was held last frame, for find's own paste.
+    find_paste_prev: bool,
+    /// A file dropped on find, being read.
+    find_reading: Option<similar::FindReading>,
+    /// The slides' pictures being gathered into sets of copies for find.
+    copies_job: Option<similar::CopiesJob>,
     /// The selection's tags being typed on the arrange bar. Keys go to
     /// it alone while it is open.
     tag_edit: Option<ui::arrange_bar::TagEdit>,
@@ -635,6 +645,10 @@ impl OnScreenNotesApp {
             commands: Default::default(),
             find: Default::default(),
             find_flash: None,
+            picture_index: Default::default(),
+            find_paste_prev: false,
+            find_reading: None,
+            copies_job: None,
             tag_edit: None,
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),
@@ -910,6 +924,7 @@ impl eframe::App for OnScreenNotesApp {
                     Some(BarAction::Rotate(right)) => self.rotate_selection(right),
                     Some(BarAction::ZoomToSelection) => self.zoom_to_selection(ctx),
                     Some(BarAction::PictureColours) => self.toggle_picture_colours(),
+                    Some(BarAction::FindSimilar) => self.find_similar(),
                     // Set after the restyle below, so the picture is
                     // not "recoloured" into an empty undo step.
                     Some(BarAction::UseColour(c)) => use_colour = Some(c),

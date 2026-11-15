@@ -41,6 +41,8 @@ pub enum BarAction {
     ZoomToSelection,
     /// Show the selected picture's colours, or hide them.
     PictureColours,
+    /// Find pictures like the selected one.
+    FindSimilar,
     /// Draw with this colour.
     UseColour([u8; 4]),
     /// The picture's colours become the toolbar's palette.
@@ -210,6 +212,10 @@ pub fn show(
                         let tip = with_key("Colours in this picture — draw with one, or keep them all as the palette", k.picture_colours);
                         if toggle_btn(ui, egui::include_image!("../../assets/icons/palette.svg"), row.shown.is_some(), &tip) {
                             picked = Some(BarAction::PictureColours);
+                        }
+                        let tip = with_key("Find similar — copies of this picture (resized, recoloured, mirrored or turned) and pictures like it, on every slide", k.find_similar);
+                        if icon_btn(ui, egui::include_image!("../../assets/icons/find-similar.svg"), true, &tip) {
+                            picked = Some(BarAction::FindSimilar);
                         }
                     }
                     divider(ui);

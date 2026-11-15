@@ -393,6 +393,8 @@ pub struct CanvasSection {
     /// Open the list of every tag (see, filter by, rename, remove). Unbound
     /// until set.
     #[serde(default)] pub tag_list: String,
+    /// List every set of duplicate pictures on the slides. Unbound until set.
+    #[serde(default)] pub find_duplicates: String,
     #[serde(default = "d_prev_layer")]    pub prev_layer: String,
     #[serde(default = "d_next_layer")]    pub next_layer: String,
     #[serde(default = "d_toggle_ui")]     pub toggle_ui: String,
@@ -561,6 +563,8 @@ pub struct ArrangeSection {
     pub picture_colours: String,
     /// Type the selection's tags (what find knows it by).
     pub tag: String,
+    /// Find pictures like the selected one, or the copied one.
+    pub find_similar: String,
 }
 
 impl Default for CanvasSection {
@@ -580,6 +584,7 @@ impl Default for CanvasSection {
             lock_slide: d_lock_slide(),
             move_slide_up: String::new(), move_slide_down: String::new(),
             tag_list: String::new(),
+            find_duplicates: String::new(),
             prev_layer: d_prev_layer(), next_layer: d_next_layer(),
             toggle_ui: d_toggle_ui(),
             opacity_0: d_op_0(), opacity_1: d_op_1(),
@@ -793,6 +798,7 @@ pub struct ArrangeBindings {
     pub rotate_right: Option<Binding>,
     pub picture_colours: Option<Binding>,
     pub tag: Option<Binding>,
+    pub find_similar: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -819,6 +825,7 @@ pub struct CanvasBindings {
     pub move_slide_up: Option<Binding>,
     pub move_slide_down: Option<Binding>,
     pub tag_list: Option<Binding>,
+    pub find_duplicates: Option<Binding>,
     pub prev_layer: Option<Binding>,
     pub next_layer: Option<Binding>,
     pub toggle_ui: Option<Binding>,
@@ -976,6 +983,7 @@ impl HotkeysConfig {
                 rotate_right:    p("arrange.rotate_right",    &ar.rotate_right),
                 picture_colours: p("arrange.picture_colours", &ar.picture_colours),
                 tag: p("arrange.tag", &ar.tag),
+                find_similar: p("arrange.find_similar", &ar.find_similar),
             },
             canvas: CanvasBindings {
                 undo:          p("canvas.undo",          &self.canvas.undo),
@@ -1000,6 +1008,7 @@ impl HotkeysConfig {
                 move_slide_up:   p("canvas.move_slide_up",   &cv.move_slide_up),
                 move_slide_down: p("canvas.move_slide_down", &cv.move_slide_down),
                 tag_list:        p("canvas.tag_list",        &cv.tag_list),
+                find_duplicates: p("canvas.find_duplicates", &cv.find_duplicates),
                 prev_layer:    p("canvas.prev_layer",    &self.canvas.prev_layer),
                 next_layer:    p("canvas.next_layer",    &self.canvas.next_layer),
                 toggle_ui:     p("canvas.toggle_ui",     &self.canvas.toggle_ui),
@@ -1335,6 +1344,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("arrange", "rotate_right")          => "Turn the selection a quarter turn right",
         ("arrange", "picture_colours")       => "The selected picture's colours, to draw with or keep as the palette",
         ("arrange", "tag")                   => "Type the selection's tags: words find (Ctrl+F) knows it by",
+        ("arrange", "find_similar")          => "Find pictures like the selected one (or the copied one): copies, edits, similar",
 
         ("canvas", "undo")                 => "Undo",
         ("canvas", "redo")                 => "Redo",
@@ -1358,6 +1368,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "move_slide_up")        => "Move the slide one place toward the first",
         ("canvas", "move_slide_down")      => "Move the slide one place toward the last",
         ("canvas", "tag_list")             => "Every tag in the app: see, filter the slides by, rename, remove",
+        ("canvas", "find_duplicates")      => "Every set of duplicate pictures on the slides, to go through or thin out",
         ("canvas", "prev_layer")           => "Layer below",
         ("canvas", "next_layer")           => "Layer above",
         ("canvas", "toggle_ui")            => "Hide / show the toolbar and panels",

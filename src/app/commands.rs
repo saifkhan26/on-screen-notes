@@ -171,6 +171,11 @@ impl OnScreenNotesApp {
                     self.toggle_picture_colours();
                 }
             }
+            K::FindSimilar => self.find_similar(),
+            K::FindCopies => {
+                self.commands.close();
+                self.find.find_copies();
+            }
             K::TextBox => {
                 self.tool.text_box = !self.tool.text_box;
                 self.apply_text_box_to_selection();

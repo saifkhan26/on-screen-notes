@@ -72,7 +72,12 @@ impl OnScreenNotesApp {
         }
 
         let (dropped, hovering) = ctx.input(|i| (i.raw.dropped_files.clone(), !i.raw.hovered_files.is_empty()));
-        if !dropped.is_empty() {
+        // Dropped on find: look for pictures like it, insert nothing.
+        if !dropped.is_empty() && self.find.is_open() {
+            if let Some(path) = dropped.into_iter().find_map(|f| f.path) {
+                self.find_like_file(path);
+            }
+        } else if !dropped.is_empty() {
             let at = self.drop_point(ctx);
             for (n, file) in dropped.into_iter().enumerate() {
                 let Some(path) = file.path else { continue };
@@ -95,7 +100,11 @@ impl OnScreenNotesApp {
                 .interactable(false)
                 .show(ctx, |ui| {
                     ui::theme::card_frame().inner_margin(egui::Margin::symmetric(16.0, 10.0)).show(ui, |ui| {
-                        ui.label("Drop to insert picture / video / GIF, or open a PureRef board");
+                        ui.label(if self.find.is_open() {
+                            "Drop a picture to find ones like it"
+                        } else {
+                            "Drop to insert picture / video / GIF, or open a PureRef board"
+                        });
                     });
                 });
         }

@@ -16,6 +16,7 @@ pub mod affine;
 pub mod canvas;
 pub mod hit;
 pub mod ink_gpu;
+pub mod picture_index;
 pub mod picture_store;
 pub mod pins;
 pub mod render;

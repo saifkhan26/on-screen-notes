@@ -129,6 +129,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         }
         if cx.picture {
             add("A picture's colours", s, a.picture_colours, C::Key(K::PictureColours));
+            add("Find pictures like this one (copies, edits, similar)", s, a.find_similar, C::Key(K::FindSimilar));
         }
         if cx.selected >= 2 {
             let r = "Arrange";
@@ -172,6 +173,10 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
 
     let v = "View";
     add("Find text on the slides", v, c.find, C::Key(K::Find));
+    if !cx.picture {
+        add("Find pictures like the copied one", v, a.find_similar, C::Key(K::FindSimilar));
+    }
+    add("Find every duplicate picture", v, c.find_duplicates, C::Key(K::FindCopies));
     add("Zoom to fit the slide", v, c.zoom_to_fit, C::Key(K::ZoomToFit));
     add("Reset zoom and pan", v, c.reset_view, C::ResetView);
     add("Hide / show the toolbar and panels", v, c.toggle_ui, C::ToggleUi);

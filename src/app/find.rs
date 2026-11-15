@@ -28,9 +28,14 @@ const SEEN: f32 = 0.4;
 impl OnScreenNotesApp {
     /// The find bar while it is open; go to the label it picks.
     pub(super) fn show_find_bar(&mut self, ctx: &egui::Context) {
+        self.find.free_retired();
+        self.poll_find_reading(ctx);
         if !self.find.is_open() {
+            self.find_paste_prev = false;
             return;
         }
+        self.take_find_paste(ctx);
+        let reading = self.update_picture_results(ctx).or_else(|| self.update_copies(ctx));
         let canvases = &self.canvases;
         let unread = (0..canvases.count()).filter(|&i| canvases.slide(i).is_none()).count();
         let picked = self.find.show(
@@ -39,9 +44,13 @@ impl OnScreenNotesApp {
             unread,
             canvases.active_index(),
             |i| canvases.name(i).to_string(),
+            reading,
         );
         if let Some(hit) = picked {
             self.go_to_find_hit(&hit, ctx);
+        }
+        if let Some(ui::find_bar::Request::SelectExtras { slide, layer, shapes }) = self.find.take_request() {
+            self.select_extras(slide, layer, shapes, ctx);
         }
     }
 

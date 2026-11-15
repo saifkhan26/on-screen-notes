@@ -172,7 +172,7 @@ fn from_linear(x: f32) -> u8 {
 }
 
 /// sRGB → Oklab (Björn Ottosson's).
-fn oklab([r, g, b]: [u8; 3]) -> [f32; 3] {
+pub(crate) fn oklab([r, g, b]: [u8; 3]) -> [f32; 3] {
     let (r, g, b) = (to_linear(r), to_linear(g), to_linear(b));
     let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
     let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
