@@ -1045,13 +1045,6 @@ impl CanvasManager {
         (out, unread)
     }
 
-    /// Slide `idx` is read and carries any of `tags`.
-    pub fn slide_has_any_tag(&self, idx: usize, tags: &[String]) -> bool {
-        let Some(c) = self.slide(idx) else { return false };
-        let wanted = |own: &[String]| own.iter().any(|t| tags.iter().any(|w| same_tag(t, w)));
-        c.layers.iter().any(|l| l.strokes.iter().any(|s| wanted(&s.tags)) || l.shapes.iter().any(|s| wanted(s.tags())))
-    }
-
     /// Put `to` in place of tag `from` on every object of every slide
     /// read (merging with tags it has already). See `retag`.
     pub fn rename_tag(&mut self, from: &str, to: &[String]) -> (usize, usize) {
@@ -2339,8 +2332,6 @@ mod tag_tests {
         assert_eq!(unread, 0);
         let count = |tag: &str, slides, objects| TagCount { tag: tag.into(), slides, objects };
         assert_eq!(index, vec![count("pose", 2, 3), count("poses", 1, 1), count("ref", 1, 1)]);
-        assert!(m.slide_has_any_tag(1, &["POSES".into(), "x".into()]));
-        assert!(!m.slide_has_any_tag(1, &["ref".into()]));
 
         // Renamed to a tag that exists, they merge.
         assert_eq!(m.rename_tag("poses", &["pose".into()]), (1, 0));

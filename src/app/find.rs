@@ -45,12 +45,15 @@ impl OnScreenNotesApp {
             canvases.active_index(),
             |i| canvases.name(i).to_string(),
             reading,
+            || canvases.tag_index().0,
         );
         if let Some(hit) = picked {
             self.go_to_find_hit(&hit, ctx);
         }
-        if let Some(ui::find_bar::Request::SelectExtras { slide, layer, shapes }) = self.find.take_request() {
-            self.select_extras(slide, layer, shapes, ctx);
+        match self.find.take_request() {
+            Some(ui::find_bar::Request::SelectExtras { slide, layer, shapes }) => self.select_extras(slide, layer, shapes, ctx),
+            Some(ui::find_bar::Request::Tag(a)) => self.apply_tag_action(a),
+            None => {}
         }
     }
 

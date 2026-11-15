@@ -66,7 +66,7 @@ pub enum KeyAction {
     TextBox,
     /// Move the active slide one place toward the first (−1) or last (+1).
     MoveSlide(i8),
-    /// Open the list of every tag.
+    /// Open find on the list of every tag.
     TagList,
     /// List every set of duplicate pictures.
     FindCopies,

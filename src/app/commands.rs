@@ -195,8 +195,7 @@ impl OnScreenNotesApp {
             }
             K::TagList => {
                 self.commands.close();
-                self.ui_visible = true;
-                self.slide_panel.open_tags();
+                self.find.open_tags();
             }
             K::MoveSlide(step) => {
                 let from = self.canvases.active_index();

@@ -390,8 +390,8 @@ pub struct CanvasSection {
     /// the slide panel's menu does. Unbound until set.
     #[serde(default)] pub move_slide_up: String,
     #[serde(default)] pub move_slide_down: String,
-    /// Open the list of every tag (see, filter by, rename, remove). Unbound
-    /// until set.
+    /// Open find on the list of every tag (find by, rename, remove).
+    /// Unbound until set.
     #[serde(default)] pub tag_list: String,
     /// List every set of duplicate pictures on the slides. Unbound until set.
     #[serde(default)] pub find_duplicates: String,
@@ -1367,7 +1367,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "lock_slide")           => "Lock / unlock the slide against edits",
         ("canvas", "move_slide_up")        => "Move the slide one place toward the first",
         ("canvas", "move_slide_down")      => "Move the slide one place toward the last",
-        ("canvas", "tag_list")             => "Every tag in the app: see, filter the slides by, rename, remove",
+        ("canvas", "tag_list")             => "Every tag in the app, in find: find by, rename, remove",
         ("canvas", "find_duplicates")      => "Every set of duplicate pictures on the slides, to go through or thin out",
         ("canvas", "prev_layer")           => "Layer below",
         ("canvas", "next_layer")           => "Layer above",

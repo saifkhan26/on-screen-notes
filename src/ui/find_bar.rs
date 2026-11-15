@@ -16,13 +16,20 @@
 //! each set with a button that selects all of its copies on one slide
 //! but one, for deleting. Typing goes back to finding words.
 //!
+//! With nothing typed, the bar lists every tag in the app with how many
+//! slides and objects carry it (also from the command palette's "Every
+//! tag"): a click finds what has it; each can be renamed or removed
+//! everywhere.
+//!
 //! Only slides already read are searched: the bar says how many are
 //! still opening. The query is kept between opens, selected so that
 //! typing replaces it, as in a browser.
 
 use crate::canvas::canvas::{Canvas, Layer};
-use crate::canvas::units::{bounds_of, tagged_by};
-use crate::canvas::shape::{MediaType, Shape};
+use crate::canvas::units::{bounds_of, same_tag, tagged_by};
+use crate::canvas::shape::{parse_tags, MediaType, Shape};
+use crate::canvas::TagCount;
+use crate::ui::media_filter::TAG_COLOUR;
 use crate::tools::similar::{self, Kind, Likeness, Origin, Query, Signature};
 use crate::ui::theme;
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
@@ -253,6 +260,15 @@ pub enum Request {
     /// Go to `slide` and select these pictures on `layer`: a set's
     /// copies there, all but one.
     SelectExtras { slide: usize, layer: usize, shapes: Vec<usize> },
+    /// Change a tag everywhere.
+    Tag(TagAction),
+}
+
+/// A tag changed everywhere from the tag list.
+pub enum TagAction {
+    /// Put these tags in place of this one.
+    Rename(String, Vec<String>),
+    Remove(String),
 }
 
 /// A small copy of `img` to show, its long side at most `THUMB` pixels.
@@ -310,6 +326,12 @@ pub struct FindBar {
     copies: Option<Copies>,
     /// What a click asked of the app, until it takes it.
     request: Option<Request>,
+    /// The tag being renamed in the tag list, and the name typed so far.
+    tag_renaming: Option<(String, String)>,
+    /// The rename field has yet to take the keyboard.
+    tag_focus: bool,
+    /// The tag whose removal waits for a yes.
+    tag_removing: Option<String>,
     /// The highlighted row.
     cursor: usize,
     /// The highlighted row is the one last gone to, so the next `Enter`
@@ -362,6 +384,8 @@ impl FindBar {
     /// results and thumbnails go.
     pub fn close(&mut self) {
         self.open = false;
+        self.tag_renaming = None;
+        self.tag_removing = None;
         self.retire_thumbs();
         if let Some(p) = &mut self.picture {
             p.results.clear();
@@ -371,6 +395,13 @@ impl FindBar {
         if let Some(c) = &mut self.copies {
             *c = Copies::default();
         }
+    }
+
+    /// Open it with nothing typed, so it lists every tag.
+    pub fn open_tags(&mut self) {
+        self.retire_picture();
+        self.query.clear();
+        self.open();
     }
 
     /// Open it listing every set of copies on the slides.
@@ -510,7 +541,9 @@ impl FindBar {
     /// `search` finds the matches for a query; `unread` slides are not
     /// searched yet; `active` is the slide shown; `name` gives a slide's
     /// name ("" for none); `reading` is how many of the slides' pictures
-    /// are read, of how many, while looking for a picture.
+    /// are read, of how many, while looking for a picture; `tags` gives
+    /// every tag, for the list shown while nothing is typed.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -519,12 +552,14 @@ impl FindBar {
         active: usize,
         name: impl Fn(usize) -> String,
         reading: Option<(usize, usize)>,
+        tags: impl FnOnce() -> Vec<TagCount>,
     ) -> Option<Hit> {
         if !self.open {
             return None;
         }
         let mut hits = if self.rows().is_some() { Vec::new() } else { search(&self.query) };
-        let (prev, next, up, down, esc) = ctx.input_mut(|i| {
+        // While a tag is renamed, Enter and Esc are the rename field's.
+        let keys = |i: &mut egui::InputState| {
             // Shift+Enter first: a plain Enter pattern would take it too.
             let prev = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
             (
@@ -534,7 +569,8 @@ impl FindBar {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
             )
-        });
+        };
+        let (prev, next, up, down, esc) = if self.tag_renaming.is_some() { Default::default() } else { ctx.input_mut(keys) };
         if esc {
             self.close();
             return None;
@@ -587,7 +623,7 @@ impl FindBar {
                         let all = CCursorRange::two(CCursor::new(0), CCursor::new(len));
                         state.cursor.set_char_range(Some(all));
                         state.store(ui.ctx(), out.response.id);
-                    } else if !out.response.has_focus() {
+                    } else if !out.response.has_focus() && self.tag_renaming.is_none() {
                         out.response.request_focus();
                     }
                     if out.response.changed() && in_picture && !self.typed.trim().is_empty() {
@@ -658,6 +694,20 @@ impl FindBar {
                         });
                     } else {
                         ui.label(egui::RichText::new(status).small().color(theme::TEXT_MUTED));
+                    }
+                    if self.rows().is_none() && self.query.trim().is_empty() {
+                        match tag_list(ui, &mut self.tag_renaming, &mut self.tag_focus, &mut self.tag_removing, &tags()) {
+                            Some(TagPick::Find(tag)) => {
+                                self.query = format!("#{tag}");
+                                hits = search(&self.query);
+                                restart(self, &hits);
+                                picked = None;
+                                self.focus_pending = true;
+                            }
+                            Some(TagPick::Change(a)) => self.request = Some(Request::Tag(a)),
+                            None => {}
+                        }
+                        return;
                     }
                     if let Some(c) = &self.copies {
                         let first = self.cursor.saturating_sub(PICTURE_ROWS - 1);
@@ -743,6 +793,105 @@ impl FindBar {
             None => picked.and_then(|k| hits.get(k).cloned()),
         }
     }
+}
+
+/// What a click in the tag list asks for.
+enum TagPick {
+    /// Find what has this tag.
+    Find(String),
+    Change(TagAction),
+}
+
+/// Most of the bar's height the tag list takes before it scrolls.
+const TAG_LIST_HEIGHT: f32 = 300.0;
+
+/// Every tag in `index`, a click finding what has it, and beside each its
+/// counts, a rename (into `renaming`, `focus` for its first frame) and a
+/// remove (which asks first: `removing`).
+fn tag_list(ui: &mut egui::Ui, renaming: &mut Option<(String, String)>, focus: &mut bool, removing: &mut Option<String>, index: &[TagCount]) -> Option<TagPick> {
+    ui.add_space(6.0);
+    if index.is_empty() {
+        ui.label(egui::RichText::new("No tags yet: select something, then the arrange bar's tag button").small().color(theme::TEXT_MUTED));
+        return None;
+    }
+    let title = format!("Every tag · {} — a click finds what has it; the pen renames it everywhere, the bin removes it", index.len());
+    ui.label(egui::RichText::new(title).small().color(theme::TEXT_MUTED));
+    let mut out = None;
+    // Sized by its rows: on the frame it first shows, a scroll area
+    // only knows how much fitted last frame, and cut the last row off.
+    let rows_h = index.len() as f32 * (22.0 + ui.spacing().item_spacing.y);
+    let height = rows_h.min(TAG_LIST_HEIGHT);
+    egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, true]).show(ui, |ui| {
+        for t in index {
+            ui.horizontal(|ui| {
+                if renaming.as_ref().is_some_and(|(from, _)| same_tag(from, &t.tag)) {
+                    let Some((from, text)) = renaming.as_mut() else { return };
+                    let r = ui.add(egui::TextEdit::singleline(text).desired_width(300.0).hint_text("new name (spaces: several)"));
+                    if std::mem::take(focus) {
+                        r.request_focus();
+                        if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), r.id) {
+                            let end = CCursor::new(text.chars().count());
+                            st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), end)));
+                            st.store(ui.ctx(), r.id);
+                        }
+                    } else if r.lost_focus() {
+                        // Enter renames; Esc or a click elsewhere leaves it.
+                        let to = parse_tags(text);
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !to.is_empty() && to != [from.clone()] {
+                            out = Some(TagPick::Change(TagAction::Rename(from.clone(), to)));
+                        }
+                        *renaming = None;
+                    }
+                    return;
+                }
+                if removing.as_deref().is_some_and(|r| same_tag(r, &t.tag)) {
+                    let things = if t.objects == 1 { "object" } else { "objects" };
+                    ui.label(egui::RichText::new(format!("Take #{} off {} {things}?", t.tag, t.objects)).small());
+                    if ui.small_button("Remove").clicked() {
+                        out = Some(TagPick::Change(TagAction::Remove(t.tag.clone())));
+                        *removing = None;
+                    }
+                    if ui.small_button("Keep").clicked() {
+                        *removing = None;
+                    }
+                    return;
+                }
+                let label = egui::RichText::new(format!("#{}", t.tag)).color(TAG_COLOUR);
+                if ui.add(egui::Button::new(label).frame(false)).on_hover_text("Find everything with this tag").clicked() {
+                    out = Some(TagPick::Find(t.tag.clone()));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let trash = egui::Image::new(egui::include_image!("../../assets/icons/trash.svg"));
+                    if icon_btn(ui, trash, "Remove this tag from every object (on unlocked slides)") {
+                        *removing = Some(t.tag.clone());
+                        *renaming = None;
+                    }
+                    let pen = egui::Image::new(egui::include_image!("../../assets/icons/pen.svg"));
+                    if icon_btn(ui, pen, "Rename this tag everywhere; to a tag that exists, they merge") {
+                        *renaming = Some((t.tag.clone(), t.tag.clone()));
+                        *focus = true;
+                        *removing = None;
+                    }
+                    let slides = if t.slides == 1 { "slide" } else { "slides" };
+                    ui.label(egui::RichText::new(format!("{} {slides} · {}", t.slides, t.objects)).small().color(theme::TEXT_MUTED))
+                        .on_hover_text(format!("On {} {slides}, {} objects", t.slides, t.objects));
+                });
+            });
+        }
+    });
+    out
+}
+
+/// A small icon button; whether it was clicked.
+fn icon_btn(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, egui::Rounding::same(5.0), Color32::from_white_alpha(18));
+    }
+    let r = rect.shrink(4.0);
+    img.tint(theme::TEXT_PRIMARY).fit_to_exact_size(r.size()).paint_at(ui, r);
+    response.on_hover_text(tooltip).clicked()
 }
 
 /// Above the field while listing copies: what the list is, and a button
@@ -1036,7 +1185,10 @@ mod tests {
         let hit = |slide: usize, shape: usize| picture_hit(&c, slide, 0, shape, copy, Arc::new(Vec::new())).unwrap();
         // Slide 1: shapes 4 and 2; slide 3: shapes 5, 1 and 3; slide 2: one.
         let set = vec![hit(1, 4), hit(1, 2), hit(2, 0), hit(3, 5), hit(3, 1), hit(3, 3)];
-        let got = |active| extras(&set, active).map(|Request::SelectExtras { slide, layer, shapes }| (slide, layer, shapes));
+        let got = |active| match extras(&set, active) {
+            Some(Request::SelectExtras { slide, layer, shapes }) => Some((slide, layer, shapes)),
+            _ => None,
+        };
         assert_eq!(got(3), Some((3, 0, vec![3, 5])), "the shown slide's, the backmost kept");
         assert_eq!(got(0), Some((1, 0, vec![4])), "else the first slide with two");
         assert_eq!(extras(&set[2..4], 0).map(|_| ()), None, "one copy a slide: nothing to select");
