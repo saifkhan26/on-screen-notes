@@ -220,18 +220,19 @@ fn copy_hashed(src: &Path) -> Result<String> {
     copy_hashed_into(src, &dir)
 }
 
+/// The name a file whose bytes hash to `hash` (`Fnv`) is stored under
+/// by `store_bytes_into`.
+pub(crate) fn media_name(hash: u64, ext: &str) -> String {
+    format!("{hash:016x}.{}", ext.to_ascii_lowercase())
+}
+
 /// Store `bytes` in `dir` under a name hashed from them, as
 /// `copy_hashed_into` does for a file. Returns the name and whether this
 /// call created the file (`false`: the same content was already there,
 /// so something else may be using it).
 pub(crate) fn store_bytes_into(dir: &Path, bytes: &[u8], ext: &str) -> Result<(String, bool)> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut hash = FNV_OFFSET;
-    for b in bytes {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    let name = format!("{hash:016x}.{}", ext.to_ascii_lowercase());
+    let name = media_name(crate::canvas::board_link::Fnv::of(bytes), ext);
     let dest = dir.join(&name);
     if dest.is_file() {
         return Ok((name, false));

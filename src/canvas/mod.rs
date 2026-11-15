@@ -13,6 +13,7 @@ pub mod affine;
 // `canvas::canvas::Canvas`: one slide, in its own file beside the manager.
 // Renaming it would touch every import for nothing.
 #[allow(clippy::module_inception)]
+pub mod board_link;
 pub mod canvas;
 pub mod hit;
 pub mod ink_gpu;
@@ -29,7 +30,7 @@ use crate::canvas::canvas::Canvas;
 use crate::canvas::units::same_tag;
 use crate::config::AppConfig;
 use crate::persistence::{LoadProgress, SlideView};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
@@ -1016,32 +1017,32 @@ impl CanvasManager {
     /// tags are not in yet.
     pub fn tag_index(&self) -> (Vec<TagCount>, usize) {
         let mut out: Vec<TagCount> = Vec::new();
+        // Tag (by `units::tag_key`) → its place in `out`. Looked up, not
+        // searched: the list shows every frame it is open, and a slide
+        // can hold thousands of tagged objects.
+        let mut at: HashMap<String, usize> = HashMap::new();
         let mut unread = 0;
         for slot in &self.canvases {
             let Some(c) = slot else {
                 unread += 1;
                 continue;
             };
-            let mut on_this: Vec<usize> = Vec::new();
+            let mut on_this: HashSet<usize> = HashSet::new();
             for l in &c.layers {
                 let tags = l.strokes.iter().flat_map(|s| s.tags.iter()).chain(l.shapes.iter().flat_map(|s| s.tags().iter()));
                 for t in tags {
-                    let k = match out.iter().position(|e| same_tag(&e.tag, t)) {
-                        Some(k) => k,
-                        None => {
-                            out.push(TagCount { tag: t.clone(), slides: 0, objects: 0 });
-                            out.len() - 1
-                        }
-                    };
+                    let k = *at.entry(units::tag_key(t)).or_insert_with(|| {
+                        out.push(TagCount { tag: t.clone(), slides: 0, objects: 0 });
+                        out.len() - 1
+                    });
                     out[k].objects += 1;
-                    if !on_this.contains(&k) {
-                        on_this.push(k);
+                    if on_this.insert(k) {
                         out[k].slides += 1;
                     }
                 }
             }
         }
-        out.sort_by(|a, b| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()));
+        out.sort_by_cached_key(|e| units::tag_key(&e.tag));
         (out, unread)
     }
 
@@ -1248,6 +1249,17 @@ impl CanvasManager {
         // and shift down everything past it. Simplest is to re-save all,
         // which `save_all` does on the next debounced tick.
         self.prune_orphans = true;
+    }
+
+    /// Files a PureRef resync stored that it may not have used: the next
+    /// save deletes those that no slide, undo step or clipboard uses. Only
+    /// files the resync itself just created are passed, never older ones.
+    pub fn check_media(&mut self, files: impl IntoIterator<Item = String>) {
+        let before = self.media_to_check.len();
+        self.media_to_check.extend(files);
+        if self.media_to_check.len() > before {
+            self.media_cleanup_due = true;
+        }
     }
 
     /// Save every dirty canvas to disk on a background thread. Skipped
@@ -1547,6 +1559,7 @@ mod media_cleanup_tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         }
     }
 
@@ -2272,6 +2285,7 @@ mod pin_tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         });
         c.layers[0].opacity = 0.25;
         let mut m = CanvasManager::for_tests(vec![c]);

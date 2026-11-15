@@ -113,7 +113,34 @@ impl Canvas {
                 // Invisible step: carry on to the edit before it.
                 self.undo();
             }
+            UndoEntry::Resynced(layers, link) => {
+                let swapped = self.swap_resynced(layers, link);
+                self.redo_log.push(swapped);
+            }
         }
+    }
+
+    /// Put a resync's result in place (`media::pureref_sync`) as one undo
+    /// step: these layers' new shape lists and the slide's new board link.
+    pub fn apply_resync(&mut self, layers: Vec<(usize, Vec<Shape>)>, link: crate::canvas::board_link::BoardLink) {
+        let entry = self.swap_resynced(layers, Some(Box::new(link)));
+        self.undo_log.push(entry);
+        self.redo_log.clear();
+        self.dirty = true;
+    }
+
+    /// Put these shape lists and this board link in place, and return the
+    /// `Resynced` step that puts back what they replaced.
+    pub(crate) fn swap_resynced(&mut self, layers: Vec<(usize, Vec<Shape>)>, link: Option<Box<crate::canvas::board_link::BoardLink>>) -> UndoEntry {
+        let mut out = Vec::with_capacity(layers.len());
+        for (li, shapes) in layers {
+            if let Some(layer) = self.layers.get_mut(li) {
+                out.push((li, std::mem::replace(&mut layer.shapes, shapes)));
+                layer.rev += 1;
+            }
+        }
+        let link = std::mem::replace(&mut self.board, link);
+        UndoEntry::Resynced(out, link)
     }
 
     /// Redo the most recently undone edit if any.
@@ -214,6 +241,10 @@ impl Canvas {
                 // Invisible step: carry on to the edit after it.
                 self.redo();
             }
+            UndoEntry::Resynced(layers, link) => {
+                let swapped = self.swap_resynced(layers, link);
+                self.undo_log.push(swapped);
+            }
         }
     }
 }
@@ -250,6 +281,7 @@ pub(super) fn layer_idx_of(e: &UndoEntry) -> usize {
         | UndoEntry::ObjectsInserted(li, _, _)
         | UndoEntry::ObjectsReordered(li, _, _)
         | UndoEntry::PlatePromoted(li, _) => *li,
+        UndoEntry::Resynced(layers, _) => layers.first().map_or(0, |(li, _)| *li),
     }
 }
 
@@ -277,6 +309,7 @@ pub(super) fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
         group: 0,
         tags: Vec::new(),
         turn: 0.0,
+        link: 0,
     });
     layer.rev += 1;
     Some(img.capture_zoom)

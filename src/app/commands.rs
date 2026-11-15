@@ -62,6 +62,11 @@ impl OnScreenNotesApp {
             }
             K::HighlightGroups => self.media_filter.groups = !self.media_filter.groups,
             K::HighlightTagged => self.media_filter.tagged = !self.media_filter.tagged,
+            K::HighlightGone => self.media_filter.gone = !self.media_filter.gone,
+            K::ResyncPureRef => {
+                self.commands.close();
+                self.start_resync(self.canvases.active_index());
+            }
             K::SelectHighlighted => {
                 if self.may_edit() {
                     self.select_media_matches();

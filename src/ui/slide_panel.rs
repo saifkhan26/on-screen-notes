@@ -45,6 +45,8 @@ pub enum SlideAction {
     OpenWindow(usize),
     /// Move slide `.0` to place `.1`, the slides between shifting along.
     Move(usize, usize),
+    /// Bring the slide up to date with its PureRef board.
+    Resync(usize),
 }
 
 #[derive(Default)]
@@ -308,9 +310,19 @@ fn slide_row(
         tip.push_str("\nLocked: pans and zooms, takes no edits");
     }
     let last = manager.count().saturating_sub(1);
+    // The board it was opened from, if it remembers it.
+    let board = manager.slide(i).and_then(|c| c.board.as_ref()).and_then(|b| b.path.file_name()).map(|n| n.to_string_lossy().into_owned());
     response.context_menu(|ui| {
         if ui.button("Open in a window").clicked() {
             action = Some(SlideAction::OpenWindow(i));
+            ui.close_menu();
+        }
+        let (label, tip) = match &board {
+            Some(name) => (format!("Resync from {name}"), "Bring over what changed on the board since; nothing on the slide is deleted".to_string()),
+            None => ("Resync from a PureRef board…".to_string(), "Link this slide to the board it was opened from, and bring over what changed".to_string()),
+        };
+        if !locked && ui.button(label).on_hover_text(tip).clicked() {
+            action = Some(SlideAction::Resync(i));
             ui.close_menu();
         }
         ui.separator();

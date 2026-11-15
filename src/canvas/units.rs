@@ -29,9 +29,20 @@ impl Unit {
     }
 }
 
-/// Tags are the same tag whatever their case.
+/// Tags are the same tag whatever their case. Called for every pair of
+/// tags compared each frame, so plain ASCII tags (nearly all) are
+/// compared without making lower-case copies.
 pub fn same_tag(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase()
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a.to_lowercase() == b.to_lowercase()
+    }
+}
+
+/// A tag's key for looking it up whatever its case (`same_tag`).
+pub fn tag_key(t: &str) -> String {
+    t.to_lowercase()
 }
 
 fn merge(into: &mut Vec<String>, tags: &[String]) {

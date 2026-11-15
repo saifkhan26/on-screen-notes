@@ -788,6 +788,7 @@ mod tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         }
     }
 
@@ -1114,6 +1115,7 @@ mod tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         });
         let mut t = tool(&c);
         t.sel = Selection { strokes: vec![0], shapes: vec![0] };

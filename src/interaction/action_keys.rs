@@ -70,6 +70,10 @@ pub enum KeyAction {
     TagList,
     /// List every set of duplicate pictures.
     FindCopies,
+    /// Resync the active slide from its PureRef board.
+    ResyncPureRef,
+    /// Highlight what is gone from the slide's PureRef board.
+    HighlightGone,
     /// Make the selection one group (`true`), or take it out of its groups.
     Group(bool),
     /// Onion skin on / off for every GIF and video.
@@ -148,6 +152,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.move_slide_up, KeyAction::MoveSlide(-1)),
         (c.tag_list, KeyAction::TagList),
         (c.find_duplicates, KeyAction::FindCopies),
+        (c.resync_pureref, KeyAction::ResyncPureRef),
         (c.move_slide_down, KeyAction::MoveSlide(1)),
         (c.new_slide, KeyAction::NewSlide),
         (c.toggle_slide_panel, KeyAction::ToggleSlidePanel),

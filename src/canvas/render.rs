@@ -118,6 +118,7 @@ mod rotation_tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         };
         // Where `Obb` says the red (left) and blue (right) halves went.
         let o = shape.obb();

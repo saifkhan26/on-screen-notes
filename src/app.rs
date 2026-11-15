@@ -293,6 +293,8 @@ pub struct OnScreenNotesApp {
     media_waiting: Vec<(std::path::PathBuf, Option<egui::Pos2>)>,
     /// Open dialog started by the toolbar's "Insert video / GIF".
     media_dialog: Option<std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>>,
+    /// The dialog asking which PureRef board to resync a slide from.
+    resync_dialog: Option<(usize, std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>)>,
     /// PureRef boards being read, each becoming a new slide.
     pureref_jobs: Vec<crate::media::pureref::OpenJob>,
     /// When the last frame started, for `hold_to_refresh_rate`.
@@ -667,6 +669,7 @@ impl OnScreenNotesApp {
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
             media_dialog: None,
+            resync_dialog: None,
             pureref_jobs: Vec::new(),
             last_frame_at: None,
             clip_image: Default::default(),

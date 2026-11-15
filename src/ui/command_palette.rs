@@ -188,6 +188,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Highlight videos", v, tb.highlight[2], C::Key(K::Highlight(crate::canvas::shape::MediaType::Video)));
     add("Highlight groups", v, tb.highlight_groups, C::Key(K::HighlightGroups));
     add("Highlight everything tagged", v, tb.highlight_tagged, C::Key(K::HighlightTagged));
+    add("Highlight what is gone from the PureRef board", v, None, C::Key(K::HighlightGone));
     add("Select what is highlighted", v, tb.select_highlighted, C::Key(K::SelectHighlighted));
     add("Background opacity up", v, tb.background_up, C::Key(K::Background(1)));
     add("Background opacity down", v, tb.background_down, C::Key(K::Background(-1)));
@@ -198,6 +199,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("New slide", sl, c.new_slide, C::Key(K::NewSlide));
     add("Name the slide", sl, c.rename_slide, C::RenameSlide);
     add("Lock / unlock the slide", sl, c.lock_slide, C::LockSlide);
+    add("Resync from PureRef", sl, c.resync_pureref, C::Key(K::ResyncPureRef));
     add("Delete the slide", sl, c.delete_canvas, C::DeleteSlide);
     add("Move the slide up", sl, c.move_slide_up, C::Key(K::MoveSlide(-1)));
     add("Move the slide down", sl, c.move_slide_down, C::Key(K::MoveSlide(1)));

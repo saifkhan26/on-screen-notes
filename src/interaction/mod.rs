@@ -273,6 +273,7 @@ pub fn route_text_input(
                     group: 0,
                     tags: Vec::new(),
                     turn: 0.0,
+                    link: 0,
                 });
             }
         }

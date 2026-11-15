@@ -14,7 +14,8 @@
 //! note's background becomes its label's box (`Shape::Text::background`).
 //! Items that move together in PureRef — a group's contents, a picture
 //! and the notes on it — become one group (`Shape::group`); groups in
-//! groups become one.
+//! groups become one. A named PureRef group's name becomes a tag on
+//! each of its members (`Shape::tags`).
 //!
 //! Boards can be gigabytes, so nothing holds the whole file: 1.x
 //! pictures are read one at a time from their byte ranges, and a 2.x
@@ -24,14 +25,21 @@
 //! folder (`PictureRef`); the slide keeps only their names and small
 //! previews. Animated GIFs shown whole become playing GIFs.
 //!
-//! The board file is only ever read. The slide keeps no path back to it
-//! or to the pictures' original files, so deleting the slide cannot
-//! touch them — only the app's own copies in the media folder, which
-//! the usual slide-delete cleanup removes once nothing uses them.
+//! The board file is only ever read. The slide keeps its path, and each
+//! item's id on it, only to resync from it later (`BoardLink`,
+//! `super::pureref_sync`); nothing points at the pictures' original
+//! files. Deleting the slide cannot touch the board or those files —
+//! only the app's own copies in the media folder, which the usual
+//! slide-delete cleanup removes once nothing uses them.
+//!
+//! A resync reads the board again, but decodes and stores only the
+//! pictures the slide does not show yet (`Have`); for the rest it reads
+//! just the file's header, for its size.
 
-use super::import::{encode_png, fit_side, shrink, store_bytes_into, IMAGE_SIDE};
+use super::import::{encode_png, fit_side, media_name, shrink, store_bytes_into, IMAGE_SIDE};
+use crate::canvas::board_link::{fresh_link, BoardLink, Fnv, ItemState, LinkedItem};
 use crate::canvas::canvas::Canvas;
-use crate::canvas::shape::{fresh_group_id, fresh_media_id, text_extent, MediaKind, MediaMeta, MediaRef, PictureRef, RasterKind, Shape};
+use crate::canvas::shape::{fresh_media_id, text_extent, MediaKind, MediaMeta, MediaRef, PictureRef, RasterKind, Shape};
 use crate::error::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -71,23 +79,85 @@ pub struct Board {
     /// rather than stored in the board, or in a format that cannot be
     /// decoded here.
     pub skipped: usize,
+    /// Files this open added to the media folder. A resync may not use
+    /// them all; the rest are for the media cleanup to check.
+    pub created: Vec<String>,
+}
+
+/// How a picture shows on a slide, once decoded and stored.
+#[derive(Clone)]
+pub struct Shown {
+    /// The shape's `png`: a small preview of a stored picture, or an
+    /// animated GIF's poster frame.
+    pub png: Arc<Vec<u8>>,
+    pub px_size: [u32; 2],
+    /// Exactly one of these is set.
+    pub picture: Option<PictureRef>,
+    pub media: Option<MediaRef>,
+}
+
+/// A stored file as a slide shows it: its name, and for a still picture
+/// which part and whether mirrored (`PictureRef`). A playing GIF is its
+/// file with no crop and no mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StoredAs {
+    pub file: String,
+    pub crop: Option<[u32; 4]>,
+    pub mirror: bool,
+}
+
+impl StoredAs {
+    /// What `shape` shows, if it is a stored picture or a GIF.
+    pub fn of(shape: &Shape) -> Option<StoredAs> {
+        match shape {
+            Shape::Raster { media: Some(m), .. } if m.kind == MediaKind::Gif => Some(StoredAs { file: m.file.clone(), crop: None, mirror: false }),
+            Shape::Raster { picture: Some(p), media: None, .. } => Some(StoredAs { file: p.file.clone(), crop: p.crop, mirror: p.mirror }),
+            _ => None,
+        }
+    }
+}
+
+/// What the slide a board is resynced into already shows: pictures it has
+/// are not decoded or stored again (`BoardItem::Picture::shown` is left
+/// `None`).
+#[derive(Debug, Default, Clone)]
+pub struct Have {
+    /// The `content` of board pictures the slide shows.
+    pub contents: HashSet<u64>,
+    /// Pictures the slide shows, as stored: a slide that is not linked
+    /// to the board yet is matched to it by these.
+    pub files: HashSet<StoredAs>,
+}
+
+impl Have {
+    fn has(&self, content: u64, file: Option<&StoredAs>) -> bool {
+        self.contents.contains(&content) || file.is_some_and(|f| self.files.contains(f))
+    }
 }
 
 pub enum BoardItem {
     Picture {
-        /// The shape's `png`: a small preview of a stored picture, or an
-        /// animated GIF's poster frame.
-        png: Arc<Vec<u8>>,
-        px_size: [u32; 2],
-        /// Exactly one of these is set.
-        picture: Option<PictureRef>,
-        media: Option<MediaRef>,
+        /// How it shows; `None` when it was not loaded because the slide
+        /// already shows it (`Have`).
+        shown: Option<Box<Shown>>,
+        /// The file it is stored as when that is the board's own file
+        /// (cropped and mirrored as needed) — known without decoding it.
+        /// `None` for a cut-out or a photo turned upright, which are
+        /// stored re-encoded.
+        file: Option<StoredAs>,
+        /// What it shows — the picture's bytes, crop and mirror — hashed.
+        /// Moving or scaling it on the board leaves this alone.
+        content: u64,
         center: [f64; 2],
         half: [f64; 2],
         /// Radians, clockwise on screen, about `center`.
         rotation: f64,
         /// The board item this one moves with (`RawPlacement::root`).
         group: i64,
+        /// Its id on the board.
+        key: i64,
+        /// Names of the named groups it is in, outermost first.
+        tags: Vec<String>,
     },
     Note {
         text: String,
@@ -101,6 +171,8 @@ pub enum BoardItem {
         background: Option<[u8; 4]>,
         /// The board item this one moves with (`RawPlacement::root`).
         group: i64,
+        key: i64,
+        tags: Vec<String>,
     },
 }
 
@@ -110,13 +182,114 @@ impl Board {
         let pictures = self.items.iter().filter(|i| matches!(i, BoardItem::Picture { .. })).count();
         (pictures, self.items.len() - pictures)
     }
+
+    /// Board group → how many items move with it. A group of one is no
+    /// group on the slide.
+    pub fn group_sizes(&self) -> HashMap<i64, usize> {
+        let mut members: HashMap<i64, usize> = HashMap::new();
+        for item in &self.items {
+            *members.entry(item.group()).or_default() += 1;
+        }
+        members
+    }
 }
 
 impl BoardItem {
-    fn group(&self) -> i64 {
+    pub fn group(&self) -> i64 {
         match self {
             BoardItem::Picture { group, .. } | BoardItem::Note { group, .. } => *group,
         }
+    }
+
+    pub fn key(&self) -> i64 {
+        match self {
+            BoardItem::Picture { key, .. } | BoardItem::Note { key, .. } => *key,
+        }
+    }
+
+    pub fn tags(&self) -> &[String] {
+        match self {
+            BoardItem::Picture { tags, .. } | BoardItem::Note { tags, .. } => tags,
+        }
+    }
+
+    pub fn is_note(&self) -> bool {
+        matches!(self, BoardItem::Note { .. })
+    }
+
+    /// The item as a resync compares it (`ItemState`). `sizes` is
+    /// `Board::group_sizes`.
+    pub fn state(&self, sizes: &HashMap<i64, usize>) -> ItemState {
+        let group = (sizes.get(&self.group()).copied().unwrap_or(0) >= 2).then(|| self.group());
+        match self {
+            BoardItem::Picture { content, center, half, rotation, tags, .. } => {
+                ItemState { at: *center, size: *half, rotation: *rotation, content: *content, style: 0, group, tags: tags.clone() }
+            }
+            BoardItem::Note { text, pos, font_size, color, rotation, background, tags, .. } => {
+                let mut style = Fnv::default();
+                style.write(color);
+                match background {
+                    Some(b) => style.write(&[1]).write(b),
+                    None => style.write(&[0]),
+                };
+                ItemState {
+                    at: *pos,
+                    size: [*font_size, 0.0],
+                    rotation: *rotation,
+                    content: Fnv::default().str(text).0,
+                    style: style.0,
+                    group,
+                    tags: tags.clone(),
+                }
+            }
+        }
+    }
+
+    /// The shape it becomes on a slide, placed by `link`, in slide group
+    /// `group` and linked as `link_id`; `None` for a picture not loaded.
+    pub fn to_shape(&self, link: &BoardLink, group: u64, link_id: u64) -> Option<Shape> {
+        let s = link.scale;
+        Some(match self {
+            BoardItem::Picture { shown, center, half, rotation, tags, .. } => {
+                let shown = shown.as_ref()?;
+                let c = link.to_slide(*center);
+                let half = [(half[0] * s) as f32, (half[1] * s) as f32];
+                Shape::Raster {
+                    pos: [c[0] - half[0], c[1] - half[1]],
+                    size: [half[0] * 2.0, half[1] * 2.0],
+                    png: Arc::clone(&shown.png),
+                    px_size: shown.px_size,
+                    color: [0, 0, 0, 0],
+                    rotation: *rotation as f32,
+                    kind: RasterKind::Image,
+                    media: shown.media.clone().map(|mut m| {
+                        // Each shape plays on its own.
+                        m.id = fresh_media_id();
+                        Box::new(m)
+                    }),
+                    picture: shown.picture.clone().map(Box::new),
+                    pin: 0,
+                    flip: false,
+                    group,
+                    tags: tags.clone(),
+                    turn: 0.0,
+                    link: link_id,
+                }
+            }
+            BoardItem::Note { text, pos, font_size, color, rotation, background, tags, .. } => Shape::Text {
+                pos: link.to_slide(*pos),
+                content: text.clone(),
+                font_size: (font_size * s) as f32,
+                color: *color,
+                rotation: *rotation as f32,
+                pin: 0,
+                background: *background,
+                group,
+                tags: tags.clone(),
+                turn: 0.0,
+                link: link_id,
+            },
+        })
     }
 
     fn corners(&self) -> [[f64; 2]; 4] {
@@ -179,13 +352,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Read and decode a board, storing its pictures in `media_dir`. Slow
-/// for a big one: run it off the UI thread. On failure or cancel, the
-/// files it stored are removed again.
-pub fn open(path: &Path, media_dir: &Path, progress: &Progress) -> Result<Board> {
+/// Read and decode a board, storing its pictures in `media_dir` — all of
+/// them but those `have` says the slide already shows. Slow for a big
+/// one: run it off the UI thread. On failure or cancel, the files it
+/// stored are removed again.
+pub fn open(path: &Path, media_dir: &Path, progress: &Progress, have: &Have) -> Result<Board> {
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let len = file.metadata().context("reading the board")?.len();
-    open_from(std::io::BufReader::with_capacity(1 << 20, file), len, media_dir, progress, DB_IN_MEMORY_MAX)
+    open_from(std::io::BufReader::with_capacity(1 << 20, file), len, media_dir, progress, DB_IN_MEMORY_MAX, have)
 }
 
 struct Shared {
@@ -196,24 +370,46 @@ struct Shared {
 /// One board being opened on a background thread.
 pub struct OpenJob {
     pub path: PathBuf,
+    /// The slide being resynced from it; `None` for a new slide.
+    pub resync: Option<ResyncTarget>,
     shared: Arc<Shared>,
 }
 
+/// The slide a resync is for, as it was when the board was asked for:
+/// slides can be moved or renamed while the board is read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResyncTarget {
+    pub slide: usize,
+    pub name: String,
+    /// The board it was linked to, if any.
+    pub linked: Option<PathBuf>,
+}
+
 impl OpenJob {
+    /// Open the board as a new slide.
     pub fn start(path: PathBuf) -> Self {
+        Self::spawn(path, None, Have::default())
+    }
+
+    /// Read the board to resync `target`, which shows `have`.
+    pub fn resync(path: PathBuf, target: ResyncTarget, have: Have) -> Self {
+        Self::spawn(path, Some(target), have)
+    }
+
+    fn spawn(path: PathBuf, resync: Option<ResyncTarget>, have: Have) -> Self {
         let shared = Arc::new(Shared { progress: Progress::default(), result: Mutex::new(None) });
         let s = Arc::clone(&shared);
         let p = path.clone();
         let spawned = std::thread::Builder::new().name("osn-pureref-open".into()).spawn(move || {
             let r = crate::persistence::paths::media_dir()
-                .and_then(|dir| open(&p, &dir, &s.progress))
+                .and_then(|dir| open(&p, &dir, &s.progress, &have))
                 .map_err(|e| format!("{e:#}"));
             *lock(&s.result) = Some(r);
         });
         if let Err(e) = spawned {
             *lock(&shared.result) = Some(Err(e.to_string()));
         }
-        Self { path, shared }
+        Self { path, resync, shared }
     }
 
     pub fn file_name(&self) -> String {
@@ -243,8 +439,41 @@ impl OpenJob {
 /// size (one picture pixel per physical screen pixel, as an inserted
 /// picture gets), shrunk as one piece to fit 90 % of a `view`-sized
 /// window, and centred in it. A new slide starts at pan 0 / zoom 1, so
-/// the view's centre is `view / 2`.
-pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &str) -> Canvas {
+/// the view's centre is `view / 2`. The slide is linked to the board at
+/// `path` (`Canvas::board`), so it can be resynced from it.
+pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &str, path: &Path) -> Canvas {
+    let link = BoardLink { path: path.to_path_buf(), ..fit_view(&board, view, pixels_per_point) };
+    lay_out(&board, link, name)
+}
+
+/// A slide of `board`'s items placed by `link`'s mapping, and linked to
+/// them.
+pub(crate) fn lay_out(board: &Board, mut link: BoardLink, name: &str) -> Canvas {
+    let sizes = board.group_sizes();
+    let mut shapes = Vec::with_capacity(board.items.len());
+    for item in &board.items {
+        let base = item.state(&sizes);
+        // Items that move together on the board are a group on the
+        // slide; a lone item stays out of any.
+        let group = link.group_for(base.group);
+        let id = fresh_link();
+        if let Some(shape) = item.to_shape(&link, group, id) {
+            shapes.push(shape);
+            link.items.push(LinkedItem { link: id, key: item.key(), base, gone: false });
+        }
+    }
+    let mut canvas = Canvas::default();
+    canvas.layers[0].shapes = shapes;
+    canvas.board = Some(Box::new(link));
+    if !name.is_empty() {
+        canvas.layers[0].name = name.to_string();
+    }
+    canvas
+}
+
+/// The board-to-slide mapping `into_canvas` lays a board out by (only
+/// `scale` and `offset` are set).
+fn fit_view(board: &Board, view: [f32; 2], pixels_per_point: f32) -> BoardLink {
     let mut lo = [f64::INFINITY; 2];
     let mut hi = [f64::NEG_INFINITY; 2];
     for item in &board.items {
@@ -267,64 +496,9 @@ pub fn into_canvas(board: Board, view: [f32; 2], pixels_per_point: f32, name: &s
             mid[k] = (lo[k] + hi[k]) * 0.5;
         }
     }
-    let map = |p: [f64; 2]| [((p[0] - mid[0]) * s + view[0] * 0.5) as f32, ((p[1] - mid[1]) * s + view[1] * 0.5) as f32];
-
-    // Items that move together on the board are a group on the slide; a
-    // lone item stays out of any.
-    let mut members: HashMap<i64, usize> = HashMap::new();
-    for item in &board.items {
-        *members.entry(item.group()).or_default() += 1;
-    }
-    let mut ids: HashMap<i64, u64> = HashMap::new();
-    let mut group_of = |key: i64| {
-        if members.get(&key).copied().unwrap_or(0) < 2 { 0 } else { *ids.entry(key).or_insert_with(fresh_group_id) }
-    };
-
-    let shapes = board
-        .items
-        .into_iter()
-        .map(|item| match item {
-            BoardItem::Picture { png, px_size, picture, media, center, half, rotation, group } => {
-                let c = map(center);
-                let half = [(half[0] * s) as f32, (half[1] * s) as f32];
-                Shape::Raster {
-                    pos: [c[0] - half[0], c[1] - half[1]],
-                    size: [half[0] * 2.0, half[1] * 2.0],
-                    png,
-                    px_size,
-                    color: [0, 0, 0, 0],
-                    rotation: rotation as f32,
-                    kind: RasterKind::Image,
-                    media: media.map(Box::new),
-                    picture: picture.map(Box::new),
-                    pin: 0,
-                    flip: false,
-                    group: group_of(group),
-                    tags: Vec::new(),
-                    turn: 0.0,
-                }
-            }
-            BoardItem::Note { text, pos, font_size, color, rotation, background, group } => Shape::Text {
-                pos: map(pos),
-                content: text,
-                font_size: (font_size * s) as f32,
-                color,
-                rotation: rotation as f32,
-                pin: 0,
-                background,
-                group: group_of(group),
-                tags: Vec::new(),
-                turn: 0.0,
-            },
-        })
-        .collect();
-
-    let mut canvas = Canvas::default();
-    canvas.layers[0].shapes = shapes;
-    if !name.is_empty() {
-        canvas.layers[0].name = name.to_string();
-    }
-    canvas
+    // (p − mid)·s + view/2
+    let offset = [view[0] * 0.5 - mid[0] * s, view[1] * 0.5 - mid[1] * s];
+    BoardLink { path: PathBuf::new(), scale: s, offset, items: Vec::new(), groups: Vec::new() }
 }
 
 // ---------------------------------------------------------------------
@@ -435,6 +609,10 @@ struct RawPlacement {
     /// The outermost item this one moves with: its top PureRef group,
     /// or the picture or note it hangs on, else itself.
     root: i64,
+    /// Its id on the board.
+    key: i64,
+    /// Names of the named groups it is in, outermost first.
+    tags: Vec<String>,
 }
 
 struct RawNote {
@@ -454,21 +632,26 @@ struct RawNote {
     order: Vec<f64>,
     /// See `RawPlacement::root`.
     root: i64,
+    key: i64,
+    tags: Vec<String>,
 }
 
-fn open_from<R: Read + Seek>(mut src: R, len: u64, media_dir: &Path, progress: &Progress, db_in_memory_max: u64) -> Result<Board> {
+fn open_from<R: Read + Seek>(mut src: R, len: u64, media_dir: &Path, progress: &Progress, db_in_memory_max: u64, have: &Have) -> Result<Board> {
     let mut magic = [0u8; 4];
     if len < 12 || src.seek(SeekFrom::Start(0)).and_then(|_| src.read_exact(&mut magic)).is_err() {
         bail!("not a PureRef board (the file is too short)");
     }
     let store = Store { dir: media_dir.to_path_buf(), created: Mutex::new(Vec::new()) };
     let result = match u32::from_be_bytes(magic) {
-        8 => parse_v1(&mut src, len).and_then(|raw| build(raw, &mut Fetch::File(&mut src), &store, progress)),
-        6 => parse_v2(&mut src, len, progress, db_in_memory_max).and_then(|(raw, db)| build(raw, &mut Fetch::<R>::Db(&db.conn), &store, progress)),
+        8 => parse_v1(&mut src, len).and_then(|raw| build(raw, &mut Fetch::File(&mut src), &store, progress, have)),
+        6 => parse_v2(&mut src, len, progress, db_in_memory_max).and_then(|(raw, db)| build(raw, &mut Fetch::<R>::Db(&db.conn), &store, progress, have)),
         _ => Err(anyhow!("not a PureRef board, or one from an unsupported PureRef version")),
     };
     match result {
-        Ok(board) if !progress.cancelled() => Ok(board),
+        Ok(mut board) if !progress.cancelled() => {
+            board.created = std::mem::take(&mut *lock(&store.created));
+            Ok(board)
+        }
         other => {
             // Nothing will refer to what this open stored.
             store.remove_created();
@@ -812,6 +995,8 @@ fn read_v1_item(
                     crop: outline.iter().map(|p| inv.apply(*p)).collect(),
                     order: order.clone(),
                     root: top,
+                    key: i64::from(id),
+                    tags: Vec::new(),
                 }),
                 _ => out.skipped += 1,
             }
@@ -840,6 +1025,8 @@ fn read_v1_item(
                     width: None,
                     order: order.clone(),
                     root: top,
+                    key: i64::from(id),
+                    tags: Vec::new(),
                 });
             }
             (to_scene, order, children, top)
@@ -1017,6 +1204,9 @@ struct V2Item {
     parent: i64,
     z: f64,
     xf: Option<Xf>,
+    /// The name PureRef shows on a group; pictures keep their file's
+    /// name here, which is not used.
+    name: Option<String>,
 }
 
 fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
@@ -1031,16 +1221,23 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
     }
 
     let mut items: HashMap<i64, V2Item> = HashMap::new();
-    let mut stmt = conn.prepare("SELECT id, parent, z, CAST(transform AS BLOB) FROM items")?;
+    let has_names = conn.prepare("SELECT name FROM items LIMIT 0").is_ok();
+    let names = if has_names { "name" } else { "NULL" };
+    let mut stmt = conn.prepare(&format!("SELECT id, parent, z, CAST(transform AS BLOB), {names} FROM items"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let blob: Option<Vec<u8>> = row.get(3)?;
+        let name = match row.get_ref(4)? {
+            rusqlite::types::ValueRef::Text(t) | rusqlite::types::ValueRef::Blob(t) => Some(String::from_utf8_lossy(t).into_owned()),
+            _ => None,
+        };
         items.insert(
             row.get(0)?,
             V2Item {
                 parent: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
                 z: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
                 xf: blob.as_deref().and_then(|b| qt_value(b, qtransform)).filter(Xf::is_finite),
+                name,
             },
         );
     }
@@ -1084,7 +1281,8 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
         let ids = st.query_map([], |row| row.get(0))?.collect();
         ids
     };
-    let mut holders = ids_in("items_groups")?;
+    let groups = ids_in("items_groups")?;
+    let mut holders = groups.clone();
     holders.extend(ids_in("items_images")?);
     holders.extend(ids_in("items_notes")?);
     let root_of = |id: i64| -> i64 {
@@ -1100,6 +1298,26 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
             }
         }
         best
+    };
+    // The names of the named groups an item is in, outermost first, as
+    // tags.
+    let tags_of = |id: i64| -> Vec<String> {
+        let mut tags: Vec<String> = Vec::new();
+        let mut cur = id;
+        for _ in 0..MAX_DEPTH {
+            let Some(item) = items.get(&cur) else { break };
+            cur = item.parent;
+            let Some(parent) = items.get(&cur) else { break };
+            if groups.contains(&cur) {
+                if let Some(tag) = parent.name.as_deref().map(group_tag).filter(|t| !t.is_empty()) {
+                    if !tags.iter().any(|t| crate::canvas::units::same_tag(t, &tag)) {
+                        tags.push(tag);
+                    }
+                }
+            }
+        }
+        tags.reverse();
+        tags
     };
 
     let mut out = RawBoard::default();
@@ -1133,7 +1351,15 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
                     Some(inv) => outline.iter().map(|p| inv.apply(*p)).collect(),
                     None => Vec::new(),
                 };
-                out.placements.push(RawPlacement { picture, to_scene: image_xf.then(to_scene), crop, order: order_of(id), root: root_of(id) });
+                out.placements.push(RawPlacement {
+                    picture,
+                    to_scene: image_xf.then(to_scene),
+                    crop,
+                    order: order_of(id),
+                    root: root_of(id),
+                    key: id,
+                    tags: tags_of(id),
+                });
             }
             _ => out.skipped += 1,
         }
@@ -1177,10 +1403,19 @@ fn read_v2_db(conn: &rusqlite::Connection) -> Result<RawBoard> {
                 width,
                 order: order_of(id),
                 root: root_of(id),
+                key: id,
+                tags: tags_of(id),
             });
         }
     }
     Ok(out)
+}
+
+/// A group's name as one tag: a tag is one word (`shape::parse_tags`),
+/// so the words are joined by `-`, and a leading `#` is dropped.
+fn group_tag(name: &str) -> String {
+    let words: Vec<&str> = name.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()).collect();
+    words.join("-").trim_start_matches('#').to_string()
 }
 
 /// Decode a Qt value stored in the database. PureRef keeps these as
@@ -1372,7 +1607,7 @@ type PictureJob = (Vec<u8>, Option<[u32; 2]>, Vec<RawPlacement>);
 /// A slide item with its paint-order key.
 type Placed = (Vec<f64>, BoardItem);
 
-fn build<R: Read + Seek>(raw: RawBoard, fetch: &mut Fetch<'_, R>, store: &Store, progress: &Progress) -> Result<Board> {
+fn build<R: Read + Seek>(raw: RawBoard, fetch: &mut Fetch<'_, R>, store: &Store, progress: &Progress, have: &Have) -> Result<Board> {
     // Placements grouped by picture, so each is read and decoded once.
     let mut by_picture: Vec<Vec<RawPlacement>> = (0..raw.pictures.len()).map(|_| Vec::new()).collect();
     for p in raw.placements {
@@ -1398,7 +1633,7 @@ fn build<R: Read + Seek>(raw: RawBoard, fetch: &mut Fetch<'_, R>, store: &Store,
             s.spawn(|| loop {
                 let Ok((bytes, shown, placements)) = lock(&rx).recv() else { break };
                 if !progress.cancelled() {
-                    match place_picture(&bytes, shown, &placements, store) {
+                    match place_picture(&bytes, shown, &placements, store, have) {
                         Ok((placed, missed)) => {
                             lock(&items).extend(placed);
                             skipped.fetch_add(missed, Ordering::Relaxed);
@@ -1457,7 +1692,37 @@ fn build<R: Read + Seek>(raw: RawBoard, fetch: &mut Fetch<'_, R>, store: &Store,
         // A group paints under its own children.
         a.0.len().cmp(&b.0.len())
     });
-    Ok(Board { items: items.into_iter().map(|(_, item)| item).collect(), skipped: skipped.into_inner() })
+    Ok(Board { items: items.into_iter().map(|(_, item)| item).collect(), skipped: skipped.into_inner(), created: Vec::new() })
+}
+
+/// What a picture file is, from its header alone.
+struct Info {
+    /// Its bytes, hashed: a stored copy of the file is named by this.
+    hash: u64,
+    format: Option<image::ImageFormat>,
+    /// Its size as PureRef shows it, which crops and transforms are
+    /// relative to.
+    dims: [u32; 2],
+    /// A phone photo stored sideways that PureRef shows upright; it is
+    /// stored re-encoded, upright, rather than as the file it is.
+    turned: bool,
+    orientation: image::metadata::Orientation,
+}
+
+fn inspect(data: &[u8], shown: Option<[u32; 2]>) -> Result<Info> {
+    use image::metadata::Orientation as O;
+    use image::ImageDecoder;
+    let reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format().context("reading a picture")?;
+    let format = reader.format();
+    let mut decoder = reader.into_decoder().context("reading a picture")?;
+    let orientation = decoder.orientation().unwrap_or(O::NoTransforms);
+    let (w, h) = decoder.dimensions();
+    // A sideways photo shows upright only if PureRef turned it, which the
+    // size PureRef recorded gives away.
+    let turned = matches!(shown, Some([sw, sh]) if sw != sh && [sw, sh] == [h, w]);
+    let swaps = matches!(orientation, O::Rotate90 | O::Rotate270 | O::Rotate90FlipH | O::Rotate270FlipH);
+    let dims = if turned && swaps { [h, w] } else { [w, h] };
+    Ok(Info { hash: Fnv::of(data), format, dims, turned, orientation })
 }
 
 struct Decoded {
@@ -1468,24 +1733,17 @@ struct Decoded {
     as_stored: bool,
 }
 
-fn decode(data: &[u8], shown: Option<[u32; 2]>) -> Result<Decoded> {
-    use image::ImageDecoder;
+/// The pixels of a picture `inspect` read, as PureRef shows them.
+fn decode(data: &[u8], info: &Info) -> Result<Decoded> {
     let reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format().context("reading a picture")?;
-    let format = reader.format();
-    let mut decoder = reader.into_decoder().context("reading a picture")?;
-    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut img = image::DynamicImage::from_decoder(decoder).context("decoding a picture")?;
-    // A phone photo stored sideways shows upright only if PureRef turned
-    // it, which the size PureRef recorded gives away; its crops and
-    // transforms are relative to the picture as PureRef shows it.
-    let mut as_stored = true;
-    if let Some([w, h]) = shown {
-        if w != h && [w, h] == [img.height(), img.width()] {
-            img.apply_orientation(orientation);
-            as_stored = false;
-        }
+    let mut img = reader.decode().context("decoding a picture")?;
+    if info.turned {
+        img.apply_orientation(info.orientation);
     }
-    Ok(Decoded { img: img.to_rgba8(), format, as_stored })
+    if [img.width(), img.height()] != info.dims {
+        bail!("the picture is not the size its header says");
+    }
+    Ok(Decoded { img: img.to_rgba8(), format: info.format, as_stored: !info.turned })
 }
 
 /// Which part of a picture one placement shows, and where.
@@ -1502,14 +1760,21 @@ struct Cut {
 }
 
 impl Cut {
+    /// It covers the whole `dims`-sized picture, as a plain rectangle.
+    fn all(&self, dims: [u32; 2]) -> bool {
+        !self.masked && [self.x0, self.y0, self.w, self.h] == [0, 0, dims[0], dims[1]]
+    }
+
     /// The placement shows the whole picture as it is.
-    fn whole(&self, img: &image::RgbaImage) -> bool {
-        !self.masked && !self.mirrored && [self.x0, self.y0, self.w, self.h] == [0, 0, img.width(), img.height()]
+    fn whole(&self, dims: [u32; 2]) -> bool {
+        self.all(dims) && !self.mirrored
     }
 }
 
-fn cut_of(img: &image::RgbaImage, p: &RawPlacement) -> Option<Cut> {
-    let (w, h) = (f64::from(img.width()), f64::from(img.height()));
+/// Where placement `p` of a `dims`-sized picture is, and what part of it
+/// it shows.
+fn cut_of(dims: [u32; 2], p: &RawPlacement) -> Option<Cut> {
+    let (w, h) = (f64::from(dims[0]), f64::from(dims[1]));
     // Values within float noise of a whole pixel count as that pixel.
     let snap = |v: f64| if (v - v.round()).abs() < 1e-6 { v.round() } else { v };
     let (mut lo, mut hi) = ([0.0, 0.0], [w, h]);
@@ -1566,6 +1831,46 @@ fn cut_of(img: &image::RgbaImage, p: &RawPlacement) -> Option<Cut> {
     Some(Cut { x0, y0, w: cw, h: ch, masked, mirrored, center, half, rotation: u[1].atan2(u[0]) })
 }
 
+/// The extension a picture file in `format` keeps when stored as it is;
+/// `None` for one the app cannot read back, which is re-encoded.
+fn original_ext(format: Option<image::ImageFormat>) -> Option<&'static str> {
+    use image::ImageFormat as F;
+    match format {
+        Some(F::Png) => Some("png"),
+        Some(F::Jpeg) => Some("jpg"),
+        Some(F::WebP) => Some("webp"),
+        Some(F::Bmp) => Some("bmp"),
+        Some(F::Gif) => Some("gif"),
+        _ => None,
+    }
+}
+
+/// The file a cut is stored as when that is the picture's own file —
+/// as `store_cut` stores it, or a playing GIF — known from the header
+/// alone; `None` when it is re-encoded.
+fn stored_as(info: &Info, cut: &Cut) -> Option<StoredAs> {
+    let ext = original_ext(info.format).filter(|_| !cut.masked && !info.turned)?;
+    let crop = (!cut.all(info.dims)).then_some([cut.x0, cut.y0, cut.w, cut.h]);
+    Some(StoredAs { file: media_name(info.hash, ext), crop, mirror: cut.mirrored })
+}
+
+/// What a cut shows, hashed: the picture's bytes, the part shown, the
+/// outline cut out of it, mirrored or not.
+fn content_of(info: &Info, cut: &Cut, outline: &[[f64; 2]]) -> u64 {
+    let mut h = Fnv::default();
+    h.u64(info.hash).u64(u64::from(info.turned));
+    for v in [cut.x0, cut.y0, cut.w, cut.h] {
+        h.u64(u64::from(v));
+    }
+    h.u64(u64::from(cut.mirrored)).u64(u64::from(cut.masked));
+    if cut.masked {
+        for q in outline {
+            h.f64(q[0]).f64(q[1]);
+        }
+    }
+    h.0
+}
+
 /// What one stored cut of a picture became: its file, and the preview
 /// the slide keeps.
 #[derive(Clone)]
@@ -1576,36 +1881,65 @@ struct Stored {
 }
 
 /// Turn one picture's placements into slide items, storing what they
-/// show in the media folder. Returns the items and how many placements
-/// could not be shown. An error means the media folder could not be
-/// written, which stops the whole open.
-fn place_picture(bytes: &[u8], shown: Option<[u32; 2]>, placements: &[RawPlacement], store: &Store) -> Result<(Vec<Placed>, usize)> {
-    let decoded = match decode(bytes, shown) {
-        Ok(d) => d,
+/// show in the media folder — unless `have` says the slide shows it
+/// already, which leaves the picture undecoded. Returns the items and
+/// how many placements could not be shown. An error means the media
+/// folder could not be written, which stops the whole open.
+fn place_picture(bytes: &[u8], shown: Option<[u32; 2]>, placements: &[RawPlacement], store: &Store, have: &Have) -> Result<(Vec<Placed>, usize)> {
+    let info = match inspect(bytes, shown) {
+        Ok(i) => i,
         Err(e) => {
             log::warn!("PureRef picture skipped: {e:#}");
             return Ok((Vec::new(), placements.len()));
         }
     };
-    let img = &decoded.img;
+    // Decoded on first need; `Err` once that has failed.
+    let mut decoded: Option<std::result::Result<Decoded, ()>> = None;
     // An animated GIF plays where it is shown whole; a crop or mirror of
     // one is a still of its first frame, as the player cannot show those.
-    let animation = (decoded.format == Some(image::ImageFormat::Gif))
-        .then(|| super::gif_player::scan_reader(std::io::Cursor::new(bytes)).ok())
-        .flatten()
-        .filter(|s| s.frames > 1);
+    let mut animation: Option<Option<super::gif_player::GifScan>> = None;
     let mut gif: Option<(MediaRef, Arc<Vec<u8>>, [u32; 2])> = None;
     let mut original: Option<String> = None;
     let mut made: HashMap<(u32, u32, u32, u32, bool), Stored> = HashMap::new();
     let mut out = Vec::new();
     let mut missed = 0;
     for p in placements {
-        let Some(cut) = cut_of(img, p) else {
+        let Some(cut) = cut_of(info.dims, p) else {
             missed += 1;
             continue;
         };
-        let item = match animation {
-            Some(scan) if cut.whole(img) && decoded.as_stored => {
+        let file = stored_as(&info, &cut);
+        let content = content_of(&info, &cut, &p.crop);
+        let item = |shown: Option<Shown>| BoardItem::Picture {
+            shown: shown.map(Box::new),
+            file: file.clone(),
+            content,
+            center: cut.center,
+            half: cut.half,
+            rotation: cut.rotation,
+            group: p.root,
+            key: p.key,
+            tags: p.tags.clone(),
+        };
+        if have.has(content, file.as_ref()) {
+            out.push((p.order.clone(), item(None)));
+            continue;
+        }
+        let d = decoded.get_or_insert_with(|| {
+            decode(bytes, &info).map_err(|e| log::warn!("PureRef picture skipped: {e:#}"))
+        });
+        let Ok(d) = d else {
+            missed += 1;
+            continue;
+        };
+        let img = &d.img;
+        let scan = if info.format == Some(image::ImageFormat::Gif) && cut.whole(info.dims) && d.as_stored {
+            *animation.get_or_insert_with(|| super::gif_player::scan_reader(std::io::Cursor::new(bytes)).ok().filter(|s| s.frames > 1))
+        } else {
+            None
+        };
+        let shown = match scan {
+            Some(scan) => {
                 if gif.is_none() {
                     let file = store.put(bytes, "gif")?;
                     // The poster only shows until the GIF starts playing,
@@ -1618,42 +1952,24 @@ fn place_picture(bytes: &[u8], shown: Option<[u32; 2]>, placements: &[RawPlaceme
                 let Some((media, poster, size)) = &gif else { unreachable!("set just above") };
                 let mut media = media.clone();
                 media.id = fresh_media_id();
-                BoardItem::Picture {
-                    png: Arc::clone(poster),
-                    px_size: *size,
-                    picture: None,
-                    media: Some(media),
-                    center: cut.center,
-                    half: cut.half,
-                    rotation: cut.rotation,
-                    group: p.root,
-                }
+                Shown { png: Arc::clone(poster), px_size: *size, picture: None, media: Some(media) }
             }
-            _ => {
+            None => {
                 let key = (cut.x0, cut.y0, cut.w, cut.h, cut.mirrored);
                 let stored = match made.get(&key) {
                     Some(s) if !cut.masked => s.clone(),
                     _ => {
-                        let s = store_cut(bytes, &decoded, &cut, &p.crop, store, &mut original)?;
+                        let s = store_cut(bytes, d, &cut, &p.crop, store, &mut original)?;
                         if !cut.masked {
                             made.insert(key, s.clone());
                         }
                         s
                     }
                 };
-                BoardItem::Picture {
-                    png: stored.preview,
-                    px_size: stored.preview_size,
-                    picture: Some(stored.picture),
-                    media: None,
-                    center: cut.center,
-                    half: cut.half,
-                    rotation: cut.rotation,
-                    group: p.root,
-                }
+                Shown { png: stored.preview, px_size: stored.preview_size, picture: Some(stored.picture), media: None }
             }
         };
-        out.push((p.order.clone(), item));
+        out.push((p.order.clone(), item(Some(shown))));
     }
     Ok((out, missed))
 }
@@ -1665,23 +1981,16 @@ fn place_picture(bytes: &[u8], shown: Option<[u32; 2]>, placements: &[RawPlaceme
 /// again is re-encoded instead (JPEG when opaque, else PNG) at most
 /// `IMAGE_SIDE` pixels.
 fn store_cut(bytes: &[u8], decoded: &Decoded, cut: &Cut, outline: &[[f64; 2]], store: &Store, original: &mut Option<String>) -> Result<Stored> {
-    use image::ImageFormat as F;
     let img = &decoded.img;
-    let original_ext = match decoded.format {
-        Some(F::Png) => Some("png"),
-        Some(F::Jpeg) => Some("jpg"),
-        Some(F::WebP) => Some("webp"),
-        Some(F::Bmp) => Some("bmp"),
-        Some(F::Gif) => Some("gif"),
-        _ => None,
-    };
-    let (picture, preview) = match original_ext.filter(|_| !cut.masked && decoded.as_stored) {
+    // Kept in step with `stored_as`, which says what this stores without
+    // decoding the picture.
+    let (picture, preview) = match original_ext(decoded.format).filter(|_| !cut.masked && decoded.as_stored) {
         Some(ext) => {
             let file = match original {
                 Some(f) => f.clone(),
                 None => original.insert(store.put(bytes, ext)?).clone(),
             };
-            let all = [cut.x0, cut.y0, cut.w, cut.h] == [0, 0, img.width(), img.height()];
+            let all = cut.all([img.width(), img.height()]);
             let picture = PictureRef { file, size: [cut.w, cut.h], crop: (!all).then_some([cut.x0, cut.y0, cut.w, cut.h]), mirror: cut.mirrored };
             let preview = picture.view(img, PREVIEW_SIDE);
             (picture, preview)
@@ -1771,7 +2080,17 @@ fn place_note(n: &RawNote) -> Option<BoardItem> {
     if !(pos.iter().all(|v| v.is_finite()) && font_size > 0.0 && font_size.is_finite()) {
         return None;
     }
-    Some(BoardItem::Note { text, pos, font_size, color: n.color, rotation: u[1].atan2(u[0]), background: n.background, group: n.root })
+    Some(BoardItem::Note {
+        text,
+        pos,
+        font_size,
+        color: n.color,
+        rotation: u[1].atan2(u[0]),
+        background: n.background,
+        group: n.root,
+        key: n.key,
+        tags: n.tags.clone(),
+    })
 }
 
 /// Word-wrap `text` to lines about `width` note units long at
@@ -1868,7 +2187,7 @@ mod tests {
     fn open_bytes_with(bytes: Vec<u8>, db_in_memory_max: u64) -> (Board, TempDir) {
         let media = TempDir::new("media");
         let len = bytes.len() as u64;
-        let board = open_from(std::io::Cursor::new(bytes), len, &media.0, &Progress::default(), db_in_memory_max).unwrap();
+        let board = open_from(std::io::Cursor::new(bytes), len, &media.0, &Progress::default(), db_in_memory_max, &Have::default()).unwrap();
         (board, media)
     }
 
@@ -1916,9 +2235,10 @@ mod tests {
 
     fn picture(item: &BoardItem) -> Pic<'_> {
         match item {
-            BoardItem::Picture { png, picture, media, center, half, rotation, .. } => {
-                Pic { png, picture: picture.as_ref(), media: media.as_ref(), center: *center, half: *half, rotation: *rotation }
+            BoardItem::Picture { shown: Some(s), center, half, rotation, .. } => {
+                Pic { png: &s.png, picture: s.picture.as_ref(), media: s.media.as_ref(), center: *center, half: *half, rotation: *rotation }
             }
+            BoardItem::Picture { shown: None, .. } => panic!("expected a loaded picture"),
             BoardItem::Note { .. } => panic!("expected a picture"),
         }
     }
@@ -2167,7 +2487,7 @@ mod tests {
         assert!(close(rotation, 0.0));
         // A note on a picture moves with it: one group on the slide.
         assert_eq!(board.items[0].group(), board.items[1].group());
-        let slide = into_canvas(board, [800.0, 600.0], 1.0, "");
+        let slide = into_canvas(board, [800.0, 600.0], 1.0, "", Path::new("b.pur"));
         let shapes = &slide.layers[0].shapes;
         assert!(shapes[0].group() != 0 && shapes[0].group() == shapes[1].group());
     }
@@ -2309,6 +2629,67 @@ mod tests {
         check_v2_board(&board, &media);
     }
 
+    /// Named groups become tags on what they hold (one word each, outer
+    /// group first); unnamed ones give none. Items keep their board ids.
+    #[test]
+    fn v2_named_groups_tag_their_members() {
+        use rusqlite::params;
+        let conn = v2_db();
+        conn.execute("INSERT INTO images (id, format, data, width, height) VALUES (1, 'PNG', ?1, 40, 20)", params![two_tone_png(40, 20)]).unwrap();
+        // Group 10 "walk cycle" holds group 11 "#Ref", which holds item 1;
+        // group 12, unnamed, holds item 2.
+        for (id, parent, name) in [(10, -1, Some("walk cycle")), (11, 10, Some("#Ref")), (12, -1, None)] {
+            conn.execute("INSERT INTO items (parent, id, name, transform, z) VALUES (?1, ?2, ?3, ?4, 0)", params![parent, id, name, qt_blob(move_by(0.0, 0.0))]).unwrap();
+            conn.execute("INSERT INTO items_groups (id) VALUES (?1)", params![id]).unwrap();
+        }
+        v2_place(&conn, 1, 1, 40.0, 20.0, move_by(0.0, 0.0), 1.0, None);
+        v2_place(&conn, 2, 1, 40.0, 20.0, move_by(100.0, 0.0), 2.0, None);
+        conn.execute("UPDATE items SET parent = 11 WHERE id = 1", []).unwrap();
+        conn.execute("UPDATE items SET parent = 12, name = 'a picture name' WHERE id = 2", []).unwrap();
+        let (board, _media) = open_bytes(v2_container(&conn.serialize(rusqlite::MAIN_DB).unwrap()));
+        let by_key = |k: i64| board.items.iter().find(|i| i.key() == k).expect("item");
+        assert_eq!(by_key(1).tags(), ["walk-cycle".to_string(), "Ref".to_string()]);
+        assert!(by_key(2).tags().is_empty(), "unnamed group, and a picture's own name is no tag");
+        let slide = into_canvas(board, [800.0, 600.0], 1.0, "", Path::new("b.pur"));
+        let link = slide.board.as_ref().unwrap();
+        assert_eq!(link.items.len(), 2);
+        let tagged = slide.layers[0].shapes.iter().find(|s| !s.tags().is_empty()).unwrap();
+        assert_eq!(link.item(tagged.link()).map(|i| i.key), Some(1));
+    }
+
+    /// Reading a board again for a resync decodes and stores nothing the
+    /// slide already shows, yet places it the same.
+    #[test]
+    fn a_resync_read_skips_what_the_slide_shows() {
+        let png = two_tone_png(40, 20);
+        let bytes = v1_board(
+            &[(1, Slot::Png(png.clone())), (2, Slot::Same(1))],
+            &[image(1, 40.0, 20.0, qt(2.0, 2.0, FRAC_PI_2, 100.0, 50.0), 1.0), image(2, 40.0, 20.0, qt(-1.0, 1.0, 0.0, 0.0, 0.0), 2.0)],
+        );
+        let (first, _media) = open_bytes(bytes.clone());
+        let slide = into_canvas(first, [800.0, 600.0], 1.0, "", Path::new("b.pur"));
+        let have = super::super::pureref_sync::have(&slide);
+        assert_eq!((have.contents.len(), have.files.len()), (2, 2), "a picture and its mirror");
+
+        let fresh = TempDir::new("resync");
+        let len = bytes.len() as u64;
+        let again = open_from(std::io::Cursor::new(bytes), len, &fresh.0, &Progress::default(), DB_IN_MEMORY_MAX, &have).unwrap();
+        assert!(fresh.files().is_empty() && again.created.is_empty(), "nothing stored");
+        let (first, _m) = open_bytes(v1_board(
+            &[(1, Slot::Png(png)), (2, Slot::Same(1))],
+            &[image(1, 40.0, 20.0, qt(2.0, 2.0, FRAC_PI_2, 100.0, 50.0), 1.0), image(2, 40.0, 20.0, qt(-1.0, 1.0, 0.0, 0.0, 0.0), 2.0)],
+        ));
+        for (a, b) in first.items.iter().zip(&again.items) {
+            let (BoardItem::Picture { shown: Some(s), file: fa, content: ca, center: pa, .. }, BoardItem::Picture { shown: None, file: fb, content: cb, center: pb, .. }) = (a, b) else {
+                panic!("loaded, then not");
+            };
+            assert_eq!((fa, ca, pa), (fb, cb, pb));
+            // What it would be stored as is what it was stored as.
+            let p = s.picture.as_ref().unwrap();
+            assert_eq!(fa.as_ref(), Some(&StoredAs { file: p.file.clone(), crop: p.crop, mirror: p.mirror }));
+        }
+    }
+
     /// A big board's database goes through a temporary file instead of
     /// memory, with the same result.
     #[test]
@@ -2349,7 +2730,7 @@ mod tests {
         let progress = Progress::default();
         progress.cancel();
         let len = bytes.len() as u64;
-        let err = open_from(std::io::Cursor::new(bytes), len, &media.0, &progress, DB_IN_MEMORY_MAX).err().expect("cancelled");
+        let err = open_from(std::io::Cursor::new(bytes), len, &media.0, &progress, DB_IN_MEMORY_MAX, &Have::default()).err().expect("cancelled");
         assert_eq!(format!("{err}"), "cancelled");
         assert!(media.files().is_empty());
     }
@@ -2363,7 +2744,7 @@ mod tests {
         );
         let progress = Progress::default();
         let len = bytes.len() as u64;
-        open_from(std::io::Cursor::new(bytes), len, &media.0, &progress, DB_IN_MEMORY_MAX).unwrap();
+        open_from(std::io::Cursor::new(bytes), len, &media.0, &progress, DB_IN_MEMORY_MAX, &Have::default()).unwrap();
         assert_eq!(progress.get(), (Stage::Pictures, 2, 2));
     }
 
@@ -2372,7 +2753,7 @@ mod tests {
         let media = TempDir::new("damaged");
         let try_open = |b: Vec<u8>| {
             let len = b.len() as u64;
-            let _ = open_from(std::io::Cursor::new(b), len, &media.0, &Progress::default(), DB_IN_MEMORY_MAX);
+            let _ = open_from(std::io::Cursor::new(b), len, &media.0, &Progress::default(), DB_IN_MEMORY_MAX, &Have::default());
         };
         for good in [
             v1_board(&[(1, Slot::Png(two_tone_png(8, 8)))], &[image(1, 8.0, 8.0, move_by(0.0, 0.0), 1.0)]),
@@ -2388,8 +2769,8 @@ mod tests {
             try_open(garbled);
         }
         let len = 24;
-        assert!(open_from(std::io::Cursor::new(b"PNG\x89 not a board at all".to_vec()), len, &media.0, &Progress::default(), 0).is_err());
-        assert!(open_from(std::io::Cursor::new(Vec::new()), 0, &media.0, &Progress::default(), 0).is_err());
+        assert!(open_from(std::io::Cursor::new(b"PNG\x89 not a board at all".to_vec()), len, &media.0, &Progress::default(), 0, &Have::default()).is_err());
+        assert!(open_from(std::io::Cursor::new(Vec::new()), 0, &media.0, &Progress::default(), 0, &Have::default()).is_err());
     }
 
     #[test]
@@ -2413,15 +2794,17 @@ mod tests {
 
     fn lone_picture(center: [f64; 2], half: [f64; 2]) -> Board {
         let picture = Some(PictureRef { file: "x.png".into(), size: [1, 1], crop: None, mirror: false });
+        let shown = Some(Shown { png: Arc::new(Vec::new()), px_size: [1, 1], picture, media: None });
         Board {
-            items: vec![BoardItem::Picture { png: Arc::new(Vec::new()), px_size: [1, 1], picture, media: None, center, half, rotation: 0.0, group: 0 }],
+            items: vec![BoardItem::Picture { shown: shown.map(Box::new), file: None, content: 0, center, half, rotation: 0.0, group: 0, key: 1, tags: Vec::new() }],
             skipped: 0,
+            created: Vec::new(),
         }
     }
 
     #[test]
     fn a_board_fits_and_centres_in_the_view() {
-        let c = into_canvas(lone_picture([5000.0, -40.0], [1000.0, 500.0]), [800.0, 600.0], 1.0, "refs");
+        let c = into_canvas(lone_picture([5000.0, -40.0], [1000.0, 500.0]), [800.0, 600.0], 1.0, "refs", Path::new("refs.pur"));
         assert_eq!(c.layers[0].name, "refs");
         let Shape::Raster { pos, size, kind, media, picture, .. } = &c.layers[0].shapes[0] else { panic!("expected a picture") };
         // Limited by the width: 90 % of 800 over 2000.
@@ -2432,7 +2815,7 @@ mod tests {
 
         // A small board stays at natural size: one picture pixel per
         // physical pixel, so half as many points at 200 % display scale.
-        let c = into_canvas(lone_picture([0.0, 0.0], [10.0, 10.0]), [800.0, 600.0], 2.0, "");
+        let c = into_canvas(lone_picture([0.0, 0.0], [10.0, 10.0]), [800.0, 600.0], 2.0, "", Path::new("b.pur"));
         let Shape::Raster { pos, size, .. } = &c.layers[0].shapes[0] else { panic!("expected a picture") };
         assert_eq!((*pos, *size), ([395.0, 295.0], [10.0, 10.0]));
     }
@@ -2462,15 +2845,20 @@ mod tests {
         let before = snapshot();
         assert!(is_pureref(&board_path));
 
-        let board = open(&board_path, &media.0, &Progress::default()).unwrap();
-        let canvas = into_canvas(board, [800.0, 600.0], 1.0, "Board");
+        let board = open(&board_path, &media.0, &Progress::default(), &Have::default()).unwrap();
+        let canvas = into_canvas(board, [800.0, 600.0], 1.0, "Board", &board_path);
         let mut used = HashSet::new();
         canvas.media_files(&mut used);
         let mut used: Vec<String> = used.into_iter().collect();
         used.sort();
         assert_eq!(used, media.files(), "the slide uses exactly the copies it stored, which cleanup tracks");
+        // The board's path is kept only to read it again for a resync;
+        // nothing points at the pictures' own files, and cleanup only
+        // knows the media folder's copies (checked above).
         let saved = crate::persistence::serialize_canvas(&canvas).unwrap();
-        assert!(!saved.contains("Board.PUR") && !saved.contains("pic.png") && !saved.contains("refs/pic"), "no path back to the originals");
+        assert_eq!(saved.matches("Board.PUR").count(), 1, "the board, once, in the slide's link");
+        assert!(canvas.board.as_ref().is_some_and(|b| b.path == board_path));
+        assert!(!saved.contains("pic.png") && !saved.contains("refs/pic"), "no path to the pictures' files");
         drop(canvas);
 
         assert!(before == snapshot(), "the board folder is unchanged");
@@ -2492,12 +2880,12 @@ mod tests {
             let path = Path::new(path.trim());
             let before = std::fs::metadata(path).unwrap();
             let t = std::time::Instant::now();
-            let board = open(path, &media_dir, &Progress::default()).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+            let board = open(path, &media_dir, &Progress::default(), &Have::default()).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
             let (pictures, notes) = board.counts();
-            let gifs = board.items.iter().filter(|i| matches!(i, BoardItem::Picture { media: Some(_), .. })).count();
+            let gifs = board.items.iter().filter(|i| matches!(i, BoardItem::Picture { shown: Some(s), .. } if s.media.is_some())).count();
             println!("{}: {pictures} pictures ({gifs} playing GIFs), {notes} notes, {} skipped, {:?}", path.display(), board.skipped, t.elapsed());
             let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-            let canvas = into_canvas(board, [1920.0, 1080.0], 1.0, &name);
+            let canvas = into_canvas(board, [1920.0, 1080.0], 1.0, &name, path);
             let shapes = &canvas.layers[0].shapes;
             let groups: HashSet<u64> = shapes.iter().map(Shape::group).filter(|&g| g != 0).collect();
             let grouped = shapes.iter().filter(|s| s.group() != 0).count();

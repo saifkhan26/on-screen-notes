@@ -207,6 +207,7 @@ the binary on first launch.
 | Straight line | toolbar only | |
 | Insert picture / video / GIF | toolbar film button, or drag & drop | See [Videos & GIFs](#videos--gifs) |
 | Open a PureRef board | toolbar film button, or drag & drop a `.pur` | Opens as a new slide; see [PureRef boards](#pureref-boards) |
+| Resync a slide from its PureRef board | slide panel right-click, or the command palette | Brings over board changes, deletes nothing; see [PureRef boards](#pureref-boards) |
 
 ### Shape snap
 
@@ -764,7 +765,10 @@ by PureRef 2 (including 2's "save as legacy") both work.
   them: those come in as a still of the first frame.
 - **Groups** come over: what moves together in PureRef — a group's
   contents, a picture and the notes on it — is one group on the slide.
-  A group inside a group becomes part of the outer one.
+  A group inside a group becomes part of the outer one. A **named**
+  group's name becomes a tag on each of its members (one word: spaces
+  become `-`, so "walk cycle" is `#walk-cycle`), and so does the name of
+  every named group around it; find (Ctrl+F) and the filter know them.
 - **Notes** become text labels with their colour and rotation, wrapped
   to the note's width when it has a fixed one. A note's background
   becomes the label's box, in the note's colour; rich-text styling is
@@ -784,8 +788,46 @@ picture is loaded in the background at about the size it is shown, so a
 big board opens quickly and zooming in sharpens what you look at.
 Screenshots use the full pictures.
 
-Opening is one-way: the board file is only read, never changed, and
-the slide keeps no link to it or to the pictures' original files.
+**Resync from PureRef.** Keep working on the board in PureRef, then
+right-click the slide in the slide panel → **Resync from *board*.pur**
+(or the command palette's "Resync from PureRef", or a key you bind to
+`canvas.resync_pureref`). The slide is brought up to date with the
+board and **nothing on the slide is deleted**:
+
+- What changed on the board since the last resync comes over, part by
+  part — where an item is, its size and turn, its crop or picture, a
+  note's text and colours, its group, its group's name as a tag. What
+  the board did not change keeps your edits on the slide: move a picture
+  on the slide and leave it alone in PureRef, and it stays where you put
+  it. Where both changed the same part, the board's version wins.
+- New items on the board are added at their place and depth, and left
+  selected so you can see them.
+- Your additions are never touched: ink, shapes, labels and pictures you
+  added, tags you typed. Group tags are only added — a group renamed in
+  PureRef leaves its old name on its members too.
+- Items deleted from the board **stay on the slide**. The filter's
+  **Gone from the board** row (or the command palette's "Highlight what
+  is gone from the PureRef board") highlights them, so you can decide.
+- Items you deleted on the slide stay deleted.
+- The whole resync is **one undo step**. Only pictures the slide does
+  not show yet are decoded, so a resync of an unchanged board is quick.
+
+Slides opened from a board before resync existed do not know their
+board yet: the first resync asks for the `.pur` file and links the slide
+by matching — pictures by the picture they show, notes by their text,
+and by position for anything edited since. Matched items keep the
+slide's version but join their board group and gain its name as a tag
+(a board group the slide never had a group for is made on the next
+resync; one you ungroup on the slide afterwards stays ungrouped); board
+items with no match
+are added and selected, in case they are ones you had deleted (Delete
+them again and later resyncs leave them out). A board with too little
+in common with the slide is refused. If a board has moved, the next
+resync asks where it is.
+
+Opening is one-way: the board file is only read, never changed. The
+slide keeps the board's path only to read it again for a resync, and no
+link to the pictures' original files.
 Deleting the slide never touches the `.pur` file or any picture on disk;
 the app's own copies in `media` are deleted once the slides are saved
 without it and nothing else uses them (another slide, undo history, the

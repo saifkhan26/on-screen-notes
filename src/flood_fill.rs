@@ -217,5 +217,6 @@ pub fn flood_fill_active(
         group: 0,
         tags: Vec::new(),
         turn: 0.0,
+        link: 0,
     })
 }

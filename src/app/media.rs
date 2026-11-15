@@ -70,6 +70,19 @@ impl OnScreenNotesApp {
                 Err(TryRecvError::Empty) => {}
             }
         }
+        if let Some((slide, rx)) = &self.resync_dialog {
+            match rx.try_recv() {
+                Ok(paths) => {
+                    let slide = *slide;
+                    self.resync_dialog = None;
+                    if let Some(p) = paths.into_iter().next() {
+                        self.resync_from(slide, p);
+                    }
+                }
+                Err(TryRecvError::Disconnected) => self.resync_dialog = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
 
         let (dropped, hovering) = ctx.input(|i| (i.raw.dropped_files.clone(), !i.raw.hovered_files.is_empty()));
         // Dropped on find: look for pictures like it, insert nothing.
@@ -142,13 +155,18 @@ impl OnScreenNotesApp {
         let mut boards = Vec::new();
         self.pureref_jobs.retain(|job| match job.take() {
             Some(r) => {
-                boards.push((job.path.clone(), job.file_name(), r));
+                boards.push((job.path.clone(), job.file_name(), job.resync.clone(), r));
                 false
             }
             None => true,
         });
-        for (path, name, result) in boards {
+        for (path, name, resync, result) in boards {
             match result {
+                Ok(board) if resync.is_some() => {
+                    if let Some(target) = resync {
+                        self.finish_resync(&target, &path, &name, board);
+                    }
+                }
                 Ok(board) => {
                     let (pictures, notes) = board.counts();
                     let skipped = board.skipped;
@@ -158,6 +176,7 @@ impl OnScreenNotesApp {
                         [canvas_rect.width(), canvas_rect.height()],
                         ctx.pixels_per_point(),
                         &stem,
+                        &path,
                     );
                     let idx = self.canvases.push_canvas(canvas);
                     // The board's file name is the slide's first name.
@@ -175,11 +194,13 @@ impl OnScreenNotesApp {
                     self.toast = Some((msg, Instant::now()));
                 }
                 Err(e) if e == "cancelled" => {
-                    self.toast = Some((format!("Stopped opening {name}"), Instant::now()));
+                    let what = if resync.is_some() { "resyncing from" } else { "opening" };
+                    self.toast = Some((format!("Stopped {what} {name} — nothing changed"), Instant::now()));
                 }
                 Err(e) => {
                     log::warn!("opening {name} failed: {e}");
-                    self.toast = Some((format!("Couldn't open {name}: {e}"), Instant::now()));
+                    let what = if resync.is_some() { "resync from" } else { "open" };
+                    self.toast = Some((format!("Couldn't {what} {name}: {e}"), Instant::now()));
                 }
             }
         }
@@ -189,6 +210,114 @@ impl OnScreenNotesApp {
     /// The board file is only read, never written.
     pub(crate) fn start_pureref_open(&mut self, path: std::path::PathBuf) {
         self.pureref_jobs.push(crate::media::pureref::OpenJob::start(path));
+    }
+
+    /// Resync slide `slide` from the PureRef board it was opened from
+    /// (`media::pureref_sync`): from the board it remembers, or, for a
+    /// slide opened before slides remembered it or a board since moved,
+    /// from one picked in a dialog.
+    pub(super) fn start_resync(&mut self, slide: usize) {
+        if self.canvases.is_locked(slide) {
+            self.toast = Some((format!("Not resynced: this slide is locked — {} unlocks it", self.lock_key()), Instant::now()));
+            return;
+        }
+        if self.pureref_jobs.iter().any(|j| j.resync.as_ref().is_some_and(|t| t.slide == slide)) || self.resync_dialog.is_some() {
+            self.toast = Some(("Already resyncing this slide".to_string(), Instant::now()));
+            return;
+        }
+        let Some(c) = self.canvases.slide(slide) else {
+            self.canvases.prefetch(slide);
+            self.toast = Some(("That slide is still opening — try again in a moment".to_string(), Instant::now()));
+            return;
+        };
+        match c.board.as_ref().map(|b| b.path.clone()) {
+            Some(p) if p.is_file() => self.resync_from(slide, p),
+            known => {
+                let title = match &known {
+                    Some(p) => format!(
+                        "{} is not where it was — pick the board to resync from",
+                        p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                    ),
+                    None => "Pick the PureRef board this slide was opened from".to_string(),
+                };
+                let rx = ui::media_controls::pick_files(self.osn_hwnd, &title, &[("PureRef boards", &["pur"])], false);
+                self.resync_dialog = Some((slide, rx));
+            }
+        }
+    }
+
+    /// Start reading `path` to resync slide `slide`. Only the pictures the
+    /// slide does not show yet are decoded and stored.
+    fn resync_from(&mut self, slide: usize, path: std::path::PathBuf) {
+        let Some(c) = self.canvases.slide(slide) else { return };
+        let target = crate::media::pureref::ResyncTarget {
+            slide,
+            name: self.canvases.name(slide).to_string(),
+            linked: c.board.as_ref().map(|b| b.path.clone()),
+        };
+        let have = crate::media::pureref_sync::have(c);
+        self.pureref_jobs.push(crate::media::pureref::OpenJob::resync(path, target, have));
+    }
+
+    /// Merge a board read for a resync into its slide, as one undo step,
+    /// and select what came in new when that slide is shown.
+    fn finish_resync(&mut self, target: &crate::media::pureref::ResyncTarget, path: &std::path::Path, name: &str, mut board: crate::media::pureref::Board) {
+        use crate::media::pureref_sync::{merge, Merged};
+        // What the read stored that the slide may not use. Only files this
+        // read created are listed, and the cleanup keeps any in use.
+        self.canvases.check_media(std::mem::take(&mut board.created));
+        // The slide, wherever it is now: slides can move while a board is
+        // read.
+        let same = |i: usize, me: &Self| {
+            me.canvases.slide(i).is_some_and(|c| c.board.as_ref().map(|b| &b.path) == target.linked.as_ref()) && me.canvases.name(i) == target.name
+        };
+        let slide = if same(target.slide, self) {
+            Some(target.slide)
+        } else {
+            let found: Vec<usize> = (0..self.canvases.count()).filter(|&i| same(i, self)).collect();
+            (found.len() == 1).then(|| found[0])
+        };
+        let Some(slide) = slide else {
+            self.toast = Some(("Not resynced: the slide changed while the board was read — resync it again".to_string(), Instant::now()));
+            return;
+        };
+        if self.canvases.is_locked(slide) {
+            self.toast = Some((format!("Not resynced: this slide is locked — {} unlocks it", self.lock_key()), Instant::now()));
+            return;
+        }
+        let Some(c) = self.canvases.slide(slide) else { return };
+        let (pan, zoom, layer) = (c.pan, c.zoom, c.active_layer);
+        let Merged { layers, link, added, report } = match merge(c, board, path, layer) {
+            Ok(m) => m,
+            Err(e) => {
+                self.toast = Some((e, Instant::now()));
+                return;
+            }
+        };
+        let nothing = layers.is_empty();
+        self.canvases.edit_slide_in_view(slide, pan, zoom, |c| {
+            if nothing {
+                // Only what the link records changed (say an item gone from
+                // the board whose shape was deleted here): no undo step that
+                // seems to do nothing.
+                c.board = Some(Box::new(link));
+                c.dirty = true;
+            } else {
+                c.apply_resync(layers, link);
+            }
+        });
+        // What came in new, selected, to look over.
+        let active = self.canvases.active_index() == slide;
+        let li = self.canvases.active().active_layer;
+        let shapes: Vec<usize> = added.iter().filter(|(l, _)| *l == li).map(|&(_, i)| i).collect();
+        let selected = active && !shapes.is_empty();
+        if selected {
+            self.tool.kind = crate::tools::ToolKind::Select;
+            self.tool.select.gesture = None;
+            self.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
+            self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        }
+        self.toast = Some((resync_message(name, slide, &report, selected), Instant::now()));
     }
 
     /// A card at the bottom of the screen for each board being opened:
@@ -212,6 +341,7 @@ impl OnScreenNotesApp {
                                 format!("Reading {name} — {} of {} MB", done >> 20, total >> 20)
                             }
                             Stage::Reading => format!("Reading {name}…"),
+                            Stage::Pictures if job.resync.is_some() => format!("Resyncing from {name} — picture {} of {total}", done.min(total)),
                             Stage::Pictures => format!("Opening {name} — picture {} of {total}", done.min(total)),
                         };
                         if i > 0 {
@@ -278,6 +408,7 @@ impl OnScreenNotesApp {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         };
         if let Some((a, b)) = beside.then(|| self.beside_selection(crate::canvas::canvas::shape_bounds(&shape))).flatten() {
             shape.transform(a, b);
@@ -324,5 +455,31 @@ impl OnScreenNotesApp {
             "Onion skin off"
         };
         self.toast = Some((msg.to_string(), Instant::now()));
+    }
+}
+
+/// What a resync did, in a line: "Resynced slide 3 from refs.pur — 2
+/// updated, 1 added (selected), 1 gone from the board (kept …)".
+fn resync_message(name: &str, slide: usize, r: &crate::media::pureref_sync::Report, selected: bool) -> String {
+    let mut parts = Vec::new();
+    if let Some(n) = r.linked {
+        parts.push(format!("{n} linked"));
+    }
+    if r.updated > 0 {
+        parts.push(format!("{} updated", r.updated));
+    }
+    if r.added > 0 {
+        parts.push(format!("{} added{}", r.added, if selected { " (selected)" } else { "" }));
+    }
+    if r.gone > 0 {
+        parts.push(format!("{} gone from the board, kept here (the filter can highlight them)", r.gone));
+    }
+    if r.skipped > 0 {
+        parts.push(format!("{} skipped", r.skipped));
+    }
+    if parts.is_empty() {
+        format!("Slide {} is up to date with {name}", slide + 1)
+    } else {
+        format!("Resynced slide {} from {name} — {}", slide + 1, parts.join(", "))
     }
 }

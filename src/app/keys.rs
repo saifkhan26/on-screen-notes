@@ -450,6 +450,7 @@ impl OnScreenNotesApp {
                 self.canvases.push_canvas(crate::canvas::canvas::Canvas::default());
             }
             Some(ui::slide_panel::SlideAction::Move(from, to)) => self.move_slide(from, to),
+            Some(ui::slide_panel::SlideAction::Resync(i)) => self.start_resync(i),
             Some(ui::slide_panel::SlideAction::OpenWindow(i)) => match self.slide_window.as_mut() {
                 // One slide window: asking again shows the slide there.
                 Some(win) => {
