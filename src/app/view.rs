@@ -65,8 +65,8 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// Glide the view to show the selection; with nothing selected, the
-    /// whole slide.
+    /// Glide the view to show the selection, fitted to the view by its
+    /// size however small it is; with nothing selected, the whole slide.
     pub(super) fn zoom_to_selection(&mut self, ctx: &egui::Context) {
         match self.selection_bounds() {
             Some(b) => {

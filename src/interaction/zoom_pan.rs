@@ -141,9 +141,12 @@ fn zoom_about_cursor(pan: &mut [f32; 2], zoom: &mut f32, raw_delta_y: f32, curso
 /// Most a zoom to fit enlarges the whole slide: a slide holding one
 /// small note should not fill the screen with it.
 pub const FIT_MAX_ZOOM: f32 = 4.0;
-/// Most a zoom to the selection enlarges: one handwritten word comes up
-/// to read comfortably, not to a blur.
-pub const FIT_SELECTION_MAX_ZOOM: f32 = 8.0;
+/// Most a zoom to the selection enlarges: no fixed most, so the
+/// selection fills the view however small it is on the board. How far
+/// in goes by the selection's size, not by a set zoom level — a small
+/// picture on a big board, seen far out, comes right up to the screen.
+/// A fixed most (it was 8×) left such a selection a speck there.
+pub const FIT_SELECTION_MAX_ZOOM: f32 = MAX_ZOOM;
 
 /// The view (`pan`, `zoom`) that shows the canvas box `[x0, y0, x1, y1]`
 /// whole and centred in `area` — `[x, y, width, height]` in the same
@@ -319,6 +322,22 @@ mod tests {
         assert_eq!(view.1, FIT_MAX_ZOOM);
         let c = on_screen(view, [1.0, 1.0]);
         assert!((c[0] - 220.0).abs() < 1e-3 && (c[1] - 210.0).abs() < 1e-3);
+    }
+
+    /// A selection fills the view by its own size, far past the old
+    /// fixed 8×: a small object on a big board comes right up.
+    #[test]
+    fn a_small_selection_fills_the_view_whatever_its_size() {
+        let area = [0.0, 0.0, 1800.0, 1000.0];
+        for (w, h) in [(20.0, 10.0), (2.0, 1.0), (900.0, 500.0)] {
+            let b = [100.0, 100.0, 100.0 + w, 100.0 + h];
+            let view = fit_view(b, area, FIT_SELECTION_MAX_ZOOM);
+            assert!((view.1 - 1800.0 / w).abs() < 1e-3 * view.1, "{w}×{h}: zoom {}", view.1);
+            let (a, z) = (on_screen(view, [b[0], b[1]]), on_screen(view, [b[2], b[3]]));
+            assert!(a[0].abs() < 0.05 && (z[0] - 1800.0).abs() < 0.05, "{w}×{h} edge to edge: {a:?} {z:?}");
+        }
+        // Only the overall zoom range still bounds it.
+        assert_eq!(fit_view([0.0, 0.0, 0.01, 0.01], area, FIT_SELECTION_MAX_ZOOM).1, MAX_ZOOM);
     }
 
     #[test]
