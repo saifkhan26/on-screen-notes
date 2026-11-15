@@ -79,6 +79,30 @@ impl OnScreenNotesApp {
         self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
+    /// Select everything on the active layer with the Select tool; when
+    /// it is empty or hidden, everything on the topmost visible layer
+    /// that has something (a selection lives on one layer).
+    pub(super) fn select_all(&mut self) {
+        let c = self.canvases.active();
+        let filled = |li: usize| {
+            c.layers.get(li).is_some_and(|l| l.visible && l.opacity > 0.0 && (!l.strokes.is_empty() || !l.shapes.is_empty()))
+        };
+        let li = if filled(c.active_layer) { Some(c.active_layer) } else { (0..c.layers.len()).rev().find(|&li| filled(li)) };
+        let Some(li) = li else {
+            self.toast = Some(("Nothing on this slide to select".to_string(), Instant::now()));
+            return;
+        };
+        let layer = &c.layers[li];
+        let sel = crate::canvas::hit::Selection { strokes: (0..layer.strokes.len()).collect(), shapes: (0..layer.shapes.len()).collect() };
+        if li != c.active_layer {
+            self.canvases.active_mut().active_layer = li;
+        }
+        self.tool.kind = crate::tools::ToolKind::Select;
+        self.tool.select.gesture = None;
+        self.tool.select.sel = sel;
+        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+    }
+
     /// Copy the selected objects onto a new slide and go there, with the
     /// copies selected, at the same spot and in the same view. The slide
     /// goes after the last one: putting it in mid-deck would renumber,

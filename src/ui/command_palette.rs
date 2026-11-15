@@ -105,6 +105,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         add(label, "Tool", key, C::Tool(kind, style));
     }
     add("Eyedropper (pick a colour from the screen)", "Tool", t.eyedropper, C::Eyedropper);
+    add("Select all (on the active layer)", "Selection", c.select_all, C::Key(K::SelectAll));
 
     if cx.selected > 0 {
         let s = "Selection";

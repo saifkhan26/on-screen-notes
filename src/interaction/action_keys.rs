@@ -78,6 +78,8 @@ pub enum KeyAction {
     CommandPalette,
     /// Open the find bar.
     Find,
+    /// Select everything on the active layer.
+    SelectAll,
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -140,6 +142,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.media_onion, KeyAction::Onion),
         (c.command_palette, KeyAction::CommandPalette),
         (c.find, KeyAction::Find),
+        (c.select_all, KeyAction::SelectAll),
         (c.group, KeyAction::Group(true)),
         (c.ungroup, KeyAction::Group(false)),
         (c.move_slide_up, KeyAction::MoveSlide(-1)),
@@ -219,6 +222,11 @@ mod tests {
         assert_eq!(press(&keys, egui::Key::F, ctrl), vec![KeyAction::Find]);
         assert_eq!(press(&keys, egui::Key::F, ctrl | egui::Modifiers::SHIFT), vec![], "Ctrl+Shift+F is the freeze");
         assert_eq!(press(&keys, egui::Key::G, ctrl | egui::Modifiers::SHIFT), vec![KeyAction::Group(false)]);
+        assert_eq!(press(&keys, egui::Key::A, ctrl), vec![KeyAction::SelectAll]);
+        let cfg: HotkeysConfig = toml::from_str("[canvas]\nselect_all = \"alt+shift+a\"\n").unwrap();
+        let rebound = cfg.parsed();
+        assert_eq!(press(&rebound, egui::Key::A, ctrl), vec![], "rebound: Ctrl+A is free");
+        assert_eq!(press(&rebound, egui::Key::A, egui::Modifiers::ALT | egui::Modifiers::SHIFT), vec![KeyAction::SelectAll]);
         let cfg: HotkeysConfig = toml::from_str("[canvas]\nmove_slide_up = \"alt+pageup\"\nmove_slide_down = \"alt+pagedown\"\n").unwrap();
         let keys = cfg.parsed();
         assert_eq!(press(&keys, egui::Key::PageUp, egui::Modifiers::ALT), vec![KeyAction::MoveSlide(-1)]);

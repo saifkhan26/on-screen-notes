@@ -779,6 +779,7 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Add / remove; one of a group", s("Shift+click; Alt+click")),
             ("Group / ungroup",             k2(c.group, c.ungroup)),
             ("Box select",                  s("drag on empty space")),
+            ("Select all (active layer)",   k(c.select_all)),
             ("Move / resize / rotate",      s("drag / handles / knob")),
             ("Nudge 1 px",                  k4(c.nudge_1px)),
             ("Nudge 10 px",                 k4(c.nudge_10px)),

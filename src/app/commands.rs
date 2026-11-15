@@ -67,6 +67,11 @@ impl OnScreenNotesApp {
                     self.select_media_matches();
                 }
             }
+            K::SelectAll => {
+                if self.may_edit() {
+                    self.select_all();
+                }
+            }
             K::PinToWindow => {
                 if self.pinned_hwnd.is_some() {
                     self.pinned_hwnd = None;
