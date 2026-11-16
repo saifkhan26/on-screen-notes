@@ -1,7 +1,8 @@
 //! Media filter: highlight the pictures, GIFs and / or videos on the
 //! slide, its groups, and what is tagged — everything tagged, or just the
-//! tags picked. Matches get an outline and a small label in their kind's
-//! colour (a tagged one's label is its tags); everything else fades back.
+//! tags picked. Matches get an outline and, where they show big enough
+//! for one, a small label in their kind's colour (a tagged one's label
+//! is its tags); everything else fades back.
 //! A group is outlined whole, and so is a group tagged as one (every
 //! member has the tag); in any other group only the tagged members
 //! light up. On a slide opened from a PureRef board it can also light up
@@ -339,20 +340,71 @@ fn marks(rect: Rect, canvas: &Canvas, filter: &MediaFilter, moving: InFlight) ->
     }
     found.retain(|(q, _, _)| Rect::from_points(q).intersects(rect));
     // A group that is also tagged comes twice from the units: keep one of
-    // each label.
-    let mut seen: Vec<([Pos2; 4], String)> = Vec::new();
-    found.retain(|(q, _, b)| {
-        let dup = seen.iter().any(|(sq, sb)| sb == b && sq.iter().zip(q).all(|(a, b)| a.distance(*b) < 0.5));
-        seen.push((*q, b.clone()));
-        !dup
-    });
+    // each label. Earlier boxes are looked up by their first corner, not
+    // gone through one by one: a slide of 1,500 pictures would make that
+    // a million comparisons a frame.
+    let mut earlier: Near<usize> = Near::default();
+    let mut keep: Vec<bool> = Vec::with_capacity(found.len());
+    for (i, (q, _, b)) in found.iter().enumerate() {
+        let dup = earlier.around(q[0]).any(|&(_, j)| {
+            let (sq, _, sb) = &found[j];
+            sb == b && sq.iter().zip(q).all(|(a, b)| a.distance(*b) < 0.5)
+        });
+        earlier.add(q[0], i);
+        keep.push(!dup);
+    }
+    let mut keep = keep.into_iter();
+    found.retain(|_| keep.next().unwrap_or(true));
     let holes = holes.into_iter().filter(|h| h.intersects(rect)).map(|h| h.intersect(rect)).collect();
     Marks { found, holes }
 }
 
+/// Screen points looked up by what lies within half a pixel of a point:
+/// kept in 1 px cells, so those are all in its cell or the eight round it.
+struct Near<T> {
+    cells: HashMap<(i32, i32), Vec<(Pos2, T)>>,
+}
+
+impl<T> Default for Near<T> {
+    fn default() -> Self {
+        Near { cells: HashMap::new() }
+    }
+}
+
+impl<T> Near<T> {
+    fn cell(p: Pos2) -> (i32, i32) {
+        (p.x.floor() as i32, p.y.floor() as i32)
+    }
+
+    fn add(&mut self, p: Pos2, v: T) {
+        self.cells.entry(Self::cell(p)).or_default().push((p, v));
+    }
+
+    /// What was added within half a pixel of `p`.
+    fn around(&self, p: Pos2) -> impl Iterator<Item = &(Pos2, T)> {
+        let (x, y) = Self::cell(p);
+        (-1..=1)
+            .flat_map(move |dx| (-1..=1).map(move |dy| (x.saturating_add(dx), y.saturating_add(dy))))
+            .filter_map(|k| self.cells.get(&k))
+            .flatten()
+            .filter(move |(q, _)| q.distance(p) < 0.5)
+    }
+}
+
+/// Whether a label at `tag` has room in the box it labels, `boxed`: it
+/// ends inside the box, and the box is as wide as the label, or 64 px
+/// (a long list of tags may run past a picture's edge). Zoomed far out,
+/// labels on boxes smaller than that would only pile up over the
+/// pictures, and cost a frame to draw on a slide of 1,500.
+fn has_room(boxed: Rect, tag: Rect) -> bool {
+    const MARGIN: f32 = 4.0;
+    tag.bottom() + MARGIN <= boxed.bottom() && boxed.width() >= (tag.width() + 2.0 * MARGIN).min(64.0)
+}
+
 /// Fade everything on `rect` except the matches, then outline and label
 /// each match. `rect` is the canvas area on screen. Labels for one box
-/// (a tagged group is a group too) stack down its corner.
+/// (a tagged group is a group too) stack down its corner; a box too
+/// small for a label (`has_room`) is only outlined.
 pub fn paint(painter: &egui::Painter, rect: Rect, canvas: &Canvas, filter: &MediaFilter, moving: InFlight) {
     let Marks { found, holes } = marks(rect, canvas, filter, moving);
     let mut mesh = egui::Mesh::default();
@@ -363,16 +415,22 @@ pub fn paint(painter: &egui::Painter, rect: Rect, canvas: &Canvas, filter: &Medi
 
     let under = Color32::from_black_alpha(150);
     let font = egui::FontId::proportional(10.0);
-    let mut labelled: Vec<(Pos2, f32)> = Vec::new();
+    let mut labelled: Near<f32> = Near::default();
     for (quad, col, text) in &found {
         painter.add(egui::Shape::closed_line(quad.to_vec(), Stroke::new(4.0, under)));
         painter.add(egui::Shape::closed_line(quad.to_vec(), Stroke::new(2.0, *col)));
-        let top_left = Rect::from_points(quad).min;
+        let boxed = Rect::from_points(quad);
+        let top_left = boxed.min;
         // Below the labels already on this corner.
-        let below = labelled.iter().filter(|(p, _)| p.distance(top_left) < 0.5).map(|(_, h)| h + 3.0).sum::<f32>();
+        let below = labelled.around(top_left).map(|(_, h)| h + 3.0).sum::<f32>();
         let galley = painter.layout_no_wrap(text.clone(), font.clone(), Color32::BLACK);
         let tag = Rect::from_min_size(top_left + egui::vec2(4.0, 4.0 + below), galley.size() + egui::vec2(8.0, 4.0));
-        labelled.push((top_left, tag.height()));
+        // Left out, it holds no place: a group's label is not pushed
+        // down by one its small top-left member had no room for.
+        if !has_room(boxed, tag) {
+            continue;
+        }
+        labelled.add(top_left, tag.height());
         if tag.intersects(rect) {
             painter.rect_filled(tag, Rounding::same(3.0), *col);
             painter.galley(tag.min + egui::vec2(4.0, 2.0), galley, Color32::BLACK);
@@ -572,6 +630,132 @@ mod tests {
         assert!(!m.holes.iter().any(|h| h.contains(Pos2::new(5.0, 25.0))));
     }
 
+    fn picture(pos: [f32; 2], size: [f32; 2], group: u64) -> crate::canvas::shape::Shape {
+        use crate::canvas::shape::{RasterKind, Shape};
+        Shape::Raster {
+            pos,
+            size,
+            png: std::sync::Arc::new(Vec::new()),
+            px_size: [1, 1],
+            color: [0; 4],
+            rotation: 0.0,
+            kind: RasterKind::Image,
+            media: None,
+            picture: None,
+            pin: 0,
+            flip: false,
+            group,
+            tags: Vec::new(),
+            turn: 0.0,
+            link: 0,
+        }
+    }
+
+    /// What `paint` draws in a 1000 × 800 area: each label's text and
+    /// where it goes, in paint order, and how many outlines.
+    fn drawn(c: &Canvas, f: &MediaFilter) -> (Vec<(String, Pos2)>, usize) {
+        let ctx = egui::Context::default();
+        let area = r(0.0, 0.0, 1000.0, 800.0);
+        let input = egui::RawInput { screen_rect: Some(area), ..Default::default() };
+        let out = ctx.run(input, |ctx| paint(&ctx.layer_painter(egui::LayerId::background()), area, c, f, InFlight::default()));
+        let mut labels = Vec::new();
+        let mut outlines = 0;
+        for s in out.shapes {
+            match s.shape {
+                egui::Shape::Text(t) => labels.push((t.galley.text().to_string(), t.pos)),
+                egui::Shape::Path(_) => outlines += 1,
+                _ => {}
+            }
+        }
+        (labels, outlines / 2)
+    }
+
+    #[test]
+    fn a_label_needs_room_in_its_box() {
+        let tag = |w: f32| Rect::from_min_size(Pos2::new(4.0, 4.0), egui::vec2(w, 17.0));
+        let boxed = |w: f32, h: f32| r(0.0, 0.0, w, h);
+        assert!(has_room(boxed(100.0, 100.0), tag(52.0)));
+        assert!(has_room(boxed(60.0, 25.0), tag(52.0)), "just fits");
+        assert!(!has_room(boxed(59.0, 100.0), tag(52.0)), "too narrow");
+        assert!(!has_room(boxed(100.0, 24.0), tag(52.0)), "too short");
+        // A long list of tags runs past a box 64 px wide or more.
+        assert!(has_room(boxed(64.0, 100.0), tag(170.0)));
+        assert!(!has_room(boxed(63.0, 100.0), tag(170.0)));
+        // A label stacked lower down needs its own room.
+        let second = Rect::from_min_size(Pos2::new(4.0, 24.0), egui::vec2(52.0, 17.0));
+        assert!(!has_room(boxed(100.0, 40.0), second) && has_room(boxed(100.0, 45.0), second));
+    }
+
+    /// Zoomed in, every box is labelled; a box too small for its label
+    /// is only outlined, and holds no place in the stack on its corner.
+    /// Zoomed far out, only outlines.
+    #[test]
+    fn small_boxes_are_outlined_without_a_label() {
+        let mut c = Canvas { pan: [0.0, 0.0], zoom: 1.0, ..Default::default() };
+        // Group 7: a small picture at its top-left corner and a big one
+        // below; another big picture on its own.
+        c.layers[0].shapes = vec![
+            picture([0.0, 0.0], [20.0, 15.0], 7),
+            picture([0.0, 200.0], [200.0, 150.0], 7),
+            picture([300.0, 0.0], [200.0, 150.0], 0),
+        ];
+        let corner = |i: usize| {
+            let b = c.layers[0].shapes[i].obb().aabb();
+            Pos2::new(b[0] + 8.0, b[1] + 6.0)
+        };
+        let f = MediaFilter { pictures: true, groups: true, ..Default::default() };
+        let (labels, outlines) = drawn(&c, &f);
+        assert_eq!(outlines, 4);
+        let got: Vec<&str> = labels.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(got, ["PICTURE", "PICTURE", "GROUP · 2"]);
+        assert!(labels[0].1.distance(corner(1)) < 0.6 && labels[1].1.distance(corner(2)) < 0.6);
+        assert!(labels[2].1.distance(corner(0)) < 0.6, "the group's label takes the corner the small picture left");
+        c.zoom = 0.2;
+        let (labels, outlines) = drawn(&c, &f);
+        assert_eq!((labels.len(), outlines), (0, 4));
+    }
+
+    /// The same box with the same label is outlined once, a box under
+    /// half a pixel off counts as the same (across a pixel's edge too),
+    /// and another label on the same box stays.
+    #[test]
+    fn a_box_given_twice_is_outlined_once() {
+        let mut c = Canvas { pan: [0.0, 0.0], zoom: 1.0, ..Default::default() };
+        c.layers[0].shapes = vec![
+            shape([0.9, 5.0], 1, &[]),  // GROUP · 1
+            shape([1.2, 5.0], 2, &[]),  // 0.3 px off, other side of x = 1: the same
+            shape([3.0, 5.0], 3, &[]),  // 2 px further: its own
+            shape([3.0, 5.0], 0, &["x"]), // on 3's box, but #x
+        ];
+        let area = r(0.0, 0.0, 100.0, 100.0);
+        let f = MediaFilter { groups: true, tagged: true, ..Default::default() };
+        let m = marks(area, &c, &f, InFlight::default());
+        let labels: Vec<&str> = m.found.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert_eq!(labels, ["GROUP · 1", "GROUP · 1", "#x"]);
+        assert!((outline(&m, 1).min.x - 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn near_finds_exactly_what_is_within_half_a_pixel() {
+        let mut seed = 7u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 8) % 4000) as f32 / 400.0 - 5.0
+        };
+        let pts: Vec<Pos2> = (0..400).map(|_| Pos2::new(rnd(), rnd())).collect();
+        let mut near = Near::default();
+        for (i, p) in pts.iter().enumerate() {
+            near.add(*p, i);
+        }
+        for _ in 0..400 {
+            let q = Pos2::new(rnd(), rnd());
+            let mut got: Vec<usize> = near.around(q).map(|&(_, i)| i).collect();
+            got.sort_unstable();
+            let want: Vec<usize> = (0..pts.len()).filter(|&i| pts[i].distance(q) < 0.5).collect();
+            assert_eq!(got, want, "around {q:?}");
+        }
+    }
+
     /// A group being moved, resized or turned, or its layer dragged,
     /// takes its highlight along before the gesture commits.
     #[test]
@@ -697,6 +881,20 @@ mod tests {
                 std::hint::black_box(uncovered(area, &m.holes));
             }
             println!("  of which uncovered: {:?} ({} holes)", t.elapsed() / n, m.holes.len());
+            // The whole frame's share: painting, and egui turning it into
+            // triangles.
+            let ctx = egui::Context::default();
+            let frame = || {
+                let input = egui::RawInput { screen_rect: Some(area), ..Default::default() };
+                let out = ctx.run(input, |ctx| paint(&ctx.layer_painter(egui::LayerId::background()), area, &c, &f, InFlight::default()));
+                ctx.tessellate(out.shapes, out.pixels_per_point)
+            };
+            frame();
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(frame());
+            }
+            println!("  paint + tessellate: {:?} a frame", t.elapsed() / n);
         }
     }
 
