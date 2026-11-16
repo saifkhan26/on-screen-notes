@@ -51,13 +51,37 @@ pub enum BarAction {
     RestorePalette,
     /// Make the selection one group (`true`), or take it out of its groups.
     Group(bool),
-    /// Give every selected object these tags in place of its own.
-    SetTags(Vec<String>),
+    /// The tag row was saved: it showed tags `was` and now holds `now`
+    /// (see `parse_row`). Each object's tags change by the difference.
+    SetTags { was: Vec<String>, now: Vec<(String, bool)> },
+}
+
+/// What the tag row holds (as `shape::parse_tags` reads it): each tag
+/// with whether it is marked `tag*`, on only some of the selection and
+/// left that way. A tag typed both ways goes on all of it.
+pub fn parse_row(text: &str) -> Vec<(String, bool)> {
+    use crate::canvas::units::same_tag;
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for t in crate::canvas::shape::parse_tags(text) {
+        let bare = t.trim_end_matches('*');
+        if bare.is_empty() {
+            continue;
+        }
+        let some = bare.len() < t.len();
+        match out.iter_mut().find(|(o, _)| same_tag(o, bare)) {
+            Some(e) => e.1 &= some,
+            None => out.push((bare.to_string(), some)),
+        }
+    }
+    out
 }
 
 /// The tags being typed for the selection, while the tag row is open.
 pub struct TagEdit {
     pub text: String,
+    /// The selection's tags when the row opened: one taken out of the
+    /// row comes off every object.
+    pub was: Vec<String>,
     /// The field has yet to take the keyboard (and its caret goes to
     /// the end).
     pub focus: bool,
@@ -68,12 +92,13 @@ pub struct TagEdit {
 
 impl TagEdit {
     /// Start from the selection's tags, `current`, ready for one more.
-    pub fn new(current: &[String]) -> Self {
-        let mut text = current.join(" ");
+    /// One only some of the selection carry (`.1`) is written `tag*`.
+    pub fn new(current: &[(String, bool)]) -> Self {
+        let mut text = current.iter().map(|(t, some)| if *some { format!("{t}*") } else { t.clone() }).collect::<Vec<_>>().join(" ");
         if !text.is_empty() {
             text.push(' ');
         }
-        TagEdit { text, focus: true, known: Vec::new() }
+        TagEdit { text, was: current.iter().map(|(t, _)| t.clone()).collect(), focus: true, known: Vec::new() }
     }
 
     /// Where the tag being typed starts: after the last space or comma.
@@ -87,9 +112,9 @@ impl TagEdit {
     pub fn suggestions(&self, most: usize) -> Vec<String> {
         use crate::canvas::units::same_tag;
         let start = self.word_start();
-        let have = crate::canvas::shape::parse_tags(&self.text[..start]);
+        let have = parse_row(&self.text[..start]);
         let word = self.text[start..].trim_start_matches('#').to_lowercase();
-        let fresh = self.known.iter().filter(|(t, _)| !have.iter().any(|h| same_tag(h, t)));
+        let fresh = self.known.iter().filter(|(t, _)| !have.iter().any(|(h, _)| same_tag(h, t)));
         let (mut first, mut then): (Vec<_>, Vec<_>) = fresh.filter(|(t, _)| t.to_lowercase().contains(&word)).partition(|(t, _)| t.to_lowercase().starts_with(&word));
         first.sort_by(|a, b| b.1.cmp(&a.1));
         then.sort_by(|a, b| b.1.cmp(&a.1));
@@ -137,9 +162,9 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 /// opens "Move to slide…" as its key asks; `picture` is set when the
 /// selection is one picture, for its palette button; `grouped` when some
 /// of it is in a group, for the ungroup button. `tags` are the
-/// selection's, shown beside the tag button; `tag_edit` is the row
-/// for typing them while it is open. Returns what was clicked this
-/// frame, if anything.
+/// selection's (`.1` set for one only some of it carries), shown beside
+/// the tag button; `tag_edit` is the row for typing them while it is
+/// open. Returns what was clicked this frame, if anything.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
@@ -152,7 +177,7 @@ pub fn show(
     open_move: bool,
     picture: Option<ColourRow<'_>>,
     grouped: bool,
-    tags: &[String],
+    tags: &[(String, bool)],
     tag_edit: &mut Option<TagEdit>,
 ) -> Option<BarAction> {
     let pos = bar_pos(ctx);
@@ -250,7 +275,7 @@ pub fn show(
                 if let Some(edit) = tag_edit.as_mut() {
                     match tag_row(ui, edit) {
                         Some(Some(typed)) => {
-                            picked = Some(BarAction::SetTags(crate::canvas::shape::parse_tags(&typed)));
+                            picked = Some(BarAction::SetTags { was: std::mem::take(&mut edit.was), now: parse_row(&typed) });
                             *tag_edit = None;
                         }
                         Some(None) => *tag_edit = None,
@@ -268,12 +293,18 @@ pub fn show(
     picked
 }
 
-/// The selection's tags beside the tag button, cut short if long; a
-/// click opens them for typing, as the button does.
-fn tag_chips(ui: &mut egui::Ui, tags: &[String]) -> bool {
-    let all = crate::ui::media_filter::tags_text(tags, usize::MAX);
-    let text = egui::RichText::new(crate::ui::media_filter::tags_text(tags, 32)).small().color(crate::ui::media_filter::TAG_COLOUR);
-    ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(format!("{all} — click to change")).clicked()
+/// The selection's tags beside the tag button, cut short if long, one
+/// only some of it carries marked `*`; a click opens them for typing,
+/// as the button does.
+fn tag_chips(ui: &mut egui::Ui, tags: &[(String, bool)]) -> bool {
+    let shown: Vec<String> = tags.iter().map(|(t, some)| if *some { format!("{t}*") } else { t.clone() }).collect();
+    let all = crate::ui::media_filter::tags_text(&shown, usize::MAX);
+    let text = egui::RichText::new(crate::ui::media_filter::tags_text(&shown, 32)).small().color(crate::ui::media_filter::TAG_COLOUR);
+    let mut tip = format!("{all} — click to change");
+    if tags.iter().any(|(_, some)| *some) {
+        tip.push_str("\n* only some of the selection has it");
+    }
+    ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked()
 }
 
 /// The row for typing the selection's tags, with the tags already used
@@ -305,6 +336,10 @@ fn tag_row(ui: &mut egui::Ui, edit: &mut TagEdit) -> Option<Option<String>> {
                 ui.add(field)
             })
             .inner;
+        if parse_row(&edit.text).iter().any(|(_, some)| *some) {
+            let note = "tag* — stays only on the objects that have it; take the * off to put it on all";
+            ui.label(egui::RichText::new(note).small().color(theme::TEXT_MUTED));
+        }
         let offered = edit.suggestions(SUGGESTED);
         if !offered.is_empty() {
             ui.horizontal_wrapped(|ui| {
@@ -628,7 +663,7 @@ mod tests {
 
     fn edit(text: &str) -> TagEdit {
         let known = [("pose", 9), ("ref", 4), ("portrait", 6), ("prop", 1), ("hands", 2)];
-        TagEdit { text: text.into(), focus: false, known: known.iter().map(|(t, n)| (t.to_string(), *n)).collect() }
+        TagEdit { text: text.into(), was: Vec::new(), focus: false, known: known.iter().map(|(t, n)| (t.to_string(), *n)).collect() }
     }
 
     #[test]
@@ -651,6 +686,19 @@ mod tests {
         let mut e = edit("");
         e.accept("hands");
         assert_eq!(e.text, "hands ");
-        assert_eq!(TagEdit::new(&["a".into(), "b".into()]).text, "a b ");
+        assert_eq!(TagEdit::new(&[("a".into(), false), ("b".into(), false)]).text, "a b ");
+    }
+
+    #[test]
+    fn tags_only_some_of_the_selection_carry_are_marked() {
+        let e = TagEdit::new(&[("cat".into(), true), ("ref".into(), false)]);
+        assert_eq!(e.text, "cat* ref ");
+        assert_eq!(e.was, vec!["cat".to_string(), "ref".to_string()]);
+        let row = |v: &[(&str, bool)]| v.iter().map(|(t, s)| (t.to_string(), *s)).collect::<Vec<_>>();
+        assert_eq!(parse_row("cat* ref dog"), row(&[("cat", true), ("ref", false), ("dog", false)]));
+        // Typed both ways it goes on all; a lone * is no tag.
+        assert_eq!(parse_row("cat* CAT * #x**"), row(&[("cat", false), ("x", true)]));
+        // A marked tag is not offered again.
+        assert_eq!(edit("pose* ").suggestions(1), vec!["portrait"]);
     }
 }

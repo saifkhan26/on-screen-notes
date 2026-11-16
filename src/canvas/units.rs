@@ -45,6 +45,19 @@ pub fn tag_key(t: &str) -> String {
     t.to_lowercase()
 }
 
+/// An object's tags once the tag row changed the selection's from `was`
+/// to `now`. A tag the row lost comes off; a tag in the row goes on,
+/// except one marked as on only some of the selection (`tag*`, `.1`
+/// set), which stays only where it is. In the row's order and spelling,
+/// then any of the object's own the row never showed.
+pub fn retagged(own: &[String], was: &[String], now: &[(String, bool)]) -> Vec<String> {
+    let has = |list: &[String], t: &str| list.iter().any(|o| same_tag(o, t));
+    let mut out: Vec<String> = now.iter().filter(|(t, some)| !some || has(own, t)).map(|(t, _)| t.clone()).collect();
+    let rest: Vec<String> = own.iter().filter(|t| !has(was, t) && !has(&out, t)).cloned().collect();
+    out.extend(rest);
+    out
+}
+
 fn merge(into: &mut Vec<String>, tags: &[String]) {
     for t in tags {
         if !into.iter().any(|have| same_tag(have, t)) {
@@ -142,6 +155,30 @@ mod tests {
         s.set_group(group);
         s.set_tags(&tags.iter().map(|t| t.to_string()).collect::<Vec<_>>());
         s
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn the_tag_row_changes_each_objects_own_tags() {
+        let row = |v: &[(&str, bool)]| v.iter().map(|(t, s)| (t.to_string(), *s)).collect::<Vec<_>>();
+        // One image tagged "cat", two untagged; the row shows "cat*" and
+        // "dog" is typed: the others get only "dog".
+        let was = strs(&["cat"]);
+        let now = row(&[("cat", true), ("dog", false)]);
+        assert_eq!(retagged(&strs(&["cat"]), &was, &now), strs(&["cat", "dog"]));
+        assert_eq!(retagged(&[], &was, &now), strs(&["dog"]));
+        // The * taken off: "cat" goes on all of them.
+        let now = row(&[("cat", false)]);
+        assert_eq!(retagged(&[], &was, &now), strs(&["cat"]));
+        // Taken out of the row: off every one.
+        assert_eq!(retagged(&strs(&["cat", "x"]), &strs(&["cat", "x"]), &row(&[("x", false)])), strs(&["x"]));
+        // One object alone: the row is its tags, in the row's spelling.
+        assert_eq!(retagged(&strs(&["Pose", "ref"]), &strs(&["Pose", "ref"]), &row(&[("ref", false), ("pose", false)])), strs(&["ref", "pose"]));
+        // Tags the row never showed are kept.
+        assert_eq!(retagged(&strs(&["old"]), &[], &row(&[("new", false)])), strs(&["new", "old"]));
     }
 
     #[test]

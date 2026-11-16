@@ -431,38 +431,61 @@ impl OnScreenNotesApp {
         self.toast = Some((msg, Instant::now()));
     }
 
-    /// The selected objects' tags, each once, in the order first met.
-    pub(super) fn selection_tags(&self) -> Vec<String> {
+    /// The selected objects' tags, each once (case aside), in the order
+    /// first met; `.1` is set for one only some of them carry.
+    pub(super) fn selection_tags(&self) -> Vec<(String, bool)> {
+        use crate::canvas::units::same_tag;
         let c = self.canvases.active();
         let Some(layer) = c.layers.get(c.active_layer) else { return Vec::new() };
         let sel = &self.tool.select.sel;
-        let strokes = sel.strokes.iter().filter_map(|&i| layer.strokes.get(i)).flat_map(|s| s.tags.iter());
-        let shapes = sel.shapes.iter().filter_map(|&i| layer.shapes.get(i)).flat_map(|s| s.tags().iter());
-        let mut out: Vec<String> = Vec::new();
-        for t in strokes.chain(shapes) {
-            if !out.contains(t) {
-                out.push(t.clone());
+        let strokes = sel.strokes.iter().filter_map(|&i| layer.strokes.get(i)).map(|s| s.tags.as_slice());
+        let shapes = sel.shapes.iter().filter_map(|&i| layer.shapes.get(i)).map(|s| s.tags());
+        let each: Vec<&[String]> = strokes.chain(shapes).collect();
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for t in each.iter().flat_map(|tags| tags.iter()) {
+            if !out.iter().any(|(o, _)| same_tag(o, t)) {
+                let some = !each.iter().all(|tags| tags.iter().any(|h| same_tag(h, t)));
+                out.push((t.clone(), some));
             }
         }
         out
     }
 
-    /// Give every selected object `tags` in place of its own: one undo
-    /// step. Empty takes them all off.
-    pub(super) fn tag_selection(&mut self, tags: Vec<String>) {
+    /// Change the selected objects' tags as the tag row was changed from
+    /// `was` to `now` (see `units::retagged`): each object keeps its own
+    /// tags the row left alone, so one object's tags do not spread to
+    /// the rest. One undo step.
+    pub(super) fn tag_selection(&mut self, was: Vec<String>, now: Vec<(String, bool)>) {
+        use crate::canvas::units::retagged;
         let sel = self.tool.select.sel.clone();
         if sel.is_empty() || !self.may_edit() {
             return;
         }
         let c = self.canvases.active_mut();
         let li = c.active_layer;
-        if !c.set_tags(li, &sel.strokes, &sel.shapes, &tags) {
+        let Some(layer) = c.layers.get(li) else { return };
+        // Only objects whose tags change, ascending by index.
+        let change = |i: usize, own: &[String]| {
+            let to = retagged(own, &was, &now);
+            (to != own).then_some((i, to))
+        };
+        let sorted = |mut v: Vec<(usize, Vec<String>)>| {
+            v.sort_by_key(|e| e.0);
+            v.dedup_by_key(|e| e.0);
+            v
+        };
+        let strokes = sorted(sel.strokes.iter().filter_map(|&i| change(i, &layer.strokes.get(i)?.tags)).collect());
+        let shapes = sorted(sel.shapes.iter().filter_map(|&i| change(i, layer.shapes.get(i)?.tags())).collect());
+        if !c.set_tags_each(li, &strokes, &shapes) {
             return;
         }
-        let msg = if tags.is_empty() {
+        let on_all: Vec<String> = now.iter().filter(|(_, some)| !some).map(|(t, _)| format!("#{t}")).collect();
+        let msg = if now.is_empty() {
             "Tags taken off".to_string()
+        } else if on_all.is_empty() {
+            "Tags changed".to_string()
         } else {
-            format!("Tagged {} — Ctrl+F finds it", tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "))
+            format!("Tagged {} — Ctrl+F finds it", on_all.join(" "))
         };
         self.toast = Some((msg, Instant::now()));
     }

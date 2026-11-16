@@ -927,7 +927,7 @@ impl eframe::App for OnScreenNotesApp {
                     Some(BarAction::UseColour(c)) => use_colour = Some(c),
                     Some(BarAction::KeepColours) => self.keep_picture_colours(),
                     Some(BarAction::RestorePalette) => self.restore_palette(),
-                    Some(BarAction::SetTags(tags)) => self.tag_selection(tags),
+                    Some(BarAction::SetTags { was, now }) => self.tag_selection(was, now),
                     None => {}
                 }
             } else {

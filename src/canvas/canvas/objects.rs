@@ -124,9 +124,9 @@ impl Canvas {
     }
 
     /// Give each chosen object its own new tags, all in one undo step —
-    /// what renaming or removing a tag everywhere does. Laid out like
-    /// `move_objects_each`, ascending by index. Returns false when
-    /// nothing changed.
+    /// what the tag row, and renaming or removing a tag everywhere, do.
+    /// Laid out like `move_objects_each`, ascending by index. Returns
+    /// false when nothing changed.
     pub fn set_tags_each(&mut self, li: usize, strokes: &[(usize, Vec<String>)], shapes: &[(usize, Vec<String>)]) -> bool {
         let tags_of = |list: &[(usize, Vec<String>)], i: usize| {
             list.binary_search_by_key(&i, |e| e.0).map(|k| list[k].1.clone()).unwrap_or_default()
@@ -134,16 +134,6 @@ impl Canvas {
         let stroke_ix: Vec<usize> = strokes.iter().map(|e| e.0).collect();
         let shape_ix: Vec<usize> = shapes.iter().map(|e| e.0).collect();
         self.edit_objects(li, &stroke_ix, &shape_ix, |i, s| s.tags = tags_of(strokes, i), |i, s| s.set_tags(&tags_of(shapes, i)))
-    }
-
-    /// Give the chosen objects these tags in place of their own (see
-    /// `shape::parse_tags`). One undo step; objects that have them
-    /// already are left out of it. Returns false when nothing changed.
-    pub fn set_tags(&mut self, li: usize, strokes: &[usize], shapes: &[usize], tags: &[String]) -> bool {
-        let Some(layer) = self.layers.get(li) else { return false };
-        let strokes: Vec<usize> = strokes.iter().copied().filter(|&i| layer.strokes.get(i).is_some_and(|s| s.tags != tags)).collect();
-        let shapes: Vec<usize> = shapes.iter().copied().filter(|&i| layer.shapes.get(i).is_some_and(|s| s.tags() != tags)).collect();
-        self.edit_objects(li, &strokes, &shapes, |_, s| s.tags = tags.to_vec(), |_, s| s.set_tags(tags))
     }
 
     /// Put the chosen text labels in a box that keeps them readable
