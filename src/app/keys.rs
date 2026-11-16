@@ -119,6 +119,17 @@ impl OnScreenNotesApp {
         let nudge_live = self.tool.kind == crate::tools::ToolKind::Select
             && !self.tool.select.sel.is_empty()
             && self.tool.select.gesture.is_none();
+        // Likewise a hop key selects the next object and does nothing
+        // else, even when it is a slide or layer key too (the arrows are,
+        // by default) or a tool or media key; and inside a group the step-out key goes
+        // back to the whole group (Esc by default, which would otherwise
+        // drop the selection). Enter closes a lasso polygon, not this.
+        let step_out_live = nudge_live && {
+            let c = self.canvases.active();
+            c.layers.get(c.active_layer).is_some_and(|l| crate::tools::hop::inside_group(l, &self.tool.select.sel).is_some())
+        };
+        let step_in_live = self.tool.select.gesture.is_none()
+            && !matches!(self.tool.kind, crate::tools::ToolKind::LassoErase | crate::tools::ToolKind::LassoSelect);
         // An edit key on a slide that takes no edits, to say why
         // nothing happened.
         let mut refused = false;
@@ -141,6 +152,21 @@ impl OnScreenNotesApp {
             }
             let keys = &self.hotkeys_cfg;
             for ev in &i.events {
+                if let egui::Event::Key { key, pressed: true, .. } = ev {
+                    use interaction::action_keys::KeyAction as K;
+                    let c = &keys.canvas;
+                    let hit = |b: Option<crate::input::hotkeys_config::Binding>| b.is_some_and(|b| b.matches(*key, mods));
+                    let hop = nudge_live
+                        .then(|| c.hop.iter().zip(crate::tools::hop::Dir::ALL).find(|(b, _)| hit(**b)).map(|(_, d)| K::Hop(d)))
+                        .flatten();
+                    let took = hop
+                        .or_else(|| (step_out_live && hit(c.step_out)).then_some(K::StepOut))
+                        .or_else(|| (step_in_live && hit(c.step_in)).then_some(K::StepIn));
+                    if let Some(act) = took {
+                        key_actions.push(act);
+                        continue;
+                    }
+                }
                 match ev {
                     // egui-winit swallows the Ctrl+C / X / V key
                     // presses and hands us these instead.

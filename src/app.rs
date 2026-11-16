@@ -1046,6 +1046,10 @@ impl eframe::App for OnScreenNotesApp {
                         },
                         picture: self.selected_picture().is_some(),
                         grouped: self.selection_grouped(),
+                        inside_group: {
+                            let c = self.canvases.active();
+                            c.layers.get(c.active_layer).is_some_and(|l| crate::tools::hop::inside_group(l, &self.tool.select.sel).is_some())
+                        },
                         pin: self.pin_tool.selected.is_some() && self.tool.kind == crate::tools::ToolKind::Select,
                         palette: &self.config.palette,
                         slides: (0..self.canvases.count()).map(|i| self.canvases.name(i).to_string()).collect(),

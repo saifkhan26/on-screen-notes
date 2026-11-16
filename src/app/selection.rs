@@ -83,15 +83,8 @@ impl OnScreenNotesApp {
     /// it is empty or hidden, everything on the topmost visible layer
     /// that has something (a selection lives on one layer).
     pub(super) fn select_all(&mut self) {
+        let Some(li) = self.layer_to_select() else { return };
         let c = self.canvases.active();
-        let filled = |li: usize| {
-            c.layers.get(li).is_some_and(|l| l.visible && l.opacity > 0.0 && (!l.strokes.is_empty() || !l.shapes.is_empty()))
-        };
-        let li = if filled(c.active_layer) { Some(c.active_layer) } else { (0..c.layers.len()).rev().find(|&li| filled(li)) };
-        let Some(li) = li else {
-            self.toast = Some(("Nothing on this slide to select".to_string(), Instant::now()));
-            return;
-        };
         let layer = &c.layers[li];
         let sel = crate::canvas::hit::Selection { strokes: (0..layer.strokes.len()).collect(), shapes: (0..layer.shapes.len()).collect() };
         if li != c.active_layer {
@@ -101,6 +94,85 @@ impl OnScreenNotesApp {
         self.tool.select.gesture = None;
         self.tool.select.sel = sel;
         self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+    }
+
+    /// The layer a fresh selection goes on: the active one, or when it is
+    /// empty or hidden the topmost shown layer with something on it.
+    /// `None`, said in a toast, when no layer has anything.
+    fn layer_to_select(&mut self) -> Option<usize> {
+        let c = self.canvases.active();
+        let filled = |li: usize| {
+            c.layers.get(li).is_some_and(|l| l.visible && l.opacity > 0.0 && (!l.strokes.is_empty() || !l.shapes.is_empty()))
+        };
+        let li = if filled(c.active_layer) { Some(c.active_layer) } else { (0..c.layers.len()).rev().find(|&li| filled(li)) };
+        if li.is_none() {
+            self.toast = Some(("Nothing on this slide to select".to_string(), Instant::now()));
+        }
+        li
+    }
+
+    /// Select the nearest group or object `dir` of the selection; inside
+    /// a group, its nearest member (`tools::hop`). Brought on screen.
+    pub(super) fn hop_selection(&mut self, dir: crate::tools::hop::Dir, ctx: &egui::Context) {
+        let c = self.canvases.active();
+        let Some(layer) = c.layers.get(c.active_layer) else { return };
+        let sel = &self.tool.select.sel;
+        match crate::tools::hop::hop(layer, sel, dir) {
+            Some(next) => self.take_hopped(next, ctx),
+            None => {
+                let within = if crate::tools::hop::inside_group(layer, sel).is_some() { " in this group" } else { "" };
+                self.toast = Some((format!("Nothing further {}{within}", dir.name()), Instant::now()));
+            }
+        }
+    }
+
+    /// With a group selected, select one of its members: the hop keys
+    /// then go from member to member. With nothing selected (any tool),
+    /// select the group or object in the middle of the view.
+    pub(super) fn step_in(&mut self, ctx: &egui::Context) {
+        let selecting = self.tool.kind == crate::tools::ToolKind::Select && !self.tool.select.sel.is_empty();
+        if selecting {
+            let c = self.canvases.active();
+            let Some(layer) = c.layers.get(c.active_layer) else { return };
+            if let Some(member) = crate::tools::hop::step_in(layer, &self.tool.select.sel) {
+                self.take_hopped(member, ctx);
+            }
+            return;
+        }
+        if !self.may_edit() {
+            return;
+        }
+        let Some(li) = self.layer_to_select() else { return };
+        let area = self.fit_area(ctx);
+        let c = self.canvases.active();
+        let zoom = c.zoom.max(1e-3);
+        let mid = [(area[0] + area[2] * 0.5 - c.pan[0]) / zoom, (area[1] + area[3] * 0.5 - c.pan[1]) / zoom];
+        let Some(sel) = crate::tools::hop::nearest(&c.layers[li], mid) else { return };
+        if li != c.active_layer {
+            self.canvases.active_mut().active_layer = li;
+        }
+        self.take_hopped(sel, ctx);
+    }
+
+    /// Inside a group: select the whole group again.
+    pub(super) fn step_out(&mut self, ctx: &egui::Context) {
+        let c = self.canvases.active();
+        let Some(layer) = c.layers.get(c.active_layer) else { return };
+        if let Some(group) = crate::tools::hop::step_out(layer, &self.tool.select.sel) {
+            self.take_hopped(group, ctx);
+        }
+    }
+
+    /// `sel` (on the active layer) is the Select tool's selection now,
+    /// glided on screen if it is not.
+    fn take_hopped(&mut self, sel: crate::canvas::hit::Selection, ctx: &egui::Context) {
+        self.tool.kind = crate::tools::ToolKind::Select;
+        self.tool.select.gesture = None;
+        self.tool.select.sel = sel;
+        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        if let Some(b) = self.selection_bounds() {
+            self.bring_into_view(b, ctx);
+        }
     }
 
     /// Copy the selected objects onto a new slide and go there, with the

@@ -3,7 +3,9 @@
 //! pin bar's. Each binding is in `hotkeys.toml` (`[arrange]`,
 //! `[toolbar]`, `[canvas]`), unbound until set; a key only says which
 //! button it presses, and the app runs it as the click would. The
-//! Select tool's nudge keys come through here too (bound by default).
+//! Select tool's nudge keys come through here too (bound by default);
+//! its hop and step keys are read in `app::keys`, which lets them win
+//! over the rest while objects are selected.
 
 use crate::canvas::shape::MediaType;
 use crate::input::hotkeys_config::{Binding, ParsedHotkeys};
@@ -84,6 +86,12 @@ pub enum KeyAction {
     Find,
     /// Select everything on the active layer.
     SelectAll,
+    /// Select the nearest object that way of the selection.
+    Hop(crate::tools::hop::Dir),
+    /// Select what is mid-view, or step inside the selected group.
+    StepIn,
+    /// Inside a group: select the whole group again.
+    StepOut,
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -201,7 +209,7 @@ mod tests {
         let cfg: HotkeysConfig = toml::from_str(
             "[arrange]\nalign_left = \"alt+a\"\nmatch_tallest_height = \"alt+shift+h\"\n\
              [toolbar]\ncolour_3 = \"shift+3\"\nhighlight_gifs = \"alt+g\"\nsize_down = \"[\"\n\
-             [canvas]\nmove_layer_down = \"alt+arrowdown\"\n",
+             [canvas]\nmove_layer_down = \"alt+end\"\n",
         )
         .unwrap();
         let keys = cfg.parsed();
@@ -212,7 +220,7 @@ mod tests {
         assert_eq!(press(&keys, egui::Key::Num3, egui::Modifiers::SHIFT), vec![KeyAction::Colour(2)]);
         assert_eq!(press(&keys, egui::Key::G, alt), vec![KeyAction::Highlight(MediaType::Gif)]);
         assert_eq!(press(&keys, egui::Key::OpenBracket, egui::Modifiers::NONE), vec![KeyAction::Size(-1)]);
-        assert_eq!(press(&keys, egui::Key::ArrowDown, alt), vec![KeyAction::MoveLayer(-1)]);
+        assert_eq!(press(&keys, egui::Key::End, alt), vec![KeyAction::MoveLayer(-1)]);
     }
 
     #[test]
@@ -239,18 +247,20 @@ mod tests {
     }
 
     #[test]
-    fn arrows_nudge_by_one_and_shift_arrows_by_ten() {
+    fn alt_arrows_nudge_by_one_and_shift_arrows_by_ten() {
         let keys = HotkeysConfig::default().parsed();
         let shift = egui::Modifiers::SHIFT;
-        assert_eq!(press(&keys, egui::Key::ArrowLeft, egui::Modifiers::NONE), vec![KeyAction::Nudge([-1.0, 0.0])]);
-        assert_eq!(press(&keys, egui::Key::ArrowDown, egui::Modifiers::NONE), vec![KeyAction::Nudge([0.0, 1.0])]);
+        let alt = egui::Modifiers::ALT;
+        assert_eq!(press(&keys, egui::Key::ArrowLeft, alt), vec![KeyAction::Nudge([-1.0, 0.0])]);
+        assert_eq!(press(&keys, egui::Key::ArrowDown, alt), vec![KeyAction::Nudge([0.0, 1.0])]);
+        assert_eq!(press(&keys, egui::Key::ArrowLeft, egui::Modifiers::NONE), vec![], "plain arrows hop (app::keys)");
         assert_eq!(press(&keys, egui::Key::ArrowUp, shift), vec![KeyAction::Nudge([0.0, -10.0])]);
         assert_eq!(press(&keys, egui::Key::ArrowRight, shift), vec![KeyAction::Nudge([10.0, 0.0])]);
         assert_eq!(press(&keys, egui::Key::ArrowRight, egui::Modifiers::CTRL), vec![], "Ctrl+arrows are not nudges");
         let cfg: HotkeysConfig = toml::from_str("[canvas]\nnudge_left_1px = \"j\"\nnudge_left_10px = \"\"\n").unwrap();
         let keys = cfg.parsed();
         assert_eq!(press(&keys, egui::Key::J, egui::Modifiers::NONE), vec![KeyAction::Nudge([-1.0, 0.0])]);
-        assert_eq!(press(&keys, egui::Key::ArrowLeft, egui::Modifiers::NONE), vec![], "rebound");
+        assert_eq!(press(&keys, egui::Key::ArrowLeft, alt), vec![], "rebound");
         assert_eq!(press(&keys, egui::Key::ArrowLeft, shift), vec![], "unbound");
     }
 }

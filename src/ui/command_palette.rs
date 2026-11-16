@@ -64,6 +64,8 @@ pub struct Context<'a> {
     pub picture: bool,
     /// Some of the selection is grouped.
     pub grouped: bool,
+    /// The selection is inside a group: some of its members.
+    pub inside_group: bool,
     /// A pin is selected.
     pub pin: bool,
     /// The palette's colours.
@@ -106,6 +108,9 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     }
     add("Eyedropper (pick a colour from the screen)", "Tool", t.eyedropper, C::Eyedropper);
     add("Select all (on the active layer)", "Selection", c.select_all, C::Key(K::SelectAll));
+    if cx.selected == 0 {
+        add("Select what is in the middle of the view", "Selection", c.step_in, C::Key(K::StepIn));
+    }
 
     if cx.selected > 0 {
         let s = "Selection";
@@ -122,6 +127,14 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         add("Turn right 90°", s, a.rotate_right, C::Key(K::Rotate(true)));
         add("Zoom to the selection", s, c.zoom_to_selection, C::Key(K::ZoomToSelection));
         add("Tag the selection (find knows it by its tags)", s, a.tag, C::Key(K::Tag));
+        for (dir, key) in crate::tools::hop::Dir::ALL.into_iter().zip(c.hop) {
+            add(&format!("Select the nearest object {}", dir.name()), s, key, C::Key(K::Hop(dir)));
+        }
+        if cx.inside_group {
+            add("Step out to the whole group", s, c.step_out, C::Key(K::StepOut));
+        } else if cx.grouped {
+            add("Step inside the group (one member at a time)", s, c.step_in, C::Key(K::StepIn));
+        }
         if cx.selected >= 2 {
             add("Group", s, c.group, C::Key(K::Group(true)));
         }
@@ -439,7 +452,7 @@ mod tests {
     }
 
     fn context<'a>(keys: &'a ParsedHotkeys, selected: usize, palette: &'a [[u8; 4]]) -> Context<'a> {
-        Context { keys, selected, picture: false, grouped: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0 }
+        Context { keys, selected, picture: false, grouped: false, inside_group: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0 }
     }
 
     #[test]

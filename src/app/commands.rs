@@ -77,6 +77,17 @@ impl OnScreenNotesApp {
                     self.select_all();
                 }
             }
+            K::Hop(dir) => {
+                if selecting {
+                    self.hop_selection(dir, ctx);
+                }
+            }
+            K::StepIn => self.step_in(ctx),
+            K::StepOut => {
+                if selecting {
+                    self.step_out(ctx);
+                }
+            }
             K::PinToWindow => {
                 if self.pinned_hwnd.is_some() {
                     self.pinned_hwnd = None;
