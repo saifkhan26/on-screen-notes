@@ -64,6 +64,8 @@ pub struct Context<'a> {
     pub picture: bool,
     /// Some of the selection is grouped.
     pub grouped: bool,
+    /// The selection is inside a group: some of its members.
+    pub inside_group: bool,
     /// A pin is selected.
     pub pin: bool,
     /// The palette's colours.
@@ -105,6 +107,10 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         add(label, "Tool", key, C::Tool(kind, style));
     }
     add("Eyedropper (pick a colour from the screen)", "Tool", t.eyedropper, C::Eyedropper);
+    add("Select all (on the active layer)", "Selection", c.select_all, C::Key(K::SelectAll));
+    if cx.selected == 0 {
+        add("Select what is in the middle of the view", "Selection", c.step_in, C::Key(K::StepIn));
+    }
 
     if cx.selected > 0 {
         let s = "Selection";
@@ -121,6 +127,14 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         add("Turn right 90°", s, a.rotate_right, C::Key(K::Rotate(true)));
         add("Zoom to the selection", s, c.zoom_to_selection, C::Key(K::ZoomToSelection));
         add("Tag the selection (find knows it by its tags)", s, a.tag, C::Key(K::Tag));
+        for (dir, key) in crate::tools::hop::Dir::ALL.into_iter().zip(c.hop) {
+            add(&format!("Select the nearest object {}", dir.name()), s, key, C::Key(K::Hop(dir)));
+        }
+        if cx.inside_group {
+            add("Step out to the whole group", s, c.step_out, C::Key(K::StepOut));
+        } else if cx.grouped {
+            add("Step inside the group (one member at a time)", s, c.step_in, C::Key(K::StepIn));
+        }
         if cx.selected >= 2 {
             add("Group", s, c.group, C::Key(K::Group(true)));
         }
@@ -129,6 +143,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         }
         if cx.picture {
             add("A picture's colours", s, a.picture_colours, C::Key(K::PictureColours));
+            add("Find pictures like this one (copies, edits, similar)", s, a.find_similar, C::Key(K::FindSimilar));
         }
         if cx.selected >= 2 {
             let r = "Arrange";
@@ -172,6 +187,10 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
 
     let v = "View";
     add("Find text on the slides", v, c.find, C::Key(K::Find));
+    if !cx.picture {
+        add("Find pictures like the copied one", v, a.find_similar, C::Key(K::FindSimilar));
+    }
+    add("Find every duplicate picture", v, c.find_duplicates, C::Key(K::FindCopies));
     add("Zoom to fit the slide", v, c.zoom_to_fit, C::Key(K::ZoomToFit));
     add("Reset zoom and pan", v, c.reset_view, C::ResetView);
     add("Hide / show the toolbar and panels", v, c.toggle_ui, C::ToggleUi);
@@ -182,6 +201,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Highlight videos", v, tb.highlight[2], C::Key(K::Highlight(crate::canvas::shape::MediaType::Video)));
     add("Highlight groups", v, tb.highlight_groups, C::Key(K::HighlightGroups));
     add("Highlight everything tagged", v, tb.highlight_tagged, C::Key(K::HighlightTagged));
+    add("Highlight what is gone from the PureRef board", v, None, C::Key(K::HighlightGone));
     add("Select what is highlighted", v, tb.select_highlighted, C::Key(K::SelectHighlighted));
     add("Background opacity up", v, tb.background_up, C::Key(K::Background(1)));
     add("Background opacity down", v, tb.background_down, C::Key(K::Background(-1)));
@@ -192,13 +212,14 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("New slide", sl, c.new_slide, C::Key(K::NewSlide));
     add("Name the slide", sl, c.rename_slide, C::RenameSlide);
     add("Lock / unlock the slide", sl, c.lock_slide, C::LockSlide);
+    add("Resync from PureRef", sl, c.resync_pureref, C::Key(K::ResyncPureRef));
     add("Delete the slide", sl, c.delete_canvas, C::DeleteSlide);
     add("Move the slide up", sl, c.move_slide_up, C::Key(K::MoveSlide(-1)));
     add("Move the slide down", sl, c.move_slide_down, C::Key(K::MoveSlide(1)));
     add("Freeze the screen into a new layer", sl, c.freeze_frame, C::FreezeFrame);
     add("Open the slide window / close it", sl, c.slide_window, C::Key(K::SlideWindow));
     add("Fold / unfold the slide panel", sl, c.toggle_slide_panel, C::Key(K::ToggleSlidePanel));
-    add("Every tag (filter slides, rename, remove)", sl, c.tag_list, C::Key(K::TagList));
+    add("Every tag (find, rename, remove)", sl, c.tag_list, C::Key(K::TagList));
     add("Ctrl+Tab: slides in order / recently used", sl, c.toggle_slide_order, C::Key(K::ToggleSlideOrder));
 
     let l = "Layer";
@@ -431,7 +452,7 @@ mod tests {
     }
 
     fn context<'a>(keys: &'a ParsedHotkeys, selected: usize, palette: &'a [[u8; 4]]) -> Context<'a> {
-        Context { keys, selected, picture: false, grouped: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0 }
+        Context { keys, selected, picture: false, grouped: false, inside_group: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0 }
     }
 
     #[test]

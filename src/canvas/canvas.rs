@@ -10,6 +10,7 @@
 //! separation makes each part easier to read and test.
 
 use crate::canvas::affine::Affine;
+use crate::canvas::board_link::BoardLink;
 use crate::canvas::hit;
 use crate::canvas::shape::{RasterKind, Shape};
 use crate::canvas::stroke::Stroke;
@@ -53,6 +54,12 @@ pub struct Canvas {
     /// Zoom factor: 1.0 = 100%. Stored separately from pan so we can zoom
     /// "toward the cursor" by adjusting both.
     pub zoom: f32,
+
+    /// The PureRef board the slide was opened from, kept so it can be
+    /// resynced (`media::pureref_sync`). Not written when there is none,
+    /// so other slides keep their old on-disk form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<Box<BoardLink>>,
 
     /// History of "undo" snapshots. We don't snapshot the whole canvas
     /// (memory!) — instead we store a tag that lets us undo the last edit.
@@ -139,6 +146,12 @@ pub enum UndoEntry {
     /// would be a Ctrl+Z that appears to do nothing. Undo and redo
     /// therefore pass straight through it to the next entry.
     PlatePromoted(usize, f32),
+    /// A resync from PureRef changed the slide: each `(layer, shapes)` is
+    /// a layer's whole shape list as it was, and the link is the slide's
+    /// board link as it was. Undo swaps them with what is there now, and
+    /// the swapped-out state is the redo — the same step either way.
+    /// Pictures share their bytes, so the lists are cheap to keep.
+    Resynced(Vec<(usize, Vec<Shape>)>, Option<Box<BoardLink>>),
 }
 
 impl Default for Canvas {
@@ -150,6 +163,7 @@ impl Default for Canvas {
             legacy_shapes:  Vec::new(),
             pan: [0.0, 0.0],
             zoom: 1.0,
+            board: None,
             undo_log: Vec::new(),
             redo_log: Vec::new(),
             // A freshly created canvas has no file behind it yet.
@@ -304,6 +318,9 @@ impl Canvas {
                 UndoEntry::ObjectsRemoved(_, _, shapes) | UndoEntry::ObjectsInserted(_, _, shapes) => {
                     shapes.iter().for_each(|(_, s)| add(s));
                 }
+                UndoEntry::Resynced(layers, _) => {
+                    layers.iter().flat_map(|(_, shapes)| shapes).for_each(&mut add);
+                }
                 UndoEntry::StrokeAdded(_)
                 | UndoEntry::ShapeAdded(_)
                 | UndoEntry::StrokeErased(..)
@@ -356,7 +373,7 @@ mod layer_xform_tests {
     #[test]
     fn boxing_labels_is_one_undo_step_and_skips_other_shapes() {
         let mut c = Canvas::default();
-        c.add_shape(Shape::Text { pos: [0.0, 0.0], content: "a".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 });
+        c.add_shape(Shape::Text { pos: [0.0, 0.0], content: "a".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0, link: 0 });
         c.add_shape(Shape::Rect { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border: crate::canvas::shape::BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 });
         let steps = c.undo_log.len();
         assert!(c.set_text_box(0, &[0, 1], true));
@@ -455,6 +472,7 @@ mod object_edit_tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         }
     }
 

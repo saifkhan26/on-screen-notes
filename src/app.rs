@@ -38,6 +38,7 @@ mod pointer;
 mod media;
 mod commands;
 mod find;
+mod similar;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
@@ -225,6 +226,15 @@ pub struct OnScreenNotesApp {
     find: ui::find_bar::FindBar,
     /// The label find just went to, flashing.
     find_flash: Option<find::FindFlash>,
+    /// The slides' pictures read for finding ones like a picture; read
+    /// only once find is given one.
+    picture_index: crate::canvas::picture_index::PictureIndex,
+    /// Ctrl+V was held last frame, for find's own paste.
+    find_paste_prev: bool,
+    /// A file dropped on find, being read.
+    find_reading: Option<similar::FindReading>,
+    /// The slides' pictures being gathered into sets of copies for find.
+    copies_job: Option<similar::CopiesJob>,
     /// The selection's tags being typed on the arrange bar. Keys go to
     /// it alone while it is open.
     tag_edit: Option<ui::arrange_bar::TagEdit>,
@@ -283,6 +293,8 @@ pub struct OnScreenNotesApp {
     media_waiting: Vec<(std::path::PathBuf, Option<egui::Pos2>)>,
     /// Open dialog started by the toolbar's "Insert video / GIF".
     media_dialog: Option<std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>>,
+    /// The dialog asking which PureRef board to resync a slide from.
+    resync_dialog: Option<(usize, std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>)>,
     /// PureRef boards being read, each becoming a new slide.
     pureref_jobs: Vec<crate::media::pureref::OpenJob>,
     /// When the last frame started, for `hold_to_refresh_rate`.
@@ -635,6 +647,10 @@ impl OnScreenNotesApp {
             commands: Default::default(),
             find: Default::default(),
             find_flash: None,
+            picture_index: Default::default(),
+            find_paste_prev: false,
+            find_reading: None,
+            copies_job: None,
             tag_edit: None,
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),
@@ -653,6 +669,7 @@ impl OnScreenNotesApp {
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
             media_dialog: None,
+            resync_dialog: None,
             pureref_jobs: Vec::new(),
             last_frame_at: None,
             clip_image: Default::default(),
@@ -840,19 +857,13 @@ impl eframe::App for OnScreenNotesApp {
             // Slide panel. Going to a slide waits until after this frame's
             // keys, where the arrow keys switch slides too: everything
             // drawn before then still belongs to the current slide.
-            let mut slides = if self.ui_visible {
+            let slides = if self.ui_visible {
                 // No higher than the REC badge (top-left) while it shows.
                 let top = if self.recorder.is_recording() { 44.0 } else { 10.0 };
                 ui::slide_panel::show(ctx, &mut self.slide_panel, &mut self.config, top, &self.canvases)
             } else {
                 Default::default()
             };
-            if let Some(a) = slides.tag_action.take() {
-                self.apply_tag_action(a);
-            }
-            if let Some(tags) = slides.highlight_tags.take() {
-                self.media_filter.tags = tags;
-            }
             if select_filtered && self.may_edit() {
                 self.select_media_matches();
             }
@@ -910,12 +921,13 @@ impl eframe::App for OnScreenNotesApp {
                     Some(BarAction::Rotate(right)) => self.rotate_selection(right),
                     Some(BarAction::ZoomToSelection) => self.zoom_to_selection(ctx),
                     Some(BarAction::PictureColours) => self.toggle_picture_colours(),
+                    Some(BarAction::FindSimilar) => self.find_similar(),
                     // Set after the restyle below, so the picture is
                     // not "recoloured" into an empty undo step.
                     Some(BarAction::UseColour(c)) => use_colour = Some(c),
                     Some(BarAction::KeepColours) => self.keep_picture_colours(),
                     Some(BarAction::RestorePalette) => self.restore_palette(),
-                    Some(BarAction::SetTags(tags)) => self.tag_selection(tags),
+                    Some(BarAction::SetTags { was, now }) => self.tag_selection(was, now),
                     None => {}
                 }
             } else {
@@ -1034,6 +1046,10 @@ impl eframe::App for OnScreenNotesApp {
                         },
                         picture: self.selected_picture().is_some(),
                         grouped: self.selection_grouped(),
+                        inside_group: {
+                            let c = self.canvases.active();
+                            c.layers.get(c.active_layer).is_some_and(|l| crate::tools::hop::inside_group(l, &self.tool.select.sel).is_some())
+                        },
                         pin: self.pin_tool.selected.is_some() && self.tool.kind == crate::tools::ToolKind::Select,
                         palette: &self.config.palette,
                         slides: (0..self.canvases.count()).map(|i| self.canvases.name(i).to_string()).collect(),

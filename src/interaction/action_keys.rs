@@ -3,7 +3,9 @@
 //! pin bar's. Each binding is in `hotkeys.toml` (`[arrange]`,
 //! `[toolbar]`, `[canvas]`), unbound until set; a key only says which
 //! button it presses, and the app runs it as the click would. The
-//! Select tool's nudge keys come through here too (bound by default).
+//! Select tool's nudge keys come through here too (bound by default);
+//! its hop and step keys are read in `app::keys`, which lets them win
+//! over the rest while objects are selected.
 
 use crate::canvas::shape::MediaType;
 use crate::input::hotkeys_config::{Binding, ParsedHotkeys};
@@ -60,12 +62,20 @@ pub enum KeyAction {
     PictureColours,
     /// Type the selection's tags.
     Tag,
+    /// Find pictures like the selected one, or else the copied one.
+    FindSimilar,
     /// Text labels in a box, or not.
     TextBox,
     /// Move the active slide one place toward the first (−1) or last (+1).
     MoveSlide(i8),
-    /// Open the list of every tag.
+    /// Open find on the list of every tag.
     TagList,
+    /// List every set of duplicate pictures.
+    FindCopies,
+    /// Resync the active slide from its PureRef board.
+    ResyncPureRef,
+    /// Highlight what is gone from the slide's PureRef board.
+    HighlightGone,
     /// Make the selection one group (`true`), or take it out of its groups.
     Group(bool),
     /// Onion skin on / off for every GIF and video.
@@ -74,6 +84,14 @@ pub enum KeyAction {
     CommandPalette,
     /// Open the find bar.
     Find,
+    /// Select everything on the active layer.
+    SelectAll,
+    /// Select the nearest object that way of the selection.
+    Hop(crate::tools::hop::Dir),
+    /// Select what is mid-view, or step inside the selected group.
+    StepIn,
+    /// Inside a group: select the whole group again.
+    StepOut,
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -106,6 +124,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (a.rotate_right, KeyAction::Rotate(true)),
         (a.picture_colours, KeyAction::PictureColours),
         (a.tag, KeyAction::Tag),
+        (a.find_similar, KeyAction::FindSimilar),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));
     for (i, b) in t.colour.iter().enumerate() {
@@ -135,10 +154,13 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.media_onion, KeyAction::Onion),
         (c.command_palette, KeyAction::CommandPalette),
         (c.find, KeyAction::Find),
+        (c.select_all, KeyAction::SelectAll),
         (c.group, KeyAction::Group(true)),
         (c.ungroup, KeyAction::Group(false)),
         (c.move_slide_up, KeyAction::MoveSlide(-1)),
         (c.tag_list, KeyAction::TagList),
+        (c.find_duplicates, KeyAction::FindCopies),
+        (c.resync_pureref, KeyAction::ResyncPureRef),
         (c.move_slide_down, KeyAction::MoveSlide(1)),
         (c.new_slide, KeyAction::NewSlide),
         (c.toggle_slide_panel, KeyAction::ToggleSlidePanel),
@@ -187,7 +209,7 @@ mod tests {
         let cfg: HotkeysConfig = toml::from_str(
             "[arrange]\nalign_left = \"alt+a\"\nmatch_tallest_height = \"alt+shift+h\"\n\
              [toolbar]\ncolour_3 = \"shift+3\"\nhighlight_gifs = \"alt+g\"\nsize_down = \"[\"\n\
-             [canvas]\nmove_layer_down = \"alt+arrowdown\"\n",
+             [canvas]\nmove_layer_down = \"alt+end\"\n",
         )
         .unwrap();
         let keys = cfg.parsed();
@@ -198,7 +220,7 @@ mod tests {
         assert_eq!(press(&keys, egui::Key::Num3, egui::Modifiers::SHIFT), vec![KeyAction::Colour(2)]);
         assert_eq!(press(&keys, egui::Key::G, alt), vec![KeyAction::Highlight(MediaType::Gif)]);
         assert_eq!(press(&keys, egui::Key::OpenBracket, egui::Modifiers::NONE), vec![KeyAction::Size(-1)]);
-        assert_eq!(press(&keys, egui::Key::ArrowDown, alt), vec![KeyAction::MoveLayer(-1)]);
+        assert_eq!(press(&keys, egui::Key::End, alt), vec![KeyAction::MoveLayer(-1)]);
     }
 
     #[test]
@@ -213,6 +235,11 @@ mod tests {
         assert_eq!(press(&keys, egui::Key::F, ctrl), vec![KeyAction::Find]);
         assert_eq!(press(&keys, egui::Key::F, ctrl | egui::Modifiers::SHIFT), vec![], "Ctrl+Shift+F is the freeze");
         assert_eq!(press(&keys, egui::Key::G, ctrl | egui::Modifiers::SHIFT), vec![KeyAction::Group(false)]);
+        assert_eq!(press(&keys, egui::Key::A, ctrl), vec![KeyAction::SelectAll]);
+        let cfg: HotkeysConfig = toml::from_str("[canvas]\nselect_all = \"alt+shift+a\"\n").unwrap();
+        let rebound = cfg.parsed();
+        assert_eq!(press(&rebound, egui::Key::A, ctrl), vec![], "rebound: Ctrl+A is free");
+        assert_eq!(press(&rebound, egui::Key::A, egui::Modifiers::ALT | egui::Modifiers::SHIFT), vec![KeyAction::SelectAll]);
         let cfg: HotkeysConfig = toml::from_str("[canvas]\nmove_slide_up = \"alt+pageup\"\nmove_slide_down = \"alt+pagedown\"\n").unwrap();
         let keys = cfg.parsed();
         assert_eq!(press(&keys, egui::Key::PageUp, egui::Modifiers::ALT), vec![KeyAction::MoveSlide(-1)]);
@@ -220,18 +247,20 @@ mod tests {
     }
 
     #[test]
-    fn arrows_nudge_by_one_and_shift_arrows_by_ten() {
+    fn alt_arrows_nudge_by_one_and_shift_arrows_by_ten() {
         let keys = HotkeysConfig::default().parsed();
         let shift = egui::Modifiers::SHIFT;
-        assert_eq!(press(&keys, egui::Key::ArrowLeft, egui::Modifiers::NONE), vec![KeyAction::Nudge([-1.0, 0.0])]);
-        assert_eq!(press(&keys, egui::Key::ArrowDown, egui::Modifiers::NONE), vec![KeyAction::Nudge([0.0, 1.0])]);
+        let alt = egui::Modifiers::ALT;
+        assert_eq!(press(&keys, egui::Key::ArrowLeft, alt), vec![KeyAction::Nudge([-1.0, 0.0])]);
+        assert_eq!(press(&keys, egui::Key::ArrowDown, alt), vec![KeyAction::Nudge([0.0, 1.0])]);
+        assert_eq!(press(&keys, egui::Key::ArrowLeft, egui::Modifiers::NONE), vec![], "plain arrows hop (app::keys)");
         assert_eq!(press(&keys, egui::Key::ArrowUp, shift), vec![KeyAction::Nudge([0.0, -10.0])]);
         assert_eq!(press(&keys, egui::Key::ArrowRight, shift), vec![KeyAction::Nudge([10.0, 0.0])]);
         assert_eq!(press(&keys, egui::Key::ArrowRight, egui::Modifiers::CTRL), vec![], "Ctrl+arrows are not nudges");
         let cfg: HotkeysConfig = toml::from_str("[canvas]\nnudge_left_1px = \"j\"\nnudge_left_10px = \"\"\n").unwrap();
         let keys = cfg.parsed();
         assert_eq!(press(&keys, egui::Key::J, egui::Modifiers::NONE), vec![KeyAction::Nudge([-1.0, 0.0])]);
-        assert_eq!(press(&keys, egui::Key::ArrowLeft, egui::Modifiers::NONE), vec![], "rebound");
+        assert_eq!(press(&keys, egui::Key::ArrowLeft, alt), vec![], "rebound");
         assert_eq!(press(&keys, egui::Key::ArrowLeft, shift), vec![], "unbound");
     }
 }

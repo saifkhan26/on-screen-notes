@@ -44,6 +44,7 @@ fn is_fill(k: &RasterKind) -> bool { *k == RasterKind::Fill }
 fn is_false(v: &bool) -> bool { !*v }
 pub(crate) fn is_unpinned(v: &u64) -> bool { *v == 0 }
 pub(crate) fn is_ungrouped(v: &u64) -> bool { *v == 0 }
+pub(crate) fn is_unlinked(v: &u64) -> bool { *v == 0 }
 
 #[cfg(test)]
 pub(crate) mod tests_support {
@@ -460,6 +461,10 @@ pub enum Shape {
         /// plain label keeps its old on-disk form.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         background: Option<[u8; 4]>,
+        /// The PureRef board item this label is (`BoardLink::items`), or
+        /// 0. Copies are not linked. A zero is not written.
+        #[serde(default, skip_serializing_if = "is_unlinked")]
+        link: u64,
     },
     /// Raster sticker — a PNG-backed image dropped at `pos` with
     /// canvas-local `size`. Produced by the flood-fill tool (which
@@ -527,10 +532,30 @@ pub enum Shape {
         /// Like `rotation`, a zero is not written.
         #[serde(default, skip_serializing_if = "is_zero")]
         turn: f32,
+        /// Same as `Text::link`.
+        #[serde(default, skip_serializing_if = "is_unlinked")]
+        link: u64,
     },
 }
 
 impl Shape {
+    /// The PureRef board item this shape is (`BoardLink::items`); 0 when
+    /// it is none, as every drawn shape is.
+    pub fn link(&self) -> u64 {
+        match self {
+            Shape::Text { link, .. } | Shape::Raster { link, .. } => *link,
+            _ => 0,
+        }
+    }
+
+    /// Link the shape to a board item, or (0) unlink it. Drawn shapes
+    /// cannot be linked; they are left alone.
+    pub fn set_link(&mut self, id: u64) {
+        if let Shape::Text { link, .. } | Shape::Raster { link, .. } = self {
+            *link = id;
+        }
+    }
+
     /// Color accessor — useful for "highlight selected shape" rendering.
     #[allow(dead_code)]
     pub fn color(&self) -> [u8; 4] {
@@ -943,6 +968,7 @@ mod tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         };
         let text = ron::to_string(&raster).unwrap();
         assert!(!text.contains("rotation") && !text.contains("kind") && !text.contains("media"), "{text}");
@@ -959,6 +985,7 @@ mod tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         };
         let back: Shape = ron::from_str(&ron::to_string(&raster).unwrap()).unwrap();
         assert!(matches!(back, Shape::Raster { rotation, kind: RasterKind::Image, .. } if (rotation - 0.5).abs() < 1e-6));
@@ -981,6 +1008,7 @@ mod tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         }
     }
 
@@ -1032,6 +1060,7 @@ mod tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         }
     }
 
@@ -1127,7 +1156,7 @@ mod tests {
 
     #[test]
     fn text_turns_about_its_anchor() {
-        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 };
+        let mut t = Shape::Text { pos: [10.0, 10.0], content: "ab".into(), font_size: 20.0, color: [0; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0, link: 0 };
         t.apply_affine(&Affine::rotate_about([10.0, 10.0], 0.3).then(Affine::scale_about([10.0, 10.0], 2.0, 2.0)));
         assert!(matches!(t, Shape::Text { pos, font_size, rotation, .. }
             if (pos[0] - 10.0).abs() < 1e-3 && (font_size - 40.0).abs() < 1e-2 && (rotation - 0.3).abs() < 1e-4));
@@ -1179,7 +1208,7 @@ mod tests {
         assert!((rotation + 0.2).abs() < 1e-4, "mirrored turn, not half a turn off: {rotation}");
         assert!(near(*a, [0.0, 0.0]) && near(*b, [40.0, 20.0]));
 
-        let mut t = Shape::Text { pos: [100.0, 50.0], content: "abc".into(), font_size: 20.0, color: [0; 4], rotation: 0.1, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 };
+        let mut t = Shape::Text { pos: [100.0, 50.0], content: "abc".into(), font_size: 20.0, color: [0; 4], rotation: 0.1, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0, link: 0 };
         let centre = t.obb().center;
         t.apply_affine(&Affine::scale_about([0.0, 0.0], 1.0, -1.0));
         let Shape::Text { rotation, font_size, .. } = &t else { panic!() };
@@ -1189,7 +1218,7 @@ mod tests {
 
     #[test]
     fn a_text_box_widens_the_frame_and_follows_a_recolour() {
-        let plain = Shape::Text { pos: [0.0, 0.0], content: "ab".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0 };
+        let plain = Shape::Text { pos: [0.0, 0.0], content: "ab".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0, link: 0 };
         let mut boxed = plain.clone();
         if let Shape::Text { background, .. } = &mut boxed { *background = Some(auto_text_box([255; 4])); }
         let (a, b) = (plain.obb(), boxed.obb());

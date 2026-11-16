@@ -251,6 +251,8 @@ impl Layer {
 
 /// Give copies groups of their own: objects grouped together stay
 /// together under a new id, so a copy never joins its original's group.
+/// Copies are not linked to a PureRef board item either: only the
+/// original follows the board (`Shape::link`).
 pub fn regroup_copies(strokes: &mut [Stroke], shapes: &mut [Shape]) {
     let mut new: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     let mut fresh = |g: u64| if g == 0 { 0 } else { *new.entry(g).or_insert_with(crate::canvas::shape::fresh_group_id) };
@@ -260,6 +262,7 @@ pub fn regroup_copies(strokes: &mut [Stroke], shapes: &mut [Shape]) {
     for s in shapes {
         let g = fresh(s.group());
         s.set_group(g);
+        s.set_link(0);
     }
 }
 

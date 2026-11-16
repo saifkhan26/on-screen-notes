@@ -8,16 +8,34 @@
 //! (`App::go_to_find_hit`): the slide, the view gliding to the match,
 //! and a flash on it.
 //!
+//! A picture pasted (`Ctrl+V`) or dropped while the bar is open, or the
+//! selected picture's "find similar", is looked for instead: the bar
+//! lists the pictures, GIFs and videos like it (`tools::similar`),
+//! copies first, each with a thumbnail and how alike it is. Or it lists
+//! every set of copies on the slides ("find every duplicate picture"),
+//! each set with a button that selects all of its copies on one slide
+//! but one, for deleting. Typing goes back to finding words.
+//!
+//! With nothing typed, the bar lists every tag in the app with how many
+//! slides and objects carry it (also from the command palette's "Every
+//! tag"): a click finds what has it; each can be renamed or removed
+//! everywhere.
+//!
 //! Only slides already read are searched: the bar says how many are
 //! still opening. The query is kept between opens, selected so that
 //! typing replaces it, as in a browser.
 
 use crate::canvas::canvas::{Canvas, Layer};
-use crate::canvas::units::{bounds_of, tagged_by};
-use crate::canvas::shape::{MediaType, Shape};
+use crate::canvas::units::{bounds_of, same_tag, tagged_by};
+use crate::canvas::shape::{parse_tags, MediaType, Shape};
+use crate::canvas::TagCount;
+use crate::ui::media_filter::TAG_COLOUR;
+use crate::tools::similar::{self, Kind, Likeness, Origin, Query, Signature};
 use crate::ui::theme;
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
-use egui::{Color32, FontId, Vec2};
+use egui::{Color32, ColorImage, FontId, TextureHandle, TextureOptions, Vec2};
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 /// The colour a match is marked in, here and on the canvas.
 pub const FOUND: Color32 = Color32::from_rgb(255, 196, 64);
@@ -170,11 +188,150 @@ fn snippet(text: &[char], at: usize, len: usize) -> (String, std::ops::Range<usi
     (s, mark)
 }
 
+/// A picture find looks for others like.
+pub struct PictureQuery {
+    query: Query,
+    origin: Origin,
+    /// What it is, for the bar: "the pasted picture", a file's name.
+    label: String,
+    thumb: ColorImage,
+    texture: Option<TextureHandle>,
+    /// Its matches, and what they were found from (`update_pictures`).
+    results: Vec<PictureHit>,
+    results_for: Option<(u64, usize)>,
+}
+
+impl PictureQuery {
+    /// Look for pictures like `img`. `None` for an empty picture.
+    pub fn new(img: &image::RgbaImage, label: &str, origin: Origin) -> Option<Self> {
+        let query = Query::of(img)?;
+        Some(Self { query, origin, label: label.to_string(), thumb: thumb_of(img), texture: None, results: Vec::new(), results_for: None })
+    }
+}
+
+/// A picture like the query.
+#[derive(Clone)]
+pub struct PictureHit {
+    pub hit: Hit,
+    pub likeness: Likeness,
+    /// Its bytes, for the thumbnail.
+    png: Arc<Vec<u8>>,
+}
+
+/// The pictures on `slides` like `q`'s, copies first. `signature` gives
+/// a picture's signature from its bytes, once read.
+pub fn picture_search<'a>(
+    q: &PictureQuery,
+    slides: impl IntoIterator<Item = (usize, &'a Canvas)>,
+    signature: impl Fn(&Arc<Vec<u8>>) -> Option<Signature>,
+) -> Vec<PictureHit> {
+    let slides: Vec<(usize, &Canvas)> = slides.into_iter().collect();
+    let found = similar::search(&q.query, &q.origin, slides.iter().copied(), signature);
+    found
+        .into_iter()
+        .filter_map(|m| {
+            let c = slides.iter().find(|(i, _)| *i == m.slide)?.1;
+            picture_hit(c, m.slide, m.layer, m.shape, m.likeness, m.png)
+        })
+        .collect()
+}
+
+/// The row for the picture at `(slide, layer, shape)` of `c`.
+pub fn picture_hit(c: &Canvas, slide: usize, layer: usize, shape: usize, likeness: Likeness, png: Arc<Vec<u8>>) -> Option<PictureHit> {
+    let l = c.layers.get(layer)?;
+    let what = describe(l, &[], &[shape]);
+    let found = Found::Tagged { strokes: Vec::new(), shapes: vec![shape], what };
+    let hit = Hit { slide, layer, found, snippet: String::new(), mark: 0..0, hidden: !l.visible };
+    Some(PictureHit { hit, likeness, png })
+}
+
+/// Every set of copies on the slides, as the bar lists them.
+#[derive(Default)]
+pub struct Copies {
+    /// Every copy, set after set; `sets` cuts the list into its sets.
+    results: Vec<PictureHit>,
+    sets: Vec<std::ops::Range<usize>>,
+    /// What they were found from, once found (`set_copies`).
+    results_for: Option<(u64, usize)>,
+}
+
+/// What a click on the bar asks of the app.
+pub enum Request {
+    /// Go to `slide` and select these pictures on `layer`: a set's
+    /// copies there, all but one.
+    SelectExtras { slide: usize, layer: usize, shapes: Vec<usize> },
+    /// Change a tag everywhere.
+    Tag(TagAction),
+}
+
+/// A tag changed everywhere from the tag list.
+pub enum TagAction {
+    /// Put these tags in place of this one.
+    Rename(String, Vec<String>),
+    Remove(String),
+}
+
+/// A small copy of `img` to show, its long side at most `THUMB` pixels.
+fn thumb_of(img: &image::RgbaImage) -> ColorImage {
+    let (w, h) = img.dimensions();
+    let s = (THUMB as f32 / w.max(h).max(1) as f32).min(1.0);
+    let (tw, th) = (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1));
+    let small = image::imageops::thumbnail(img, tw, th);
+    ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], small.as_raw())
+}
+
+/// Long side of a thumbnail, in pixels.
+const THUMB: u32 = 64;
+/// Thumbnails made per frame at most; the rest come in the next frames.
+const THUMBS_PER_FRAME: usize = 3;
+
+/// A result's thumbnail, by the address of its bytes.
+struct Thumb {
+    /// Keeps the address from going to other bytes while it is a key.
+    _png: Weak<Vec<u8>>,
+    texture: Option<TextureHandle>,
+}
+
+/// The thumbnail of a picture's bytes: made now if `budget` allows, else
+/// in a later frame.
+fn thumb(ctx: &egui::Context, cache: &mut HashMap<usize, Thumb>, png: &Arc<Vec<u8>>, budget: &mut usize) -> Option<TextureHandle> {
+    let key = Arc::as_ptr(png) as usize;
+    if let Some(t) = cache.get(&key) {
+        return t.texture.clone();
+    }
+    if *budget == 0 {
+        ctx.request_repaint();
+        return None;
+    }
+    *budget -= 1;
+    let texture = image::load_from_memory(png).ok().map(|img| ctx.load_texture(format!("osn_find_thumb_{key}"), thumb_of(&img.to_rgba8()), TextureOptions::LINEAR));
+    cache.insert(key, Thumb { _png: Arc::downgrade(png), texture: texture.clone() });
+    texture
+}
+
 /// The find bar's state between frames.
 #[derive(Default)]
 pub struct FindBar {
     open: bool,
     query: String,
+    /// Set while looking for pictures like one.
+    picture: Option<PictureQuery>,
+    /// What is typed while looking for a picture: once there is any, it
+    /// becomes the query.
+    typed: String,
+    thumbs: HashMap<usize, Thumb>,
+    /// Textures no longer shown, freed next frame (`free_retired`).
+    retired: Vec<TextureHandle>,
+    /// Set while listing every set of copies.
+    copies: Option<Copies>,
+    /// What a click asked of the app, until it takes it.
+    request: Option<Request>,
+    /// The tag being renamed in the tag list, and the name typed so far.
+    tag_renaming: Option<(String, String)>,
+    /// The rename field has yet to take the keyboard.
+    tag_focus: bool,
+    /// The tag whose removal waits for a yes.
+    tag_removing: Option<String>,
     /// The highlighted row.
     cursor: usize,
     /// The highlighted row is the one last gone to, so the next `Enter`
@@ -187,8 +344,21 @@ pub struct FindBar {
     focus_pending: bool,
 }
 
-/// Most rows shown at once.
+/// Most rows shown at once, of words and of pictures.
 const ROWS: usize = 8;
+const PICTURE_ROWS: usize = 7;
+/// Height of a picture's row, and of its thumbnail.
+const PICTURE_ROW: f32 = 40.0;
+const PICTURE_THUMB: f32 = 32.0;
+
+/// How each kind of likeness is marked.
+fn kind_colour(k: Kind) -> Color32 {
+    match k {
+        Kind::Duplicate => FOUND,
+        Kind::Edited => Color32::from_rgb(255, 226, 160),
+        Kind::Alike => theme::TEXT_PRIMARY,
+    }
+}
 const WIDTH: f32 = 520.0;
 
 impl FindBar {
@@ -202,10 +372,145 @@ impl FindBar {
         self.shown = false;
         self.restart = true;
         self.focus_pending = true;
+        if let Some(p) = &mut self.picture {
+            p.results_for = None;
+        }
+        if let Some(c) = &mut self.copies {
+            c.results_for = None;
+        }
     }
 
+    /// Close it. The picture looked for stays, as the query does; its
+    /// results and thumbnails go.
     pub fn close(&mut self) {
         self.open = false;
+        self.tag_renaming = None;
+        self.tag_removing = None;
+        self.retire_thumbs();
+        if let Some(p) = &mut self.picture {
+            p.results.clear();
+            p.results_for = None;
+            self.retired.extend(p.texture.take());
+        }
+        if let Some(c) = &mut self.copies {
+            *c = Copies::default();
+        }
+    }
+
+    /// Open it with nothing typed, so it lists every tag.
+    pub fn open_tags(&mut self) {
+        self.retire_picture();
+        self.query.clear();
+        self.open();
+    }
+
+    /// Open it listing every set of copies on the slides.
+    pub fn find_copies(&mut self) {
+        self.retire_picture();
+        self.copies = Some(Copies::default());
+        self.typed.clear();
+        self.open();
+    }
+
+    /// It is open, listing every set of copies.
+    pub fn has_copies(&self) -> bool {
+        self.open && self.copies.is_some()
+    }
+
+    /// What the copies listed were found from; `None` before any are.
+    pub fn copies_found_for(&self) -> Option<(u64, usize)> {
+        self.copies.as_ref().and_then(|c| c.results_for)
+    }
+
+    /// The sets of copies found from `key` (see `update_pictures`). The
+    /// highlighted copy stays highlighted.
+    pub fn set_copies(&mut self, sets: Vec<Vec<PictureHit>>, key: (u64, usize)) {
+        let Some(c) = self.copies.as_mut() else { return };
+        let current = c.results.get(self.cursor).map(|h| (h.hit.slide, h.hit.layer, h.hit.found.clone()));
+        c.results.clear();
+        c.sets.clear();
+        for set in sets {
+            let start = c.results.len();
+            c.results.extend(set);
+            c.sets.push(start..c.results.len());
+        }
+        c.results_for = Some(key);
+        if let Some(cur) = current {
+            if let Some(i) = c.results.iter().position(|h| (h.hit.slide, h.hit.layer, &h.hit.found) == (cur.0, cur.1, &cur.2)) {
+                self.cursor = i;
+            }
+        }
+    }
+
+    /// What a click on the bar asked for, once.
+    pub fn take_request(&mut self) -> Option<Request> {
+        self.request.take()
+    }
+
+    /// The pictures listed, when listing pictures rather than words.
+    fn rows(&self) -> Option<&[PictureHit]> {
+        self.picture.as_ref().map(|p| p.results.as_slice()).or_else(|| self.copies.as_ref().map(|c| c.results.as_slice()))
+    }
+
+    /// Open it looking for pictures like `q`.
+    pub fn find_picture(&mut self, q: PictureQuery) {
+        self.retire_picture();
+        self.picture = Some(q);
+        self.typed.clear();
+        self.retire_thumbs();
+        self.open();
+    }
+
+    /// Free the textures put aside in an earlier frame. Call once a
+    /// frame, before the bar is drawn.
+    pub fn free_retired(&mut self) {
+        self.retired.clear();
+    }
+
+    /// Put the thumbnails aside rather than free them: one may have
+    /// been drawn this frame, and a texture freed in the frame that
+    /// draws it is gone before the frame is shown (wgpu then panics).
+    fn retire_thumbs(&mut self) {
+        self.retired.extend(self.thumbs.drain().filter_map(|(_, t)| t.texture));
+    }
+
+    /// Stop listing pictures (like one, or copies); the thumbnails are
+    /// put aside as above.
+    fn retire_picture(&mut self) {
+        if let Some(p) = self.picture.take() {
+            self.retired.extend(p.texture);
+        }
+        self.copies = None;
+        self.retire_thumbs();
+    }
+
+    /// It is open, looking for pictures like one.
+    pub fn has_picture(&self) -> bool {
+        self.open && self.picture.is_some()
+    }
+
+    /// The picture looked for has results, maybe not the latest.
+    pub fn has_picture_results(&self) -> bool {
+        self.picture.as_ref().is_some_and(|p| p.results_for.is_some())
+    }
+
+    /// Bring the picture's results up to date, finding them with
+    /// `search` when what they were found from (`key`: the index's
+    /// generation, the slides read) has changed. The highlighted
+    /// result stays highlighted.
+    pub fn update_pictures(&mut self, key: (u64, usize), search: impl FnOnce(&PictureQuery) -> Vec<PictureHit>) {
+        let Some(p) = self.picture.as_mut() else { return };
+        if p.results_for == Some(key) {
+            return;
+        }
+        let current = p.results.get(self.cursor).map(|h| (h.hit.slide, h.hit.layer, h.hit.found.clone()));
+        p.results = search(p);
+        p.results_for = Some(key);
+        if let Some(cur) = current {
+            if let Some(i) = p.results.iter().position(|h| (h.hit.slide, h.hit.layer, &h.hit.found) == (cur.0, cur.1, &cur.2)) {
+                self.cursor = i;
+            }
+        }
     }
 
     /// The row a key moves to and goes to, if a key did: `Enter` the next
@@ -235,7 +540,10 @@ impl FindBar {
     /// Draw the bar while open; the match to go to, if one was picked.
     /// `search` finds the matches for a query; `unread` slides are not
     /// searched yet; `active` is the slide shown; `name` gives a slide's
-    /// name ("" for none).
+    /// name ("" for none); `reading` is how many of the slides' pictures
+    /// are read, of how many, while looking for a picture; `tags` gives
+    /// every tag, for the list shown while nothing is typed.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -243,12 +551,15 @@ impl FindBar {
         unread: usize,
         active: usize,
         name: impl Fn(usize) -> String,
+        reading: Option<(usize, usize)>,
+        tags: impl FnOnce() -> Vec<TagCount>,
     ) -> Option<Hit> {
         if !self.open {
             return None;
         }
-        let mut hits = search(&self.query);
-        let (prev, next, up, down, esc) = ctx.input_mut(|i| {
+        let mut hits = if self.rows().is_some() { Vec::new() } else { search(&self.query) };
+        // While a tag is renamed, Enter and Esc are the rename field's.
+        let keys = |i: &mut egui::InputState| {
             // Shift+Enter first: a plain Enter pattern would take it too.
             let prev = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
             (
@@ -258,20 +569,24 @@ impl FindBar {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
             )
-        });
+        };
+        let (prev, next, up, down, esc) = if self.tag_renaming.is_some() { Default::default() } else { ctx.input_mut(keys) };
         if esc {
             self.close();
             return None;
         }
+        // Words from the shown slide on; pictures from the most alike.
         let restart = |bar: &mut Self, hits: &[Hit]| {
-            bar.cursor = hits.iter().position(|h| h.slide >= active).unwrap_or(0);
+            bar.cursor = if bar.rows().is_some() { 0 } else { hits.iter().position(|h| h.slide >= active).unwrap_or(0) };
             bar.shown = false;
             bar.restart = false;
         };
         if self.restart {
             restart(self, &hits);
         }
-        let mut picked = self.step(hits.len(), next, prev, up, down);
+        let n = self.rows().map_or(hits.len(), <[PictureHit]>::len);
+        let mut picked = self.step(n, next, prev, up, down);
+        let mut to_copies = false;
 
         let top = ctx.memory(|m| m.area_rect(egui::Id::new("osn_toolbar"))).map_or(70.0, |r| r.bottom() + 10.0);
         let x = ctx.screen_rect().center().x - WIDTH * 0.5;
@@ -281,27 +596,81 @@ impl FindBar {
             .show(ctx, |ui| {
                 theme::card_frame().inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
                     ui.set_width(WIDTH - 16.0);
-                    let out = egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Find labels and tags on the slides")
-                        .desired_width(f32::INFINITY)
-                        .show(ui);
+                    let back = match (self.picture.as_mut(), &self.copies) {
+                        (Some(p), _) => picture_header(ui, p),
+                        (None, Some(_)) => copies_header(ui),
+                        _ => false,
+                    };
+                    if back {
+                        // Back to words.
+                        self.retire_picture();
+                        hits = search(&self.query);
+                        restart(self, &hits);
+                        picked = None;
+                        self.focus_pending = true;
+                    }
+                    let in_picture = self.rows().is_some();
+                    let (field, hint) = if in_picture {
+                        (&mut self.typed, "Or type to find labels and tags instead")
+                    } else {
+                        (&mut self.query, "Find labels and tags — or paste or drop a picture")
+                    };
+                    let out = egui::TextEdit::singleline(field).hint_text(hint).desired_width(f32::INFINITY).show(ui);
                     if std::mem::take(&mut self.focus_pending) {
                         out.response.request_focus();
                         let mut state = out.state.clone();
-                        let all = CCursorRange::two(CCursor::new(0), CCursor::new(self.query.chars().count()));
+                        let len = if in_picture { self.typed.chars().count() } else { self.query.chars().count() };
+                        let all = CCursorRange::two(CCursor::new(0), CCursor::new(len));
                         state.cursor.set_char_range(Some(all));
                         state.store(ui.ctx(), out.response.id);
-                    } else if !out.response.has_focus() {
+                    } else if !out.response.has_focus() && self.tag_renaming.is_none() {
                         out.response.request_focus();
                     }
-                    if out.response.changed() {
+                    if out.response.changed() && in_picture && !self.typed.trim().is_empty() {
+                        // Typing goes back to finding words.
+                        self.query = std::mem::take(&mut self.typed);
+                        self.retire_picture();
+                    }
+                    if out.response.changed() && self.rows().is_none() {
                         hits = search(&self.query);
                         restart(self, &hits);
                         picked = None;
                     }
                     ui.add_space(4.0);
-                    let status = if self.query.trim().is_empty() {
-                        "Type a label's words or a tag".to_string()
+                    let status = if let Some(c) = &self.copies {
+                        let m = c.results.len();
+                        if c.results_for.is_none() {
+                            match reading.filter(|(r, t)| r < t) {
+                                Some((r, t)) => format!("Reading pictures, {r} of {t}"),
+                                None if unread > 0 => "Waiting for every slide to open".to_string(),
+                                None => "Comparing…".to_string(),
+                            }
+                        } else if m == 0 {
+                            "No duplicate pictures on the slides".to_string()
+                        } else if self.shown {
+                            format!("{} of {m}", self.cursor + 1)
+                        } else {
+                            let sets = c.sets.len();
+                            format!("{sets} {} of copies, {m} pictures — Enter goes to each in turn", if sets == 1 { "set" } else { "sets" })
+                        }
+                    } else if let Some(p) = &self.picture {
+                        let n = p.results.len();
+                        let reading = reading.filter(|(r, t)| r < t);
+                        let s = if n == 0 {
+                            if reading.is_some() { "Looking…".to_string() } else { "No picture like this on the slides".to_string() }
+                        } else if self.shown {
+                            format!("{} of {n}", self.cursor + 1)
+                        } else if n == 1 {
+                            "1 picture like this — Enter goes there".to_string()
+                        } else {
+                            format!("{n} pictures like this — Enter goes to each in turn")
+                        };
+                        match reading {
+                            Some((r, t)) => format!("{s} · reading pictures, {r} of {t}"),
+                            None => s,
+                        }
+                    } else if self.query.trim().is_empty() {
+                        "Type a label's words or a tag — or paste or drop a picture to find ones like it".to_string()
                     } else if hits.is_empty() {
                         "No label says that, and nothing is tagged so".to_string()
                     } else if self.shown {
@@ -316,7 +685,71 @@ impl FindBar {
                         1 => format!("{status} · 1 slide still opening"),
                         n => format!("{status} · {n} slides still opening"),
                     };
-                    ui.label(egui::RichText::new(status).small().color(theme::TEXT_MUTED));
+                    if self.rows().is_none() && self.query.trim().is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(status).small().color(theme::TEXT_MUTED));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                to_copies = ui.link(egui::RichText::new("Find every duplicate picture").small()).clicked();
+                            });
+                        });
+                    } else {
+                        ui.label(egui::RichText::new(status).small().color(theme::TEXT_MUTED));
+                    }
+                    if self.rows().is_none() && self.query.trim().is_empty() {
+                        match tag_list(ui, &mut self.tag_renaming, &mut self.tag_focus, &mut self.tag_removing, &tags()) {
+                            Some(TagPick::Find(tag)) => {
+                                self.query = format!("#{tag}");
+                                hits = search(&self.query);
+                                restart(self, &hits);
+                                picked = None;
+                                self.focus_pending = true;
+                            }
+                            Some(TagPick::Change(a)) => self.request = Some(Request::Tag(a)),
+                            None => {}
+                        }
+                        return;
+                    }
+                    if let Some(c) = &self.copies {
+                        let first = self.cursor.saturating_sub(PICTURE_ROWS - 1);
+                        let mut budget = THUMBS_PER_FRAME;
+                        for (k, h) in c.results.iter().enumerate().skip(first).take(PICTURE_ROWS) {
+                            let set = c.sets.iter().find(|r| r.contains(&k)).cloned().unwrap_or(k..k + 1);
+                            if k == set.start || k == first {
+                                if let Some(r) = set_header(ui, &c.results[set.clone()], active) {
+                                    self.request = Some(r);
+                                }
+                            }
+                            let texture = thumb(ui.ctx(), &mut self.thumbs, &h.png, &mut budget);
+                            let label = format!("Copy {} of {}", k - set.start + 1, set.len());
+                            if picture_row(ui, h, k == self.cursor, texture.as_ref(), &name, Some(&label)) {
+                                self.cursor = k;
+                                self.shown = true;
+                                picked = Some(k);
+                            }
+                        }
+                        if c.results.len() > first + PICTURE_ROWS {
+                            let more = c.results.len() - first - PICTURE_ROWS;
+                            ui.label(egui::RichText::new(format!("{more} more below")).small().color(theme::TEXT_MUTED));
+                        }
+                        return;
+                    }
+                    if let Some(p) = &self.picture {
+                        let first = self.cursor.saturating_sub(PICTURE_ROWS - 1);
+                        let mut budget = THUMBS_PER_FRAME;
+                        for (k, h) in p.results.iter().enumerate().skip(first).take(PICTURE_ROWS) {
+                            let texture = thumb(ui.ctx(), &mut self.thumbs, &h.png, &mut budget);
+                            if picture_row(ui, h, k == self.cursor, texture.as_ref(), &name, None) {
+                                self.cursor = k;
+                                self.shown = true;
+                                picked = Some(k);
+                            }
+                        }
+                        if p.results.len() > first + PICTURE_ROWS {
+                            let more = p.results.len() - first - PICTURE_ROWS;
+                            ui.label(egui::RichText::new(format!("{more} more below")).small().color(theme::TEXT_MUTED));
+                        }
+                        return;
+                    }
                     let first = self.cursor.saturating_sub(ROWS - 1);
                     for (k, h) in hits.iter().enumerate().skip(first).take(ROWS) {
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::click());
@@ -326,15 +759,7 @@ impl FindBar {
                             ui.painter().rect_filled(rect, egui::Rounding::same(5.0), fill);
                         }
                         let y = rect.center().y;
-                        let slide = match name(h.slide) {
-                            n if n.is_empty() => format!("Slide {}", h.slide + 1),
-                            n => format!("{} · {n}", h.slide + 1),
-                        };
-                        let slide = match &h.found {
-                            Found::Tagged { what, .. } => format!("{what} · {slide}"),
-                            Found::Label(_) => slide,
-                        };
-                        let slide = if h.hidden { format!("{slide} · hidden layer") } else { slide };
+                        let slide = place(h, &name);
                         let g = ui.painter().text(egui::pos2(rect.right() - 8.0, y), egui::Align2::RIGHT_CENTER, slide, FontId::proportional(11.0), theme::TEXT_MUTED);
                         let room = (g.left() - rect.left() - 24.0).max(40.0);
                         let galley = ui.painter().layout_job(row_text(h, room));
@@ -359,8 +784,258 @@ impl FindBar {
         if picked.is_some() {
             ctx.request_repaint();
         }
-        picked.and_then(|k| hits.get(k).cloned())
+        if to_copies {
+            self.find_copies();
+            return None;
+        }
+        match self.rows() {
+            Some(rows) => picked.and_then(|k| rows.get(k)).map(|h| h.hit.clone()),
+            None => picked.and_then(|k| hits.get(k).cloned()),
+        }
     }
+}
+
+/// What a click in the tag list asks for.
+enum TagPick {
+    /// Find what has this tag.
+    Find(String),
+    Change(TagAction),
+}
+
+/// Most of the bar's height the tag list takes before it scrolls.
+const TAG_LIST_HEIGHT: f32 = 300.0;
+
+/// Every tag in `index`, a click finding what has it, and beside each its
+/// counts, a rename (into `renaming`, `focus` for its first frame) and a
+/// remove (which asks first: `removing`).
+fn tag_list(ui: &mut egui::Ui, renaming: &mut Option<(String, String)>, focus: &mut bool, removing: &mut Option<String>, index: &[TagCount]) -> Option<TagPick> {
+    ui.add_space(6.0);
+    if index.is_empty() {
+        ui.label(egui::RichText::new("No tags yet: select something, then the arrange bar's tag button").small().color(theme::TEXT_MUTED));
+        return None;
+    }
+    let title = format!("Every tag · {} — a click finds what has it; the pen renames it everywhere, the bin removes it", index.len());
+    ui.label(egui::RichText::new(title).small().color(theme::TEXT_MUTED));
+    let mut out = None;
+    // Sized by its rows: on the frame it first shows, a scroll area
+    // only knows how much fitted last frame, and cut the last row off.
+    let rows_h = index.len() as f32 * (22.0 + ui.spacing().item_spacing.y);
+    let height = rows_h.min(TAG_LIST_HEIGHT);
+    egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, true]).show(ui, |ui| {
+        for t in index {
+            ui.horizontal(|ui| {
+                if renaming.as_ref().is_some_and(|(from, _)| same_tag(from, &t.tag)) {
+                    let Some((from, text)) = renaming.as_mut() else { return };
+                    let r = ui.add(egui::TextEdit::singleline(text).desired_width(300.0).hint_text("new name (spaces: several)"));
+                    if std::mem::take(focus) {
+                        r.request_focus();
+                        if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), r.id) {
+                            let end = CCursor::new(text.chars().count());
+                            st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), end)));
+                            st.store(ui.ctx(), r.id);
+                        }
+                    } else if r.lost_focus() {
+                        // Enter renames; Esc or a click elsewhere leaves it.
+                        let to = parse_tags(text);
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !to.is_empty() && to != [from.clone()] {
+                            out = Some(TagPick::Change(TagAction::Rename(from.clone(), to)));
+                        }
+                        *renaming = None;
+                    }
+                    return;
+                }
+                if removing.as_deref().is_some_and(|r| same_tag(r, &t.tag)) {
+                    let things = if t.objects == 1 { "object" } else { "objects" };
+                    ui.label(egui::RichText::new(format!("Take #{} off {} {things}?", t.tag, t.objects)).small());
+                    if ui.small_button("Remove").clicked() {
+                        out = Some(TagPick::Change(TagAction::Remove(t.tag.clone())));
+                        *removing = None;
+                    }
+                    if ui.small_button("Keep").clicked() {
+                        *removing = None;
+                    }
+                    return;
+                }
+                let label = egui::RichText::new(format!("#{}", t.tag)).color(TAG_COLOUR);
+                if ui.add(egui::Button::new(label).frame(false)).on_hover_text("Find everything with this tag").clicked() {
+                    out = Some(TagPick::Find(t.tag.clone()));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let trash = egui::Image::new(egui::include_image!("../../assets/icons/trash.svg"));
+                    if icon_btn(ui, trash, "Remove this tag from every object (on unlocked slides)") {
+                        *removing = Some(t.tag.clone());
+                        *renaming = None;
+                    }
+                    let pen = egui::Image::new(egui::include_image!("../../assets/icons/pen.svg"));
+                    if icon_btn(ui, pen, "Rename this tag everywhere; to a tag that exists, they merge") {
+                        *renaming = Some((t.tag.clone(), t.tag.clone()));
+                        *focus = true;
+                        *removing = None;
+                    }
+                    let slides = if t.slides == 1 { "slide" } else { "slides" };
+                    ui.label(egui::RichText::new(format!("{} {slides} · {}", t.slides, t.objects)).small().color(theme::TEXT_MUTED))
+                        .on_hover_text(format!("On {} {slides}, {} objects", t.slides, t.objects));
+                });
+            });
+        }
+    });
+    out
+}
+
+/// A small icon button; whether it was clicked.
+fn icon_btn(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, egui::Rounding::same(5.0), Color32::from_white_alpha(18));
+    }
+    let r = rect.shrink(4.0);
+    img.tint(theme::TEXT_PRIMARY).fit_to_exact_size(r.size()).paint_at(ui, r);
+    response.on_hover_text(tooltip).clicked()
+}
+
+/// Above the field while listing copies: what the list is, and a button
+/// back to finding words. Returns whether that was clicked.
+fn copies_header(ui: &mut egui::Ui) -> bool {
+    let mut back = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new("Duplicate pictures on every slide").color(theme::TEXT_PRIMARY));
+            ui.label(egui::RichText::new("Resized, recompressed, mirrored or turned copies count too").small().color(theme::TEXT_MUTED));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            back = ui.button(egui::RichText::new("×").size(16.0)).on_hover_text("Back to finding words").clicked();
+        });
+    });
+    ui.add_space(4.0);
+    back
+}
+
+/// The line over a set of copies: how many and on which slides, and,
+/// where two or more sit on one layer of one slide (the shown slide's
+/// first), a button that selects all of those but one.
+fn set_header(ui: &mut egui::Ui, set: &[PictureHit], active: usize) -> Option<Request> {
+    let mut slides: Vec<usize> = set.iter().map(|h| h.hit.slide).collect();
+    slides.dedup();
+    let on = slides.iter().map(|s| (s + 1).to_string()).collect::<Vec<_>>().join(", ");
+    let text = format!("{} copies · {} {on}", set.len(), if slides.len() == 1 { "slide" } else { "slides" });
+    let mut out = None;
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(text).small().color(FOUND));
+        if let Some(Request::SelectExtras { slide, shapes, .. }) = extras(set, active) {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let n = shapes.len();
+                let tip = format!("Go to slide {} and select {n} of the {} copies there, keeping the one at the back — Delete then removes them", slide + 1, n + 1);
+                if ui.small_button(format!("Select {n} extra")).on_hover_text(tip).clicked() {
+                    out = extras(set, active);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// A set's copies to select for deleting: where two or more sit on one
+/// layer of one slide (the shown slide's first), all of those but the
+/// one at the back.
+fn extras(set: &[PictureHit], active: usize) -> Option<Request> {
+    let mut places: Vec<((usize, usize), Vec<usize>)> = Vec::new();
+    for h in set {
+        let Found::Tagged { shapes, .. } = &h.hit.found else { continue };
+        let at = (h.hit.slide, h.hit.layer);
+        match places.iter_mut().find(|(p, _)| *p == at) {
+            Some((_, v)) => v.extend(shapes),
+            None => places.push((at, shapes.clone())),
+        }
+    }
+    places.retain(|(_, v)| v.len() >= 2);
+    let i = places.iter().position(|((s, _), _)| *s == active).unwrap_or(0);
+    let ((slide, layer), mut shapes) = places.into_iter().nth(i)?;
+    shapes.sort_unstable();
+    shapes.remove(0);
+    Some(Request::SelectExtras { slide, layer, shapes })
+}
+
+/// Where a match is, for the right of its row: what it is (if not a
+/// label), its slide, and whether its layer is hidden.
+fn place(h: &Hit, name: &impl Fn(usize) -> String) -> String {
+    let slide = match name(h.slide) {
+        n if n.is_empty() => format!("Slide {}", h.slide + 1),
+        n => format!("{} · {n}", h.slide + 1),
+    };
+    let slide = match &h.found {
+        Found::Tagged { what, .. } => format!("{what} · {slide}"),
+        Found::Label(_) => slide,
+    };
+    if h.hidden { format!("{slide} · hidden layer") } else { slide }
+}
+
+/// The picture looked for, above the field: its thumbnail, what it is,
+/// and a button back to finding words. Returns whether that was clicked.
+fn picture_header(ui: &mut egui::Ui, p: &mut PictureQuery) -> bool {
+    let texture = p.texture.get_or_insert_with(|| ui.ctx().load_texture("osn_find_query", p.thumb.clone(), TextureOptions::LINEAR));
+    let mut back = false;
+    ui.horizontal(|ui| {
+        let size = texture.size_vec2();
+        ui.image((texture.id(), size * (40.0 / size.max_elem().max(1.0))));
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(format!("Pictures like {}", p.label)).color(theme::TEXT_PRIMARY));
+            ui.label(egui::RichText::new("Paste or drop another picture to look for it instead").small().color(theme::TEXT_MUTED));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            back = ui.button(egui::RichText::new("×").size(16.0)).on_hover_text("Back to finding words").clicked();
+        });
+    });
+    ui.add_space(4.0);
+    back
+}
+
+/// One picture's row: thumbnail, how alike (or `copy`, which copy it
+/// is), and where. Returns whether it was clicked.
+fn picture_row(ui: &mut egui::Ui, h: &PictureHit, lit: bool, texture: Option<&TextureHandle>, name: &impl Fn(usize) -> String, copy: Option<&str>) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), PICTURE_ROW), egui::Sense::click());
+    if lit || resp.hovered() {
+        let fill = if lit { theme::ACCENT } else { Color32::from_white_alpha(16) };
+        ui.painter().rect_filled(rect, egui::Rounding::same(5.0), fill);
+    }
+    let pad = (PICTURE_ROW - PICTURE_THUMB) * 0.5;
+    let well = egui::Rect::from_min_size(rect.left_top() + egui::vec2(pad + 2.0, pad), Vec2::splat(PICTURE_THUMB));
+    match texture {
+        Some(t) => {
+            let size = t.size_vec2();
+            let shown = egui::Rect::from_center_size(well.center(), size * (PICTURE_THUMB / size.max_elem().max(1.0)));
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(t.id(), shown, uv, Color32::WHITE);
+        }
+        None => {
+            ui.painter().rect_filled(well, egui::Rounding::same(4.0), Color32::from_white_alpha(12));
+        }
+    }
+    let y = rect.center().y;
+    let l = &h.likeness;
+    let right = match copy {
+        Some(_) => place(&h.hit, name),
+        None => format!("{:.0}% · {}", l.score * 100.0, place(&h.hit, name)),
+    };
+    let g = ui.painter().text(egui::pos2(rect.right() - 8.0, y), egui::Align2::RIGHT_CENTER, right, FontId::proportional(11.0), theme::TEXT_MUTED);
+    let mut job = LayoutJob::default();
+    match copy {
+        Some(label) => job.append(label, 0.0, TextFormat { font_id: FontId::proportional(13.5), color: theme::TEXT_PRIMARY, ..Default::default() }),
+        None => {
+            job.append(l.kind.label(), 0.0, TextFormat { font_id: FontId::proportional(13.5), color: kind_colour(l.kind), ..Default::default() });
+            let notes: Vec<&str> = [l.way.note(), if l.other_crop { "another crop of it" } else { "" }].into_iter().filter(|n| !n.is_empty()).collect();
+            if !notes.is_empty() {
+                job.append(&format!(" · {}", notes.join(", ")), 0.0, TextFormat { font_id: FontId::proportional(12.0), color: theme::TEXT_MUTED, ..Default::default() });
+            }
+        }
+    }
+    job.wrap.max_width = (g.left() - well.right() - 20.0).max(40.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(egui::pos2(well.right() + 10.0, y - galley.size().y * 0.5), galley, theme::TEXT_PRIMARY);
+    resp.clicked()
 }
 
 /// A row's text: the snippet, its match in the found colour, cut to `width`.
@@ -394,6 +1069,7 @@ mod tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         }
     }
 
@@ -500,6 +1176,23 @@ mod tests {
         let (s, mark) = snippet(&text, 100, 3);
         assert_eq!(&s[mark], "end");
         assert!(!s.ends_with('…'));
+    }
+
+    #[test]
+    fn extras_keep_one_copy_per_layer_on_the_shown_slide_first() {
+        let copy = Likeness { kind: Kind::Duplicate, score: 1.0, way: Default::default(), other_crop: false };
+        let mut c = Canvas::default();
+        c.layers[0].shapes.extend((0..6).map(|i| label([0.0, i as f32 * 10.0], "x")));
+        let hit = |slide: usize, shape: usize| picture_hit(&c, slide, 0, shape, copy, Arc::new(Vec::new())).unwrap();
+        // Slide 1: shapes 4 and 2; slide 3: shapes 5, 1 and 3; slide 2: one.
+        let set = vec![hit(1, 4), hit(1, 2), hit(2, 0), hit(3, 5), hit(3, 1), hit(3, 3)];
+        let got = |active| match extras(&set, active) {
+            Some(Request::SelectExtras { slide, layer, shapes }) => Some((slide, layer, shapes)),
+            _ => None,
+        };
+        assert_eq!(got(3), Some((3, 0, vec![3, 5])), "the shown slide's, the backmost kept");
+        assert_eq!(got(0), Some((1, 0, vec![4])), "else the first slide with two");
+        assert_eq!(extras(&set[2..4], 0).map(|_| ()), None, "one copy a slide: nothing to select");
     }
 
     #[test]

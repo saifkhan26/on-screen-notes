@@ -330,13 +330,22 @@ fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: &media_filter
                     }
                 });
             }
+            // A slide opened from a PureRef board: what the board has
+            // dropped since (a resync keeps it on the slide).
+            if let Some(gone) = counts.gone {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("PureRef board").small().color(theme::TEXT_MUTED));
+                ui.add_space(2.0);
+                dot_row(ui, media_filter::GONE_COLOUR, &mut filter.gone, format!("Gone from the board  ({gone})"));
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let media: usize = MediaType::ALL.into_iter().zip(counts.media).filter(|(t, _)| filter.shows(*t)).map(|(_, n)| n).sum();
                 let picked: usize = tags.iter().filter(|(t, _)| filter.has_tag(t)).map(|(_, n)| n).sum();
                 let matching = media
                     + if filter.groups { counts.groups } else { 0 }
-                    + if filter.tagged { counts.tagged } else { picked };
+                    + if filter.tagged { counts.tagged } else { picked }
+                    + if filter.gone { counts.gone.unwrap_or(0) } else { 0 };
                 if ui
                     .add_enabled(matching > 0, egui::Button::new("Select these"))
                     .on_hover_text("Select the highlighted objects, ready to arrange")
@@ -779,9 +788,13 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Add / remove; one of a group", s("Shift+click; Alt+click")),
             ("Group / ungroup",             k2(c.group, c.ungroup)),
             ("Box select",                  s("drag on empty space")),
+            ("Select all (active layer)",   k(c.select_all)),
             ("Move / resize / rotate",      s("drag / handles / knob")),
             ("Nudge 1 px",                  k4(c.nudge_1px)),
             ("Nudge 10 px",                 k4(c.nudge_10px)),
+            ("Next object left / right / up / down", k4(c.hop)),
+            ("Select mid-view; into a group", k(c.step_in)),
+            ("Out of a group",              k(c.step_out)),
             ("Rotate in 15° steps",         s("hold Shift")),
             ("Delete",                      format!("{} / Backspace", k(c.delete_selection))),
             ("Duplicate",                   k(c.duplicate)),
@@ -804,6 +817,7 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("First / last",                k2(c.first_slide, c.last_slide)),
             ("Name the slide",              k(c.rename_slide)),
             ("Lock / unlock",               k(c.lock_slide)),
+            ("Resync from its PureRef board", c.resync_pureref.map_or_else(|| s("slide right-click"), |b| b.label())),
             ("Undo / redo",                 k2(c.undo, c.redo)),
             ("Delete the slide (asks first)", k(c.delete_canvas)),
             ("Zoom to fit / selection / while held", format!("{} / hold {}", k2(c.zoom_to_fit, c.zoom_to_selection), k(c.hold_zoom_to_selection))),

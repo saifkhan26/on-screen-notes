@@ -14,11 +14,13 @@ pub mod arrow_tool;
 pub mod beside;
 pub mod eraser_tool;
 pub mod guides;
+pub mod hop;
 pub mod lasso_tool;
 pub mod pen_tool;
 pub mod picture_colours;
 pub mod select_tool;
 pub mod shape_snap;
+pub mod similar;
 pub mod shape_tool;
 
 use crate::canvas::canvas::Canvas;
@@ -613,6 +615,7 @@ impl ActiveTool {
                             group: 0,
                             tags: Vec::new(),
                             turn: 0.0,
+                            link: 0,
                         });
                     }
                 }

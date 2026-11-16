@@ -300,6 +300,7 @@ pub(super) fn raster_partial_erase(shape: &Shape, polygon: &[[f32; 2]]) -> Raste
         group: 0,
         tags: Vec::new(),
         turn: 0.0,
+        link: 0,
     })
 }
 

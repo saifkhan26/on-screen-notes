@@ -54,6 +54,32 @@ impl OnScreenNotesApp {
         interaction::zoom_pan::fit_view(bounds, self.fit_area(ctx), max_zoom)
     }
 
+    /// Glide the view just far enough to show canvas box `b` whole, at
+    /// the zoom it has; a box too big for the view is centred instead,
+    /// that way. While it shows already nothing moves.
+    pub(super) fn bring_into_view(&mut self, b: [f32; 4], ctx: &egui::Context) {
+        let area = self.fit_area(ctx);
+        let c = self.canvases.active();
+        let (pan, zoom) = (c.pan, c.zoom);
+        // How far to move the view along one axis: `lo..hi` on screen,
+        // the view `start..start + len`.
+        let shift = |lo: f32, hi: f32, start: f32, len: f32| {
+            if hi - lo > len {
+                start + len * 0.5 - (lo + hi) * 0.5
+            } else {
+                (start - lo).max(0.0) + (start + len - hi).min(0.0)
+            }
+        };
+        let d = [
+            shift(b[0] * zoom + pan[0], b[2] * zoom + pan[0], area[0], area[2]),
+            shift(b[1] * zoom + pan[1], b[3] * zoom + pan[1], area[1], area[3]),
+        ];
+        if d[0].abs() < 0.5 && d[1].abs() < 0.5 {
+            return;
+        }
+        self.glide_view(([pan[0] + d[0], pan[1] + d[1]], zoom), ctx);
+    }
+
     /// Glide the view to show everything on the slide.
     pub(super) fn zoom_to_fit(&mut self, ctx: &egui::Context) {
         match self.slide_bounds() {
@@ -65,8 +91,8 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// Glide the view to show the selection; with nothing selected, the
-    /// whole slide.
+    /// Glide the view to show the selection, fitted to the view by its
+    /// size however small it is; with nothing selected, the whole slide.
     pub(super) fn zoom_to_selection(&mut self, ctx: &egui::Context) {
         match self.selection_bounds() {
             Some(b) => {

@@ -4,13 +4,15 @@
 //! colour (a tagged one's label is its tags); everything else fades back.
 //! A group is outlined whole, and so is a group tagged as one (every
 //! member has the tag); in any other group only the tagged members
-//! light up. The toolbar's filter
-//! popup also offers "Select these", which hands the matches to the
-//! Select tool so Arrange can sort them.
+//! light up. On a slide opened from a PureRef board it can also light up
+//! what is gone from the board since (a resync keeps those on the
+//! slide). The toolbar's filter popup also offers "Select these", which
+//! hands the matches to the Select tool so Arrange can sort them.
 
 use crate::canvas::canvas::{Canvas, Layer};
 use crate::canvas::shape::MediaType;
 use crate::canvas::units::{self, same_tag, Unit};
+use std::collections::{HashMap, HashSet};
 use egui::{Color32, Pos2, Rect, Rounding, Stroke};
 
 /// What is highlighted. Runtime only.
@@ -25,11 +27,13 @@ pub struct MediaFilter {
     pub tagged: bool,
     /// What has one of these tags (case aside).
     pub tags: Vec<String>,
+    /// What the slide's PureRef board no longer has (`LinkedItem::gone`).
+    pub gone: bool,
 }
 
 impl MediaFilter {
     pub fn any(&self) -> bool {
-        self.pictures || self.gifs || self.videos || self.groups || self.tagged || !self.tags.is_empty()
+        self.pictures || self.gifs || self.videos || self.groups || self.tagged || !self.tags.is_empty() || self.gone
     }
 
     pub fn shows(&self, t: MediaType) -> bool {
@@ -79,6 +83,8 @@ pub fn color(t: MediaType) -> Color32 {
 /// Groups' colour, and tags' (here and on the arrange bar).
 pub const GROUP_COLOUR: Color32 = Color32::from_rgb(150, 132, 255);
 pub const TAG_COLOUR: Color32 = Color32::from_rgb(72, 196, 236);
+/// What is gone from the slide's PureRef board.
+pub const GONE_COLOUR: Color32 = Color32::from_rgb(240, 96, 80);
 
 pub fn label(t: MediaType) -> &'static str {
     match t {
@@ -117,15 +123,26 @@ pub struct Counts {
     /// Each tag, how many tagged objects have it (a group once), in
     /// name order.
     pub tags: Vec<(String, usize)>,
+    /// Shapes gone from the slide's PureRef board; `None` when the slide
+    /// is not linked to a board.
+    pub gone: Option<usize>,
 }
 
 fn shown(canvas: &Canvas) -> impl Iterator<Item = &Layer> {
     canvas.layers.iter().filter(|l| l.visible && l.opacity > 0.0)
 }
 
-/// How many of each the slide's shown layers hold.
+/// How many of each the slide's shown layers hold. Runs every frame the
+/// toolbar shows, so it goes over each object once: a slide of 1,500
+/// pictures with a hundred tags among them must stay well under a frame.
 pub fn counts(canvas: &Canvas) -> Counts {
-    let mut n = Counts::default();
+    let gone = canvas.board.as_ref().map(|_| {
+        let links = gone_links(canvas);
+        shown(canvas).flat_map(|l| &l.shapes).filter(|s| links.contains(&s.link())).count()
+    });
+    let mut n = Counts { gone, ..Counts::default() };
+    // Tag (by `tag_key`) → its spelling where first met, and its count.
+    let mut tags: HashMap<String, (String, usize)> = HashMap::new();
     for layer in shown(canvas) {
         for t in layer.shapes.iter().filter_map(|s| s.media_type()) {
             n.media[MediaType::ALL.iter().position(|a| *a == t).unwrap_or(0)] += 1;
@@ -133,23 +150,55 @@ pub fn counts(canvas: &Canvas) -> Counts {
         n.groups += units::groups(layer).len();
         n.tagged += units::tagged(layer).len();
         // Each tag counted as its toggle would light it up: a group
-        // tagged as one once, else each member with the tag.
-        let mut here: Vec<String> = Vec::new();
-        for tag in layer.strokes.iter().flat_map(|s| s.tags.iter()).chain(layer.shapes.iter().flat_map(|s| s.tags().iter())) {
-            if !here.iter().any(|t| same_tag(t, tag)) {
-                here.push(tag.clone());
+        // tagged as one (every member has it) once, else each member
+        // with the tag; an object in no group once.
+        // Group → (members, tag key → members with it).
+        let mut groups: HashMap<u64, (usize, HashMap<String, usize>)> = HashMap::new();
+        let objects = layer
+            .strokes
+            .iter()
+            .map(|s| (s.group, s.tags.as_slice()))
+            .chain(layer.shapes.iter().map(|s| (s.group(), s.tags())));
+        for (group, own) in objects {
+            let mut keys: Vec<String> = Vec::with_capacity(own.len());
+            for t in own {
+                let key = units::tag_key(t);
+                if !keys.contains(&key) {
+                    tags.entry(key.clone()).or_insert_with(|| (t.clone(), 0));
+                    keys.push(key);
+                }
+            }
+            if group == 0 {
+                for key in keys {
+                    if let Some(e) = tags.get_mut(&key) {
+                        e.1 += 1;
+                    }
+                }
+            } else {
+                let g = groups.entry(group).or_default();
+                g.0 += 1;
+                for key in keys {
+                    *g.1.entry(key).or_default() += 1;
+                }
             }
         }
-        for tag in here {
-            let k = units::tagged_by(layer, |tags| tags.iter().any(|t| same_tag(t, &tag))).len();
-            match n.tags.iter_mut().find(|(t, _)| same_tag(t, &tag)) {
-                Some((_, have)) => *have += k,
-                None => n.tags.push((tag, k)),
+        for (members, with) in groups.into_values() {
+            for (key, k) in with {
+                if let Some(e) = tags.get_mut(&key) {
+                    e.1 += if k == members { 1 } else { k };
+                }
             }
         }
     }
-    n.tags.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    n.tags = tags.into_values().collect();
+    n.tags.sort_by_cached_key(|(t, _)| units::tag_key(t));
     n
+}
+
+/// The link ids of the shapes whose item is gone from the slide's
+/// PureRef board.
+fn gone_links(canvas: &Canvas) -> HashSet<u64> {
+    canvas.board.as_ref().map(|b| b.items.iter().filter(|i| i.gone).map(|i| i.link).collect()).unwrap_or_default()
 }
 
 /// What `filter` highlights on one layer: the media shapes, and the
@@ -176,11 +225,12 @@ fn units_on(layer: &Layer, filter: &MediaFilter) -> Vec<(Unit, Why)> {
 /// once, in index order.
 pub fn matches_on(canvas: &Canvas, li: usize, filter: &MediaFilter) -> (Vec<usize>, Vec<usize>) {
     let Some(layer) = canvas.layers.get(li) else { return (Vec::new(), Vec::new()) };
+    let gone = if filter.gone { gone_links(canvas) } else { HashSet::new() };
     let mut shapes: Vec<usize> = layer
         .shapes
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.media_type().is_some_and(|t| filter.shows(t)))
+        .filter(|(_, s)| s.media_type().is_some_and(|t| filter.shows(t)) || gone.contains(&s.link()))
         .map(|(i, _)| i)
         .collect();
     let mut strokes: Vec<usize> = Vec::new();
@@ -202,11 +252,16 @@ pub fn paint(painter: &egui::Painter, rect: Rect, canvas: &Canvas, filter: &Medi
     let zoom = canvas.zoom;
     let to_screen = |p: [f32; 2]| Pos2::new(rect.min.x + canvas.pan[0] + p[0] * zoom, rect.min.y + canvas.pan[1] + p[1] * zoom);
     let mut found: Vec<([Pos2; 4], Color32, String)> = Vec::new();
+    let gone = if filter.gone { gone_links(canvas) } else { HashSet::new() };
     for layer in shown(canvas) {
         for shape in &layer.shapes {
-            let Some(t) = shape.media_type().filter(|t| filter.shows(*t)) else { continue };
             let c = shape.obb().corners();
-            found.push(([to_screen(c[0]), to_screen(c[1]), to_screen(c[2]), to_screen(c[3])], color(t), badge(t).to_string()));
+            let quad = [to_screen(c[0]), to_screen(c[1]), to_screen(c[2]), to_screen(c[3])];
+            if gone.contains(&shape.link()) {
+                found.push((quad, GONE_COLOUR, "GONE FROM BOARD".to_string()));
+            }
+            let Some(t) = shape.media_type().filter(|t| filter.shows(*t)) else { continue };
+            found.push((quad, color(t), badge(t).to_string()));
         }
         for (u, why) in units_on(layer, filter) {
             // One shape keeps its own (maybe turned) box.
@@ -350,6 +405,65 @@ mod tests {
         assert_eq!(counts(&c).tags[0], ("pose".to_string(), 3), "shape 0, shape 2, group 8");
         assert_eq!(tags_text(&["walk cycle".into(), "ref".into()], 32), "#walk cycle #ref");
         assert_eq!(tags_text(&["a".repeat(40)], 10).chars().count(), 10);
+    }
+
+    #[test]
+    fn what_the_board_dropped_is_counted_and_matched() {
+        use crate::canvas::board_link::{BoardLink, ItemState, LinkedItem};
+        let text = |link: u64| crate::canvas::shape::Shape::Text {
+            pos: [0.0, 0.0],
+            content: "x".into(),
+            font_size: 10.0,
+            color: [255; 4],
+            rotation: 0.0,
+            pin: 0,
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
+            background: None,
+            link,
+        };
+        let mut c = Canvas::default();
+        c.layers[0].shapes = vec![text(1), text(2), text(0)];
+        assert_eq!(counts(&c).gone, None, "not linked to a board: no row");
+        let base = ItemState { at: [0.0; 2], size: [10.0, 0.0], rotation: 0.0, content: 0, style: 0, group: None, tags: Vec::new() };
+        let item = |link, gone| LinkedItem { link, key: link as i64, base: base.clone(), gone };
+        c.board = Some(Box::new(BoardLink { path: "b.pur".into(), scale: 1.0, offset: [0.0; 2], items: vec![item(1, false), item(2, true)], groups: Vec::new() }));
+        assert_eq!(counts(&c).gone, Some(1));
+        let gone = MediaFilter { gone: true, ..Default::default() };
+        assert!(gone.any());
+        assert_eq!(matches_on(&c, 0, &gone), (vec![], vec![1]));
+    }
+
+    /// Times the per-frame work on a real slide: `OSN_PERF_SLIDE` names a
+    /// copy of a slide file (only read).
+    #[test]
+    #[ignore]
+    fn counts_on_a_real_slide() {
+        let path = std::env::var("OSN_PERF_SLIDE").expect("set OSN_PERF_SLIDE to a copy of a slide file");
+        let text = std::fs::read_to_string(path).unwrap();
+        let c = crate::persistence::parse_canvas(&text, 1).unwrap();
+        let shapes: usize = c.layers.iter().map(|l| l.shapes.len()).sum();
+        let tagged = c.layers.iter().flat_map(|l| &l.shapes).filter(|s| !s.tags().is_empty()).count();
+        println!("{shapes} shapes, {tagged} tagged, {} link items", c.board.as_ref().map_or(0, |b| b.items.len()));
+        let n = 20;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(counts(&c));
+        }
+        println!("counts: {:?} a frame", t.elapsed() / n);
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let links = gone_links(&c);
+            std::hint::black_box(shown(&c).flat_map(|l| &l.shapes).filter(|s| links.contains(&s.link())).count());
+        }
+        println!("  of which gone: {:?}", t.elapsed() / n);
+        let all = MediaFilter { tagged: true, gone: true, ..Default::default() };
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(matches_on(&c, 0, &all));
+        }
+        println!("matches_on (all tagged + gone): {:?}", t.elapsed() / n);
     }
 
     #[test]

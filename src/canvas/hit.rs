@@ -432,6 +432,7 @@ mod tests {
             group: 0,
             tags: Vec::new(),
             turn: 0.0,
+            link: 0,
         }
     }
 

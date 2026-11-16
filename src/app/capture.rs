@@ -276,6 +276,7 @@ impl OnScreenNotesApp {
                     group: 0,
                     tags: Vec::new(),
                     turn: 0.0,
+                    link: 0,
                 };
                 let c = self.canvases.active_mut();
                 c.add_shape(shape);

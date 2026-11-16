@@ -62,9 +62,30 @@ impl OnScreenNotesApp {
             }
             K::HighlightGroups => self.media_filter.groups = !self.media_filter.groups,
             K::HighlightTagged => self.media_filter.tagged = !self.media_filter.tagged,
+            K::HighlightGone => self.media_filter.gone = !self.media_filter.gone,
+            K::ResyncPureRef => {
+                self.commands.close();
+                self.start_resync(self.canvases.active_index());
+            }
             K::SelectHighlighted => {
                 if self.may_edit() {
                     self.select_media_matches();
+                }
+            }
+            K::SelectAll => {
+                if self.may_edit() {
+                    self.select_all();
+                }
+            }
+            K::Hop(dir) => {
+                if selecting {
+                    self.hop_selection(dir, ctx);
+                }
+            }
+            K::StepIn => self.step_in(ctx),
+            K::StepOut => {
+                if selecting {
+                    self.step_out(ctx);
                 }
             }
             K::PinToWindow => {
@@ -171,6 +192,11 @@ impl OnScreenNotesApp {
                     self.toggle_picture_colours();
                 }
             }
+            K::FindSimilar => self.find_similar(),
+            K::FindCopies => {
+                self.commands.close();
+                self.find.find_copies();
+            }
             K::TextBox => {
                 self.tool.text_box = !self.tool.text_box;
                 self.apply_text_box_to_selection();
@@ -190,8 +216,7 @@ impl OnScreenNotesApp {
             }
             K::TagList => {
                 self.commands.close();
-                self.ui_visible = true;
-                self.slide_panel.open_tags();
+                self.find.open_tags();
             }
             K::MoveSlide(step) => {
                 let from = self.canvases.active_index();

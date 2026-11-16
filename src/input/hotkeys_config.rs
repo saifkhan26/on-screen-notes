@@ -390,9 +390,14 @@ pub struct CanvasSection {
     /// the slide panel's menu does. Unbound until set.
     #[serde(default)] pub move_slide_up: String,
     #[serde(default)] pub move_slide_down: String,
-    /// Open the list of every tag (see, filter by, rename, remove). Unbound
-    /// until set.
+    /// Open find on the list of every tag (find by, rename, remove).
+    /// Unbound until set.
     #[serde(default)] pub tag_list: String,
+    /// List every set of duplicate pictures on the slides. Unbound until set.
+    #[serde(default)] pub find_duplicates: String,
+    /// Bring the slide up to date with the PureRef board it was opened
+    /// from. Unbound until set.
+    #[serde(default)] pub resync_pureref: String,
     #[serde(default = "d_prev_layer")]    pub prev_layer: String,
     #[serde(default = "d_next_layer")]    pub next_layer: String,
     #[serde(default = "d_toggle_ui")]     pub toggle_ui: String,
@@ -428,6 +433,8 @@ pub struct CanvasSection {
     #[serde(default = "d_duplicate")]        pub duplicate: String,
     /// Copy the selection onto a new slide (added after the last one).
     #[serde(default = "d_copy_to_new_slide")] pub copy_to_new_slide: String,
+    /// Select everything on the active layer, with the Select tool.
+    #[serde(default = "d_select_all")]       pub select_all: String,
     /// Open the command palette: find any command by name and run it.
     #[serde(default = "d_command_palette")] pub command_palette: String,
     /// Open the find bar: text labels on every slide by what they say.
@@ -443,9 +450,9 @@ pub struct CanvasSection {
     #[serde(default = "d_bring_front")]      pub bring_front: String,
     /// Paint the selection below everything else of its kind on the layer.
     #[serde(default = "d_send_back")]        pub send_back: String,
-    /// Move the selection 1 or 10 screen pixels. While objects are
-    /// selected these win over the slide and layer keys, so they can
-    /// share the arrows with them (the defaults do).
+    /// Move the selection 1 or 10 screen pixels (Alt+ and Shift+arrows
+    /// by default). While objects are selected these win over the slide
+    /// and layer keys, so they can share keys with them.
     #[serde(default = "d_nudge_left_1px")]   pub nudge_left_1px: String,
     #[serde(default = "d_nudge_right_1px")]  pub nudge_right_1px: String,
     #[serde(default = "d_nudge_up_1px")]     pub nudge_up_1px: String,
@@ -454,6 +461,21 @@ pub struct CanvasSection {
     #[serde(default = "d_nudge_right_10px")] pub nudge_right_10px: String,
     #[serde(default = "d_nudge_up_10px")]    pub nudge_up_10px: String,
     #[serde(default = "d_nudge_down_10px")]  pub nudge_down_10px: String,
+    /// Select the nearest group or object left / right / up / down of
+    /// the selection; inside a group, its nearest member. While objects
+    /// are selected these win over every key but the selection's own, so
+    /// they can share keys with tools and the rest: the arrows by
+    /// default, which go to another slide or layer with nothing selected,
+    /// or h / j / k / l, which pick the laser, hide the layer, … then.
+    #[serde(default = "d_hop_left")]  pub hop_left: String,
+    #[serde(default = "d_hop_right")] pub hop_right: String,
+    #[serde(default = "d_hop_up")]    pub hop_up: String,
+    #[serde(default = "d_hop_down")]  pub hop_down: String,
+    /// Nothing selected: select what is in the middle of the view. A
+    /// group selected: step inside it, to one of its members.
+    #[serde(default = "d_step_in")]  pub step_in: String,
+    /// Inside a group: select the whole group again.
+    #[serde(default = "d_step_out")] pub step_out: String,
 
     // Video / GIF playback. They act on the selected video or GIF, else
     // the one under the pointer, else the only one on the slide.
@@ -561,6 +583,8 @@ pub struct ArrangeSection {
     pub picture_colours: String,
     /// Type the selection's tags (what find knows it by).
     pub tag: String,
+    /// Find pictures like the selected one, or the copied one.
+    pub find_similar: String,
 }
 
 impl Default for CanvasSection {
@@ -580,6 +604,8 @@ impl Default for CanvasSection {
             lock_slide: d_lock_slide(),
             move_slide_up: String::new(), move_slide_down: String::new(),
             tag_list: String::new(),
+            find_duplicates: String::new(),
+            resync_pureref: String::new(),
             prev_layer: d_prev_layer(), next_layer: d_next_layer(),
             toggle_ui: d_toggle_ui(),
             opacity_0: d_op_0(), opacity_1: d_op_1(),
@@ -594,6 +620,7 @@ impl Default for CanvasSection {
             delete_selection: d_delete_selection(),
             duplicate: d_duplicate(),
             copy_to_new_slide: d_copy_to_new_slide(),
+            select_all: d_select_all(),
             command_palette: d_command_palette(),
             find: d_find(),
             group: d_group(),
@@ -610,6 +637,12 @@ impl Default for CanvasSection {
             nudge_right_10px: d_nudge_right_10px(),
             nudge_up_10px: d_nudge_up_10px(),
             nudge_down_10px: d_nudge_down_10px(),
+            hop_left: d_hop_left(),
+            hop_right: d_hop_right(),
+            hop_up: d_hop_up(),
+            hop_down: d_hop_down(),
+            step_in: d_step_in(),
+            step_out: d_step_out(),
             media_play_pause: d_media_play_pause(),
             media_prev_frame: d_media_prev_frame(),
             media_next_frame: d_media_next_frame(),
@@ -668,6 +701,7 @@ fn d_preview_layer() -> String { "q".into() }
 fn d_toggle_layer_visible() -> String { "h".into() }
 fn d_delete_selection() -> String { "delete".into() }
 fn d_duplicate()   -> String { "ctrl+d".into() }
+fn d_select_all()  -> String { "ctrl+a".into() }
 fn d_copy_to_new_slide() -> String { "ctrl+shift+d".into() }
 fn d_command_palette() -> String { "ctrl+k".into() }
 fn d_find()        -> String { "ctrl+f".into() }
@@ -677,14 +711,20 @@ fn d_pin_selection() -> String { "ctrl+p".into() }
 fn d_toggle_pins() -> String { "shift+p".into() }
 fn d_bring_front() -> String { "ctrl+arrowup".into() }
 fn d_send_back()   -> String { "ctrl+arrowdown".into() }
-fn d_nudge_left_1px()   -> String { "arrowleft".into() }
-fn d_nudge_right_1px()  -> String { "arrowright".into() }
-fn d_nudge_up_1px()     -> String { "arrowup".into() }
-fn d_nudge_down_1px()   -> String { "arrowdown".into() }
+fn d_nudge_left_1px()   -> String { "alt+arrowleft".into() }
+fn d_nudge_right_1px()  -> String { "alt+arrowright".into() }
+fn d_nudge_up_1px()     -> String { "alt+arrowup".into() }
+fn d_nudge_down_1px()   -> String { "alt+arrowdown".into() }
 fn d_nudge_left_10px()  -> String { "shift+arrowleft".into() }
 fn d_nudge_right_10px() -> String { "shift+arrowright".into() }
 fn d_nudge_up_10px()    -> String { "shift+arrowup".into() }
 fn d_nudge_down_10px()  -> String { "shift+arrowdown".into() }
+fn d_hop_left()  -> String { "arrowleft".into() }
+fn d_hop_right() -> String { "arrowright".into() }
+fn d_hop_up()    -> String { "arrowup".into() }
+fn d_hop_down()  -> String { "arrowdown".into() }
+fn d_step_in()   -> String { "enter".into() }
+fn d_step_out()  -> String { "escape".into() }
 fn d_media_play_pause() -> String { "k".into() }
 fn d_media_prev_frame() -> String { "comma".into() }
 fn d_media_next_frame() -> String { "period".into() }
@@ -693,8 +733,10 @@ fn d_media_next_frame() -> String { "period".into() }
 /// made every button bindable and lists each binding in the file; 4
 /// added the nudge keys; 5 zoom to fit / to the selection (and the held
 /// peek), flipping, the text box and a picture's colours; 6 moving
-/// slides; 7 groups; 8 onion skin; 9 the command palette; 10 find and tags.
-const FORMAT: u32 = 10;
+/// slides; 7 groups; 8 onion skin; 9 the command palette; 10 find and tags;
+/// 11 select all (and lists finding like pictures and duplicates);
+/// 12 resync from PureRef; 13 hopping from object to object.
+const FORMAT: u32 = 13;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -793,6 +835,7 @@ pub struct ArrangeBindings {
     pub rotate_right: Option<Binding>,
     pub picture_colours: Option<Binding>,
     pub tag: Option<Binding>,
+    pub find_similar: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -819,6 +862,8 @@ pub struct CanvasBindings {
     pub move_slide_up: Option<Binding>,
     pub move_slide_down: Option<Binding>,
     pub tag_list: Option<Binding>,
+    pub find_duplicates: Option<Binding>,
+    pub resync_pureref: Option<Binding>,
     pub prev_layer: Option<Binding>,
     pub next_layer: Option<Binding>,
     pub toggle_ui: Option<Binding>,
@@ -831,6 +876,7 @@ pub struct CanvasBindings {
     pub delete_selection: Option<Binding>,
     pub duplicate: Option<Binding>,
     pub copy_to_new_slide: Option<Binding>,
+    pub select_all: Option<Binding>,
     pub command_palette: Option<Binding>,
     pub find: Option<Binding>,
     pub group: Option<Binding>,
@@ -842,6 +888,10 @@ pub struct CanvasBindings {
     /// Left, right, up, down; by 1 / by 10 pixels.
     pub nudge_1px: [Option<Binding>; 4],
     pub nudge_10px: [Option<Binding>; 4],
+    /// Left, right, up, down (`tools::hop::Dir::ALL`).
+    pub hop: [Option<Binding>; 4],
+    pub step_in: Option<Binding>,
+    pub step_out: Option<Binding>,
     pub media_play_pause: Option<Binding>,
     pub media_prev_frame: Option<Binding>,
     pub media_next_frame: Option<Binding>,
@@ -976,6 +1026,7 @@ impl HotkeysConfig {
                 rotate_right:    p("arrange.rotate_right",    &ar.rotate_right),
                 picture_colours: p("arrange.picture_colours", &ar.picture_colours),
                 tag: p("arrange.tag", &ar.tag),
+                find_similar: p("arrange.find_similar", &ar.find_similar),
             },
             canvas: CanvasBindings {
                 undo:          p("canvas.undo",          &self.canvas.undo),
@@ -1000,6 +1051,8 @@ impl HotkeysConfig {
                 move_slide_up:   p("canvas.move_slide_up",   &cv.move_slide_up),
                 move_slide_down: p("canvas.move_slide_down", &cv.move_slide_down),
                 tag_list:        p("canvas.tag_list",        &cv.tag_list),
+                find_duplicates: p("canvas.find_duplicates", &cv.find_duplicates),
+                resync_pureref:  p("canvas.resync_pureref",  &cv.resync_pureref),
                 prev_layer:    p("canvas.prev_layer",    &self.canvas.prev_layer),
                 next_layer:    p("canvas.next_layer",    &self.canvas.next_layer),
                 toggle_ui:     p("canvas.toggle_ui",     &self.canvas.toggle_ui),
@@ -1022,6 +1075,7 @@ impl HotkeysConfig {
                 delete_selection: p("canvas.delete_selection", &self.canvas.delete_selection),
                 duplicate:   p("canvas.duplicate",   &self.canvas.duplicate),
                 copy_to_new_slide: p("canvas.copy_to_new_slide", &self.canvas.copy_to_new_slide),
+                select_all:  p("canvas.select_all",  &cv.select_all),
                 command_palette: p("canvas.command_palette", &cv.command_palette),
                 find:        p("canvas.find",        &cv.find),
                 group:       p("canvas.group",       &cv.group),
@@ -1042,6 +1096,14 @@ impl HotkeysConfig {
                     p("canvas.nudge_up_10px",    &cv.nudge_up_10px),
                     p("canvas.nudge_down_10px",  &cv.nudge_down_10px),
                 ],
+                hop: [
+                    p("canvas.hop_left",  &cv.hop_left),
+                    p("canvas.hop_right", &cv.hop_right),
+                    p("canvas.hop_up",    &cv.hop_up),
+                    p("canvas.hop_down",  &cv.hop_down),
+                ],
+                step_in:  p("canvas.step_in",  &cv.step_in),
+                step_out: p("canvas.step_out", &cv.step_out),
                 media_play_pause: p("canvas.media_play_pause", &self.canvas.media_play_pause),
                 media_prev_frame: p("canvas.media_prev_frame", &self.canvas.media_prev_frame),
                 media_next_frame: p("canvas.media_next_frame", &self.canvas.media_next_frame),
@@ -1064,8 +1126,9 @@ impl HotkeysConfig {
     /// Every pair of in-app bindings (`[tool]`, `[toolbar]`, `[arrange]`,
     /// `[canvas]`) set to the same keys, as `(name, name, keys)`. Both
     /// would fire on one press, so the file's loader warns about them —
-    /// all but a nudge key on a slide or layer key, where one press does
-    /// only one of them (`nudge_shares_with`).
+    /// all but a nudge key on a slide or layer key, or a hop key on a key
+    /// that is not the selection's, where one press does only one of
+    /// them (`shares_keys`).
     pub fn clashes(&self) -> Vec<(String, String, String)> {
         let Ok(value) = toml::Value::try_from(self) else { return Vec::new() };
         let mut seen: Vec<(String, Binding)> = Vec::new();
@@ -1075,7 +1138,7 @@ impl HotkeysConfig {
             for (name, s) in table {
                 let Some(b) = s.as_str().and_then(parse) else { continue };
                 let name = format!("{section}.{name}");
-                if let Some((other, _)) = seen.iter().find(|(o, ob)| *ob == b && !nudge_shares_with(o, &name)) {
+                if let Some((other, _)) = seen.iter().find(|(o, ob)| *ob == b && !shares_keys(o, &name)) {
                     out.push((other.clone(), name.clone(), b.label()));
                 }
                 seen.push((name, b));
@@ -1089,13 +1152,31 @@ impl HotkeysConfig {
 /// `react_layer_nav`) may be the same keys, as the arrows are by default:
 /// with objects selected the press nudges them, else it goes to the
 /// slide or layer.
-fn nudge_shares_with(a: &str, b: &str) -> bool {
+///
+/// A hop key, or the step-out key, may be any key that does not act on
+/// the selection itself: with objects selected the press hops, else it
+/// does the other thing (picks the laser, plays a video, …).
+fn shares_keys(a: &str, b: &str) -> bool {
     const NAV: [&str; 8] = [
         "canvas.prev_canvas", "canvas.next_canvas", "canvas.cycle_prev_slide", "canvas.cycle_next_slide",
         "canvas.first_slide", "canvas.last_slide", "canvas.prev_layer", "canvas.next_layer",
     ];
     let nudge = |n: &str| n.starts_with("canvas.nudge_");
-    (nudge(a) && NAV.contains(&b)) || (nudge(b) && NAV.contains(&a))
+    let hop = |n: &str| n.starts_with("canvas.hop_") || n == "canvas.step_out";
+    let on_selection = |n: &str| {
+        nudge(n)
+            || hop(n)
+            || n.starts_with("arrange.")
+            || matches!(
+                n,
+                "canvas.delete_selection" | "canvas.duplicate" | "canvas.copy_to_new_slide" | "canvas.pin_selection"
+                    | "canvas.bring_front" | "canvas.send_back" | "canvas.group" | "canvas.ungroup"
+            )
+    };
+    (nudge(a) && NAV.contains(&b))
+        || (nudge(b) && NAV.contains(&a))
+        || (hop(a) && !on_selection(b))
+        || (hop(b) && !on_selection(a))
 }
 
 // ============================================================================
@@ -1335,6 +1416,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("arrange", "rotate_right")          => "Turn the selection a quarter turn right",
         ("arrange", "picture_colours")       => "The selected picture's colours, to draw with or keep as the palette",
         ("arrange", "tag")                   => "Type the selection's tags: words find (Ctrl+F) knows it by",
+        ("arrange", "find_similar")          => "Find pictures like the selected one (or the copied one): copies, edits, similar",
 
         ("canvas", "undo")                 => "Undo",
         ("canvas", "redo")                 => "Redo",
@@ -1357,7 +1439,9 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "lock_slide")           => "Lock / unlock the slide against edits",
         ("canvas", "move_slide_up")        => "Move the slide one place toward the first",
         ("canvas", "move_slide_down")      => "Move the slide one place toward the last",
-        ("canvas", "tag_list")             => "Every tag in the app: see, filter the slides by, rename, remove",
+        ("canvas", "tag_list")             => "Every tag in the app, in find: find by, rename, remove",
+        ("canvas", "find_duplicates")      => "Every set of duplicate pictures on the slides, to go through or thin out",
+        ("canvas", "resync_pureref")       => "Bring the slide up to date with the PureRef board it was opened from",
         ("canvas", "prev_layer")           => "Layer below",
         ("canvas", "next_layer")           => "Layer above",
         ("canvas", "toggle_ui")            => "Hide / show the toolbar and panels",
@@ -1368,6 +1452,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "delete_selection")     => "Delete the selection",
         ("canvas", "duplicate")            => "Duplicate the selection",
         ("canvas", "copy_to_new_slide")    => "Copy the selection to a new slide",
+        ("canvas", "select_all")           => "Select everything on the active layer",
         ("canvas", "command_palette")      => "Command palette: find any command by a few letters and run it",
         ("canvas", "find")                 => "Find text labels on every slide by what they say, and go to them",
         ("canvas", "group")                => "Make the selection one group (selects, moves and arranges as one)",
@@ -1384,6 +1469,12 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "nudge_right_10px")     => "Selection 10 px right",
         ("canvas", "nudge_up_10px")        => "Selection 10 px up",
         ("canvas", "nudge_down_10px")      => "Selection 10 px down",
+        ("canvas", "hop_left")             => "Select the nearest object left (wins over other keys while selected)",
+        ("canvas", "hop_right")            => "Select the nearest object right",
+        ("canvas", "hop_up")               => "Select the nearest object up",
+        ("canvas", "hop_down")             => "Select the nearest object down",
+        ("canvas", "step_in")              => "Select the object mid-view; on a group, step inside it",
+        ("canvas", "step_out")             => "Inside a group: select the whole group again",
         ("canvas", "media_play_pause")     => "Play / pause the video or GIF",
         ("canvas", "media_prev_frame")     => "Video or GIF: previous frame",
         ("canvas", "media_next_frame")     => "Video or GIF: next frame",
@@ -1641,7 +1732,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 10"));
+        assert!(up.contains("version = 13"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1650,7 +1741,7 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 10\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 13\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
         assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
@@ -1687,13 +1778,13 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 10\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 13\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
         assert_eq!(cfg.arrange.align_left, "ctrl+arrowleft");
         let line = |key: &str| new.lines().find(|l| l.starts_with(&format!("{key} = "))).unwrap().to_owned();
-        assert!(line("nudge_left_1px").starts_with("nudge_left_1px = \"arrowleft\""));
+        assert!(line("nudge_left_1px").starts_with("nudge_left_1px = \"alt+arrowleft\""));
         assert!(line("nudge_down_10px").starts_with("nudge_down_10px = \"shift+arrowdown\""));
         assert!(line("nudge_up_10px").ends_with("# Selection 10 px up"));
     }
@@ -1703,12 +1794,46 @@ mod tests {
         let keys = HotkeysConfig::default().parsed().canvas;
         let b = |b: Option<Binding>| b.map(|b| (b.key, b.shift));
         assert_eq!(b(keys.nudge_1px[0]), Some((egui::Key::ArrowLeft, false)));
+        assert!(keys.nudge_1px[0].is_some_and(|b| b.alt));
         assert_eq!(b(keys.nudge_10px[3]), Some((egui::Key::ArrowDown, true)));
-        // The arrows are slide and layer keys too by default: no clash.
-        assert_eq!(keys.prev_canvas, keys.nudge_1px[0]);
         assert_eq!(HotkeysConfig::default().clashes(), vec![]);
         let cfg: HotkeysConfig = toml::from_str("[canvas]\nnudge_left_1px = \"ctrl+z\"\nnudge_up_1px = \"home\"\n").unwrap();
         assert_eq!(cfg.clashes(), vec![("canvas.nudge_left_1px".into(), "canvas.undo".into(), "Ctrl+Z".into())]);
+    }
+
+    #[test]
+    fn hop_keys_are_the_arrows_and_share_any_key_but_the_selections() {
+        let keys = HotkeysConfig::default().parsed().canvas;
+        let k = |b: Option<Binding>| b.map(|b| b.key);
+        let arrows = [Some(egui::Key::ArrowLeft), Some(egui::Key::ArrowRight), Some(egui::Key::ArrowUp), Some(egui::Key::ArrowDown)];
+        assert_eq!(keys.hop.map(k), arrows);
+        assert_eq!((k(keys.step_in), k(keys.step_out)), (Some(egui::Key::Enter), Some(egui::Key::Escape)));
+        // The arrows are slide and layer keys too: shared, as one press
+        // does one of them (the hop while selected).
+        assert_eq!((keys.hop[0], keys.hop[3]), (keys.prev_canvas, keys.prev_layer));
+        assert_eq!(HotkeysConfig::default().clashes(), vec![]);
+        // Vim keys share with the laser, hiding the layer and play / pause.
+        let vim: HotkeysConfig =
+            toml::from_str("[canvas]\nhop_left = \"h\"\nhop_right = \"l\"\nhop_up = \"k\"\nhop_down = \"j\"\n").unwrap();
+        assert_eq!(vim.parsed().canvas.hop[0], keys.toggle_layer_visible);
+        assert_eq!(vim.clashes(), vec![]);
+        // On a key that acts on the selection too, one press would lose.
+        let cfg: HotkeysConfig = toml::from_str("[canvas]\nhop_left = \"delete\"\nhop_up = \"ctrl+g\"\nhop_down = \"j\"\n").unwrap();
+        assert_eq!(
+            cfg.clashes(),
+            vec![
+                ("canvas.delete_selection".into(), "canvas.hop_left".into(), "Delete".into()),
+                ("canvas.group".into(), "canvas.hop_up".into(), "Ctrl+G".into()),
+            ],
+        );
+        let cfg: HotkeysConfig = toml::from_str("[canvas]\nhop_left = \"arrowdown\"\n").unwrap();
+        assert_eq!(cfg.clashes(), vec![("canvas.hop_down".into(), "canvas.hop_left".into(), "\u{2193}".into())], "two hops on one key");
+        let cfg: HotkeysConfig = toml::from_str("[canvas]\nnudge_left_1px = \"arrowleft\"\n").unwrap();
+        assert_eq!(
+            cfg.clashes(),
+            vec![("canvas.hop_left".into(), "canvas.nudge_left_1px".into(), "\u{2190}".into())],
+            "a hop and a nudge on one key: the hop wins, the nudge is lost",
+        );
     }
 
     #[test]
@@ -1790,7 +1915,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 10\n\n\
+             version = 13\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1811,13 +1936,13 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 10\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 13\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 10");
-        assert_eq!(upgrade_text("", 0), "version = 10\n");
+        assert_eq!(new, "version = 13");
+        assert_eq!(upgrade_text("", 0), "version = 13\n");
     }
 
     #[test]
