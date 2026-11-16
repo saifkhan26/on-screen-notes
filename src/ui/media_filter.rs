@@ -9,7 +9,9 @@
 //! slide). The toolbar's filter popup also offers "Select these", which
 //! hands the matches to the Select tool so Arrange can sort them.
 
+use crate::canvas::affine::Affine;
 use crate::canvas::canvas::{Canvas, Layer};
+use crate::canvas::hit::Selection;
 use crate::canvas::shape::MediaType;
 use crate::canvas::units::{self, same_tag, Unit};
 use std::collections::{HashMap, HashSet};
@@ -245,34 +247,90 @@ pub fn matches_on(canvas: &Canvas, li: usize, filter: &MediaFilter) -> (Vec<usiz
     (strokes, shapes)
 }
 
-/// Fade everything on `rect` except the matches, then outline and label
-/// each match. `rect` is the canvas area on screen. Labels for one box
-/// (a tagged group is a group too) stack down its corner.
-pub fn paint(painter: &egui::Painter, rect: Rect, canvas: &Canvas, filter: &MediaFilter) {
+/// Gestures in flight that show objects somewhere else than the canvas
+/// has them until they commit; the highlights go along with them, as
+/// the renderer previews them (`render::paint_canvas_egui`).
+#[derive(Clone, Copy, Default)]
+pub struct InFlight<'a> {
+    /// The Select tool's move, resize or turn: `(layer index, selected
+    /// objects, transform)`.
+    pub sel: Option<(usize, &'a Selection, Affine)>,
+    /// The Shift+Space layer drag: `(layer index, scale, offset)`, the
+    /// similarity `p → scale · p + offset`.
+    pub layer: Option<(usize, f32, [f32; 2])>,
+}
+
+/// What `paint` draws: each match's outline (screen corners), colour
+/// and label, and the screen boxes left out of the fade. Those are each
+/// highlighted object's own box, not a group's whole box, so an object
+/// that only sits among a group's members still fades.
+struct Marks {
+    found: Vec<([Pos2; 4], Color32, String)>,
+    holes: Vec<Rect>,
+}
+
+fn marks(rect: Rect, canvas: &Canvas, filter: &MediaFilter, moving: InFlight) -> Marks {
     let zoom = canvas.zoom;
-    let to_screen = |p: [f32; 2]| Pos2::new(rect.min.x + canvas.pan[0] + p[0] * zoom, rect.min.y + canvas.pan[1] + p[1] * zoom);
     let mut found: Vec<([Pos2; 4], Color32, String)> = Vec::new();
+    let mut holes: Vec<Rect> = Vec::new();
     let gone = if filter.gone { gone_links(canvas) } else { HashSet::new() };
-    for layer in shown(canvas) {
-        for shape in &layer.shapes {
-            let c = shape.obb().corners();
-            let quad = [to_screen(c[0]), to_screen(c[1]), to_screen(c[2]), to_screen(c[3])];
-            if gone.contains(&shape.link()) {
+    for (li, layer) in canvas.layers.iter().enumerate().filter(|(_, l)| l.visible && l.opacity > 0.0) {
+        let (a, off) = match moving.layer {
+            Some((l, a, off)) if l == li => (a, off),
+            _ => (1.0, [0.0, 0.0]),
+        };
+        let to_screen = |p: [f32; 2]| {
+            Pos2::new(rect.min.x + canvas.pan[0] + (a * p[0] + off[0]) * zoom, rect.min.y + canvas.pan[1] + (a * p[1] + off[1]) * zoom)
+        };
+        let dragged = moving.sel.filter(|(l, _, _)| *l == li);
+        // Each object's corners on screen as it shows this frame.
+        let shape_quad = |i: usize| -> Option<[Pos2; 4]> {
+            let s = layer.shapes.get(i)?;
+            let c = match dragged {
+                Some((_, sel, m)) if sel.shapes.binary_search(&i).is_ok() => {
+                    let mut moved = s.clone();
+                    moved.apply_affine(&m);
+                    moved.obb().corners()
+                }
+                _ => s.obb().corners(),
+            };
+            Some(c.map(to_screen))
+        };
+        let stroke_quad = |i: usize| -> Option<[Pos2; 4]> {
+            let b = layer.strokes.get(i)?.bounds()?;
+            let mut c = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
+            if let Some((_, _, m)) = dragged.filter(|(_, sel, _)| sel.strokes.binary_search(&i).is_ok()) {
+                c = c.map(|p| m.apply(p));
+            }
+            Some(c.map(to_screen))
+        };
+        for (i, shape) in layer.shapes.iter().enumerate() {
+            let is_gone = gone.contains(&shape.link());
+            let media = shape.media_type().filter(|t| filter.shows(*t));
+            if !is_gone && media.is_none() {
+                continue;
+            }
+            let Some(quad) = shape_quad(i) else { continue };
+            holes.push(Rect::from_points(&quad));
+            if is_gone {
                 found.push((quad, GONE_COLOUR, "GONE FROM BOARD".to_string()));
             }
-            let Some(t) = shape.media_type().filter(|t| filter.shows(*t)) else { continue };
-            found.push((quad, color(t), badge(t).to_string()));
+            if let Some(t) = media {
+                found.push((quad, color(t), badge(t).to_string()));
+            }
         }
         for (u, why) in units_on(layer, filter) {
+            let members: Vec<[Pos2; 4]> =
+                u.strokes.iter().filter_map(|&i| stroke_quad(i)).chain(u.shapes.iter().filter_map(|&i| shape_quad(i))).collect();
             // One shape keeps its own (maybe turned) box.
-            let corners = match (u.strokes.as_slice(), u.shapes.as_slice()) {
-                ([], [i]) => layer.shapes[*i].obb().corners(),
+            let quad = match (u.strokes.as_slice(), u.shapes.as_slice(), members.as_slice()) {
+                ([], [_], [q]) => *q,
                 _ => {
-                    let Some(b) = units::bounds_of(layer, &u.strokes, &u.shapes) else { continue };
-                    [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
+                    let Some(b) = members.iter().map(|q| Rect::from_points(q)).reduce(|a, b| a.union(b)) else { continue };
+                    [b.left_top(), b.right_top(), b.right_bottom(), b.left_bottom()]
                 }
             };
-            let quad = corners.map(to_screen);
+            holes.extend(members.iter().map(|q| Rect::from_points(q)));
             match why {
                 Why::Group => found.push((quad, GROUP_COLOUR, format!("GROUP · {}", u.len()))),
                 Why::Tags => found.push((quad, TAG_COLOUR, tags_text(&u.tags, 32))),
@@ -288,8 +346,15 @@ pub fn paint(painter: &egui::Painter, rect: Rect, canvas: &Canvas, filter: &Medi
         seen.push((*q, b.clone()));
         !dup
     });
+    let holes = holes.into_iter().filter(|h| h.intersects(rect)).map(|h| h.intersect(rect)).collect();
+    Marks { found, holes }
+}
 
-    let holes: Vec<Rect> = found.iter().map(|(q, _, _)| Rect::from_points(q).intersect(rect)).collect();
+/// Fade everything on `rect` except the matches, then outline and label
+/// each match. `rect` is the canvas area on screen. Labels for one box
+/// (a tagged group is a group too) stack down its corner.
+pub fn paint(painter: &egui::Painter, rect: Rect, canvas: &Canvas, filter: &MediaFilter, moving: InFlight) {
+    let Marks { found, holes } = marks(rect, canvas, filter, moving);
     let mut mesh = egui::Mesh::default();
     for r in uncovered(rect, &holes) {
         mesh.add_colored_rect(r, Color32::from_black_alpha(150));
@@ -317,9 +382,19 @@ pub fn paint(painter: &egui::Painter, rect: Rect, canvas: &Canvas, filter: &Medi
 
 /// `area` minus the union of `holes`, as non-overlapping rectangles.
 /// Cut into horizontal bands at every hole's top and bottom; within a
-/// band the holes are plain x-intervals.
+/// band the holes are plain x-intervals. The sweep down the bands only
+/// looks at the holes the band crosses, and a gap the band below has
+/// too grows down instead of starting a new rectangle: a slide of
+/// 1,500 highlighted pictures stays a few thousand rectangles, cheap to
+/// work out and to draw each frame.
 fn uncovered(area: Rect, holes: &[Rect]) -> Vec<Rect> {
-    let holes: Vec<Rect> = holes.iter().copied().filter(|h| h.is_positive()).collect();
+    let mut holes: Vec<Rect> = holes.iter().copied().filter(|h| h.is_positive()).collect();
+    // By top; and a box given twice (a picture also in a group) once.
+    let key = |h: &Rect| [h.top(), h.left(), h.bottom(), h.right()];
+    holes.sort_by(|a, b| {
+        key(a).iter().zip(key(b).iter()).map(|(x, y)| x.total_cmp(y)).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    holes.dedup();
     let mut ys: Vec<f32> = vec![area.top(), area.bottom()];
     for h in &holes {
         ys.push(h.top().clamp(area.top(), area.bottom()));
@@ -328,19 +403,65 @@ fn uncovered(area: Rect, holes: &[Rect]) -> Vec<Rect> {
     ys.sort_by(f32::total_cmp);
     ys.dedup();
     let mut out = Vec::new();
+    // The holes the band crosses, left to right, and the next hole (by
+    // top) to come in.
+    let mut active: Vec<Rect> = Vec::new();
+    let mut next = 0;
+    // The band above's gaps `(left, right, top)`, left to right, the top
+    // where each began.
+    let mut open: Vec<(f32, f32, f32)> = Vec::new();
+    let close = |out: &mut Vec<Rect>, (l, r, top): (f32, f32, f32), y: f32| {
+        out.push(Rect::from_min_max(Pos2::new(l, top), Pos2::new(r, y)));
+    };
+    let mut gaps: Vec<(f32, f32)> = Vec::new();
+    let mut bottom = area.top();
     for band in ys.windows(2) {
         let (y0, y1) = (band[0], band[1]);
         if y1 <= y0 { continue; }
         let mid = (y0 + y1) * 0.5;
-        let mut spans: Vec<(f32, f32)> =
-            holes.iter().filter(|h| h.top() <= mid && mid < h.bottom()).map(|h| (h.left(), h.right())).collect();
-        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        while next < holes.len() && holes[next].top() <= mid {
+            let h = holes[next];
+            active.insert(active.partition_point(|a| a.left() <= h.left()), h);
+            next += 1;
+        }
+        active.retain(|h| mid < h.bottom());
+        gaps.clear();
         let mut x = area.left();
-        for (l, r) in spans {
-            if l > x { out.push(Rect::from_min_max(Pos2::new(x, y0), Pos2::new(l.min(area.right()), y1))); }
+        for h in &active {
+            let (l, r) = (h.left(), h.right());
+            if l.min(area.right()) > x { gaps.push((x, l.min(area.right()))); }
             x = x.max(r);
         }
-        if x < area.right() { out.push(Rect::from_min_max(Pos2::new(x, y0), Pos2::new(area.right(), y1))); }
+        if x < area.right() { gaps.push((x, area.right())); }
+        // Gaps the band above had too carry on down; its others end.
+        let mut carried: Vec<(f32, f32, f32)> = Vec::with_capacity(gaps.len());
+        let mut k = 0;
+        for &(l, r) in &gaps {
+            while k < open.len() && open[k].0 < l {
+                close(&mut out, open[k], y0);
+                k += 1;
+            }
+            match open.get(k) {
+                Some(&o) if o.0 == l && o.1 == r => {
+                    carried.push(o);
+                    k += 1;
+                }
+                Some(&o) if o.0 == l => {
+                    close(&mut out, o, y0);
+                    carried.push((l, r, y0));
+                    k += 1;
+                }
+                _ => carried.push((l, r, y0)),
+            }
+        }
+        for &o in &open[k..] {
+            close(&mut out, o, y0);
+        }
+        open = carried;
+        bottom = y1;
+    }
+    for o in open {
+        close(&mut out, o, bottom);
     }
     out
 }
@@ -407,6 +528,80 @@ mod tests {
         assert_eq!(tags_text(&["a".repeat(40)], 10).chars().count(), 10);
     }
 
+    /// Screen box of an outline.
+    fn outline(m: &Marks, k: usize) -> Rect {
+        Rect::from_points(&m.found[k].0)
+    }
+
+    fn near(a: Rect, b: [f32; 4]) -> bool {
+        [a.min.x - b[0], a.min.y - b[1], a.max.x - b[2], a.max.y - b[3]].iter().all(|d| d.abs() < 1e-3)
+    }
+
+    /// Group 4 over two rows: top-left and bottom-right. Shape 1,
+    /// bottom-left, is in no group but inside the group's box. No pan,
+    /// zoom 1.
+    fn two_rows() -> Canvas {
+        let mut c = Canvas { pan: [0.0, 0.0], zoom: 1.0, ..Default::default() };
+        c.layers[0].shapes = vec![shape([0.0, 0.0], 4, &[]), shape([0.0, 20.0], 0, &[]), shape([20.0, 20.0], 4, &[])];
+        c
+    }
+
+    /// A group spanning two rows: its outline is the box round it, but
+    /// only its members stay out of the fade, so an object that just sits
+    /// inside that box fades like any other.
+    #[test]
+    fn only_a_groups_own_members_stay_bright() {
+        let mut c = two_rows();
+        let area = r(0.0, 0.0, 400.0, 400.0);
+        let groups = MediaFilter { groups: true, ..Default::default() };
+        let m = marks(area, &c, &groups, InFlight::default());
+        assert_eq!(m.found.len(), 1);
+        let whole = units::bounds_of(&c.layers[0], &[], &[0, 2]).unwrap();
+        assert!(near(outline(&m, 0), whole), "the outline is round the whole group, as before");
+        let bright = |p: [f32; 2]| m.holes.iter().any(|h| h.contains(Pos2::new(p[0], p[1])));
+        assert!(bright([5.0, 5.0]) && bright([25.0, 25.0]), "members stay bright");
+        assert!(!bright([5.0, 25.0]), "the object in no group fades");
+        assert!(uncovered(area, &m.holes).iter().any(|d| d.contains(Pos2::new(5.0, 25.0))));
+        // Tagged as one, likewise.
+        for i in [0, 2] {
+            c.layers[0].shapes[i].set_tags(&["pose".to_string()]);
+        }
+        let tagged = MediaFilter { tagged: true, ..Default::default() };
+        let m = marks(area, &c, &tagged, InFlight::default());
+        assert!(near(outline(&m, 0), whole));
+        assert!(!m.holes.iter().any(|h| h.contains(Pos2::new(5.0, 25.0))));
+    }
+
+    /// A group being moved, resized or turned, or its layer dragged,
+    /// takes its highlight along before the gesture commits.
+    #[test]
+    fn highlights_follow_a_gesture_in_flight() {
+        let c = two_rows();
+        let area = r(-400.0, -400.0, 400.0, 400.0);
+        let at = |b: [f32; 4]| [b[0] - 400.0, b[1] - 400.0, b[2] - 400.0, b[3] - 400.0];
+        let groups = MediaFilter { groups: true, ..Default::default() };
+        let whole = units::bounds_of(&c.layers[0], &[], &[0, 2]).unwrap();
+        // The whole group dragged by (100, 50).
+        let sel = Selection { strokes: vec![], shapes: vec![0, 2] };
+        let moving = InFlight { sel: Some((0, &sel, Affine::translate([100.0, 50.0]))), layer: None };
+        let m = marks(area, &c, &groups, moving);
+        assert!(near(outline(&m, 0), at([whole[0] + 100.0, whole[1] + 50.0, whole[2] + 100.0, whole[3] + 50.0])));
+        let bright = |m: &Marks, p: [f32; 2]| m.holes.iter().any(|h| h.contains(Pos2::new(p[0] - 400.0, p[1] - 400.0)));
+        assert!(bright(&m, [105.0, 55.0]) && !bright(&m, [5.0, 5.0]), "the bright spots move too");
+        // Only one member taken along (Alt+click): the box stretches to it.
+        let one = Selection { strokes: vec![], shapes: vec![2] };
+        let moving = InFlight { sel: Some((0, &one, Affine::translate([100.0, 0.0]))), layer: None };
+        let m = marks(area, &c, &groups, moving);
+        assert!(near(outline(&m, 0), at([whole[0], whole[1], whole[2] + 100.0, whole[3]])));
+        // Another layer's gesture leaves this one alone.
+        let moving = InFlight { sel: Some((1, &sel, Affine::translate([100.0, 50.0]))), layer: Some((1, 2.0, [7.0, 0.0])) };
+        assert!(near(outline(&marks(area, &c, &groups, moving), 0), at(whole)));
+        // The layer dragged and scaled with Shift+Space: p → 2p + (7, 0).
+        let moving = InFlight { sel: None, layer: Some((0, 2.0, [7.0, 0.0])) };
+        let m = marks(area, &c, &groups, moving);
+        assert!(near(outline(&m, 0), at([2.0 * whole[0] + 7.0, 2.0 * whole[1], 2.0 * whole[2] + 7.0, 2.0 * whole[3]])));
+    }
+
     #[test]
     fn what_the_board_dropped_is_counted_and_matched() {
         use crate::canvas::board_link::{BoardLink, ItemState, LinkedItem};
@@ -433,6 +628,15 @@ mod tests {
         let gone = MediaFilter { gone: true, ..Default::default() };
         assert!(gone.any());
         assert_eq!(matches_on(&c, 0, &gone), (vec![], vec![1]));
+        // Its box is marked, and follows it while it is dragged.
+        let area = Rect::from_min_max(Pos2::new(-400.0, -400.0), Pos2::new(400.0, 400.0));
+        let still = marks(area, &c, &gone, InFlight::default());
+        assert_eq!(still.found.len(), 1);
+        let sel = crate::canvas::hit::Selection { strokes: vec![], shapes: vec![1] };
+        let moving = InFlight { sel: Some((0, &sel, Affine::translate([30.0, 0.0]))), layer: None };
+        let moved = marks(area, &c, &gone, moving);
+        assert!((outline(&moved, 0).min - outline(&still, 0).min - egui::vec2(30.0, 0.0)).length() < 1e-3);
+        assert!(moved.holes.iter().any(|h| h.contains(outline(&moved, 0).center())));
     }
 
     /// Times the per-frame work on a real slide: `OSN_PERF_SLIDE` names a
@@ -464,6 +668,36 @@ mod tests {
             std::hint::black_box(matches_on(&c, 0, &all));
         }
         println!("matches_on (all tagged + gone): {:?}", t.elapsed() / n);
+        // What `paint` works out each frame with the whole slide in view:
+        // the outlines and the fade's cut-outs, one per highlighted object.
+        let mut c = c;
+        let area = Rect::from_min_size(Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let all: Vec<[f32; 4]> = c.layers.iter().flat_map(|l| &l.shapes).map(|s| s.obb().aabb()).collect();
+        if let Some(b) = all.into_iter().reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]) {
+            c.zoom = (1920.0 / (b[2] - b[0])).min(1080.0 / (b[3] - b[1]));
+            c.pan = [-b[0] * c.zoom, -b[1] * c.zoom];
+        }
+        let filters = [
+            ("groups", MediaFilter { groups: true, ..Default::default() }),
+            ("pictures", MediaFilter { pictures: true, ..Default::default() }),
+            ("everything", MediaFilter { pictures: true, gifs: true, videos: true, groups: true, tagged: true, ..Default::default() }),
+        ];
+        for (name, f) in filters {
+            let t = std::time::Instant::now();
+            let mut rects = 0;
+            for _ in 0..n {
+                let m = marks(area, &c, &f, InFlight::default());
+                rects = uncovered(area, &m.holes).len();
+                std::hint::black_box(&m.found);
+            }
+            println!("paint work, {name}: {:?} a frame, {rects} faded rects", t.elapsed() / n);
+            let m = marks(area, &c, &f, InFlight::default());
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(uncovered(area, &m.holes));
+            }
+            println!("  of which uncovered: {:?} ({} holes)", t.elapsed() / n, m.holes.len());
+        }
     }
 
     #[test]
@@ -479,5 +713,54 @@ mod tests {
                 assert!(d.intersect(*h).area() < 1e-3 || !d.intersect(*h).is_positive());
             }
         }
+    }
+
+    /// Every point of the area is faded exactly once, unless a hole is on
+    /// it: then not at all. Random holes, some past the area's edges,
+    /// some lined up so gaps run on down.
+    #[test]
+    fn uncovered_fades_each_point_once_outside_the_holes() {
+        let mut seed = 12345u32;
+        let mut rnd = |n: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) % n
+        };
+        let area = r(0.0, 0.0, 60.0, 40.0);
+        for _ in 0..300 {
+            let n = rnd(14);
+            let mut holes: Vec<Rect> = Vec::new();
+            for _ in 0..n {
+                let (x, y) = (rnd(70) as f32 - 5.0, rnd(50) as f32 - 5.0);
+                holes.push(r(x, y, x + 1.0 + rnd(20) as f32, y + 1.0 + rnd(15) as f32));
+            }
+            // A row of same-height holes, as pictures in a row are.
+            let y = rnd(40) as f32;
+            for k in 0..rnd(5) {
+                let x = 12.0 * k as f32 + rnd(3) as f32;
+                holes.push(r(x, y, x + 8.0, y + 6.0));
+            }
+            let dim = uncovered(area, &holes);
+            assert!(dim.iter().all(|d| d.is_positive() && area.contains_rect(*d)));
+            for gx in 0..60 {
+                for gy in 0..40 {
+                    let p = Pos2::new(gx as f32 + 0.5, gy as f32 + 0.5);
+                    let want = usize::from(!holes.iter().any(|h| h.contains(p)));
+                    assert_eq!(dim.iter().filter(|d| d.contains(p)).count(), want, "at {p:?}, holes {holes:?}");
+                }
+            }
+        }
+        // A column of holes cut into bands by the one beside it: the gap
+        // right of them is the same in every band, and is one rectangle
+        // all the way down, not one per band.
+        let mut cols: Vec<Rect> = Vec::new();
+        for k in 0..10 {
+            let y = 4.0 * k as f32;
+            cols.push(r(0.0, y, 4.0, y + 2.0));
+            cols.push(r(10.0, y + 1.0, 14.0, y + 5.0));
+        }
+        let dim = uncovered(r(0.0, 0.0, 20.0, 43.0), &cols);
+        let right: Vec<&Rect> = dim.iter().filter(|d| d.left() == 14.0).collect();
+        assert_eq!(right.len(), 1, "{right:?}");
+        assert_eq!((right[0].top(), right[0].bottom(), right[0].right()), (1.0, 41.0, 20.0));
     }
 }

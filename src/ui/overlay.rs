@@ -652,9 +652,11 @@ pub fn show(
 
             // Media filter — under the selection chrome, so a selection
             // made with "Select these" still shows its frame on top. Kept
-            // out of screenshots and recordings like the chrome is.
+            // out of screenshots and recordings like the chrome is. Its
+            // highlights follow objects a gesture is moving, as they show.
             if media_filter.any() && chrome_visible && show_selection {
-                crate::ui::media_filter::paint(&ui.painter_at(rect), rect, manager.active(), media_filter);
+                let moving = crate::ui::media_filter::InFlight { sel: sel_preview, layer: layer_xform };
+                crate::ui::media_filter::paint(&ui.painter_at(rect), rect, manager.active(), media_filter, moving);
             }
 
             // Select tool — frame, resize handles, rotate knob and the
