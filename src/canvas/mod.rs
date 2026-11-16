@@ -15,6 +15,7 @@ pub mod affine;
 #[allow(clippy::module_inception)]
 pub mod board_link;
 pub mod canvas;
+pub mod cover;
 pub mod hit;
 pub mod ink_gpu;
 pub mod picture_index;

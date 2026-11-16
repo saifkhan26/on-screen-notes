@@ -126,6 +126,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         add("Turn left 90°", s, a.rotate_left, C::Key(K::Rotate(false)));
         add("Turn right 90°", s, a.rotate_right, C::Key(K::Rotate(true)));
         add("Zoom to the selection", s, c.zoom_to_selection, C::Key(K::ZoomToSelection));
+        add("Dim the rest on / off (fade what is not selected)", s, a.dim_unselected, C::Key(K::DimUnselected));
         add("Tag the selection (find knows it by its tags)", s, a.tag, C::Key(K::Tag));
         for (dir, key) in crate::tools::hop::Dir::ALL.into_iter().zip(c.hop) {
             add(&format!("Select the nearest object {}", dir.name()), s, key, C::Key(K::Hop(dir)));

@@ -711,6 +711,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Flip left to right",       a.flip_horizontal),
             ("Flip top to bottom",       a.flip_vertical),
             ("A picture's colours",      a.picture_colours),
+            ("Dim the rest on / off",    a.dim_unselected),
         ])),
         ("Panels & pins", bound(vec![
             ("New slide",                c.new_slide),

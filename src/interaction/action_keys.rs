@@ -21,6 +21,8 @@ pub enum KeyAction {
     Match(Match),
     /// Flip the arrange bar's "keep apart" switch.
     KeepApart,
+    /// Flip the arrange bar's "dim the rest" switch.
+    DimUnselected,
     /// Open "Move to slide…".
     MoveToSlide,
     /// Pick the palette's colour at this index.
@@ -125,6 +127,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (a.picture_colours, KeyAction::PictureColours),
         (a.tag, KeyAction::Tag),
         (a.find_similar, KeyAction::FindSimilar),
+        (a.dim_unselected, KeyAction::DimUnselected),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));
     for (i, b) in t.colour.iter().enumerate() {

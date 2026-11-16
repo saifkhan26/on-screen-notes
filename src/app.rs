@@ -903,6 +903,7 @@ impl eframe::App for OnScreenNotesApp {
                     pinned,
                     &self.canvases,
                     &mut self.config.arrange_apart,
+                    &mut self.config.dim_unselected,
                     &mut self.config.pack_mode,
                     keys,
                     open_move,
@@ -1007,6 +1008,7 @@ impl eframe::App for OnScreenNotesApp {
                     selected: self.pin_tool.selected,
                     outlines: self.ui_visible && self.tool.kind == crate::tools::ToolKind::Select,
                 },
+                self.config.dim_unselected,
             );
 
             // ---- Videos & GIFs ------------------------------------------

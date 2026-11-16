@@ -183,6 +183,10 @@ pub struct AppConfig {
     /// around it. On unless turned off in the settings.
     #[serde(default = "default_shape_snap")]
     pub smart_guides: bool,
+    /// The arrange bar's "dim the rest": while objects are selected,
+    /// everything else on the slide fades back. Off until switched on.
+    #[serde(default)]
+    pub dim_unselected: bool,
 
     /// How the arrange bar's Pack lays objects out: the tightest block,
     /// rows or columns. Picked from the arrow beside it.
@@ -250,6 +254,7 @@ impl Default for AppConfig {
             arrange_apart: true,
             shape_snap: true,
             smart_guides: true,
+            dim_unselected: false,
             pack_mode: PackMode::default(),
             beside_fit: BesideFit::default(),
             beside_side: BesideSide::default(),

@@ -4,7 +4,8 @@
 //! there are two or more; flips it and zooms to it; shows a lone
 //! picture's colours (`tools::picture_colours`) in a row of its own;
 //! copies it to a new slide, moves it to another slide, and pins it
-//! (see `canvas::pins`), and tags it for find (Ctrl+F) to know it by.
+//! (see `canvas::pins`), and tags it for find (Ctrl+F) to know it by. Its
+//! "dim the rest" switch fades everything that is not selected.
 //! A selected pin gets a bar of its own in the
 //! same place, which also shows it on one slide or every slide.
 
@@ -157,7 +158,8 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 /// one of them is in a pin; `slides` for the list "Move to slide" opens.
 /// `apart` is the "keep apart" switch: on, the align buttons slide
 /// objects until they touch rather than piling them up; the bar flips
-/// it when clicked. `pack` is how Pack lays objects out, picked from the
+/// it when clicked. `dim` is the "dim the rest" switch: on, everything
+/// not selected fades back; the bar flips it too. `pack` is how Pack lays objects out, picked from the
 /// arrow beside it. `keys` label the buttons' tooltips; `open_move`
 /// opens "Move to slide…" as its key asks; `picture` is set when the
 /// selection is one picture, for its palette button; `grouped` when some
@@ -172,6 +174,7 @@ pub fn show(
     pinned: bool,
     slides: &CanvasManager,
     apart: &mut bool,
+    dim: &mut bool,
     pack: &mut PackMode,
     keys: &ParsedHotkeys,
     open_move: bool,
@@ -232,6 +235,14 @@ pub fn show(
                     let tip = with_key("Zoom to the selection", keys.canvas.zoom_to_selection);
                     if icon_btn(ui, egui::include_image!("../../assets/icons/zoom-selection.svg"), true, &tip) {
                         picked = Some(BarAction::ZoomToSelection);
+                    }
+                    let tip = if *dim {
+                        "Dim the rest: on — while objects are selected, everything else fades back. Click to stop"
+                    } else {
+                        "Dim the rest: off — click to fade everything that is not selected, so it is plain what is"
+                    };
+                    if toggle_btn(ui, egui::include_image!("../../assets/icons/dim-rest.svg"), *dim, &with_key(tip, k.dim_unselected)) {
+                        *dim = !*dim;
                     }
                     if let Some(row) = &picture {
                         let tip = with_key("Colours in this picture — draw with one, or keep them all as the palette", k.picture_colours);

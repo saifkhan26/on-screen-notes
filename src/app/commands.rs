@@ -38,6 +38,15 @@ impl OnScreenNotesApp {
                 };
                 say(self, msg.to_string());
             }
+            K::DimUnselected => {
+                self.config.dim_unselected = !self.config.dim_unselected;
+                let msg = if self.config.dim_unselected {
+                    "Dim the rest on: while objects are selected, everything else fades back"
+                } else {
+                    "Dim the rest off"
+                };
+                say(self, msg.to_string());
+            }
             K::MoveToSlide => {
                 if selecting {
                     self.move_picker_pending = true;

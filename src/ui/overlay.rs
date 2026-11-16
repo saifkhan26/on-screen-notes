@@ -375,6 +375,9 @@ pub fn show(
     // Media types to highlight; the rest of the slide fades back.
     media_filter: &crate::ui::media_filter::MediaFilter,
     pin_marks: PinMarks,
+    // The arrange bar's "dim the rest": while the Select tool has
+    // objects selected, everything else fades back.
+    dim_unselected: bool,
 ) -> egui::Rect {
     // Select-tool gesture in flight: the selected objects preview under
     // its transform until pen-up commits it.
@@ -654,9 +657,18 @@ pub fn show(
             // made with "Select these" still shows its frame on top. Kept
             // out of screenshots and recordings like the chrome is. Its
             // highlights follow objects a gesture is moving, as they show.
+            // "Dim the rest": with objects selected, everything else fades
+            // the same way, the selection's fade taking the filter's place
+            // (its outlines and labels still show).
+            let moving = crate::ui::media_filter::InFlight { sel: sel_preview, layer: layer_xform };
+            let dim_rest = dim_unselected && show_selection && tool.kind == ToolKind::Select && !tool.select.sel.is_empty();
+            if dim_rest {
+                let canvas = manager.active();
+                let holes = crate::ui::media_filter::selection_holes(rect, canvas, canvas.active_layer, &tool.select.sel, moving);
+                crate::ui::media_filter::fade(&ui.painter_at(rect), rect, &holes);
+            }
             if media_filter.any() && chrome_visible && show_selection {
-                let moving = crate::ui::media_filter::InFlight { sel: sel_preview, layer: layer_xform };
-                crate::ui::media_filter::paint(&ui.painter_at(rect), rect, manager.active(), media_filter, moving);
+                crate::ui::media_filter::paint(&ui.painter_at(rect), rect, manager.active(), media_filter, moving, !dim_rest);
             }
 
             // Select tool — frame, resize handles, rotate knob and the
@@ -845,8 +857,19 @@ pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f3
             painter.circle_filled(to_screen(*p), 2.0, GUIDE);
         }
     }
-    // Groups inside the selection: a light dashed box each.
+    // Each selected object, when there are two or more: a thin line round
+    // it, so one that only sits inside the frame shows as not selected.
+    for o in &chrome.objects {
+        let pts: Vec<egui::Pos2> = o.iter().map(|p| to_screen(*p)).collect();
+        painter.add(egui::Shape::closed_line(pts.clone(), egui::Stroke::new(2.5, egui::Color32::from_black_alpha(110))));
+        painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.0, line)));
+    }
+    // Groups inside the selection: a light dashed line round each one's
+    // members.
     for g in &chrome.groups {
+        if g.is_empty() {
+            continue;
+        }
         let mut pts: Vec<egui::Pos2> = g.iter().map(|p| to_screen(*p)).collect();
         pts.push(pts[0]);
         let dash = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(160, 205, 255, 200));
