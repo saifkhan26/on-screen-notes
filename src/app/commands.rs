@@ -256,6 +256,8 @@ impl OnScreenNotesApp {
                 }
             }
             C::Eyedropper => self.tool.eyedropper_pending = true,
+            // An open pad takes undo and redo for its own strokes.
+            C::Undo | C::Redo if self.pad.is_open() => self.pad_undo(cmd == C::Redo),
             C::Undo | C::Redo => {
                 if self.may_edit() {
                     let c = self.canvases.active_mut();
@@ -306,6 +308,8 @@ impl OnScreenNotesApp {
                 self.toast = Some((msg.to_string(), Instant::now()));
             }
             C::GoTo(i) => self.canvases.go_to(i),
+            C::NewPad => self.new_pad(ctx, canvas_rect),
+            C::DrawOnPicture => self.draw_on_selected_picture(),
         }
     }
 }

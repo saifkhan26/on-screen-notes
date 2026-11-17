@@ -46,6 +46,9 @@ pub struct OverlayCache {
     /// Where the canvas was drawn last frame, to tell which pictures are
     /// on screen before this frame's layout runs.
     last_canvas_rect: Option<egui::Rect>,
+    /// The drawing pad open now (`canvas::pad`): the picture whose pixel
+    /// bytes start at this address shows this GPU texture instead.
+    pad: Option<(usize, egui::TextureId)>,
 }
 
 /// When a texture was last drawn: the `show` call and the time.
@@ -89,6 +92,12 @@ impl OverlayCache {
         for (from, to) in swaps {
             self.pictures.carry(from, to);
         }
+    }
+
+    /// The drawing pad open now: the picture whose `png` bytes are at
+    /// `key` shows `texture`, live, wherever it is drawn.
+    pub fn set_pad(&mut self, pad: Option<(usize, egui::TextureId)>) {
+        self.pad = pad;
     }
 
     /// Pictures are still loading at their on-screen size.
@@ -211,6 +220,7 @@ impl OverlayCache {
             let long = obb.half[0].max(obb.half[1]) * 2.0 * zoom * ppp;
             (long, r.intersects(near))
         };
+        let pad = self.pad;
         let pictures = &mut self.pictures;
         pictures.count_shown(overlay);
         let shapes = canvas
@@ -222,6 +232,12 @@ impl OverlayCache {
                     .iter()
                     .map(|shape| match shape {
                         Shape::Raster { png, media: m, picture, px_size, .. } => {
+                            // The pad being drawn on shows its live pixels.
+                            if let Some((key, tex)) = pad {
+                                if std::sync::Arc::as_ptr(png) as usize == key {
+                                    return Some(tex);
+                                }
+                            }
                             // A video's live frame, else its poster.
                             if let Some(tex) = m.as_ref().and_then(|m| media.texture(m.id)) {
                                 return Some(tex);
@@ -263,6 +279,7 @@ impl OverlayCache {
         use crate::canvas::hit::ObjRef;
         let ppp = ctx.pixels_per_point();
         let near = view.expand(view.width().max(view.height()) * 0.25);
+        let pad = self.pad;
         let pictures = &mut self.pictures;
         pictures.count_shown(overlay);
         let textures = pinned
@@ -275,6 +292,11 @@ impl OverlayCache {
                         let layer = p.canvas.layers.get(m.layer)?;
                         let shape = layer.shapes.get(si)?;
                         let Shape::Raster { png, media: md, picture, px_size, .. } = shape else { return None };
+                        if let Some((key, tex)) = pad {
+                            if std::sync::Arc::as_ptr(png) as usize == key {
+                                return Some(tex);
+                            }
+                        }
                         if let Some(tex) = md.as_ref().and_then(|md| media.texture(md.id)) {
                             return Some(tex);
                         }

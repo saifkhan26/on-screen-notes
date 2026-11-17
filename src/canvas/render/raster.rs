@@ -437,12 +437,19 @@ pub(super) fn draw_shape(
             draw_line(pixmap, *b, [b[0] + h1x, b[1] + h1y], *color, *stroke_width, t);
             draw_line(pixmap, *b, [b[0] + h2x, b[1] + h2y], *color, *stroke_width, t);
         }
-        Shape::Raster { pos, size, png, rotation, kind, media, picture, flip, .. } => {
+        Shape::Raster { pos, size, png, rotation, kind, media, picture, flip, paper, .. } => {
             let t = turned(t, *rotation, pos[0] + size[0] * 0.5, pos[1] + size[1] * 0.5);
             let opacity = match kind {
                 crate::canvas::shape::RasterKind::Image => image_opacity.clamp(0.0, 1.0),
                 crate::canvas::shape::RasterKind::Fill => 1.0,
             };
+            // A drawing pad's paper goes under its pixels.
+            if let Some(p) = paper.filter(|p| p[3] > 0) {
+                let a = (p[3] as f32 * opacity).round() as u8;
+                if let Some(rect) = tiny_skia::Rect::from_xywh(pos[0], pos[1], size[0], size[1]) {
+                    pixmap.fill_rect(rect, &rgba_paint([p[0], p[1], p[2], a]), t, None);
+                }
+            }
             // A video or GIF draws the frame it is showing when there is
             // one; otherwise (and for every still picture) the PNG is
             // decoded inline. Slow per call but the screenshot path only

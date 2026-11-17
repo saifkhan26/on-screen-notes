@@ -325,6 +325,14 @@ impl OnScreenNotesApp {
                         }
                     }
                 }
+                // An open drawing pad takes the pen (`app::pad`).
+                let to_pad = transform_pen_event(*ev, canvas_rect, self.canvases.active());
+                if self.pad_pointer(to_pad, self.pen_using_eraser) {
+                    if matches!(ev, PenEvent::Up(_)) {
+                        self.pen_using_eraser = false;
+                    }
+                    continue;
+                }
                 // A selection let go over the slide window moves there.
                 if matches!(ev, PenEvent::Up(_)) && !self.pen_using_eraser {
                     let screen = [client_origin[0] as f32 + s.pos[0], client_origin[1] as f32 + s.pos[1]];
@@ -439,16 +447,18 @@ impl OnScreenNotesApp {
                         }
                     }
                     if self.mouse_gesture {
+                        // An open drawing pad takes the mouse (`app::pad`).
+                        let to_pad = self.pad_pointer(ev, self.pen_using_eraser);
                         // A selection let go over the slide window
                         // moves there.
-                        let dropped = matches!(ev, PenEvent::Up(_)) && !self.pen_using_eraser && {
+                        let dropped = !to_pad && matches!(ev, PenEvent::Up(_)) && !self.pen_using_eraser && {
                             let ppp = ctx.pixels_per_point();
                             let screen = [client_origin[0] as f32 + p.x * ppp, client_origin[1] as f32 + p.y * ppp];
                             self.drop_on_slide_window(screen, ppp)
                         };
                         // Pins sit over the slide; see `pin_pointer`.
-                        let to_pin = !dropped && editable && !self.pen_using_eraser && self.pin_pointer(ev, cursor_screen, shift_held, canvas_rect.size());
-                        if !to_pin && !dropped {
+                        let to_pin = !to_pad && !dropped && editable && !self.pen_using_eraser && self.pin_pointer(ev, cursor_screen, shift_held, canvas_rect.size());
+                        if !to_pad && !to_pin && !dropped {
                             let target_tool: &mut ActiveTool = if self.pen_using_eraser {
                                 &mut self.eraser_override
                             } else {

@@ -14,6 +14,7 @@ impl OnScreenNotesApp {
         self.canvases.poll_loads();
         let stored = self.canvases.store_pictures();
         self.overlay_cache.carry_pictures(&stored);
+        self.pad_follow_store(&stored);
         self.canvases.refresh_pins();
         // The global pins are on the canvas, or in the slide window when
         // its "Pins" toggle is on; never both.

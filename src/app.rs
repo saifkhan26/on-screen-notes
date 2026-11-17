@@ -39,6 +39,7 @@ mod media;
 mod commands;
 mod find;
 mod similar;
+mod pad;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
@@ -307,6 +308,9 @@ pub struct OnScreenNotesApp {
     /// Since when the slide-loading bar has had something to show, so a
     /// quick load does not flash it.
     progress_since: Option<Instant>,
+
+    /// The picture being drawn on, if any (`app::pad`).
+    pad: pad::PadState,
 }
 
 /// How long after the pen was last used the pointer still counts as
@@ -523,6 +527,8 @@ impl OnScreenNotesApp {
         // it; see `canvas::ink_gpu`.
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             crate::canvas::ink_gpu::init(rs);
+            // Drawing pads paint on the same device.
+            crate::canvas::pad_gpu::init(rs);
         }
 
         let config = crate::persistence::load_config();
@@ -674,6 +680,7 @@ impl OnScreenNotesApp {
             last_frame_at: None,
             clip_image: Default::default(),
             progress_since: None,
+            pad: Default::default(),
         }
     }
 
@@ -756,6 +763,9 @@ impl eframe::App for OnScreenNotesApp {
         }
 
         self.take_in_slides(ctx);
+
+        // The drawing pad: put away if it must be, shown live if open.
+        self.pad_frame_start();
 
         self.advance_captures(ctx);
 
@@ -1010,6 +1020,7 @@ impl eframe::App for OnScreenNotesApp {
                 },
                 self.config.dim_unselected,
             );
+            self.pad_chrome(ctx, canvas_rect);
 
             // ---- Videos & GIFs ------------------------------------------
             // New files from the dialog / drag-and-drop, finished imports,
@@ -1108,6 +1119,11 @@ impl eframe::App for OnScreenNotesApp {
 
             self.run_deferred_tools(ctx, canvas_rect);
 
+            // This frame's stamps on the open pad, and its Esc / undo keys
+            // before anything else reads the keys.
+            self.pad_flush();
+            self.pad_keys(ctx);
+
             let keys = self.take_keys(ctx, &slides, space_held, canvas_rect);
 
             self.run_keys(ctx, keys, slides, canvas_rect, &media_objs, media_selected);
@@ -1153,6 +1169,8 @@ impl eframe::App for OnScreenNotesApp {
     /// With glow it would be `(&mut self, Option<&glow::Context>)`. Since we
     /// build with `wgpu` only, the no-arg form is correct.
     fn on_exit(&mut self) {
+        // A pad still open goes into its slide first.
+        self.close_pad(false);
         // Shutdown path: block until every dirty canvas is on disk.
         // The background variant would race with process exit.
         self.canvases.save_all_blocking();

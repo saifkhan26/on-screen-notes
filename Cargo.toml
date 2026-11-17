@@ -200,6 +200,10 @@ arboard = "3"
 # `#![windows_subsystem = "windows"]` instead of doing it here, so debug
 # builds keep the console for `println!` output.
 
+# Tests that drive the GPU wait on wgpu's futures (already built for eframe).
+[dev-dependencies]
+pollster = "0.3"
+
 # -----------------------------------------------------------------------------
 # Release profile — tuned for "smallest, still-fast" binary.
 # -----------------------------------------------------------------------------

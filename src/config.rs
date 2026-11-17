@@ -201,7 +201,14 @@ pub struct AppConfig {
     /// …and lands on this side of it.
     #[serde(default)]
     pub beside_side: BesideSide,
+
+    /// The paper a new drawing pad gets: the last one picked, straight
+    /// RGBA (alpha is its opacity). White to start.
+    #[serde(default = "default_pad_paper")]
+    pub pad_paper: [u8; 4],
 }
+
+fn default_pad_paper() -> [u8; 4] { [255, 255, 255, 255] }
 
 fn default_slide_panel_open() -> bool { true }
 
@@ -258,6 +265,7 @@ impl Default for AppConfig {
             pack_mode: PackMode::default(),
             beside_fit: BesideFit::default(),
             beside_side: BesideSide::default(),
+            pad_paper: default_pad_paper(),
         }
     }
 }

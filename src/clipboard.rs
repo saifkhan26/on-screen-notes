@@ -79,7 +79,21 @@ fn picture_pixels(shape: &Shape, frames: &MediaFrames, media_dir: Option<&Path>)
     if matches!(shape, Shape::Raster { flip: true, .. }) {
         image::imageops::flip_horizontal_in_place(&mut img);
     }
+    // A drawing pad copies as it shows: on its paper.
+    if let Shape::Raster { paper: Some(p), .. } = shape {
+        crate::canvas::pad::on_paper(&mut img, *p);
+    }
     Some(img)
+}
+
+/// A still picture's own pixels at full size, as stored (before its
+/// `flip`): what a drawing pad opens (`canvas::pad`). `None` for a video
+/// or GIF, or what cannot be read.
+pub fn still_pixels(shape: &Shape, media_dir: Option<&Path>) -> Option<image::RgbaImage> {
+    if matches!(shape, Shape::Raster { media: Some(_), .. }) {
+        return None;
+    }
+    unflipped_pixels(shape, &MediaFrames::new(), media_dir)
 }
 
 fn unflipped_pixels(shape: &Shape, frames: &MediaFrames, media_dir: Option<&Path>) -> Option<image::RgbaImage> {
@@ -121,6 +135,7 @@ mod tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         }
     }
 

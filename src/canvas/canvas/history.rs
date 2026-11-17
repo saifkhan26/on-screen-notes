@@ -310,6 +310,7 @@ pub(super) fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
         tags: Vec::new(),
         turn: 0.0,
         link: 0,
+        paper: None,
     });
     layer.rev += 1;
     Some(img.capture_zoom)

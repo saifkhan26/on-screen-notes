@@ -12,12 +12,14 @@
 pub mod affine;
 // `canvas::canvas::Canvas`: one slide, in its own file beside the manager.
 // Renaming it would touch every import for nothing.
-#[allow(clippy::module_inception)]
 pub mod board_link;
+#[allow(clippy::module_inception)]
 pub mod canvas;
 pub mod cover;
 pub mod hit;
 pub mod ink_gpu;
+pub mod pad;
+pub mod pad_gpu;
 pub mod picture_index;
 pub mod picture_store;
 pub mod pins;
@@ -1561,6 +1563,7 @@ mod media_cleanup_tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         }
     }
 
@@ -2287,6 +2290,7 @@ mod pin_tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         });
         c.layers[0].opacity = 0.25;
         let mut m = CanvasManager::for_tests(vec![c]);

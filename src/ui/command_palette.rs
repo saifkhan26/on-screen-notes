@@ -44,6 +44,10 @@ pub enum Command {
     DeleteSelection,
     ShapeSnap,
     GoTo(usize),
+    /// A new drawing pad (white paper) in the middle of the view.
+    NewPad,
+    /// Draw on the selected picture (`canvas::pad`).
+    DrawOnPicture,
 }
 
 /// One row: what it says, where it belongs, its keys, what it does.
@@ -143,6 +147,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
             add("Ungroup", s, c.ungroup, C::Key(K::Group(false)));
         }
         if cx.picture {
+            add("Draw on this picture (pen, pencil, eraser; Esc when done)", s, None, C::DrawOnPicture);
             add("A picture's colours", s, a.picture_colours, C::Key(K::PictureColours));
             add("Find pictures like this one (copies, edits, similar)", s, a.find_similar, C::Key(K::FindSimilar));
         }
@@ -179,6 +184,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Text in a box on / off", e, tb.text_box, C::Key(K::TextBox));
     add("Shape snap on / off", e, None, C::ShapeSnap);
     add("Insert a picture, video, GIF or PureRef board", e, tb.insert_media, C::Key(K::InsertMedia));
+    add("New drawing pad (paper to draw on with the pen and pencil)", e, None, C::NewPad);
     add("Pen size up", e, tb.size_up, C::Key(K::Size(1)));
     add("Pen size down", e, tb.size_down, C::Key(K::Size(-1)));
     for (i, colour) in cx.palette.iter().enumerate().take(8) {
