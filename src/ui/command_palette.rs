@@ -148,6 +148,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         }
         if cx.picture {
             add("Draw on this picture (pen, pencil, eraser; Esc when done)", s, None, C::DrawOnPicture);
+            add("Crop this picture (drag its edges; Enter crops)", s, a.crop, C::Key(K::Crop));
             add("A picture's colours", s, a.picture_colours, C::Key(K::PictureColours));
             add("Find pictures like this one (copies, edits, similar)", s, a.find_similar, C::Key(K::FindSimilar));
         }

@@ -12,6 +12,7 @@
 pub mod arrange;
 pub mod arrow_tool;
 pub mod beside;
+pub mod crop;
 pub mod eraser_tool;
 pub mod guides;
 pub mod hop;

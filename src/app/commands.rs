@@ -202,6 +202,11 @@ impl OnScreenNotesApp {
                 }
             }
             K::FindSimilar => self.find_similar(),
+            K::Crop => {
+                if selecting {
+                    self.start_crop();
+                }
+            }
             K::FindCopies => {
                 self.commands.close();
                 self.find.find_copies();
@@ -258,6 +263,8 @@ impl OnScreenNotesApp {
             C::Eyedropper => self.tool.eyedropper_pending = true,
             // An open pad takes undo and redo for its own strokes.
             C::Undo | C::Redo if self.pad.is_open() => self.pad_undo(cmd == C::Redo),
+            // While cropping they wait: Esc first.
+            C::Undo | C::Redo if self.crop.is_open() => {}
             C::Undo | C::Redo => {
                 if self.may_edit() {
                     let c = self.canvases.active_mut();

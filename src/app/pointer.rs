@@ -327,7 +327,7 @@ impl OnScreenNotesApp {
                 }
                 // An open drawing pad takes the pen (`app::pad`).
                 let to_pad = transform_pen_event(*ev, canvas_rect, self.canvases.active());
-                if self.pad_pointer(to_pad, self.pen_using_eraser) {
+                if self.pad_pointer(to_pad, self.pen_using_eraser) || self.crop_pointer(to_pad) {
                     if matches!(ev, PenEvent::Up(_)) {
                         self.pen_using_eraser = false;
                     }
@@ -448,7 +448,8 @@ impl OnScreenNotesApp {
                     }
                     if self.mouse_gesture {
                         // An open drawing pad takes the mouse (`app::pad`).
-                        let to_pad = self.pad_pointer(ev, self.pen_using_eraser);
+                        // Crop mode takes it too (`app::crop`).
+                        let to_pad = self.pad_pointer(ev, self.pen_using_eraser) || self.crop_pointer(ev);
                         // A selection let go over the slide window
                         // moves there.
                         let dropped = !to_pad && matches!(ev, PenEvent::Up(_)) && !self.pen_using_eraser && {

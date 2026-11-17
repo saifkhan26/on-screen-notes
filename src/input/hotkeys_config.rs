@@ -587,6 +587,8 @@ pub struct ArrangeSection {
     pub find_similar: String,
     /// Fade what is not selected, or stop.
     pub dim_unselected: String,
+    /// Crop the selected picture or drawing pad.
+    pub crop: String,
 }
 
 impl Default for CanvasSection {
@@ -738,8 +740,8 @@ fn d_media_next_frame() -> String { "period".into() }
 /// slides; 7 groups; 8 onion skin; 9 the command palette; 10 find and tags;
 /// 11 select all (and lists finding like pictures and duplicates);
 /// 12 resync from PureRef; 13 hopping from object to object; 14 dimming
-/// what is not selected.
-const FORMAT: u32 = 14;
+/// what is not selected; 15 cropping a picture.
+const FORMAT: u32 = 15;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -840,6 +842,7 @@ pub struct ArrangeBindings {
     pub tag: Option<Binding>,
     pub find_similar: Option<Binding>,
     pub dim_unselected: Option<Binding>,
+    pub crop: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1032,6 +1035,7 @@ impl HotkeysConfig {
                 tag: p("arrange.tag", &ar.tag),
                 find_similar: p("arrange.find_similar", &ar.find_similar),
                 dim_unselected: p("arrange.dim_unselected", &ar.dim_unselected),
+                crop: p("arrange.crop", &ar.crop),
             },
             canvas: CanvasBindings {
                 undo:          p("canvas.undo",          &self.canvas.undo),
@@ -1423,6 +1427,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("arrange", "tag")                   => "Type the selection's tags: words find (Ctrl+F) knows it by",
         ("arrange", "find_similar")          => "Find pictures like the selected one (or the copied one): copies, edits, similar",
         ("arrange", "dim_unselected")        => "Dim the rest: while objects are selected, everything else fades back",
+        ("arrange", "crop")                  => "Crop the selected picture or drawing pad (drag its edges; Enter crops, Esc cancels)",
 
         ("canvas", "undo")                 => "Undo",
         ("canvas", "redo")                 => "Redo",
@@ -1738,7 +1743,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 14"));
+        assert!(up.contains("version = 15"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1747,7 +1752,7 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 14\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 15\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
         assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
@@ -1784,7 +1789,7 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 14\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 15\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
@@ -1921,7 +1926,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 14\n\n\
+             version = 15\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1942,13 +1947,13 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 14\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 15\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 14");
-        assert_eq!(upgrade_text("", 0), "version = 14\n");
+        assert_eq!(new, "version = 15");
+        assert_eq!(upgrade_text("", 0), "version = 15\n");
     }
 
     #[test]

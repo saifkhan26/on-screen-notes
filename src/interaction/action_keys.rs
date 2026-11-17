@@ -66,6 +66,8 @@ pub enum KeyAction {
     Tag,
     /// Find pictures like the selected one, or else the copied one.
     FindSimilar,
+    /// Crop the selected picture or pad.
+    Crop,
     /// Text labels in a box, or not.
     TextBox,
     /// Move the active slide one place toward the first (−1) or last (+1).
@@ -127,6 +129,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (a.picture_colours, KeyAction::PictureColours),
         (a.tag, KeyAction::Tag),
         (a.find_similar, KeyAction::FindSimilar),
+        (a.crop, KeyAction::Crop),
         (a.dim_unselected, KeyAction::DimUnselected),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));

@@ -40,6 +40,7 @@ mod commands;
 mod find;
 mod similar;
 mod pad;
+mod crop;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
@@ -311,6 +312,8 @@ pub struct OnScreenNotesApp {
 
     /// The picture being drawn on, if any (`app::pad`).
     pad: pad::PadState,
+    /// The picture being cropped, if any (`app::crop`).
+    crop: crop::CropState,
 }
 
 /// How long after the pen was last used the pointer still counts as
@@ -681,6 +684,7 @@ impl OnScreenNotesApp {
             clip_image: Default::default(),
             progress_since: None,
             pad: Default::default(),
+            crop: Default::default(),
         }
     }
 
@@ -766,6 +770,7 @@ impl eframe::App for OnScreenNotesApp {
 
         // The drawing pad: put away if it must be, shown live if open.
         self.pad_frame_start();
+        self.crop_frame_start();
 
         self.advance_captures(ctx);
 
@@ -933,6 +938,7 @@ impl eframe::App for OnScreenNotesApp {
                     Some(BarAction::ZoomToSelection) => self.zoom_to_selection(ctx),
                     Some(BarAction::PictureColours) => self.toggle_picture_colours(),
                     Some(BarAction::FindSimilar) => self.find_similar(),
+                    Some(BarAction::Crop) => self.start_crop(),
                     // Set after the restyle below, so the picture is
                     // not "recoloured" into an empty undo step.
                     Some(BarAction::UseColour(c)) => use_colour = Some(c),
@@ -1021,6 +1027,7 @@ impl eframe::App for OnScreenNotesApp {
                 self.config.dim_unselected,
             );
             self.pad_chrome(ctx, canvas_rect);
+            self.crop_chrome(ctx, canvas_rect);
 
             // ---- Videos & GIFs ------------------------------------------
             // New files from the dialog / drag-and-drop, finished imports,
@@ -1123,6 +1130,7 @@ impl eframe::App for OnScreenNotesApp {
             // before anything else reads the keys.
             self.pad_flush();
             self.pad_keys(ctx);
+            self.crop_keys(ctx);
 
             let keys = self.take_keys(ctx, &slides, space_held, canvas_rect);
 

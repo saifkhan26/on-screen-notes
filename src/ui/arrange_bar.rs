@@ -44,6 +44,8 @@ pub enum BarAction {
     PictureColours,
     /// Find pictures like the selected one.
     FindSimilar,
+    /// Crop the selected picture.
+    Crop,
     /// Draw with this colour.
     UseColour([u8; 4]),
     /// The picture's colours become the toolbar's palette.
@@ -252,6 +254,10 @@ pub fn show(
                         let tip = with_key("Find similar — copies of this picture (resized, recoloured, mirrored or turned) and pictures like it, on every slide", k.find_similar);
                         if icon_btn(ui, egui::include_image!("../../assets/icons/find-similar.svg"), true, &tip) {
                             picked = Some(BarAction::FindSimilar);
+                        }
+                        let tip = with_key("Crop — drag its edges or corners; Enter crops, Esc cancels", k.crop);
+                        if icon_btn(ui, egui::include_image!("../../assets/icons/crop.svg"), true, &tip) {
+                            picked = Some(BarAction::Crop);
                         }
                     }
                     divider(ui);
