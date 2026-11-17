@@ -59,8 +59,9 @@ pub struct Hit {
     /// A label's text, or the tags as `#one  #two`, on one line, cut
     /// down around the match.
     pub snippet: String,
-    /// Where the match is in `snippet`, in bytes.
-    pub mark: std::ops::Range<usize>,
+    /// Where the match is in `snippet`, in bytes: one range for a label,
+    /// one per word found for tags. In order, not overlapping.
+    pub marks: Vec<std::ops::Range<usize>>,
     /// It sits on a hidden layer, so it is not on screen.
     pub hidden: bool,
 }
@@ -70,14 +71,16 @@ const SNIPPET: usize = 56;
 
 /// Everything on `slides` that holds `query`, case aside, with line
 /// breaks and runs of spaces read as one space: text labels by their
-/// text, objects and groups by their tags. In the order given, then top
-/// to bottom and left to right on each slide. A lone label found by its
-/// text is not listed again for its tags.
+/// text, objects and groups by their tags — every word of the query
+/// (`body sketch`, `#body, #sketch`) in some tag of theirs. In the order
+/// given, then top to bottom and left to right on each slide. A lone
+/// label found by its text is not listed again for its tags.
 pub fn search<'a>(query: &str, slides: impl IntoIterator<Item = (usize, &'a Canvas)>) -> Vec<Hit> {
     let needle: Vec<char> = fold(&flat(query));
     if needle.is_empty() {
         return Vec::new();
     }
+    let words = words(query);
     let mut out = Vec::new();
     for (slide, c) in slides {
         let mut here: Vec<([f32; 2], Hit)> = Vec::new();
@@ -87,28 +90,25 @@ pub fn search<'a>(query: &str, slides: impl IntoIterator<Item = (usize, &'a Canv
                 let Shape::Text { content, .. } = s else { continue };
                 let text: Vec<char> = flat(content).chars().collect();
                 let Some(at) = find(&fold_chars(&text), &needle) else { continue };
-                let (snippet, mark) = snippet(&text, at, needle.len());
+                let (snippet, marks) = snippet(&text, &[(at, needle.len())]);
                 let b = s.obb().aabb();
                 labels.push(shape);
-                here.push(([b[1], b[0]], Hit { slide, layer, found: Found::Label(shape), snippet, mark, hidden: !l.visible }));
+                here.push(([b[1], b[0]], Hit { slide, layer, found: Found::Label(shape), snippet, marks, hidden: !l.visible }));
             }
             // An object by its own tags; a group whole only when every
             // member matches (see `units::tagged_by`).
-            let says = |tags: &[String]| {
-                let text: Vec<char> = tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join("  ").chars().collect();
-                find(&fold_chars(&text), &needle).is_some()
-            };
+            let says = |tags: &[String]| find_each(&fold_chars(&tag_text(tags)), &words).is_some();
             for unit in tagged_by(l, says) {
                 if unit.strokes.is_empty() && unit.shapes.len() == 1 && labels.contains(&unit.shapes[0]) {
                     continue;
                 }
-                let text: Vec<char> = unit.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join("  ").chars().collect();
-                let Some(at) = find(&fold_chars(&text), &needle) else { continue };
+                let text = tag_text(&unit.tags);
+                let Some(at) = find_each(&fold_chars(&text), &words) else { continue };
                 let Some(b) = bounds_of(l, &unit.strokes, &unit.shapes) else { continue };
-                let (snippet, mark) = snippet(&text, at, needle.len());
+                let (snippet, marks) = snippet(&text, &at);
                 let what = describe(l, &unit.strokes, &unit.shapes);
                 let found = Found::Tagged { strokes: unit.strokes, shapes: unit.shapes, what };
-                here.push(([b[1], b[0]], Hit { slide, layer, found, snippet, mark, hidden: !l.visible }));
+                here.push(([b[1], b[0]], Hit { slide, layer, found, snippet, marks, hidden: !l.visible }));
             }
         }
         here.sort_by(|a, b| a.0[0].total_cmp(&b.0[0]).then(a.0[1].total_cmp(&b.0[1])));
@@ -153,39 +153,67 @@ fn fold_chars(s: &[char]) -> Vec<char> {
     s.iter().map(|c| c.to_lowercase().next().unwrap_or(*c)).collect()
 }
 
+/// The words of a query, folded, as tags are typed (`parse_tags`):
+/// between spaces or commas. A `#` stays, so `#pose` finds tags that
+/// start with it.
+fn words(query: &str) -> Vec<Vec<char>> {
+    query.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()).map(fold).collect()
+}
+
+/// Tags as one line, `#one  #two`.
+fn tag_text(tags: &[String]) -> Vec<char> {
+    tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join("  ").chars().collect()
+}
+
 /// Where `needle` first starts in `hay`, in chars.
 fn find(hay: &[char], needle: &[char]) -> Option<usize> {
     (0..=hay.len().checked_sub(needle.len())?).find(|&i| hay[i..i + needle.len()] == *needle)
 }
 
-/// At most `SNIPPET` chars of `text` around the match at `at` (`len`
-/// chars), with an ellipsis where it was cut, and the match's byte range.
-fn snippet(text: &[char], at: usize, len: usize) -> (String, std::ops::Range<usize>) {
+/// Where each of `words` first is in `hay` (start, length, in chars);
+/// `None` when one is missing, or there are none.
+fn find_each(hay: &[char], words: &[Vec<char>]) -> Option<Vec<(usize, usize)>> {
+    if words.is_empty() {
+        return None;
+    }
+    words.iter().map(|w| find(hay, w).map(|at| (at, w.len()))).collect()
+}
+
+/// At most `SNIPPET` chars of `text` around the first of the matches
+/// `found` (start, length, in chars), with an ellipsis where it was
+/// cut, and the matches' byte ranges in it: in order, overlaps joined,
+/// cut where the text is.
+fn snippet(text: &[char], found: &[(usize, usize)]) -> (String, Vec<std::ops::Range<usize>>) {
     let n = text.len();
-    let start = if n <= SNIPPET { 0 } else { at.saturating_sub(16).min(n - SNIPPET) };
+    let first = found.iter().map(|f| f.0).min().unwrap_or(0);
+    let start = if n <= SNIPPET { 0 } else { first.saturating_sub(16).min(n - SNIPPET) };
     let end = (start + SNIPPET).min(n);
     let mut s = String::new();
     if start > 0 {
         s.push('…');
     }
-    let mut mark = 0..0;
-    for (i, c) in text.iter().enumerate().take(end).skip(start) {
-        if i == at {
-            mark.start = s.len();
-        }
+    // Where each char from `start` to `end` begins in `s`.
+    let mut byte = Vec::with_capacity(end - start + 1);
+    for c in &text[start..end] {
+        byte.push(s.len());
         s.push(*c);
-        if i + 1 == at + len {
-            mark.end = s.len();
-        }
     }
-    if mark.end < mark.start {
-        // The match ran past the cut.
-        mark.end = s.len();
+    byte.push(s.len());
+    let mut spans: Vec<(usize, usize)> =
+        found.iter().map(|&(at, len)| (at.clamp(start, end), (at + len).clamp(start, end))).filter(|(a, b)| a < b).collect();
+    spans.sort_unstable();
+    let mut marks: Vec<std::ops::Range<usize>> = Vec::new();
+    for (a, b) in spans {
+        let r = byte[a - start]..byte[b - start];
+        match marks.last_mut() {
+            Some(m) if r.start <= m.end => m.end = m.end.max(r.end),
+            _ => marks.push(r),
+        }
     }
     if end < n {
         s.push('…');
     }
-    (s, mark)
+    (s, marks)
 }
 
 /// A picture find looks for others like.
@@ -241,7 +269,7 @@ pub fn picture_hit(c: &Canvas, slide: usize, layer: usize, shape: usize, likenes
     let l = c.layers.get(layer)?;
     let what = describe(l, &[], &[shape]);
     let found = Found::Tagged { strokes: Vec::new(), shapes: vec![shape], what };
-    let hit = Hit { slide, layer, found, snippet: String::new(), mark: 0..0, hidden: !l.visible };
+    let hit = Hit { slide, layer, found, snippet: String::new(), marks: Vec::new(), hidden: !l.visible };
     Some(PictureHit { hit, likeness, png })
 }
 
@@ -1038,15 +1066,19 @@ fn picture_row(ui: &mut egui::Ui, h: &PictureHit, lit: bool, texture: Option<&Te
     resp.clicked()
 }
 
-/// A row's text: the snippet, its match in the found colour, cut to `width`.
+/// A row's text: the snippet, its matches in the found colour, cut to `width`.
 fn row_text(h: &Hit, width: f32) -> LayoutJob {
     let plain = TextFormat { font_id: FontId::proportional(13.5), color: theme::TEXT_PRIMARY, ..Default::default() };
     let found = TextFormat { color: FOUND, ..plain.clone() };
     let mut job = LayoutJob::default();
     let s = &h.snippet;
-    job.append(&s[..h.mark.start], 0.0, plain.clone());
-    job.append(&s[h.mark.clone()], 0.0, found);
-    job.append(&s[h.mark.end..], 0.0, plain);
+    let mut from = 0;
+    for m in &h.marks {
+        job.append(&s[from..m.start], 0.0, plain.clone());
+        job.append(&s[m.clone()], 0.0, found.clone());
+        from = m.end;
+    }
+    job.append(&s[from..], 0.0, plain);
     job.wrap.max_width = width;
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -1087,7 +1119,7 @@ mod tests {
         // "an APPLE\npie" reads as "an APPLE pie"; runs of spaces count as one.
         assert_eq!(hits.iter().map(|h| (h.slide, h.found.clone())).collect::<Vec<_>>(), vec![(0, Found::Label(1)), (1, Found::Label(0))]);
         assert_eq!(hits[0].snippet, "an APPLE pie");
-        assert_eq!(&hits[0].snippet[hits[0].mark.clone()], "APPLE pie");
+        assert_eq!(hits[0].marks.iter().map(|m| &hits[0].snippet[m.clone()]).collect::<Vec<_>>(), ["APPLE pie"]);
         // Top to bottom on a slide.
         let apples = search("apple", [(0, &a)]);
         assert_eq!(apples.iter().map(|h| h.found.clone()).collect::<Vec<_>>(), vec![Found::Label(1), Found::Label(0)]);
@@ -1124,13 +1156,44 @@ mod tests {
         assert_eq!(group, Some(Found::Tagged { strokes: vec![], shapes: vec![2, 3], what: "Group of 2".into() }));
         c.layers[0].shapes[2].set_tags(&[]);
         let hits = search("walk", [(0, &c)]);
-        assert_eq!(&hits[0].snippet[hits[0].mark.clone()], "Walk");
+        assert_eq!(hits[0].marks.iter().map(|m| &hits[0].snippet[m.clone()]).collect::<Vec<_>>(), ["Walk"]);
         assert_eq!(hits[0].snippet, "#Walk cycle  #ref");
         // A `#` typed finds tags only.
         assert_eq!(search("#pose", [(0, &c)]).len(), 1);
         // A label found by its text is not listed again for its tags.
         c.layers[0].shapes[0].set_tags(&["walk".to_string()]);
         assert_eq!(search("walk", [(0, &c)]).len(), 3);
+    }
+
+    #[test]
+    fn several_words_find_what_has_every_one_among_its_tags() {
+        let mut c = Canvas::default();
+        let l = &mut c.layers[0];
+        l.shapes.push(picture([0.0, 0.0], &["body", "sketch", "perspective"], 0)); // 0
+        l.shapes.push(picture([0.0, 100.0], &["body", "pose"], 0)); // 1
+        l.shapes.push(picture([0.0, 200.0], &["sketch"], 0)); // 2
+        let shapes = |c: &Canvas, q: &str| -> Vec<Vec<usize>> {
+            search(q, [(0, c)]).into_iter().map(|h| match h.found {
+                Found::Tagged { shapes, .. } => shapes,
+                f => panic!("{f:?}"),
+            }).collect()
+        };
+        // Any order, with `#`, commas, extra spaces; each word somewhere.
+        for q in ["body sketch", "sketch body", "#body #sketch", "body, sketch", "  Body   PERSP  "] {
+            assert_eq!(shapes(&c, q), vec![vec![0]], "{q}");
+        }
+        assert_eq!(shapes(&c, "body sketch perspective"), vec![vec![0]]);
+        assert_eq!(shapes(&c, "body"), vec![vec![0], vec![1]]);
+        assert!(shapes(&c, "body walk").is_empty());
+        assert!(shapes(&c, ",").is_empty());
+        // Each word found is marked.
+        let hit = &search("perspective body", [(0, &c)])[0];
+        assert_eq!(hit.marks.iter().map(|m| &hit.snippet[m.clone()]).collect::<Vec<_>>(), ["body", "perspective"]);
+        // A group tagged as one is found whole by several words too.
+        let l = &mut c.layers[0];
+        l.shapes.push(picture([300.0, 0.0], &["hand", "study"], 9)); // 3
+        l.shapes.push(picture([300.0, 50.0], &["hand", "study", "ref"], 9)); // 4
+        assert_eq!(shapes(&c, "study hand"), vec![vec![3, 4]]);
     }
 
     #[test]
@@ -1167,15 +1230,19 @@ mod tests {
     fn long_labels_are_cut_around_the_match() {
         let text: Vec<char> = format!("{}needle{}", "a".repeat(80), "b".repeat(80)).chars().collect();
         let at = 80;
-        let (s, mark) = snippet(&text, at, 6);
+        let (s, marks) = snippet(&text, &[(at, 6)]);
         assert!(s.starts_with('…') && s.ends_with('…'));
-        assert_eq!(&s[mark], "needle");
+        assert_eq!(&s[marks[0].clone()], "needle");
         assert!(s.chars().count() <= SNIPPET + 2);
         // A match at the very end keeps its tail.
         let text: Vec<char> = format!("{}end", "a".repeat(100)).chars().collect();
-        let (s, mark) = snippet(&text, 100, 3);
-        assert_eq!(&s[mark], "end");
+        let (s, marks) = snippet(&text, &[(100, 3)]);
+        assert_eq!(&s[marks[0].clone()], "end");
         assert!(!s.ends_with('…'));
+        // Several: in order, overlaps joined, one past the cut dropped.
+        let text: Vec<char> = format!("ab cd{}xy", "-".repeat(100)).chars().collect();
+        let (s, marks) = snippet(&text, &[(3, 2), (0, 2), (1, 1), (102, 2)]);
+        assert_eq!(marks.iter().map(|m| &s[m.clone()]).collect::<Vec<_>>(), ["ab", "cd"]);
     }
 
     #[test]
