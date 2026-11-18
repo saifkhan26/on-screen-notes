@@ -146,6 +146,21 @@ impl PenInput {
             Backend::Wintab(w) => w.used_within(window),
         }
     }
+
+    /// Lift a pen that its packets still show touching although none has
+    /// come for `quiet`, and return the `Up` to hand on. Its lift was lost:
+    /// the packet queue filled while no frames ran (the pen in use over
+    /// another app or screen), or another app's context took the pen.
+    /// While the pen seems down the mouse is ignored, so call this when the
+    /// mouse moves or clicks here: a pen really held down and still does
+    /// not move the pointer.
+    pub fn release_if_stale(&mut self, quiet: std::time::Duration) -> Option<PenEvent> {
+        match &mut self.backend {
+            Backend::Disabled => None,
+            #[cfg(target_os = "windows")]
+            Backend::Wintab(w) => w.track.release_if_stale(quiet, std::time::Instant::now()),
+        }
+    }
 }
 
 /// Translate a `PenEvent` into tool actions. Lives next to the event type
@@ -162,6 +177,130 @@ pub fn dispatch(
     }
 }
 
+/// What the packets so far say about the pen: touching or not, where it
+/// last was, and when it was last seen and used. Apart from the Wintab
+/// backend so it can be tested without a tablet.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Default)]
+struct Tracker {
+    /// True between Down and Up.
+    is_down: bool,
+    /// Most recent sample (so `Up` always carries a position).
+    last_sample: Option<PenSample>,
+    /// When the pen last pressed, or moved by more than sensor jitter. A
+    /// pen lying still on the tablet stays "in range" and can keep
+    /// emitting packets; those must not count as use, or the mouse would
+    /// be locked out for as long as it lies there.
+    last_used: Option<std::time::Instant>,
+    /// Where the pen was when it last counted as having moved.
+    rest_anchor: Option<[f32; 2]>,
+    /// When the last packet of any kind arrived.
+    last_packet: Option<std::time::Instant>,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl Tracker {
+    /// One packet, read at `now`, and the event it makes. Pressure above
+    /// zero is the pen touching. Some drivers still send packets at zero
+    /// pressure while the pen hovers; those make no event.
+    fn feed(&mut self, sample: PenSample, now: std::time::Instant) -> Option<PenEvent> {
+        self.last_packet = Some(now);
+        // Two pixels clears the jitter of a pen at rest. Measured from
+        // where the pen last counted as moved rather than from the
+        // previous packet, so a slow glide still adds up.
+        let pos = sample.pos;
+        let moved = self.rest_anchor.map_or(true, |a| (a[0] - pos[0]).abs() >= 2.0 || (a[1] - pos[1]).abs() >= 2.0);
+        if moved {
+            self.rest_anchor = Some(pos);
+        }
+        if sample.pressure > 0.0 || moved {
+            self.last_used = Some(now);
+        }
+        self.last_sample = Some(sample);
+        match (sample.pressure > 0.0, self.is_down) {
+            (true, false) => {
+                self.is_down = true;
+                Some(PenEvent::Down(sample))
+            }
+            (true, true) => Some(PenEvent::Move(sample)),
+            (false, true) => {
+                self.is_down = false;
+                Some(PenEvent::Up(sample))
+            }
+            (false, false) => None,
+        }
+    }
+
+    /// Lift a pen that is down only because its lift never came: no
+    /// packet for `quiet`. See `PenInput::release_if_stale`.
+    fn release_if_stale(&mut self, quiet: std::time::Duration, now: std::time::Instant) -> Option<PenEvent> {
+        if !self.is_down || self.last_packet.is_some_and(|t| now.saturating_duration_since(t) < quiet) {
+            return None;
+        }
+        self.is_down = false;
+        self.last_sample.map(|s| PenEvent::Up(PenSample { pressure: 0.0, ..s }))
+    }
+
+    fn used_within(&self, window: std::time::Duration, now: std::time::Instant) -> bool {
+        self.last_used.is_some_and(|t| now.saturating_duration_since(t) <= window)
+    }
+
+    fn seen_within(&self, window: std::time::Duration, now: std::time::Instant) -> bool {
+        self.last_packet.is_some_and(|t| now.saturating_duration_since(t) <= window)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn at(x: f32, pressure: f32) -> PenSample {
+        PenSample { pos: [x, 10.0], pressure, tilt: [0.0, 0.0] }
+    }
+
+    #[test]
+    fn packets_make_down_move_and_up() {
+        let mut t = Tracker::default();
+        let now = Instant::now();
+        assert!(t.feed(at(0.0, 0.0), now).is_none(), "hovering is no event");
+        assert!(matches!(t.feed(at(1.0, 0.5), now), Some(PenEvent::Down(_))));
+        assert!(matches!(t.feed(at(5.0, 0.5), now), Some(PenEvent::Move(_))));
+        assert!(matches!(t.feed(at(6.0, 0.0), now), Some(PenEvent::Up(_))));
+        assert!(!t.is_down);
+    }
+
+    /// The lift packet can be lost: the queue was full, or another app's
+    /// context took the pen. With no packet since, the pen is lifted.
+    #[test]
+    fn a_pen_down_with_no_packets_since_is_lifted() {
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        t.feed(at(1.0, 0.5), t0);
+        t.feed(at(4.0, 0.7), t0);
+        let quiet = Duration::from_millis(250);
+        assert!(t.release_if_stale(quiet, t0 + Duration::from_millis(100)).is_none(), "a pen held still a moment stays down");
+        assert!(t.is_down);
+        match t.release_if_stale(quiet, t0 + Duration::from_millis(300)) {
+            Some(PenEvent::Up(s)) => assert_eq!((s.pos, s.pressure), ([4.0, 10.0], 0.0), "lifted where it was last"),
+            other => panic!("expected an Up, got {other:?}"),
+        }
+        assert!(!t.is_down);
+        assert!(t.release_if_stale(quiet, t0 + Duration::from_millis(400)).is_none(), "lifted once");
+        assert!(matches!(t.feed(at(9.0, 0.4), t0 + Duration::from_millis(500)), Some(PenEvent::Down(_))), "the next touch is a fresh press");
+    }
+
+    #[test]
+    fn a_lifted_pen_has_nothing_to_release() {
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        assert!(t.release_if_stale(Duration::ZERO, t0).is_none());
+        t.feed(at(1.0, 0.5), t0);
+        t.feed(at(1.0, 0.0), t0);
+        assert!(t.release_if_stale(Duration::ZERO, t0 + Duration::from_secs(1)).is_none());
+    }
+}
+
 // =============================================================================
 // Windows Wintab backend.
 // =============================================================================
@@ -172,7 +311,7 @@ mod windows_backend {
     //! becomes a `PenSample` in window-client coordinates with normalised
     //! pressure 0.0..=1.0.
 
-    use super::{PenEvent, RawHandleHolder};
+    use super::{PenEvent, RawHandleHolder, Tracker};
     use crate::canvas::stroke::PenSample;
     use crate::error::{anyhow, Context, Result};
     use libloading::Library;
@@ -185,6 +324,15 @@ mod windows_backend {
     /// `WTGetA`: reads an open context's settings back. wintab_lite does
     /// not wrap it.
     type WTGet = unsafe extern "system" fn(*mut wintab_lite::HCTX, *mut LOGCONTEXT) -> i32;
+
+    /// `WTQueueSizeSet`: sets how many packets an open context's queue
+    /// holds. wintab_lite does not wrap it.
+    type WTQueueSizeSet = unsafe extern "system" fn(*mut wintab_lite::HCTX, i32) -> i32;
+
+    /// Queue lengths to ask for, longest first. A refused length leaves the
+    /// context with no queue at all, so the next one is tried until one is
+    /// taken; 8 is the spec's default.
+    const QUEUE_SIZES: [i32; 7] = [1024, 512, 256, 128, 64, 32, 8];
 
     /// Linear map from a context's output space to screen pixels: the
     /// output area of the context as opened onto the one the default
@@ -240,20 +388,8 @@ mod windows_backend {
         /// Packet coordinates → screen pixels.
         map: CoordMap,
 
-        /// True between Down and Up — used to emit synthetic `Move` only
-        /// while the pen is in contact.
-        is_down: bool,
-        /// Most recent sample (used so `Up` always carries a position).
-        last_sample: Option<PenSample>,
-        /// When the pen last pressed, or moved by more than sensor
-        /// jitter. A pen lying still on the tablet stays "in range" and
-        /// can keep emitting packets; those must not count as use, or
-        /// the mouse would be locked out for as long as it lies there.
-        last_used: Option<std::time::Instant>,
-        /// Where the pen was when it last counted as having moved.
-        rest_anchor: Option<[f32; 2]>,
-        /// When the last packet of any kind arrived.
-        last_packet: Option<std::time::Instant>,
+        /// Down / up, and when the pen was last seen and used.
+        pub(super) track: Tracker,
     }
 
     // Wintab handles are not Send / Sync; we never move Wintab off the main
@@ -374,8 +510,19 @@ mod windows_backend {
             };
             let map = CoordMap { screen_org: screen.out_org, screen_ext: screen.out_ext, ..out };
 
+            // 9) A long packet queue. The default one holds a handful of
+            //    packets. This system context gets the pen's packets
+            //    wherever it is (over other apps, on other screens), and
+            //    frames stop while nothing here changes, so nobody drains
+            //    the queue; once it is full, new packets are lost. The
+            //    pen's lift among them leaves it pressed for good, and the
+            //    mouse is ignored while it is (`PenInput::release_if_stale`
+            //    covers what a long queue still loses).
+            let set_queue: Option<WTQueueSizeSet> = unsafe { lib.get(c"WTQueueSizeSet".to_bytes()) }.ok().map(|s| *s);
+            let queue = set_queue.and_then(|set| QUEUE_SIZES.into_iter().find(|&n| unsafe { set(ctx_handle, n) } != 0));
+
             log::info!(
-                "Wintab opened: pressure_max = {pressure_max}, ctx = {:?}, {map:?}",
+                "Wintab opened: pressure_max = {pressure_max}, ctx = {:?}, queue = {queue:?}, {map:?}",
                 ctx_handle
             );
 
@@ -386,106 +533,77 @@ mod windows_backend {
                 ctx_handle,
                 pressure_max,
                 map,
-                is_down: false,
-                last_sample: None,
-                last_used: None,
-                rest_anchor: None,
-                last_packet: None,
+                track: Tracker::default(),
             })
         }
 
-        pub fn is_down(&self) -> bool { self.is_down }
+        pub fn is_down(&self) -> bool { self.track.is_down }
 
         pub fn used_within(&self, window: std::time::Duration) -> bool {
-            self.last_used.is_some_and(|t| t.elapsed() <= window)
+            self.track.used_within(window, std::time::Instant::now())
         }
 
         pub fn seen_within(&self, window: std::time::Duration) -> bool {
-            self.last_packet.is_some_and(|t| t.elapsed() <= window)
+            self.track.seen_within(window, std::time::Instant::now())
         }
 
-        /// Drain any new packets and translate into `PenEvent`s.
+        /// Drain every queued packet and translate them into `PenEvent`s.
         ///
         /// `client_origin` is the screen-pixel coordinate of the window's
         /// client-area top-left. Subtracting it converts each packet's
         /// screen-pixel position into window-client space.
         pub fn poll(&mut self, client_origin: [i32; 2]) -> Vec<PenEvent> {
-            let mut out = Vec::new();
-            let mut from = 0u32;
-            let mut to = 0u32;
-            // Quick "any packets queued?" check.
-            let any = unsafe { (self.wt_queue)(self.ctx_handle, &mut from, &mut to) };
-            if any == 0 {
-                return out;
-            }
-
-            // Drain up to 64 packets in one go. 64 keeps us well under the
-            // typical 128-deep driver queue while bounding the worst-case
-            // copy cost.
+            // Packets are read in batches of `MAX`. The queue can hold far
+            // more (see `QUEUE_SIZES`), and anything left in it now would
+            // only reach the tools a frame late, so batches are read until
+            // it is empty, up to `ROUNDS` of them in case the driver keeps
+            // adding faster than this reads.
             const MAX: usize = 64;
+            const ROUNDS: usize = 32;
+            let mut out = Vec::new();
             let mut packets: [Packet; MAX] = core::array::from_fn(|_| Packet::default());
-            // WTDataGet writes the count of removed packets here. It expects
-            // an `i32 *` (LPINT) per the Wintab API spec.
-            let mut removed: i32 = 0;
-            let _ = unsafe {
-                (self.wt_data_get)(
-                    self.ctx_handle,
-                    from,
-                    to,
-                    MAX as i32,
-                    cast_void!(packets),
-                    &mut removed,
-                )
-            };
-            let removed = removed as usize;
-            if removed > 0 {
-                self.last_packet = Some(std::time::Instant::now());
-            }
-
-            for p in &packets[..removed] {
-                let s = self.map.to_screen(p.pkXYZ.x, p.pkXYZ.y);
-                let pos = [
-                    (s[0] - client_origin[0] as f64) as f32,
-                    (s[1] - client_origin[1] as f64) as f32,
-                ];
-                let pressure = (p.pkNormalPressure as f32 / self.pressure_max).clamp(0.0, 1.0);
-                let sample = PenSample {
-                    pos,
-                    pressure,
-                    tilt: [0.0, 0.0],
+            for _ in 0..ROUNDS {
+                let mut from = 0u32;
+                let mut to = 0u32;
+                // Quick "any packets queued?" check: the oldest and newest
+                // serial numbers.
+                let any = unsafe { (self.wt_queue)(self.ctx_handle, &mut from, &mut to) };
+                if any == 0 {
+                    break;
+                }
+                // At most one batch. Serial numbers wrap, so the batch's
+                // end is counted from its start.
+                let end = if to.wrapping_sub(from) as usize >= MAX { from.wrapping_add(MAX as u32 - 1) } else { to };
+                // WTDataGet writes the count of removed packets here. It
+                // expects an `i32 *` (LPINT) per the Wintab API spec.
+                let mut removed: i32 = 0;
+                let _ = unsafe {
+                    (self.wt_data_get)(
+                        self.ctx_handle,
+                        from,
+                        end,
+                        MAX as i32,
+                        cast_void!(packets),
+                        &mut removed,
+                    )
                 };
-                // Two pixels clears the jitter of a pen at rest. Measured
-                // from where the pen last counted as moved rather than
-                // from the previous packet, so a slow glide still adds up.
-                let moved = self.rest_anchor.map_or(true, |a| {
-                    (a[0] - pos[0]).abs() >= 2.0 || (a[1] - pos[1]).abs() >= 2.0
-                });
-                if moved {
-                    self.rest_anchor = Some(pos);
+                let removed = (removed.max(0) as usize).min(MAX);
+                if removed == 0 {
+                    break;
                 }
-                if pressure > 0.0 || moved {
-                    self.last_used = Some(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                for p in &packets[..removed] {
+                    let s = self.map.to_screen(p.pkXYZ.x, p.pkXYZ.y);
+                    let pos = [
+                        (s[0] - client_origin[0] as f64) as f32,
+                        (s[1] - client_origin[1] as f64) as f32,
+                    ];
+                    let pressure = (p.pkNormalPressure as f32 / self.pressure_max).clamp(0.0, 1.0);
+                    let sample = PenSample { pos, pressure, tilt: [0.0, 0.0] };
+                    out.extend(self.track.feed(sample, now));
                 }
-                self.last_sample = Some(sample);
-
-                // Edge detection: we treat "pressure > 0" as the pen being
-                // down. Some drivers still emit pressure 0 packets on hover;
-                // those become Move events but only after the pen first
-                // became "down" once.
-                let pen_down_now = pressure > 0.0;
-                match (pen_down_now, self.is_down) {
-                    (true, false) => {
-                        self.is_down = true;
-                        out.push(PenEvent::Down(sample));
-                    }
-                    (true, true) => {
-                        out.push(PenEvent::Move(sample));
-                    }
-                    (false, true) => {
-                        self.is_down = false;
-                        out.push(PenEvent::Up(sample));
-                    }
-                    (false, false) => {}
+                if removed < MAX {
+                    break;
                 }
             }
             out

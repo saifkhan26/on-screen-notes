@@ -154,7 +154,14 @@ impl OnScreenNotesApp {
                 .map(|r| [r.min.x as i32, r.min.y as i32])
                 .unwrap_or([0, 0])
         });
-        let raw_pen_events = self.pen.poll(client_origin);
+        let mut raw_pen_events = self.pen.poll(client_origin);
+        // The packets still show the pen touching, none has come for a
+        // while, and the mouse moves or clicks here: the pen's lift was
+        // lost, so lift it now. Until then the mouse would be ignored as
+        // the pen's own (see `PenInput::release_if_stale`).
+        if raw_pen_events.is_empty() && ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed()) {
+            raw_pen_events.extend(self.pen.release_if_stale(PEN_OWNS_POINTER));
+        }
 
         // ---- Smooth raw pen samples --------------------------------------
         // Wintab packets carry digitizer noise; at low pen speed the noise
