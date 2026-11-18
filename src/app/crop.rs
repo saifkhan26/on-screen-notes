@@ -39,6 +39,11 @@ impl CropState {
     pub(super) fn is_open(&self) -> bool {
         self.edit.is_some()
     }
+
+    /// For `app::press_log`.
+    pub(super) fn debug(&self) -> String {
+        format!("open={} swallow={}", self.edit.is_some(), self.swallow)
+    }
 }
 
 impl OnScreenNotesApp {

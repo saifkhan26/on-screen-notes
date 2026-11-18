@@ -41,6 +41,7 @@ mod find;
 mod similar;
 mod pad;
 mod crop;
+mod press_log;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
@@ -1116,11 +1117,17 @@ impl eframe::App for OnScreenNotesApp {
             let pen_owns_pointer = !pen_events.is_empty()
                 || self.pen.is_down()
                 || self.pen.used_within(PEN_OWNS_POINTER);
+            let press = self.press_log_before(
+                ctx,
+                &pen_events,
+                &press_log::Gates { drag_pans, space_held, editable, pen_owns_pointer, toolbar_clicked, canvas_rect },
+            );
             self.drag_pan(ctx, &pen_events, client_origin, drag_pans, space_held, editable, pen_owns_pointer, toolbar_clicked, canvas_rect);
 
             self.dispatch_pen(ctx, &pen_events, client_origin, drag_pans, editable, canvas_rect);
 
             self.dispatch_mouse(ctx, client_origin, drag_pans, pen_owns_pointer, editable, toolbar_clicked, canvas_rect);
+            self.press_log_after(press);
 
             self.middle_button_pan(ctx, space_held);
 

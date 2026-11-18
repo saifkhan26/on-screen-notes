@@ -71,6 +71,11 @@ impl PadState {
         self.edit.is_some()
     }
 
+    /// For `app::press_log`.
+    pub(super) fn debug(&self) -> String {
+        format!("open={} swallow={}", self.edit.is_some(), self.swallow)
+    }
+
     /// What the canvas draws in the open pad's place.
     fn shown(&self) -> Option<(usize, egui::TextureId)> {
         self.edit.as_ref().map(|e| (e.key, e.session.texture_id()))
