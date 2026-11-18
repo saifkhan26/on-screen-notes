@@ -15,7 +15,7 @@
 name        = "on-screen-notes"
 version     = "0.1.0"
 edition     = "2021"               # Rust 2021 edition: stable, widely supported by all our deps.
-rust-version = "1.80"              # Minimum supported Rust version.
+rust-version = "1.88"              # Minimum supported Rust version (ort needs 1.88).
 description = "Cross-platform pressure-sensitive on-screen pen-annotation overlay."
 license     = "MIT OR Apache-2.0"
 default-run = "on-screen-notes"
@@ -194,6 +194,19 @@ gif = "0.13"
 # — we still copy the full GIF for the apps that do honour the
 # `image/gif` format. Documented in the README.
 arboard = "3"
+
+# ort = bindings to ONNX Runtime, which runs the vision model that finds
+# pictures by what they show (`ml`). `load-dynamic`: onnxruntime.dll is
+# loaded at run time from the model folder, and only once picture search
+# is turned on and downloaded — like Wintab32.dll, the app runs without
+# it. Nothing is downloaded at build time. The heavy maths lives in the
+# DLL, so our size-first release profile does not slow it down.
+# A release candidate: pinned exactly, as its API changes between them.
+# `directml`: it runs on the GPU (any DirectX 12 card), else the CPU.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "api-22", "directml"] }
+# half = 16-bit floats: picture vectors are kept on disk at half size.
+# Already built for other dependencies.
+half = "2"
 
 # Platform-specific hint: on Windows, the binary should not open a console
 # window when launched from Explorer. We add the linker flag in main.rs via

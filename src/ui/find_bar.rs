@@ -27,7 +27,7 @@
 
 use crate::canvas::canvas::{Canvas, Layer};
 use crate::canvas::units::{bounds_of, same_tag, tagged_by};
-use crate::canvas::shape::{parse_tags, MediaType, Shape};
+use crate::canvas::shape::{parse_tags, MediaType, RasterKind, Shape};
 use crate::canvas::TagCount;
 use crate::ui::media_filter::TAG_COLOUR;
 use crate::tools::similar::{self, Kind, Likeness, Origin, Query, Signature};
@@ -227,13 +227,68 @@ pub struct PictureQuery {
     /// Its matches, and what they were found from (`update_pictures`).
     results: Vec<PictureHit>,
     results_for: Option<(u64, usize)>,
+    /// The picture shrunk for reading its vector (`ml::prep::shrink`,
+    /// `canvas::picture_vectors`); gone once read or given up on.
+    probe: Option<image::RgbaImage>,
+    /// What it shows, once read: pictures of the same subject are listed.
+    vector: Option<Arc<[f32]>>,
+    /// The vector asked for, while it is read.
+    asked: Option<u64>,
 }
 
 impl PictureQuery {
     /// Look for pictures like `img`. `None` for an empty picture.
     pub fn new(img: &image::RgbaImage, label: &str, origin: Origin) -> Option<Self> {
         let query = Query::of(img)?;
-        Some(Self { query, origin, label: label.to_string(), thumb: thumb_of(img), texture: None, results: Vec::new(), results_for: None })
+        let probe = crate::ml::prep::shrink(img);
+        Some(Self {
+            query,
+            origin,
+            label: label.to_string(),
+            thumb: thumb_of(img),
+            texture: None,
+            results: Vec::new(),
+            results_for: None,
+            probe: Some(probe),
+            vector: None,
+            asked: None,
+        })
+    }
+
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    pub fn has_vector(&self) -> bool {
+        self.vector.is_some()
+    }
+
+    /// What it shows, read: from now on the pictures listed besides its
+    /// copies are those of the same subject.
+    pub fn set_vector(&mut self, v: Arc<[f32]>) {
+        self.vector = Some(v);
+        self.probe = None;
+        self.asked = None;
+    }
+
+    /// The picture to read its vector from, until read or given up on.
+    pub fn probe(&self) -> Option<&image::RgbaImage> {
+        self.probe.as_ref()
+    }
+
+    /// The vector asked for, while it is read.
+    pub fn asked(&self) -> Option<u64> {
+        self.asked
+    }
+
+    pub fn set_asked(&mut self, id: Option<u64>) {
+        self.asked = id;
+    }
+
+    /// Its vector could not be read: list pictures that look alike.
+    pub fn give_up_vector(&mut self) {
+        self.probe = None;
+        self.asked = None;
     }
 }
 
@@ -247,14 +302,44 @@ pub struct PictureHit {
 }
 
 /// The pictures on `slides` like `q`'s, copies first. `signature` gives
-/// a picture's signature from its bytes, once read.
+/// a picture's signature from its bytes, once read; `vector` its vector.
+/// Copies are told by how they look (`similar::search`). Once the
+/// query's vector is known, the rest are the pictures of the same
+/// subject (`similar::by_subject`), else those that look alike.
 pub fn picture_search<'a>(
     q: &PictureQuery,
     slides: impl IntoIterator<Item = (usize, &'a Canvas)>,
     signature: impl Fn(&Arc<Vec<u8>>) -> Option<Signature>,
+    vector: impl Fn(&Arc<Vec<u8>>) -> Option<Arc<[f32]>>,
 ) -> Vec<PictureHit> {
     let slides: Vec<(usize, &Canvas)> = slides.into_iter().collect();
-    let found = similar::search(&q.query, &q.origin, slides.iter().copied(), signature);
+    let mut found = similar::search(&q.query, &q.origin, slides.iter().copied(), signature);
+    if let Some(qv) = &q.vector {
+        found.retain(|m| m.likeness.kind != Kind::Alike);
+        let listed: std::collections::HashSet<(usize, usize, usize)> = found.iter().map(|m| (m.slide, m.layer, m.shape)).collect();
+        let mut places = Vec::new();
+        let mut vectors = Vec::new();
+        for (slide, c) in &slides {
+            for (layer, l) in c.layers.iter().enumerate() {
+                for (shape, s) in l.shapes.iter().enumerate() {
+                    let Shape::Raster { png, kind: RasterKind::Image, .. } = s else { continue };
+                    let at = (*slide, layer, shape);
+                    if q.origin.at == Some(at) || listed.contains(&at) {
+                        continue;
+                    }
+                    if let Some(v) = vector(png) {
+                        places.push((at, png));
+                        vectors.push(v);
+                    }
+                }
+            }
+        }
+        for (i, score) in similar::by_subject(qv, vectors.iter().enumerate().map(|(i, v)| (i, &v[..]))) {
+            let ((slide, layer, shape), png) = places[i];
+            let likeness = Likeness { kind: Kind::Alike, score, way: Default::default(), other_crop: false };
+            found.push(similar::Match { slide, layer, shape, likeness, png: Arc::clone(png) });
+        }
+    }
     found
         .into_iter()
         .filter_map(|m| {
@@ -515,6 +600,11 @@ impl FindBar {
     /// It is open, looking for pictures like one.
     pub fn has_picture(&self) -> bool {
         self.open && self.picture.is_some()
+    }
+
+    /// The picture looked for, while open.
+    pub fn picture_mut(&mut self) -> Option<&mut PictureQuery> {
+        self.picture.as_mut().filter(|_| self.open)
     }
 
     /// The picture looked for has results, maybe not the latest.

@@ -33,6 +33,8 @@ pub fn show(
     // New media beside the selected picture: what it matches and which
     // side, in the settings popup.
     beside: (&mut BesideFit, &mut BesideSide),
+    // Picture search on / off, and where it is, in the settings popup.
+    picture_search: (&mut bool, &str),
     pinned_hwnd: &mut Option<isize>,
     pin_picking: &mut bool,
     // Set when the "Insert video / GIF" button is clicked.
@@ -120,7 +122,7 @@ pub fn show(
                         interacted |= pins_btn(ui, hidden);
                     }
                     interacted |= pin_btn(ui, pinned_hwnd, pin_picking);
-                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve, (&mut *snaps.0, &mut *snaps.1), (&mut *beside.0, &mut *beside.1));
+                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve, (&mut *snaps.0, &mut *snaps.1), (&mut *beside.0, &mut *beside.1), (&mut *picture_search.0, picture_search.1));
                     interacted |= help_btn(ui, keys);
                 });
             });
@@ -1061,6 +1063,7 @@ fn settings_btn(
     pressure_curve: &mut f32,
     (shape_snap, smart_guides): (&mut bool, &mut bool),
     (beside_fit, beside_side): (&mut BesideFit, &mut BesideSide),
+    (picture_search, picture_status): (&mut bool, &str),
 ) -> bool {
     let size = Vec2::splat(BTN_SIZE);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -1281,6 +1284,12 @@ fn settings_btn(
                 "While a selection is moved, its edges and middle line up with those of the \
                  objects around it, and a line shows each. Hold Alt to move it freely",
             );
+            ui.checkbox(picture_search, "Picture search").on_hover_text(
+                "Find's pictures like this one lists pictures of the same subject — the same                  character, pose or kind of study — besides its copies. A vision model                  (SigLIP 2) reads every picture once, in the background, on the GPU or else                  the CPU. The first time it downloads about 215 MB",
+            );
+            if *picture_search {
+                ui.label(egui::RichText::new(picture_status).small().color(theme::TEXT_MUTED));
+            }
             ui.add_space(6.0);
             // Pills, not a ComboBox: see the smoothing mode row.
             ui.vertical(|ui| {

@@ -21,6 +21,7 @@ pub mod ink_gpu;
 pub mod pad;
 pub mod pad_gpu;
 pub mod picture_index;
+pub mod picture_vectors;
 pub mod picture_store;
 pub mod pins;
 pub mod render;

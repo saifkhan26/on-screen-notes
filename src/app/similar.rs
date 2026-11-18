@@ -126,16 +126,76 @@ impl OnScreenNotesApp {
         let order = std::iter::once(active).chain((0..canvases.count()).filter(|&i| i != active));
         let slides: Vec<&crate::canvas::canvas::Canvas> = order.filter_map(|i| canvases.slide(i)).collect();
         self.picture_index.tick(slides.iter().copied(), !self.find.has_picture_results());
-        let index = &self.picture_index;
-        let key = (index.generation(), slides.len());
+        let read_slides = slides.len();
+        let has_vector = self.query_vector();
+        let canvases = &self.canvases;
+        let (index, vectors) = (&self.picture_index, &self.picture_vectors);
+        // Fresh results when a signature or vector comes in, or the
+        // query's own vector does.
+        let key = (index.generation() ^ vectors.generation().rotate_left(32) ^ (u64::from(has_vector) << 63), read_slides);
         self.find.update_pictures(key, |q| {
-            ui::find_bar::picture_search(q, (0..canvases.count()).filter_map(|i| canvases.slide(i).map(|c| (i, c))), |png| index.get(png))
+            ui::find_bar::picture_search(q, (0..canvases.count()).filter_map(|i| canvases.slide(i).map(|c| (i, c))), |png| index.get(png), |png| vectors.vector(png))
         });
         let (read, total) = index.progress();
-        if read < total {
+        let (vread, vtotal) = vectors.progress();
+        if read < total || (vectors.is_on() && !vectors.settled()) {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
-        Some((read, total))
+        // Say how far reading is: the vectors once the signatures are read.
+        Some(if read < total || !vectors.is_on() { (read, total) } else { (vread, vtotal) })
+    }
+
+    /// Get the vector of find's picture, while picture search is on: the
+    /// picture's own if it is on a slide and read, else read now, ahead
+    /// of the pictures waiting. Whether it is known.
+    fn query_vector(&mut self) -> bool {
+        let Some(q) = self.find.picture_mut() else { return false };
+        if q.has_vector() {
+            return true;
+        }
+        if !self.picture_vectors.is_on() {
+            return false;
+        }
+        if let Some(id) = q.asked() {
+            match self.picture_vectors.answer(id) {
+                None => {}
+                Some(Some(v)) => q.set_vector(v),
+                Some(None) => q.give_up_vector(),
+            }
+            return q.has_vector();
+        }
+        let own = q.origin().at.and_then(|(s, l, sh)| match self.canvases.slide(s)?.layers.get(l)?.shapes.get(sh)? {
+            Shape::Raster { png, .. } => self.picture_vectors.vector(png),
+            _ => None,
+        });
+        if let Some(v) = own {
+            q.set_vector(v);
+            return true;
+        }
+        if let Some(img) = q.probe() {
+            let id = self.picture_vectors.ask(img);
+            q.set_asked(id);
+        }
+        false
+    }
+
+    /// Keep the picture vectors up to date while picture search is on (in
+    /// the background, the shown slide first), and stop them once off.
+    pub(super) fn tick_picture_vectors(&mut self, ctx: &egui::Context) {
+        let on = self.config.picture_search;
+        if !on && !self.picture_vectors.is_on() {
+            return;
+        }
+        let canvases = &self.canvases;
+        let active = canvases.active_index();
+        let order = std::iter::once(active).chain((0..canvases.count()).filter(|&i| i != active));
+        let slides: Vec<&crate::canvas::canvas::Canvas> = order.filter_map(|i| canvases.slide(i)).collect();
+        // Reading waits while the pen or mouse is down, so drawing stays smooth.
+        let drawing = self.pen.is_down() || ctx.input(|i| i.pointer.any_down());
+        self.picture_vectors.tick(slides, on, drawing);
+        if self.picture_vectors.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     /// While find lists every set of copies: read every slide's pictures,

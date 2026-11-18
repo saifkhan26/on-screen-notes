@@ -10,6 +10,7 @@
 
 mod blobs;
 pub mod paths;
+pub mod vectors;
 
 use crate::canvas::canvas::Canvas;
 use crate::config::AppConfig;

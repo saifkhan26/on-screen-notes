@@ -232,6 +232,9 @@ pub struct OnScreenNotesApp {
     /// The slides' pictures read for finding ones like a picture; read
     /// only once find is given one.
     picture_index: crate::canvas::picture_index::PictureIndex,
+    /// What each picture shows, for finding pictures of the same subject;
+    /// read in the background while picture search is on.
+    picture_vectors: crate::canvas::picture_vectors::PictureVectors,
     /// Ctrl+V was held last frame, for find's own paste.
     find_paste_prev: bool,
     /// A file dropped on find, being read.
@@ -658,6 +661,7 @@ impl OnScreenNotesApp {
             find: Default::default(),
             find_flash: None,
             picture_index: Default::default(),
+            picture_vectors: Default::default(),
             find_paste_prev: false,
             find_reading: None,
             copies_job: None,
@@ -833,6 +837,7 @@ impl eframe::App for OnScreenNotesApp {
             let media_counts = ui::media_filter::counts(self.canvases.active());
             let mut pins_hidden = self.canvases.pins_hidden();
             let has_pins = self.canvases.has_pins();
+            let picture_status = self.picture_vectors.status();
             let toolbar_clicked = if self.ui_visible {
                 ui::toolbar::show(
                     ctx,
@@ -845,6 +850,7 @@ impl eframe::App for OnScreenNotesApp {
                     &mut self.config.pressure_curve,
                     (&mut self.config.shape_snap, &mut self.config.smart_guides),
                     (&mut self.config.beside_fit, &mut self.config.beside_side),
+                    (&mut self.config.picture_search, picture_status.as_str()),
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
                     &mut insert_media,
@@ -1083,6 +1089,7 @@ impl eframe::App for OnScreenNotesApp {
                     self.run_command(cmd, ctx, canvas_rect);
                 }
             }
+            self.tick_picture_vectors(ctx);
             self.show_find_bar(ctx);
             self.show_find_flash(ctx, canvas_rect);
 

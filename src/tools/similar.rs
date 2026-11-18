@@ -532,10 +532,82 @@ pub fn search<'a>(
     out
 }
 
+/// Most pictures listed by subject.
+const MOST_BY_SUBJECT: usize = 24;
+/// How far from the typical picture towards the closest one a picture
+/// must be to list by subject. How close "typical" is depends on the
+/// query: measured 2026-11-18 on 7,186 reference pictures, a picture's
+/// median likeness to the rest ran from 0.36 to 0.68 and its closest
+/// from 0.63 to 0.94, so no fixed bar fits every query.
+const SUBJECT_CUT: f32 = 0.5;
+/// Likeness at which two listed pictures are the same picture: only the
+/// first is listed.
+const SAME_PICTURE: f32 = 0.985;
+
+/// The pictures among `others` (an id and a vector of length 1 each,
+/// from `canvas::picture_vectors`) that show what `query` shows, most
+/// alike first, each with a score from 0 (typical) to 1 (the same). A
+/// picture that is the same as one listed already is left out.
+pub fn by_subject<'v>(query: &[f32], others: impl IntoIterator<Item = (usize, &'v [f32])>) -> Vec<(usize, f32)> {
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+    let mut all: Vec<(usize, &[f32], f32)> = others.into_iter().map(|(id, v)| (id, v, dot(query, v))).collect();
+    if all.is_empty() {
+        return Vec::new();
+    }
+    all.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let median = all[all.len() / 2].2;
+    let cut = median + SUBJECT_CUT * (all[0].2 - median);
+    let mut kept: Vec<(usize, &[f32], f32)> = Vec::new();
+    for (id, v, like) in all {
+        if like < cut || like <= median || kept.len() == MOST_BY_SUBJECT {
+            break;
+        }
+        if kept.iter().any(|k| dot(k.1, v) >= SAME_PICTURE) {
+            continue;
+        }
+        kept.push((id, v, like));
+    }
+    kept.into_iter().map(|(id, _, like)| (id, ((like - median) / (1.0 - median).max(1e-6)).clamp(0.0, 1.0))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// A vector of length 1 pointing mostly along `axis`, `lean` of the
+    /// way towards the next one.
+    fn toward(axis: usize, lean: f32) -> Vec<f32> {
+        let mut v = vec![0.0; 8];
+        v[axis] = 1.0 - lean;
+        v[(axis + 1) % 8] = lean;
+        crate::ml::prep::unit(&v)
+    }
+
+    #[test]
+    fn by_subject_lists_the_close_ones_first_and_stops_at_the_typical() {
+        let q = toward(0, 0.0);
+        let others: Vec<Vec<f32>> = vec![
+            toward(0, 0.1), // close
+            toward(3, 0.0), // unrelated
+            toward(0, 0.3), // fairly close
+            toward(4, 0.0),
+            toward(5, 0.0),
+            toward(6, 0.0),
+        ];
+        let found = by_subject(&q, others.iter().enumerate().map(|(i, v)| (i, v.as_slice())));
+        assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), [0, 2]);
+        assert!(found[0].1 > found[1].1 && found[0].1 <= 1.0);
+        assert!(by_subject(&q, std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn by_subject_lists_a_picture_once_however_many_copies() {
+        let q = toward(0, 0.0);
+        let others = [toward(0, 0.2), toward(0, 0.2), toward(0, 0.21), toward(2, 0.0), toward(3, 0.0), toward(4, 0.0)];
+        let found = by_subject(&q, others.iter().enumerate().map(|(i, v)| (i, v.as_slice())));
+        assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), [0]);
+    }
 
     /// A made-up picture: a gradient with a few blocks and a disc, laid
     /// out and coloured by `seed`.

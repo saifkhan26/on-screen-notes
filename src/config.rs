@@ -187,6 +187,12 @@ pub struct AppConfig {
     /// everything else on the slide fades back. Off until switched on.
     #[serde(default)]
     pub dim_unselected: bool,
+    /// Picture search: find's "pictures like this" lists pictures of the
+    /// same subject, from a vision model run on the GPU or CPU
+    /// (`canvas::picture_vectors`). Off until switched on in the settings,
+    /// as it downloads about 215 MB the first time.
+    #[serde(default)]
+    pub picture_search: bool,
 
     /// How the arrange bar's Pack lays objects out: the tightest block,
     /// rows or columns. Picked from the arrow beside it.
@@ -262,6 +268,7 @@ impl Default for AppConfig {
             shape_snap: true,
             smart_guides: true,
             dim_unselected: false,
+            picture_search: false,
             pack_mode: PackMode::default(),
             beside_fit: BesideFit::default(),
             beside_side: BesideSide::default(),
