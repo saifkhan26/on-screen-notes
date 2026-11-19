@@ -13,6 +13,10 @@ const SELECTION_PAD: f32 = 16.0;
 impl OnScreenNotesApp {
     /// Drag a box on the canvas, to show in the slide window.
     pub(super) fn begin_window_region(&mut self) {
+        if self.canvases.in_view() {
+            self.toast = Some(("Drag the box on the main window".to_string(), Instant::now()));
+            return;
+        }
         if self.canvases.count() > 0 {
             self.begin_box(BoxFor::SlideWindow);
         }
@@ -30,6 +34,11 @@ impl OnScreenNotesApp {
     /// The Select tool's selection, with a little room around it, in the
     /// slide window.
     pub(super) fn show_selection_in_window(&mut self, ctx: &egui::Context) {
+        // In the slide window already: zoom to it there.
+        if self.canvases.in_view() {
+            self.zoom_to_selection(ctx);
+            return;
+        }
         let Some([x0, y0, x1, y1]) = self.selection_bounds() else {
             self.toast = Some(("Select something to show in the slide window".to_string(), Instant::now()));
             return;

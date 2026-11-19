@@ -58,7 +58,10 @@ pub fn show(
         .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 10.0))
         .show(ctx, |ui| {
             theme::card_frame().show(ui, |ui| {
-                ui.horizontal(|ui| {
+                // One row on the overlay; in a narrower window (the slide
+                // window) the buttons wrap onto more rows.
+                ui.set_max_width((ctx.screen_rect().width() - 40.0).max(200.0));
+                ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
 
                     // Group 1: freehand tools — Pen + Pencil share the
@@ -105,7 +108,7 @@ pub fn show(
 
                     // Group 3: colours
                     for (i, slot) in palette.iter_mut().enumerate() {
-                        let (new_slot, hit) = colour_swatch(ui, tool, *slot, i);
+                        let (new_slot, hit) = colour_swatch(ui, &mut tool.color, *slot, i);
                         *slot = new_slot;
                         interacted |= hit;
                     }
@@ -371,6 +374,52 @@ fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: &media_filter
 /// icons use `stroke="currentColor"`, which `egui_extras`'s SVG loader
 /// honours via `Image::tint(...)` — so the same SVG renders white when the
 /// button is selected, near-white otherwise.
+/// The tool in use, lit like a picked toolbar button, for a bar that
+/// shows only it (the slide window's): the pen's style shows as its own
+/// icon. Shows only; the tool keys pick tools.
+pub(crate) fn active_tool(ui: &mut egui::Ui, tool: &ActiveTool) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::hover());
+    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), theme::ACCENT);
+    let icon = rect.shrink(rect.width() * 0.22);
+    if tool.kind == ToolKind::Pen {
+        let img = match tool.style {
+            StrokeStyle::Default => egui::Image::new(egui::include_image!("../../assets/icons/pen.svg")),
+            StrokeStyle::Pencil => egui::Image::new(egui::include_image!("../../assets/icons/pencil.svg")),
+            StrokeStyle::Marker => egui::Image::new(egui::include_image!("../../assets/icons/marker.svg")),
+            StrokeStyle::Airbrush => egui::Image::new(egui::include_image!("../../assets/icons/spray-can.svg")),
+        };
+        img.tint(theme::TEXT_PRIMARY).fit_to_exact_size(icon.size()).paint_at(ui, icon);
+    } else {
+        paint_icon(ui, icon, tool.kind, theme::TEXT_PRIMARY);
+    }
+    response.on_hover_text(format!("{} — the tool keys pick another", tool_name(tool)));
+}
+
+/// A tool's name, as its toolbar button calls it.
+fn tool_name(tool: &ActiveTool) -> &'static str {
+    match tool.kind {
+        ToolKind::Pen => match tool.style {
+            StrokeStyle::Default => "Pen",
+            StrokeStyle::Pencil => "Pencil",
+            StrokeStyle::Marker => "Marker",
+            StrokeStyle::Airbrush => "Airbrush",
+        },
+        ToolKind::Eraser => "Eraser",
+        ToolKind::Rect => "Rectangle",
+        ToolKind::Ellipse => "Ellipse",
+        ToolKind::Line => "Line",
+        ToolKind::Arrow => "Arrow",
+        ToolKind::FreehandArrow => "Freehand arrow",
+        ToolKind::Fill => "Fill",
+        ToolKind::Laser => "Laser",
+        ToolKind::Text => "Text",
+        ToolKind::Spotlight => "Spotlight",
+        ToolKind::LassoErase => "Lasso erase",
+        ToolKind::LassoSelect => "Lasso select",
+        ToolKind::Select => "Select",
+    }
+}
+
 fn paint_icon(ui: &mut egui::Ui, rect: egui::Rect, kind: ToolKind, color: Color32) {
     let img = match kind {
         ToolKind::Pen           => egui::Image::new(egui::include_image!("../../assets/icons/pen.svg")),
@@ -405,9 +454,11 @@ fn paint_icon(ui: &mut egui::Ui, rect: egui::Rect, kind: ToolKind, color: Color3
 ///
 /// The popup uses a stable `egui::Id` derived from the swatch index so it
 /// survives across frames and only closes when the user clicks outside.
-fn colour_swatch(
+/// `active` is the drawing colour: a click sets it, and editing the
+/// slot that is the drawing colour changes it too.
+pub(crate) fn colour_swatch(
     ui: &mut egui::Ui,
-    tool: &mut ActiveTool,
+    active: &mut [u8; 4],
     color: [u8; 4],
     index: usize,
 ) -> ([u8; 4], bool) {
@@ -415,7 +466,7 @@ fn colour_swatch(
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let mut current = color;
     let c = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-    let selected = tool.color == color;
+    let selected = *active == color;
 
     let painter = ui.painter();
     // Swatch body — flat rounded square at the chosen colour. No
@@ -451,7 +502,7 @@ fn colour_swatch(
 
     let mut interacted = false;
     if response.clicked() {
-        tool.color = color;
+        *active = color;
         interacted = true;
     }
     if response.secondary_clicked() {
@@ -480,7 +531,7 @@ fn colour_swatch(
             // currently-selected one — feels more responsive than waiting
             // for the user to re-click after editing.
             if selected {
-                tool.color = current;
+                *active = current;
             }
             interacted = true;
         }
@@ -491,7 +542,7 @@ fn colour_swatch(
                 if let Some(&d) = defaults.get(index) {
                     current = d;
                     if selected {
-                        tool.color = current;
+                        *active = current;
                     }
                     interacted = true;
                 }

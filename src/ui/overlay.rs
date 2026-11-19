@@ -49,6 +49,14 @@ pub struct OverlayCache {
     /// The drawing pad open now (`canvas::pad`): the picture whose pixel
     /// bytes start at this address shows this GPU texture instead.
     pad: Option<(usize, egui::TextureId)>,
+    /// The slide window's frame is drawing (`enter_child`): nothing is
+    /// freed in it, since a texture the overlay made this frame could be
+    /// the one let go of, and its pictures stay out of the overlay's
+    /// loading count.
+    child: bool,
+    /// Textures replaced during the slide window's frame, let go of at
+    /// the next `begin_frame`.
+    retired: Vec<egui::TextureHandle>,
 }
 
 /// When a texture was last drawn: the `show` call and the time.
@@ -165,7 +173,11 @@ impl OverlayCache {
             egui::TextureOptions::LINEAR,
         );
         let id = tex.id();
-        self.layer_thumbs.insert(key, (fp, tex));
+        if let Some((_, old)) = self.layer_thumbs.insert(key, (fp, tex)) {
+            if self.child {
+                self.retired.push(old);
+            }
+        }
         Some(id)
     }
 
@@ -175,8 +187,26 @@ impl OverlayCache {
     /// `PictureCache::begin_frame`). `show` runs it; with the overlay
     /// hidden, the slide window does.
     pub fn begin_frame(&mut self, ctx: &egui::Context) {
+        if self.child {
+            return;
+        }
+        self.retired.clear();
         self.evict_idle();
         self.pictures.begin_frame(ctx);
+    }
+
+    /// The slide window's frame starts: `rect` is where its canvas was
+    /// last frame (and becomes `canvas_rect` until `leave_child`).
+    pub fn enter_child(&mut self, rect: &mut Option<egui::Rect>) {
+        self.child = true;
+        std::mem::swap(&mut self.last_canvas_rect, rect);
+    }
+
+    /// The slide window's frame is over: `rect` takes back where its
+    /// canvas was drawn, the overlay's comes back.
+    pub fn leave_child(&mut self, rect: &mut Option<egui::Rect>) {
+        std::mem::swap(&mut self.last_canvas_rect, rect);
+        self.child = false;
     }
 
     /// The textures slide `canvas_idx` paints with, shown in `view` (its
@@ -352,7 +382,11 @@ impl OverlayCache {
                 color_image,
                 egui::TextureOptions::LINEAR,
             );
-            self.images.insert(key, (image.png.len(), handle, used));
+            if let Some((_, old, _)) = self.images.insert(key, (image.png.len(), handle, used)) {
+                if self.child {
+                    self.retired.push(old);
+                }
+            }
         }
         self.images.get_mut(&key).map(|(_, h, u)| {
             *u = used;
@@ -420,14 +454,16 @@ pub fn show(
     let (layer_image_textures, shape_textures) = {
         let active = manager.active();
         let view = cache.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect());
-        cache.slide_textures(ctx, canvas_idx, active, view, active.pan, active.zoom, media, true)
+        let overlay = !cache.child;
+        cache.slide_textures(ctx, canvas_idx, active, view, active.pan, active.zoom, media, overlay)
     };
     // Pins draw over the slide; their pictures and videos are looked up
     // like the active slide's, by their own slide's index.
     let pinned = manager.pinned();
     let pin_textures = {
         let view = cache.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect());
-        cache.pin_textures(ctx, &pinned, view, view.min, 1.0, media, true)
+        let overlay = !cache.child;
+        cache.pin_textures(ctx, &pinned, view, view.min, 1.0, media, overlay)
     };
     let mut canvas_rect = egui::Rect::NOTHING;
     egui::CentralPanel::default()

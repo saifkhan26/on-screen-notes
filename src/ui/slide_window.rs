@@ -47,15 +47,13 @@ const FIT_MAX_ZOOM: f32 = 4.0;
 /// Toolbar button metrics, so the card matches the main toolbar.
 const BTN: f32 = 28.0;
 const BTN_ROUND: f32 = 7.0;
-/// Room the card takes at the top, kept clear when fitting the slide.
-const CARD_INSET: f32 = 50.0;
 /// Width of the band along each edge that resizes the window.
 const EDGE: f32 = 6.0;
 /// Frames to look for the window's handle after it opens.
 const FIND_FRAMES: u32 = 120;
 /// The window's size when it first opens on a slide, and the least it
 /// can be made, in points.
-const START_SIZE: Vec2 = Vec2::new(720.0, 480.0);
+const START_SIZE: Vec2 = Vec2::new(1040.0, 680.0);
 pub const MIN_SIZE: Vec2 = Vec2::new(580.0, 240.0);
 
 /// The open slide window: which slide it shows and how.
@@ -101,6 +99,9 @@ pub struct SlideWindow {
     /// per pixel: where a drop from the canvas lands (`canvas_at`).
     last_rect: egui::Rect,
     last_ppp: f32,
+    /// Where the window's canvas was drawn last frame, window points: the
+    /// overlay cache's canvas rect while the window's frame runs.
+    canvas_rect: Option<egui::Rect>,
 }
 
 /// How the main window looks this frame, for the slide window to match.
@@ -109,8 +110,6 @@ pub struct Look {
     pub background: Color32,
     /// The app's UI shows (Tab hides it, and captures do).
     pub chrome: bool,
-    /// The overlay's native handle, to own the slide window (0 if none).
-    pub owner: isize,
 }
 
 impl Look {
@@ -146,6 +145,7 @@ impl SlideWindow {
             edit: crate::ui::slide_edit::WindowEdit::new(cfg),
             last_rect: egui::Rect::NOTHING,
             last_ppp: 1.0,
+            canvas_rect: None,
         }
     }
 
@@ -184,13 +184,6 @@ impl SlideWindow {
             (local[1] - self.last_rect.min.y - self.pan[1]) / self.zoom,
         ];
         Some((self.slide, p, self.zoom * self.last_ppp))
-    }
-
-    /// Objects dropped here from the canvas: select them.
-    pub fn select_dropped(&mut self, placed: crate::canvas::hit::Selection, manager: &CanvasManager) {
-        if let Some(c) = manager.slide(self.slide) {
-            self.edit.select_dropped(placed, self.slide, c);
-        }
     }
 
     /// What the window has to tell the user, once.
@@ -264,75 +257,166 @@ impl SlideWindow {
     }
 }
 
-/// Draw the window for this frame. Must run every frame it stays open:
-/// a frame without it closes the window. False once the user closed it.
-#[allow(clippy::too_many_arguments)]
-pub fn show(
+impl SlideWindow {
+    /// The window's viewport: no frame, see-through, owned by the overlay
+    /// (see `find_handle`). The same every frame, so the user's moves
+    /// and resizes stick; size and place count on opening only.
+    pub fn builder(&self, manager: &CanvasManager) -> egui::ViewportBuilder {
+        // Not shown on the window; Alt+Tab and the handle search use it.
+        let title = if self.pins { "Slide window · global pins".to_string() } else { format!("Slide {}", slide_label(manager, self.slide)) };
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(true)
+            .with_taskbar(false)
+            .with_inner_size(self.place.map_or(START_SIZE, |r| r.size()))
+            .with_min_inner_size(MIN_SIZE)
+            .with_window_level(if self.on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal });
+        if let Some(r) = self.place {
+            builder = builder.with_position(r.min);
+        }
+        builder
+    }
+
+    /// Keep showing a slide that exists, and have it read soon.
+    pub fn keep_in_range(&mut self, manager: &mut CanvasManager) {
+        self.slide = self.slide.min(manager.count().saturating_sub(1));
+        manager.prefetch(self.slide);
+    }
+
+    /// The slide shown and the window's view of it.
+    pub fn view(&self) -> (usize, [f32; 2], f32) {
+        (self.slide, self.pan, self.zoom)
+    }
+
+    /// For the video players: the slide shown, the view, and where the
+    /// window's canvas is (window points). `None` while the pins show.
+    pub fn media_view(&self) -> Option<(usize, [f32; 2], f32, egui::Rect)> {
+        if self.pins {
+            return None;
+        }
+        self.canvas_rect.map(|r| (self.slide, self.pan, self.zoom, r))
+    }
+
+    /// Before the window's frame runs on its slide: fit it if that was
+    /// asked for — its region, else all of it — below `top`, the room the
+    /// toolbar takes. Waits for the slide to be read.
+    pub fn before_pass(&mut self, ctx: &egui::Context, manager: &CanvasManager, top: f32) {
+        if !self.fit_pending || manager.slide(self.slide).is_none() {
+            return;
+        }
+        self.fit_pending = false;
+        let size = self.canvas_rect.map_or(ctx.screen_rect().size(), |r| r.size());
+        let whole = std::mem::take(&mut self.fit_whole);
+        match self.region {
+            // A small region blows up as far as the canvas goes: the
+            // user picked it.
+            Some(r) if !whole => fit_bounds(self, r, size, top, crate::interaction::zoom_pan::MAX_ZOOM),
+            _ => {
+                if let Some(slide) = manager.slide(self.slide) {
+                    fit(self, slide, size, top);
+                }
+            }
+        }
+    }
+
+    /// Where the window's canvas is, for the overlay cache to use while
+    /// its frame runs (`OverlayCache::enter_child`).
+    pub fn canvas_rect_mut(&mut self) -> &mut Option<egui::Rect> {
+        &mut self.canvas_rect
+    }
+
+    /// After the window's frame: the slide it ended on (its slide panel
+    /// or keys may have gone to another, whose region this is not) and
+    /// its view there; `ppp` for drops from the canvas (`canvas_at`).
+    pub fn after_pass(&mut self, slide: usize, pan: [f32; 2], zoom: f32, ppp: f32) {
+        if slide != self.slide {
+            self.slide = slide;
+            self.region = None;
+        }
+        self.pan = pan;
+        self.zoom = zoom;
+        self.last_rect = self.canvas_rect.unwrap_or(egui::Rect::NOTHING);
+        self.last_ppp = ppp;
+    }
+
+    /// This frame's pen events over the window (see `claim_pen`), in its
+    /// client points, and its client area's top-left on screen.
+    pub fn take_pen_events(&mut self, ppp: f32) -> (Vec<crate::input::pen::PenEvent>, [i32; 2]) {
+        self.edit.take_pen_events(self.hwnd, ppp)
+    }
+
+    /// Locked: the first press with a tool that would draw says how to
+    /// unlock, once.
+    pub fn lock_hint(&mut self, ctx: &egui::Context, kind: crate::tools::ToolKind) {
+        use crate::tools::ToolKind as K;
+        let draws = !matches!(kind, K::Select | K::Laser | K::Spotlight);
+        if self.locked && !self.lock_told && draws && ctx.input(|i| i.pointer.primary_pressed()) {
+            self.lock_told = true;
+            self.notice = Some("The slide window is locked, so a drag pans. Its lock button unlocks it for editing".to_string());
+        }
+    }
+
+    /// The window exists once its viewport was shown: find its handle and
+    /// hand it to the overlay (`owner`), which keeps it above itself.
+    pub fn find_handle(&mut self, owner: isize) {
+        if self.hwnd == 0 && self.find_tries < FIND_FRAMES && owner != 0 {
+            self.find_tries += 1;
+            self.hwnd = crate::platform::own_window_titled("Slide ", owner);
+            if self.hwnd != 0 {
+                crate::platform::set_owner(self.hwnd, owner);
+                // Rounded corners, like the overlay and any Windows 11 window.
+                crate::platform::round_corners(self.hwnd);
+            }
+        }
+    }
+}
+
+/// The overlay's tint over the whole window, under everything drawn in
+/// it, with Windows 11's rounded corners.
+pub fn paint_background(ctx: &egui::Context, tint: Color32) {
+    theme::paint_window(&ctx.layer_painter(egui::LayerId::background()), ctx.screen_rect(), tint, square_corners(ctx));
+}
+
+/// The slide is still being read.
+pub fn opening(ctx: &egui::Context) {
+    egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
+        let rect = ui.max_rect();
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Opening slide…", egui::FontId::proportional(14.0), theme::TEXT_MUTED);
+    });
+}
+
+/// The window's own controls over what its frame drew: the edges that
+/// resize it and, while its UI shows, the card. False when the card's
+/// close was clicked.
+///
+/// The card shows the tool in use and the palette (`palette`, as the
+/// toolbar has it; right-click edits a slot): the window has no toolbar.
+/// Returns whether it stays open and the colour clicked, if one was.
+pub fn chrome(
     ctx: &egui::Context,
     win: &mut SlideWindow,
-    cache: &mut OverlayCache,
-    manager: &mut CanvasManager,
-    position_passes: usize,
-    media: &crate::media::MediaHub,
-    look: &Look,
-    main_tool: &mut crate::tools::ActiveTool,
-    input: &crate::ui::slide_edit::Input,
-) -> bool {
-    let count = manager.count();
-    if count == 0 {
-        return false;
+    manager: &CanvasManager,
+    card_shown: bool,
+    tool: &crate::tools::ActiveTool,
+    palette: &mut [[u8; 4]],
+) -> (bool, Option<[u8; 4]>) {
+    resize_edges(ctx);
+    if !card_shown {
+        return (true, None);
     }
-    win.slide = win.slide.min(count - 1);
-    manager.prefetch(win.slide);
-    win.edit.follow(main_tool);
+    card(ctx, win, manager, tool, palette)
+}
 
-    // Not shown on the window; Alt+Tab and the handle search use it.
-    let title = if win.pins { "Slide window · global pins".to_string() } else { format!("Slide {}", slide_label(manager, win.slide)) };
-    let mut builder = egui::ViewportBuilder::default()
-        .with_title(title)
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_resizable(true)
-        .with_taskbar(false)
-        // Size (and place) on first opening only: the builder stays the
-        // same every frame after, so the user's moves and resizes stick.
-        .with_inner_size(win.place.map_or(START_SIZE, |r| r.size()))
-        .with_min_inner_size(MIN_SIZE)
-        .with_window_level(if win.on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal });
-    if let Some(r) = win.place {
-        builder = builder.with_position(r.min);
-    }
-    let open = ctx.show_viewport_immediate(SlideWindow::viewport_id(), builder, |ctx, class| {
-        // A backend with one window would draw this over the canvas.
-        // Desktop eframe always makes a real window.
-        if class == egui::ViewportClass::Embedded {
-            return false;
-        }
-        let mut open = !ctx.input(|i| i.viewport().close_requested());
-        let top = if look.chrome { CARD_INSET } else { 0.0 };
-        if win.pins {
-            pins_area(ctx, win, cache, manager, position_passes, media, look, top, main_tool, input);
-        } else {
-            canvas_area(ctx, win, cache, manager, position_passes, media, look.background, top, main_tool, input);
-        }
-        if look.chrome {
-            open &= card(ctx, win, manager);
-        }
-        open
-    });
+/// The bar's area id: the toolbar's, so the arrange bar, find and the
+/// command palette sit under it as they sit under the toolbar.
+pub const BAR_ID: &str = "osn_toolbar";
 
-    // The window exists once the viewport has been shown: find its handle
-    // and hand it to the overlay, which keeps it above itself.
-    if win.hwnd == 0 && win.find_tries < FIND_FRAMES && look.owner != 0 {
-        win.find_tries += 1;
-        win.hwnd = crate::platform::own_window_titled("Slide ", look.owner);
-        if win.hwnd != 0 {
-            crate::platform::set_owner(win.hwnd, look.owner);
-            // Rounded corners, like the overlay and any Windows 11 window.
-            crate::platform::round_corners(win.hwnd);
-        }
-    }
-    open
+/// How far down the slide window's bar reaches, last frame; room to keep
+/// clear when fitting.
+pub fn bar_bottom(ctx: &egui::Context) -> Option<f32> {
+    ctx.memory(|m| m.area_rect(egui::Id::new(BAR_ID))).map(|r| r.bottom())
 }
 
 /// "3 · Name", or "3" for a slide without a name.
@@ -348,6 +432,43 @@ pub(crate) const PICKER_W: f32 = 170.0;
 const ROW_H: f32 = 24.0;
 /// Width of the slide-number column, as in the slide panel.
 const NUM_W: f32 = 26.0;
+
+/// One slide in the picker's list: number, then name; lit when shown.
+pub(crate) fn slide_row(ui: &mut egui::Ui, manager: &CanvasManager, i: usize, current: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(PICKER_W, ROW_H), egui::Sense::click());
+    let bg = if current {
+        theme::ACCENT
+    } else if response.hovered() {
+        Color32::from_white_alpha(14)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(6.0), bg);
+    if current {
+        response.scroll_to_me(None);
+    }
+    slide_text(ui, rect, manager, i, if current { theme::TEXT_PRIMARY } else { Color32::from_rgb(215, 215, 215) });
+    response.clicked()
+}
+
+/// A slide's number (muted, right-aligned in its column) and name, in
+/// `rect`, the name cut short to fit.
+fn slide_text(ui: &mut egui::Ui, rect: egui::Rect, manager: &CanvasManager, i: usize, colour: Color32) {
+    ui.painter().text(
+        egui::pos2(rect.min.x + NUM_W - 6.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        (i + 1).to_string(),
+        egui::FontId::proportional(12.0),
+        theme::TEXT_MUTED,
+    );
+    let name = manager.name(i);
+    let (text, colour) = if name.is_empty() { ("Untitled", theme::TEXT_MUTED) } else { (name, colour) };
+    let width = rect.width() - NUM_W - 4.0;
+    let galley = egui::WidgetText::from(egui::RichText::new(text).color(colour))
+        .into_galley(ui, Some(egui::TextWrapMode::Truncate), width, egui::TextStyle::Body);
+    let pos = egui::pos2(rect.min.x + NUM_W + 4.0, rect.center().y - galley.size().y * 0.5);
+    ui.painter().galley(pos, galley, colour);
+}
 
 /// Which slide: a toolbar-style button with the slide's number and name,
 /// opening a list of slides drawn like the slide panel's rows. The slide
@@ -390,43 +511,6 @@ fn slide_picker(ui: &mut egui::Ui, current: usize, manager: &CanvasManager) -> O
     picked
 }
 
-/// One slide in the picker's list: number, then name; lit when shown.
-pub(crate) fn slide_row(ui: &mut egui::Ui, manager: &CanvasManager, i: usize, current: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(PICKER_W, ROW_H), egui::Sense::click());
-    let bg = if current {
-        theme::ACCENT
-    } else if response.hovered() {
-        Color32::from_white_alpha(14)
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, Rounding::same(6.0), bg);
-    if current {
-        response.scroll_to_me(None);
-    }
-    slide_text(ui, rect, manager, i, if current { theme::TEXT_PRIMARY } else { Color32::from_rgb(215, 215, 215) });
-    response.clicked()
-}
-
-/// A slide's number (muted, right-aligned in its column) and name, in
-/// `rect`, the name cut short to fit.
-fn slide_text(ui: &mut egui::Ui, rect: egui::Rect, manager: &CanvasManager, i: usize, colour: Color32) {
-    ui.painter().text(
-        egui::pos2(rect.min.x + NUM_W - 6.0, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        (i + 1).to_string(),
-        egui::FontId::proportional(12.0),
-        theme::TEXT_MUTED,
-    );
-    let name = manager.name(i);
-    let (text, colour) = if name.is_empty() { ("Untitled", theme::TEXT_MUTED) } else { (name, colour) };
-    let width = rect.width() - NUM_W - 4.0;
-    let galley = egui::WidgetText::from(egui::RichText::new(text).color(colour))
-        .into_galley(ui, Some(egui::TextWrapMode::Truncate), width, egui::TextStyle::Body);
-    let pos = egui::pos2(rect.min.x + NUM_W + 4.0, rect.center().y - galley.size().y * 0.5);
-    ui.painter().galley(pos, galley, colour);
-}
-
 /// A small "v", drawn: the icon set has no down chevron.
 fn chevron_down(ui: &mut egui::Ui, r: egui::Rect) {
     let stroke = egui::Stroke::new(1.5, theme::TEXT_MUTED);
@@ -435,19 +519,41 @@ fn chevron_down(ui: &mut egui::Ui, r: egui::Rect) {
     ui.painter().line_segment([pts[1], pts[2]], stroke);
 }
 
-/// The floating card along the top, styled like the main toolbar: a grip
-/// to move the window, which slide, how it is fitted, "On top", close.
-/// False when its close button was clicked.
-fn card(ctx: &egui::Context, win: &mut SlideWindow, manager: &CanvasManager) -> bool {
-    let count = manager.count();
+/// The window's bar along the top, styled like the main toolbar: a grip
+/// to move the window, the tool in use and the colours, which slide, the
+/// lock, Pins, how it is fitted, "On top", close. Whether it stays open
+/// (false once its close was clicked), and a colour clicked.
+fn card(
+    ctx: &egui::Context,
+    win: &mut SlideWindow,
+    manager: &CanvasManager,
+    tool: &crate::tools::ActiveTool,
+    palette: &mut [[u8; 4]],
+) -> (bool, Option<[u8; 4]>) {
     let mut open = true;
-    egui::Area::new(egui::Id::new("osn_slide_window_card"))
+    let mut picked = None;
+    egui::Area::new(egui::Id::new(BAR_ID))
         .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 10.0))
         .show(ctx, |ui| {
             theme::card_frame().show(ui, |ui| {
-                ui.horizontal(|ui| {
+                // One row when there is room; a narrow window wraps it.
+                ui.set_max_width((ctx.screen_rect().width() - 40.0).max(200.0));
+                ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     grip(ui);
+                    // The tool in use and the colours, as the toolbar
+                    // shows them.
+                    crate::ui::toolbar::active_tool(ui, tool);
+                    ui.add_space(4.0);
+                    let mut colour = tool.color;
+                    for (i, slot) in palette.iter_mut().enumerate() {
+                        let (edited, _) = crate::ui::toolbar::colour_swatch(ui, &mut colour, *slot, i);
+                        *slot = edited;
+                    }
+                    if colour != tool.color {
+                        picked = Some(colour);
+                    }
+                    ui.add_space(8.0);
                     if win.pins {
                         // No slide to step through while the pins show.
                         // As wide as the arrows and the picker, so the
@@ -456,6 +562,8 @@ fn card(ctx: &egui::Context, win: &mut SlideWindow, manager: &CanvasManager) -> 
                         let text = egui::Pos2::new(rect.min.x + 8.0, rect.center().y);
                         ui.painter().text(text, egui::Align2::LEFT_CENTER, "Global pins", egui::FontId::proportional(14.0), theme::TEXT_PRIMARY);
                     } else {
+                        // The window has no slide panel: this picks.
+                        let count = manager.count();
                         let prev = egui::Image::new(egui::include_image!("../../assets/icons/chevron-left.svg"));
                         if icon_btn(ui, prev, "Previous slide", win.slide > 0) {
                             win.set_slide(win.slide - 1);
@@ -514,7 +622,7 @@ fn card(ctx: &egui::Context, win: &mut SlideWindow, manager: &CanvasManager) -> 
                 });
             });
         });
-    open
+    (open, picked)
 }
 
 /// Six dots at the card's start; dragging them moves the window.
@@ -607,137 +715,11 @@ fn zoom_label(zoom: f32) -> String {
     if pct < 10.0 { format!("{pct:.1}%") } else { format!("{pct:.0}%") }
 }
 
-/// The slide itself on the overlay's tint: the toolbar's tool working on
-/// it, wheel zoom, panning, and the resize bands along the edges. `top`
-/// is the room the card takes, which a fitted slide keeps clear of.
-#[allow(clippy::too_many_arguments)]
-fn canvas_area(
-    ctx: &egui::Context,
-    win: &mut SlideWindow,
-    cache: &mut OverlayCache,
-    manager: &mut CanvasManager,
-    position_passes: usize,
-    media: &crate::media::MediaHub,
-    background: Color32,
-    top: f32,
-    main_tool: &mut crate::tools::ActiveTool,
-    input: &crate::ui::slide_edit::Input,
-) {
-    egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-        theme::paint_window(ui.painter(), ctx.screen_rect(), background, square_corners(ctx));
-        if manager.slide(win.slide).is_none() {
-            // Still being read; the main window keeps frames coming
-            // while slides load.
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Opening slide…", egui::FontId::proportional(14.0), theme::TEXT_MUTED);
-            resize_edges(ui, rect);
-            return;
-        }
-        win.last_rect = rect;
-        win.last_ppp = ctx.pixels_per_point();
-        let editable = !win.locked && !manager.is_locked(win.slide);
-        if win.locked && !win.lock_told && response.drag_started_by(egui::PointerButton::Primary) && crate::ui::slide_edit::supported(main_tool.kind) {
-            win.lock_told = true;
-            win.notice = Some("The slide window is locked, so a drag pans. Its lock button unlocks it for editing".to_string());
-        }
-        let view = crate::ui::slide_edit::View { slide: win.slide, rect, pan: win.pan, zoom: win.zoom };
-        win.edit.keys(ctx, manager, view, editable, main_tool, input.keys);
-        win.edit.pointer(ctx, &response, manager, view, &mut win.pan, editable, input, win.hwnd, main_tool);
-        let drag_pans = win.edit.drag_pans(editable, input, ctx);
-        if navigate(ctx, win, rect, &response, drag_pans) {
-            let whole = std::mem::take(&mut win.fit_whole);
-            match win.region {
-                // A small region blows up as far as the canvas goes: the
-                // user picked it.
-                Some(r) if !whole => fit_bounds(win, r, rect.size(), top, crate::interaction::zoom_pan::MAX_ZOOM),
-                _ => {
-                    if let Some(slide) = manager.slide(win.slide) {
-                        fit(win, slide, rect.size(), top);
-                    }
-                }
-            }
-        }
-        let view = crate::ui::slide_edit::View { pan: win.pan, zoom: win.zoom, ..view };
-        let chrome = win.edit.chrome(manager, view);
-        let live = win.edit.live_stroke();
-        let Some(slide) = manager.slide(win.slide) else { return };
-
-        let painter = ui.painter_at(rect);
-        let (layer_textures, shape_textures) =
-            cache.slide_textures(ctx, win.slide, slide, rect, win.pan, win.zoom, media, false);
-        let laser: Vec<(crate::canvas::stroke::Stroke, std::time::Instant)> = win.edit.laser().to_vec();
-        if !laser.is_empty() {
-            // The trails fade on their own.
-            ctx.request_repaint();
-        }
-        let preview_shape = win.edit.tool().preview_shape();
-        let sel_preview = win.edit.sel_preview(slide, win.zoom);
-        render::paint_canvas_egui(
-            &painter,
-            rect.min,
-            slide,
-            preview_shape.as_ref(),
-            live.as_ref(),
-            position_passes,
-            &laser,
-            &layer_textures,
-            &shape_textures,
-            Some((win.pan, win.zoom)),
-            None,
-            sel_preview,
-        );
-        let origin = rect.min + Vec2::new(win.pan[0], win.pan[1]);
-        if let Some(chrome) = chrome {
-            crate::ui::overlay::paint_select_chrome(&painter, origin, win.zoom, &chrome);
-        }
-        // Counts, not `content_bounds`: that walks every pen sample, too
-        // slow to do each frame on a big slide.
-        let empty = !slide.layers.iter().any(|l| l.visible && (!l.strokes.is_empty() || !l.shapes.is_empty() || l.image.is_some()));
-        if empty {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "This slide is empty", egui::FontId::proportional(14.0), theme::TEXT_MUTED);
-        }
-        // The pen's or eraser's reach at the pointer, as on the canvas.
-        let tool = win.edit.tool();
-        let ringed = matches!(tool.kind, crate::tools::ToolKind::Pen | crate::tools::ToolKind::Eraser | crate::tools::ToolKind::FreehandArrow);
-        if editable && ringed && !drag_pans && live.is_none() {
-            if let Some(p) = response.hover_pos() {
-                let r = tool.cursor_radius(win.zoom);
-                let c = tool.color;
-                let colour = if tool.kind == crate::tools::ToolKind::Eraser {
-                    Color32::from_rgb(220, 222, 230)
-                } else {
-                    Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 220)
-                };
-                painter.circle_stroke(p, r, egui::Stroke::new(1.2, colour));
-            }
-        }
-        // A selection dragged on the canvas is over this window: say
-        // letting go drops it here.
-        if input.drop_hover {
-            let accent = Color32::from_rgb(86, 160, 255);
-            painter.rect_stroke(rect.shrink(3.0), Rounding::same(10.0), egui::Stroke::new(3.0, accent));
-            let text = if editable {
-                format!("Drop to move to slide {}", win.slide + 1)
-            } else if win.locked {
-                "This window is locked — unlock it to drop here".to_string()
-            } else {
-                format!("Slide {} is locked", win.slide + 1)
-            };
-            let at = egui::pos2(rect.center().x, rect.max.y - 28.0);
-            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(14.0), theme::TEXT_PRIMARY);
-            let pill = egui::Rect::from_center_size(at, galley.size() + Vec2::new(20.0, 10.0));
-            painter.rect_filled(pill, Rounding::same(8.0), theme::GLASS_FILL);
-            painter.galley(pill.center() - galley.size() * 0.5, galley, theme::TEXT_PRIMARY);
-        }
-        resize_edges(ui, rect);
-    });
-}
-
 /// The global pins alone, laid out as they are on the canvas, under the
 /// window's own pan and zoom (`fit` gathers them into view). With the
 /// Select tool they move, resize and turn here as on the canvas.
 #[allow(clippy::too_many_arguments)]
-fn pins_area(
+pub fn pins_frame(
     ctx: &egui::Context,
     win: &mut SlideWindow,
     cache: &mut OverlayCache,
@@ -749,9 +731,9 @@ fn pins_area(
     main_tool: &mut crate::tools::ActiveTool,
     input: &crate::ui::slide_edit::Input,
 ) {
+    win.edit.follow(main_tool);
     egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-        theme::paint_window(ui.painter(), ctx.screen_rect(), look.background, square_corners(ctx));
         win.last_rect = rect;
         win.last_ppp = ctx.pixels_per_point();
         // With the Select tool the pins move, resize and turn here as on
@@ -797,7 +779,6 @@ fn pins_area(
                 crate::ui::overlay::paint_pin_marks(ui, &painter, egui::Pos2::ZERO, &view, marks);
             }
         }
-        resize_edges(ui, rect);
     });
 }
 
@@ -830,9 +811,11 @@ fn navigate(ctx: &egui::Context, win: &mut SlideWindow, rect: egui::Rect, respon
 }
 
 /// Bands along the window's edges and corners that resize it, as a frame
-/// would. Over the slide, so they win where they overlap it.
-fn resize_edges(ui: &mut egui::Ui, rect: egui::Rect) {
+/// would: each a small area of its own over everything else, so presses
+/// anywhere else still reach the canvas.
+fn resize_edges(ctx: &egui::Context) {
     use egui::{CursorIcon as C, ResizeDirection as D};
+    let rect = ctx.screen_rect();
     let (l, r, t, b) = (rect.min.x, rect.max.x, rect.min.y, rect.max.y);
     // Corners take twice the band, so they are easy to catch.
     let c = EDGE * 2.0;
@@ -848,13 +831,19 @@ fn resize_edges(ui: &mut egui::Ui, rect: egui::Rect) {
         (band(r - EDGE, t + c, r, b - c), D::East, C::ResizeEast),
     ];
     for (i, (zone, dir, cursor)) in zones.into_iter().enumerate() {
-        let response = ui.interact(zone, egui::Id::new(("osn_slide_window_edge", i)), egui::Sense::drag());
-        if response.hovered() || response.dragged() {
-            ui.ctx().set_cursor_icon(cursor);
-        }
-        if response.drag_started_by(egui::PointerButton::Primary) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
-        }
+        egui::Area::new(egui::Id::new(("osn_slide_window_edge", i)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(zone.min)
+            .constrain(false)
+            .show(ctx, |ui| {
+                let (_, response) = ui.allocate_exact_size(zone.size(), egui::Sense::drag());
+                if response.hovered() || response.dragged() {
+                    ui.ctx().set_cursor_icon(cursor);
+                }
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                }
+            });
     }
 }
 
@@ -988,10 +977,10 @@ mod tests {
         assert!((a[0] - FIT_MARGIN).abs() < 1.0 && (b[0] - (448.0 - FIT_MARGIN)).abs() < 1.0, "wide content spans the width");
         assert!(((a[1] + b[1]) * 0.5 - 224.0).abs() < 1.0, "and is centred down");
 
-        // With the card showing, the slide sits below it.
-        fit(&mut w, &slide, Vec2::new(448.0, 448.0), CARD_INSET);
+        // With the toolbar showing, the slide sits below it.
+        fit(&mut w, &slide, Vec2::new(448.0, 448.0), 56.0);
         let a = [w.pan[0] + 100.0 * w.zoom, w.pan[1] + 100.0 * w.zoom];
-        assert!(a[1] >= CARD_INSET + FIT_MARGIN - 1.0, "top edge clears the card");
+        assert!(a[1] >= 56.0 + FIT_MARGIN - 1.0, "top edge clears the toolbar");
     }
 
     #[test]

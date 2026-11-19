@@ -202,6 +202,9 @@ impl OnScreenNotesApp {
     /// refused), so it is not the Select tool's.
     pub(super) fn drop_on_slide_window(&mut self, screen: [f32; 2], ppp: f32) -> bool {
         use crate::tools::select_tool::Gesture;
+        if self.canvases.in_view() {
+            return self.drop_on_main(screen, ppp);
+        }
         let Some(Gesture::Move { start, .. }) = self.ws.tool.select.gesture else { return false };
         if self.ws.tool.kind != crate::tools::ToolKind::Select || self.ws.tool.select.sel.is_empty() {
             return false;
@@ -227,7 +230,54 @@ impl OnScreenNotesApp {
         match self.canvases.drop_objects(from, to, li, &sel.strokes, &sel.shapes, &m) {
             Some(placed) => {
                 let n = placed.strokes.len() + placed.shapes.len();
-                win.select_dropped(placed, &self.canvases);
+                // Selected there, in the window's own tool.
+                if let (Some(ws), Some(c)) = (self.window_ws.as_mut(), self.canvases.slide(to)) {
+                    ws.tool.kind = crate::tools::ToolKind::Select;
+                    ws.tool.select.sel = placed;
+                    ws.tool.select.gesture = None;
+                    ws.tool.select.rebind(to, c);
+                }
+                if from != to {
+                    let what = if n == 1 { "1 object".to_string() } else { format!("{n} objects") };
+                    self.toast = Some((format!("Moved {what} to slide {}", to + 1), Instant::now()));
+                }
+            }
+            None => self.ws.tool.select.sel = sel,
+        }
+        true
+    }
+
+    /// In the slide window's frame: the Select tool was moving a selection
+    /// and let go over the main window at `screen` (physical pixels; `ppp`
+    /// the window's pixels per point). The objects move to the main
+    /// window's slide, under the pointer at the same size on screen, and
+    /// are selected there once the window's frame is over.
+    fn drop_on_main(&mut self, screen: [f32; 2], ppp: f32) -> bool {
+        use crate::tools::select_tool::Gesture;
+        let Some(Gesture::Move { start, .. }) = self.ws.tool.select.gesture else { return false };
+        if self.ws.tool.kind != crate::tools::ToolKind::Select || self.ws.tool.select.sel.is_empty() {
+            return false;
+        }
+        if crate::platform::top_level_window_at(screen[0] as i32, screen[1] as i32) != self.osn_hwnd {
+            return false;
+        }
+        let (Some((to, pan, zoom_to)), Some(main)) = (self.canvases.main_view(), self.main_canvas) else { return false };
+        // The slide point under the pointer on the main window's canvas.
+        let local = [(screen[0] - main.origin_px[0]) / main.ppp - main.rect.min.x, (screen[1] - main.origin_px[1]) / main.ppp - main.rect.min.y];
+        let target = [(local[0] - pan[0]) / zoom_to.max(1e-6), (local[1] - pan[1]) / zoom_to.max(1e-6)];
+        self.ws.tool.select.gesture = None;
+        if self.canvases.is_locked(to) {
+            self.toast = Some((format!("Slide {} is locked — unlock it to move objects there", to + 1), Instant::now()));
+            return true;
+        }
+        let from = self.canvases.active_index();
+        let (li, zoom) = { let c = self.canvases.active(); (c.active_layer, c.zoom) };
+        let m = ui::slide_edit::drop_mapping(start, target, zoom * ppp / (zoom_to * main.ppp).max(1e-6));
+        let sel = std::mem::take(&mut self.ws.tool.select.sel);
+        match self.canvases.drop_objects(from, to, li, &sel.strokes, &sel.shapes, &m) {
+            Some(placed) => {
+                let n = placed.strokes.len() + placed.shapes.len();
+                self.main_select = Some((to, placed));
                 if from != to {
                     let what = if n == 1 { "1 object".to_string() } else { format!("{n} objects") };
                     self.toast = Some((format!("Moved {what} to slide {}", to + 1), Instant::now()));

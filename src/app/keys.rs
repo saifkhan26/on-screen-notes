@@ -477,6 +477,10 @@ impl OnScreenNotesApp {
             }
             Some(ui::slide_panel::SlideAction::Move(from, to)) => self.move_slide(from, to),
             Some(ui::slide_panel::SlideAction::Resync(i)) => self.start_resync(i),
+            // In the slide window's own panel: it shows that slide.
+            Some(ui::slide_panel::SlideAction::OpenWindow(i) | ui::slide_panel::SlideAction::OpenRegion(i)) if self.canvases.in_view() => {
+                self.canvases.go_to(i);
+            }
             Some(ui::slide_panel::SlideAction::OpenWindow(i)) => match self.slide_window.as_mut() {
                 // One slide window: asking again shows the slide there.
                 Some(win) => {
@@ -493,7 +497,9 @@ impl OnScreenNotesApp {
             }
             None => {}
         }
-        if rename_slide {
+        if rename_slide && self.canvases.in_view() {
+            self.toast = Some(("Name slides in the main window's slide panel".to_string(), Instant::now()));
+        } else if rename_slide {
             // The name field lives in the panel, so bring it up.
             let i = self.canvases.active_index();
             self.ws.slide_panel.start_rename(i, self.canvases.name(i));

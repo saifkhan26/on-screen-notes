@@ -187,6 +187,16 @@ pub struct OnScreenNotesApp {
     media_filter: ui::media_filter::MediaFilter,
     /// The second window showing one slide, while it is open.
     slide_window: Option<ui::slide_window::SlideWindow>,
+    /// The slide window's own state (`app::workspace`), while it is open.
+    window_ws: Option<workspace::Workspace>,
+    /// Close the slide window once its frame is over (asked for in it).
+    window_close: bool,
+    /// Where the main window's canvas is, for the slide window's frame:
+    /// a selection dragged out of the window lands there.
+    main_canvas: Option<MainCanvas>,
+    /// Objects dropped on the main window from the slide window's frame,
+    /// to select there once that frame is over: their slide, and them.
+    main_select: Option<(usize, crate::canvas::hit::Selection)>,
     /// Files being copied in and read as videos / GIFs.
     media_imports: Vec<crate::media::import::ImportJob>,
     /// Videos picked or dropped before FFmpeg was set up, with where
@@ -309,6 +319,17 @@ struct RegionSelect {
     ui_visible_before: bool,
     /// What the box is for.
     purpose: BoxFor,
+}
+
+/// The main window's canvas, as the slide window's frame sees it.
+#[derive(Clone, Copy)]
+struct MainCanvas {
+    /// The canvas area, in the main window's points.
+    rect: egui::Rect,
+    /// The main window's client area's top-left on screen, pixels.
+    origin_px: [f32; 2],
+    /// The main window's pixels per point.
+    ppp: f32,
 }
 
 /// What a box dragged over the screen is for (`RegionSelect`).
@@ -554,6 +575,10 @@ impl OnScreenNotesApp {
             media: crate::media::MediaHub::new(),
             media_filter: ui::media_filter::MediaFilter::default(),
             slide_window: None,
+            window_ws: None,
+            window_close: false,
+            main_canvas: None,
+            main_select: None,
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
             media_dialog: None,
@@ -654,7 +679,8 @@ impl eframe::App for OnScreenNotesApp {
         self.update_loupe(ctx);
 
         // ---- This window's canvas, its tool and its UI -------------------
-        let space_held = self.view_pass(ctx, &pen_events, client_origin, self.overlay_visible);
+        self.ws.hwnd = self.osn_hwnd;
+        self.view_pass(ctx, &pen_events, client_origin, self.overlay_visible);
 
         // ---- Sync last-used tool state into persistent config ------------
         // Treat the most recently selected colour and size as the "default"
@@ -671,7 +697,7 @@ impl eframe::App for OnScreenNotesApp {
             self.show_slide_status(ctx);
         }
 
-        self.show_slide_window(ctx, space_held);
+        self.show_slide_window(ctx);
 
         self.autosave();
 

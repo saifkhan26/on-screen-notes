@@ -47,6 +47,16 @@ pub struct TagCount {
     pub objects: usize,
 }
 
+/// What `CanvasManager::enter_view` changed: the main window's active
+/// slide, and the second window's slide with its own view.
+struct ViewSwap {
+    main: usize,
+    slide: usize,
+    own: ([f32; 2], f32),
+    /// The window is locked: nothing on its slide takes edits.
+    locked: bool,
+}
+
 /// Top-level holder for all canvases.
 pub struct CanvasManager {
     /// One entry per slide. `None` is a slide whose file the background
@@ -55,6 +65,9 @@ pub struct CanvasManager {
     /// always points at a `Some`.
     canvases: Vec<Option<Canvas>>,
     active: usize,
+    /// A second window's frame is running (`enter_view`): its slide is
+    /// `active` for now, and this is what to put back.
+    view_swap: Option<ViewSwap>,
     /// One human-readable line per slide that could not be read at
     /// startup. Drained by the app into a toast.
     load_errors: Vec<String>,
@@ -262,6 +275,7 @@ impl CanvasManager {
         let mut m = Self {
             canvases: Vec::new(),
             active: 0,
+            view_swap: None,
             load_errors: Vec::new(),
             protected: Vec::new(),
             prune_orphans: false,
@@ -350,6 +364,7 @@ impl CanvasManager {
             recent_walk: None,
             canvases: canvases.into_iter().map(Some).collect(),
             active: 0,
+            view_swap: None,
             load_errors: Vec::new(),
             protected: Vec::new(),
             prune_orphans: false,
@@ -714,7 +729,7 @@ impl CanvasManager {
 
     /// The active slide takes edits: it is read and not locked.
     pub fn active_editable(&self) -> bool {
-        self.canvases[self.active].is_some() && !self.is_locked(self.active)
+        self.canvases[self.active].is_some() && !self.is_locked(self.active) && !self.view_locked()
     }
 
     /// Index of the active canvas (for status bar display).
@@ -785,9 +800,10 @@ impl CanvasManager {
     }
 
     /// Note the active slide as the most recently visited. Call once a
-    /// frame; held back while a recently-used walk is under way.
+    /// frame; held back while a recently-used walk is under way, and
+    /// while a second window's frame runs (its slide is no visit).
     pub fn note_visit(&mut self) {
-        if self.recent_walk.is_none() && self.recent.first() != Some(&self.active) {
+        if self.recent_walk.is_none() && self.view_swap.is_none() && self.recent.first() != Some(&self.active) {
             let a = self.active;
             self.recent.retain(|&i| i != a);
             self.recent.insert(0, a);
@@ -857,6 +873,10 @@ impl CanvasManager {
         let lock = self.locks.remove(from);
         self.locks.insert(to, lock);
         self.active = map(self.active);
+        if let Some(v) = self.view_swap.as_mut() {
+            v.main = map(v.main);
+            v.slide = map(v.slide);
+        }
         for i in &mut self.recent {
             *i = map(*i);
         }
@@ -928,6 +948,10 @@ impl CanvasManager {
 
     /// The pins with objects to show on the active slide, bottom to top.
     pub fn pinned(&self) -> Vec<pins::Pinned<'_>> {
+        // Pins are the main window's: a second window shows none.
+        if self.view_swap.is_some() {
+            return Vec::new();
+        }
         self.pins.pinned(&self.canvases, self.active)
     }
 
@@ -1152,7 +1176,64 @@ impl CanvasManager {
     }
 
     pub fn has_pins(&self) -> bool {
-        self.pins.any(self.active)
+        self.view_swap.is_none() && self.pins.any(self.active)
+    }
+
+    /// For a second window's frame: slide `idx` becomes the active one,
+    /// seen through `pan` / `zoom`, so the app's code, which works on the
+    /// active slide, works on it. Pins and the visit history are the main
+    /// window's and keep out (`pinned` is empty). `None`, changing
+    /// nothing, while that slide is not read yet or a frame is in already.
+    pub fn enter_view(&mut self, idx: usize, pan: [f32; 2], zoom: f32, locked: bool) -> Option<()> {
+        if self.view_swap.is_some() {
+            return None;
+        }
+        let c = self.canvases.get_mut(idx)?.as_mut()?;
+        self.view_swap = Some(ViewSwap { main: self.active, slide: idx, own: (c.pan, c.zoom), locked });
+        c.pan = pan;
+        c.zoom = zoom;
+        self.active = idx;
+        Some(())
+    }
+
+    /// End a second window's frame: the main window's slide is active
+    /// again, and the window's slide has its own view back. Returns the
+    /// slide the window shows now (it may have gone to another) and its
+    /// view there.
+    pub fn leave_view(&mut self) -> Option<(usize, [f32; 2], f32)> {
+        let v = self.view_swap.take()?;
+        let now = self.active.min(self.canvases.len().saturating_sub(1));
+        let (pan, zoom) = match self.canvases.get(now) {
+            Some(Some(c)) => (c.pan, c.zoom),
+            _ => (self.opening.pan, self.opening.zoom),
+        };
+        // Its own view back, wherever it is now.
+        if let Some(Some(c)) = self.canvases.get_mut(v.slide) {
+            (c.pan, c.zoom) = v.own;
+        }
+        self.active = v.main.min(self.canvases.len().saturating_sub(1));
+        Some((now, pan, zoom))
+    }
+
+    /// While a second window's frame runs: the main window's slide and
+    /// its view there.
+    pub fn main_view(&self) -> Option<(usize, [f32; 2], f32)> {
+        let v = self.view_swap.as_ref()?;
+        if v.main == v.slide {
+            return Some((v.main, v.own.0, v.own.1));
+        }
+        let c = self.canvases.get(v.main)?.as_ref()?;
+        Some((v.main, c.pan, c.zoom))
+    }
+
+    /// A second window's frame is running.
+    pub fn in_view(&self) -> bool {
+        self.view_swap.is_some()
+    }
+
+    /// A second window's frame is running, and that window is locked.
+    pub fn view_locked(&self) -> bool {
+        self.view_swap.as_ref().is_some_and(|v| v.locked)
     }
 
     pub fn pins_hidden(&self) -> bool {
@@ -1274,6 +1355,14 @@ impl CanvasManager {
         self.canvases.remove(i);
         self.names.remove(i);
         self.locks.remove(i);
+        // A second window deleted its slide: the main window's, if later,
+        // moved down one; the gone slide's view needs no putting back.
+        if let Some(v) = self.view_swap.as_mut() {
+            if v.main > i {
+                v.main -= 1;
+            }
+            v.slide = usize::MAX;
+        }
         // Every later slide moved down one place in the history too.
         self.recent_walk = None;
         self.recent.retain(|&j| j != i);
@@ -2210,6 +2299,52 @@ mod pin_tests {
         m.set_pin_area([300.0, 200.0]);
         let [x0, y0, _, _] = m.pinned()[0].frame().aabb();
         assert!(x0.abs() < 1e-3 && y0.abs() < 1e-3, "from its top-left: {:?}", [x0, y0]);
+    }
+
+    #[test]
+    fn a_second_window_works_on_its_slide_and_gives_the_view_back() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide(), slide()]);
+        m.go_to(0);
+        m.set_view(1, [5.0, 6.0], 0.5);
+        m.pin_objects(0, &[0], &[], [0.0, 0.0], false).expect("pinned");
+        assert!(!m.pinned().is_empty());
+
+        assert!(m.enter_view(1, [100.0, 200.0], 2.0, false).is_some());
+        assert_eq!(m.active_index(), 1, "the window's slide is the active one");
+        assert_eq!((m.active().pan, m.active().zoom), ([100.0, 200.0], 2.0), "seen through the window's view");
+        assert!(m.pinned().is_empty(), "pins are the main window's");
+        assert!(m.enter_view(2, [0.0; 2], 1.0, false).is_none(), "one at a time");
+        let (pan, zoom) = m.active_view_mut();
+        *pan = [110.0, 210.0];
+        *zoom = 3.0;
+        assert_eq!(m.leave_view(), Some((1, [110.0, 210.0], 3.0)), "the window's view as it left it");
+        assert_eq!(m.active_index(), 0, "the main window's slide again");
+        assert_eq!((m.slide(1).unwrap().pan, m.slide(1).unwrap().zoom), ([5.0, 6.0], 0.5), "slide 2 keeps its own view");
+        assert!(!m.pinned().is_empty());
+
+        // Locked: nothing on it takes edits.
+        m.enter_view(1, [0.0; 2], 1.0, true);
+        assert!(!m.active_editable() && m.view_locked());
+        m.leave_view();
+        assert!(m.active_editable());
+
+        // The window goes to another slide meanwhile.
+        m.enter_view(1, [0.0; 2], 1.0, false);
+        m.go_to(2);
+        let (now, _, _) = m.leave_view().unwrap();
+        assert_eq!((now, m.active_index()), (2, 0));
+    }
+
+    #[test]
+    fn a_slide_deleted_in_the_second_window_keeps_the_main_one_in_place() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide(), slide()]);
+        m.go_to(2);
+        m.enter_view(0, [0.0; 2], 1.0, false);
+        m.delete_active();
+        let (now, _, _) = m.leave_view().unwrap();
+        assert_eq!(m.count(), 2);
+        assert_eq!(m.active_index(), 1, "the main window's slide moved down one");
+        assert_eq!(now, 0);
     }
 
     #[test]

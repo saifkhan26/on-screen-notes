@@ -44,7 +44,7 @@ impl OnScreenNotesApp {
                         // window over ours, is not a pan.
                         let elsewhere = {
                             let w = crate::platform::top_level_window_at(client_origin[0] + s.pos[0] as i32, client_origin[1] + s.pos[1] as i32);
-                            w != 0 && w != self.osn_hwnd
+                            w != 0 && w != self.ws.hwnd
                         };
                         if over_ui(here) || elsewhere {
                             self.ws.pen_blocked = true;
@@ -276,7 +276,7 @@ impl OnScreenNotesApp {
                         let sx = client_origin[0] + s.pos[0] as i32;
                         let sy = client_origin[1] + s.pos[1] as i32;
                         let win_under = crate::platform::top_level_window_at(sx, sy);
-                        if win_under != 0 && win_under != self.osn_hwnd {
+                        if win_under != 0 && win_under != self.ws.hwnd {
                             self.ws.pen_blocked = true;
                             continue;
                         }
@@ -287,7 +287,7 @@ impl OnScreenNotesApp {
                         // shortcuts (P, B, T…) keep flowing here.
                         // No-op on non-Win
                         // targets and when OSN is already foreground.
-                        crate::platform::reclaim_foreground(self.osn_hwnd);
+                        crate::platform::reclaim_foreground(self.ws.hwnd);
                         // Shift-pick wins over the eraser modifier:
                         // sample the pixel at the pen tip on Down,
                         // set the pen colour, and lock the rest of
@@ -442,7 +442,7 @@ impl OnScreenNotesApp {
                             // Same reasons as the pen path: keep
                             // keyboard shortcuts flowing here, and
                             // let Ctrl turn this drag into an erase.
-                            crate::platform::reclaim_foreground(self.osn_hwnd);
+                            crate::platform::reclaim_foreground(self.ws.hwnd);
                             self.ws.pen_using_eraser = ctrl_held && !select_active && editable;
                         }
                     }

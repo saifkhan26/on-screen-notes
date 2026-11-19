@@ -7,6 +7,13 @@
 use super::*;
 
 pub(super) struct Workspace {
+    /// The window's native handle: a press over another window is not
+    /// ours, and a press here takes the foreground back to it.
+    pub(super) hwnd: isize,
+    /// A colour clicked on the slide window's bar, which has no toolbar:
+    /// taken at the toolbar's turn in the next frame, so it restyles a
+    /// selection as a toolbar click would.
+    pub(super) picked_colour: Option<[u8; 4]>,
     pub(super) tool: ActiveTool,
     /// Eraser tool used while Ctrl is held — temporary override so the
     /// user can erase mid-session without losing their current pen
@@ -138,6 +145,8 @@ impl Workspace {
     /// the eraser Ctrl holds.
     pub(super) fn new(tool: ActiveTool, eraser_override: ActiveTool) -> Self {
         Self {
+            hwnd: 0,
+            picked_colour: None,
             tool,
             eraser_override,
             mouse_was_down: false,

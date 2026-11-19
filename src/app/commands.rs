@@ -129,7 +129,10 @@ impl OnScreenNotesApp {
                 say(self, msg.to_string());
             }
             K::SlideWindow => {
-                if self.slide_window.is_some() {
+                if self.canvases.in_view() {
+                    // Pressed in the slide window: it closes.
+                    self.window_close = true;
+                } else if self.slide_window.is_some() {
                     self.slide_window = None;
                 } else {
                     self.slide_window = Some(ui::slide_window::SlideWindow::new(self.canvases.active_index(), &self.config));
@@ -290,6 +293,9 @@ impl OnScreenNotesApp {
                 }
             }
             C::LockSlide => self.toggle_lock(),
+            C::RenameSlide if self.canvases.in_view() => {
+                self.toast = Some(("Name slides in the main window's slide panel".to_string(), Instant::now()));
+            }
             C::RenameSlide => {
                 let i = self.canvases.active_index();
                 self.ws.slide_panel.start_rename(i, self.canvases.name(i));

@@ -70,7 +70,13 @@ impl OnScreenNotesApp {
             let mut pins_hidden = self.canvases.pins_hidden();
             let has_pins = self.canvases.has_pins();
             let picture_status = self.picture_vectors.status();
-            let toolbar_clicked = if self.ws.ui_visible {
+            // The slide window has no toolbar, only its bar's colours (see
+            // `ui::slide_window::chrome`); every tool and action is the
+            // keys', the palette's, the arrange bar's, as here.
+            if let Some(c) = self.ws.picked_colour.take() {
+                self.ws.tool.color = c;
+            }
+            let toolbar_clicked = if self.ws.ui_visible && !self.canvases.in_view() {
                 ui::toolbar::show(
                     ctx,
                     &mut self.ws.tool,
@@ -111,7 +117,8 @@ impl OnScreenNotesApp {
             // Slide panel. Going to a slide waits until after this frame's
             // keys, where the arrow keys switch slides too: everything
             // drawn before then still belongs to the current slide.
-            let slides = if self.ws.ui_visible {
+            // The slide window has none: its card picks the slide.
+            let slides = if self.ws.ui_visible && !self.canvases.in_view() {
                 // No higher than the REC badge (top-left) while it shows.
                 let top = if self.recorder.is_recording() { 44.0 } else { 10.0 };
                 ui::slide_panel::show(ctx, &mut self.ws.slide_panel, &mut self.config, top, &self.canvases)
@@ -234,15 +241,12 @@ impl OnScreenNotesApp {
             let layer_xform = self.layer_xform_for_render();
             // Advance video / GIF playback and upload new frames before
             // the canvas paints them.
-            let view = self.overlay_cache.canvas_rect(ctx);
-            // Pinned videos play wherever their pins are, the slide
-            // window included. Its pins count as placed on the canvas.
-            let mut pins = self.canvases.pinned();
-            if self.slide_window.as_ref().is_some_and(|w| w.shows_pins()) {
-                pins.extend(self.canvases.global_pins());
+            // Once a frame, for both windows: the overlay's pass does it,
+            // the slide window's draws what it left.
+            if !self.canvases.in_view() {
+                let view = self.overlay_cache.canvas_rect(ctx);
+                self.sync_media(ctx, view);
             }
-            self.media.sync(ctx, self.canvases.active(), &pins, ctx.pixels_per_point(), view);
-            drop(pins);
             // Selection handles must stay out of anything that grabs the
             // screen.
             let show_selection = self.pending_screenshot.is_none()
@@ -274,7 +278,10 @@ impl OnScreenNotesApp {
             // New files from the dialog / drag-and-drop, finished imports,
             // then the playback bars. Drawn before the pen dispatch below
             // so a tap on a bar counts as UI, never as ink.
-            self.poll_media_inputs(ctx, canvas_rect);
+            // Files dropped, dialogs and imports land on the overlay's slide.
+            if !self.canvases.in_view() {
+                self.poll_media_inputs(ctx, canvas_rect);
+            }
             let mut media_objs = ui::media_controls::media_on_screen(self.canvases.active(), canvas_rect);
             let pinned = self.canvases.pinned();
             media_objs.extend(ui::media_controls::pinned_media_on_screen(&pinned, canvas_rect));
@@ -293,7 +300,9 @@ impl OnScreenNotesApp {
                 && !self.ws.pin_tool.dragging();
             let mut media_out =
                 self.ws.media_ui.show(ctx, &self.media, &media_objs, media_selected, canvas_rect, show_media_bars);
-            self.ws.media_ui.ffmpeg_window(ctx, self.osn_hwnd, &mut media_out);
+            if !self.canvases.in_view() {
+                self.ws.media_ui.ffmpeg_window(ctx, self.osn_hwnd, &mut media_out);
+            }
             self.apply_media_out(media_out);
             self.show_delete_confirm(ctx);
             if self.ws.commands.is_open() {
@@ -323,7 +332,9 @@ impl OnScreenNotesApp {
                     self.run_command(cmd, ctx, canvas_rect);
                 }
             }
-            self.tick_picture_vectors(ctx);
+            if !self.canvases.in_view() {
+                self.tick_picture_vectors(ctx);
+            }
             self.show_find_bar(ctx);
             self.show_find_flash(ctx, canvas_rect);
 
@@ -332,7 +343,9 @@ impl OnScreenNotesApp {
             // turns the drag into a deferred region capture. While active it
             // suppresses the pen/mouse drawing dispatch below (guarded on
             // `region_select.is_none()`).
-            self.update_region_select(ctx);
+            if !self.canvases.in_view() {
+                self.update_region_select(ctx);
+            }
 
             // ---- Space-hold pan: consume drags before drawing -----------
             // While Space is held, the cursor turns into a grab hand and any

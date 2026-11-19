@@ -67,6 +67,11 @@ const PAPERS: [([u8; 3], &str); 5] = [
 ];
 
 impl PadState {
+    /// Take `other`'s textures waiting to be freed, to free with these.
+    pub(super) fn take_retired(&mut self, other: &mut PadState) {
+        self.retired.append(&mut other.retired);
+    }
+
     pub(super) fn is_open(&self) -> bool {
         self.edit.is_some()
     }
@@ -96,8 +101,12 @@ impl OnScreenNotesApp {
     /// last frame, put the open one away if its slide, tool or picture
     /// went, follow the picture, and have the canvas show it live.
     pub(super) fn pad_frame_start(&mut self) {
-        for id in self.ws.pad.retired.drain(..) {
-            pad_gpu::free_texture(id);
+        // Never in the slide window's frame: a texture made earlier this
+        // frame could be the one freed. Its pads' go to the overlay's.
+        if !self.canvases.in_view() {
+            for id in self.ws.pad.retired.drain(..) {
+                pad_gpu::free_texture(id);
+            }
         }
         if let Some(e) = self.ws.pad.edit.as_ref() {
             let leave = self.canvases.active_index() != e.slide

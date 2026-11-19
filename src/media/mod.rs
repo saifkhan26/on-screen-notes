@@ -209,6 +209,16 @@ pub struct MediaHub {
     tick: u64,
 }
 
+/// One window's showing, for `MediaHub::sync_views`: the slide it shows
+/// under `pan` / `zoom`, its pins, and its canvas area on screen.
+pub struct ShownIn<'a> {
+    pub canvas: &'a Canvas,
+    pub pan: [f32; 2],
+    pub zoom: f32,
+    pub pins: &'a [crate::canvas::pins::Pinned<'a>],
+    pub view: egui::Rect,
+}
+
 impl MediaHub {
     pub fn new() -> Self {
         Self::default()
@@ -224,62 +234,71 @@ impl MediaHub {
     /// could show. A video paused at its start stays dormant too, until
     /// it is played or shown bigger than its poster; at most
     /// `MAX_STARTING` videos start up at a time.
-    pub fn sync(&mut self, ctx: &egui::Context, canvas: &Canvas, pins: &[crate::canvas::pins::Pinned], ppp: f32, view: egui::Rect) {
+    ///
+    /// Every window showing slides comes in at once (`views`): an object
+    /// counts as shown where any of them shows it, at the biggest size it
+    /// has there, so a video on both windows keeps one player.
+    pub fn sync_views(&mut self, ctx: &egui::Context, views: &[ShownIn], ppp: f32) {
         self.tick += 1;
         let tick = self.tick;
         let now = Instant::now();
         let dir = crate::persistence::paths::media_dir().ok();
-        let near = view.expand(view.width().max(view.height()) * 0.25);
         // Dormant videos shown bigger than their poster: (id, how much
         // bigger).
         let mut blurry: Vec<(u64, f32)> = Vec::new();
-        // Every media object that shows: the shape, its box on screen,
-        // and its size there in pixels.
-        let mut shown: Vec<(&crate::canvas::shape::Shape, egui::Rect, [f32; 2])> = Vec::new();
-        for layer in canvas.layers.iter().filter(|l| l.visible) {
-            for shape in layer.shapes.iter().filter(|s| s.media().is_some()) {
-                let bb = shape.obb().aabb();
-                let to_screen = |x: f32, y: f32| {
-                    egui::pos2(view.min.x + canvas.pan[0] + x * canvas.zoom, view.min.y + canvas.pan[1] + y * canvas.zoom)
-                };
-                let half = shape.obb().half;
-                let on_screen = [half[0] * 2.0 * canvas.zoom * ppp, half[1] * 2.0 * canvas.zoom * ppp];
-                shown.push((shape, egui::Rect::from_two_pos(to_screen(bb[0], bb[1]), to_screen(bb[2], bb[3])), on_screen));
+        // Every media object that shows: the shape, whether it is near
+        // a window (so it keeps a player) and in one, and its size there
+        // in pixels.
+        let mut shown: Vec<(&crate::canvas::shape::Shape, bool, bool, [f32; 2])> = Vec::new();
+        for v in views {
+            let view = v.view;
+            let near = view.expand(view.width().max(view.height()) * 0.25);
+            let (canvas, pan, zoom) = (v.canvas, v.pan, v.zoom);
+            for layer in canvas.layers.iter().filter(|l| l.visible) {
+                for shape in layer.shapes.iter().filter(|s| s.media().is_some()) {
+                    let bb = shape.obb().aabb();
+                    let to_screen = |x: f32, y: f32| egui::pos2(view.min.x + pan[0] + x * zoom, view.min.y + pan[1] + y * zoom);
+                    let half = shape.obb().half;
+                    let on_screen = [half[0] * 2.0 * zoom * ppp, half[1] * 2.0 * zoom * ppp];
+                    let rect = egui::Rect::from_two_pos(to_screen(bb[0], bb[1]), to_screen(bb[2], bb[3]));
+                    shown.push((shape, rect.intersects(near), rect.intersects(view), on_screen));
+                }
+            }
+            for p in v.pins {
+                for m in p.members {
+                    let crate::canvas::hit::ObjRef::Shape(i) = m.obj else { continue };
+                    // A pin shows even when its layer is hidden.
+                    let Some(layer) = p.canvas.layers.get(m.layer) else { continue };
+                    let Some(shape) = layer.shapes.get(i).filter(|s| s.media().is_some()) else { continue };
+                    let o = p.shape_obb(shape);
+                    let [x0, y0, x1, y1] = o.aabb();
+                    let rect = egui::Rect::from_min_max(view.min + egui::vec2(x0, y0), view.min + egui::vec2(x1, y1));
+                    shown.push((shape, rect.intersects(near), rect.intersects(view), [o.half[0] * 2.0 * ppp, o.half[1] * 2.0 * ppp]));
+                }
             }
         }
-        for p in pins {
-            for m in p.members {
-                let crate::canvas::hit::ObjRef::Shape(i) = m.obj else { continue };
-                // A pin shows even when its layer is hidden.
-                let Some(layer) = p.canvas.layers.get(m.layer) else { continue };
-                let Some(shape) = layer.shapes.get(i).filter(|s| s.media().is_some()) else { continue };
-                let o = p.shape_obb(shape);
-                let [x0, y0, x1, y1] = o.aabb();
-                let rect = egui::Rect::from_min_max(view.min + egui::vec2(x0, y0), view.min + egui::vec2(x1, y1));
-                shown.push((shape, rect, [o.half[0] * 2.0 * ppp, o.half[1] * 2.0 * ppp]));
-            }
-        }
-        // An object on its slide and in its pin is one player: merge the
-        // two showings, the bigger size counting.
-        let mut merged: Vec<(&crate::canvas::shape::Shape, egui::Rect, [f32; 2])> = Vec::with_capacity(shown.len());
+        // An object on its slide and in its pin, or in both windows, is
+        // one player: merge the showings, the bigger size counting.
+        let mut merged: Vec<(&crate::canvas::shape::Shape, bool, bool, [f32; 2])> = Vec::with_capacity(shown.len());
         let mut at: HashMap<u64, usize> = HashMap::new();
-        for (shape, rect, size) in shown {
+        for (shape, near, inside, size) in shown {
             let id = shape.media().map_or(0, |m| m.id);
             match at.get(&id) {
                 Some(&k) => {
                     let e = &mut merged[k];
-                    e.1 = e.1.union(rect);
-                    e.2 = [e.2[0].max(size[0]), e.2[1].max(size[1])];
+                    e.1 |= near;
+                    e.2 |= inside;
+                    e.3 = [e.3[0].max(size[0]), e.3[1].max(size[1])];
                 }
                 None => {
                     at.insert(id, merged.len());
-                    merged.push((shape, rect, size));
+                    merged.push((shape, near, inside, size));
                 }
             }
         }
-        for (shape, rect, on_screen) in merged {
+        for (shape, near, inside, on_screen) in merged {
             let Some(m) = shape.media() else { continue };
-            if !rect.intersects(near) {
+            if !near {
                 continue;
             }
             let entry = match self.entries.entry(m.id) {
@@ -315,7 +334,7 @@ impl MediaHub {
             if let Player::Video(v) = &mut entry.player {
                 v.set_on_screen(on_screen);
                 v.set_onion(self.onion);
-                if v.is_dormant() && view.intersects(rect) {
+                if v.is_dormant() && inside {
                     let poster = match shape {
                         crate::canvas::shape::Shape::Raster { px_size, .. } => px_size[0].max(px_size[1]).max(1) as f32,
                         _ => 1.0,

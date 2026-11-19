@@ -159,6 +159,8 @@ impl OnScreenNotesApp {
         }
         let msg = if self.canvases.opening().is_some() {
             "This slide is still opening".to_string()
+        } else if self.canvases.view_locked() {
+            "The slide window is locked — its lock button unlocks it".to_string()
         } else {
             format!("This slide is locked — {} unlocks it", self.lock_key())
         };
