@@ -2,11 +2,12 @@
 //! they say or how they are tagged: text labels by their text, and any
 //! object by its tags (`Canvas::set_tags`) — a group as one when every
 //! member matches. Matches are listed with their slide, in slide
-//! order; `Enter` goes to the next one (`Shift+Enter` the one before),
-//! `↑` / `↓` step through the list and go there, a click goes to that
-//! one, `Esc` closes. Going there is the app's job
-//! (`App::go_to_find_hit`): the slide, the view gliding to the match,
-//! and a flash on it.
+//! order. `↑` / `↓` step through the list and show each match (the first
+//! press shows the highlighted one), as does a click on one; `Enter` goes
+//! to the highlighted match and closes, staying there, as does a click
+//! outside; `Esc` closes and goes back to the slide and view find started
+//! from. Going there is the app's job (`App::go_to_find_hit`): the slide,
+//! the view gliding to the match, and a flash on it.
 //!
 //! A picture pasted (`Ctrl+V`) or dropped while the bar is open, or the
 //! selected picture's "find similar", is looked for instead: the bar
@@ -14,7 +15,15 @@
 //! copies first, each with a thumbnail and how alike it is. Or it lists
 //! every set of copies on the slides ("find every duplicate picture"),
 //! each set with a button that selects all of its copies on one slide
-//! but one, for deleting. Typing goes back to finding words.
+//! but one, for deleting, and each copy with a button that deletes it
+//! where it is, whatever slide that is; the last copy of a set is kept.
+//! Typing goes back to finding words.
+//!
+//! With picture search on, typed words also find the pictures that show
+//! them (`canvas::picture_vectors`), listed after the labels and tags;
+//! and a single `#tag` lists the untagged pictures that look like the
+//! ones tagged so ("probably #tag", `tools::tag_suggest`), each with a
+//! button to tag it and one to turn it down.
 //!
 //! With nothing typed, the bar lists every tag in the app with how many
 //! slides and objects carry it (also from the command palette's "Every
@@ -299,6 +308,8 @@ pub struct PictureHit {
     pub likeness: Likeness,
     /// Its bytes, for the thumbnail.
     png: Arc<Vec<u8>>,
+    /// A picture suggested for a tag: likely, not only maybe.
+    likely: bool,
 }
 
 /// The pictures on `slides` like `q`'s, copies first. `signature` gives
@@ -355,7 +366,123 @@ pub fn picture_hit(c: &Canvas, slide: usize, layer: usize, shape: usize, likenes
     let what = describe(l, &[], &[shape]);
     let found = Found::Tagged { strokes: Vec::new(), shapes: vec![shape], what };
     let hit = Hit { slide, layer, found, snippet: String::new(), marks: Vec::new(), hidden: !l.visible };
-    Some(PictureHit { hit, likeness, png })
+    Some(PictureHit { hit, likeness, png, likely: false })
+}
+
+/// The pictures on `slides` that show typed words whose vector is
+/// `words` (`similar::by_words`); `vector` gives a picture's vector.
+pub fn word_picture_search<'a>(
+    words: &[f32],
+    slides: impl IntoIterator<Item = (usize, &'a Canvas)>,
+    vector: impl Fn(&Arc<Vec<u8>>) -> Option<Arc<[f32]>>,
+) -> Vec<PictureHit> {
+    let slides: Vec<(usize, &Canvas)> = slides.into_iter().collect();
+    let mut places = Vec::new();
+    let mut vectors = Vec::new();
+    for (slide, c) in &slides {
+        for (layer, l) in c.layers.iter().enumerate() {
+            for (shape, s) in l.shapes.iter().enumerate() {
+                let Shape::Raster { png, kind: RasterKind::Image, .. } = s else { continue };
+                if let Some(v) = vector(png) {
+                    places.push((*slide, layer, shape, png, *c));
+                    vectors.push(v);
+                }
+            }
+        }
+    }
+    similar::by_words(words, vectors.iter().enumerate().map(|(i, v)| (i, &v[..])))
+        .into_iter()
+        .filter_map(|(i, score)| {
+            let (slide, layer, shape, png, c) = places[i];
+            let likeness = Likeness { kind: Kind::Alike, score, way: Default::default(), other_crop: false };
+            picture_hit(c, slide, layer, shape, likeness, Arc::clone(png))
+        })
+        .collect()
+}
+
+/// The pictures on the slides as `tools::tag_suggest` sees them for one
+/// tag: those tagged so, those turned down for it, and the rest that may
+/// be suggested (not on a locked slide).
+pub struct TagPool {
+    tagged: Vec<Arc<[f32]>>,
+    turned_down: Vec<Arc<[f32]>>,
+    places: Vec<Candidate>,
+}
+
+/// A picture that may be suggested: slide, layer, shape, bytes, vector.
+type Candidate = (usize, usize, usize, Arc<Vec<u8>>, Arc<[f32]>);
+
+impl TagPool {
+    /// Look through `slides` for `tag`. `locked` says a slide is locked;
+    /// `vector` gives a picture's vector, `rejected` whether it was
+    /// turned down for the tag.
+    pub fn gather<'a>(
+        tag: &str,
+        slides: impl IntoIterator<Item = (usize, &'a Canvas)>,
+        locked: impl Fn(usize) -> bool,
+        vector: impl Fn(&Arc<Vec<u8>>) -> Option<Arc<[f32]>>,
+        rejected: impl Fn(&Arc<Vec<u8>>) -> bool,
+    ) -> TagPool {
+        let mut pool = TagPool { tagged: Vec::new(), turned_down: Vec::new(), places: Vec::new() };
+        for (si, c) in slides {
+            let locked = locked(si);
+            for (li, l) in c.layers.iter().enumerate() {
+                for (shi, s) in l.shapes.iter().enumerate() {
+                    let Shape::Raster { png, kind: RasterKind::Image, .. } = s else { continue };
+                    let Some(v) = vector(png) else { continue };
+                    if s.tags().iter().any(|t| same_tag(t, tag)) {
+                        pool.tagged.push(v);
+                    } else if rejected(png) {
+                        pool.turned_down.push(v);
+                    } else if !locked {
+                        pool.places.push((si, li, shi, Arc::clone(png), v));
+                    }
+                }
+            }
+        }
+        pool
+    }
+
+    /// How many pictures carry the tag, and how many are turned down: the
+    /// suggestions change when either does.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.tagged.len(), self.turned_down.len())
+    }
+
+    /// The suggestions, most likely first. `slides` as given to `gather`.
+    pub fn suggest<'a>(&self, slides: impl IntoIterator<Item = (usize, &'a Canvas)>) -> Vec<PictureHit> {
+        let slides: Vec<(usize, &Canvas)> = slides.into_iter().collect();
+        let t: Vec<&[f32]> = self.tagged.iter().map(|v| &v[..]).collect();
+        let r: Vec<&[f32]> = self.turned_down.iter().map(|v| &v[..]).collect();
+        crate::tools::tag_suggest::suggest(&t, &r, self.places.iter().enumerate().map(|(i, p)| (i, &p.4[..])))
+            .into_iter()
+            .filter_map(|s| {
+                let (si, li, shi, png, _) = &self.places[s.id];
+                let c = slides.iter().find(|(k, _)| k == si)?.1;
+                let likeness = Likeness { kind: Kind::Alike, score: s.close, way: Default::default(), other_crop: false };
+                let mut hit = picture_hit(c, *si, *li, *shi, likeness, Arc::clone(png))?;
+                hit.likely = s.likely;
+                Some(hit)
+            })
+            .collect()
+    }
+}
+
+/// Pictures that show the words typed, or that probably carry the one
+/// `#tag` typed, listed after the label and tag matches while picture
+/// search is on.
+#[derive(Default)]
+struct WordPictures {
+    /// What is typed that they are for.
+    query: String,
+    /// The tag they are suggested for: `None` for typed words.
+    tag: Option<String>,
+    results: Vec<PictureHit>,
+    /// What they were found from (`set_word_pictures`).
+    results_for: Option<(u64, usize)>,
+    /// Said after the count while they are not ready: "Looking at
+    /// pictures…", "Downloading the text model…".
+    note: Option<String>,
 }
 
 /// Every set of copies on the slides, as the bar lists them.
@@ -375,6 +502,14 @@ pub enum Request {
     SelectExtras { slide: usize, layer: usize, shapes: Vec<usize> },
     /// Change a tag everywhere.
     Tag(TagAction),
+    /// Tag the picture at `slide`, `layer`, `shape` with `tag`: a
+    /// suggestion taken.
+    TagPicture { slide: usize, layer: usize, shape: usize, tag: String },
+    /// The picture there is not `tag`: suggest it for it no more.
+    NotThis { slide: usize, layer: usize, shape: usize, tag: String },
+    /// Delete this copy where it is: `png` is its bytes, to make sure it
+    /// is still the picture listed.
+    DeleteCopy { slide: usize, layer: usize, shape: usize, png: Arc<Vec<u8>> },
 }
 
 /// A tag changed everywhere from the tag list.
@@ -437,6 +572,8 @@ pub struct FindBar {
     retired: Vec<TextureHandle>,
     /// Set while listing every set of copies.
     copies: Option<Copies>,
+    /// Pictures that show the typed words.
+    words: WordPictures,
     /// What a click asked of the app, until it takes it.
     request: Option<Request>,
     /// The tag being renamed in the tag list, and the name typed so far.
@@ -447,6 +584,11 @@ pub struct FindBar {
     tag_removing: Option<String>,
     /// The highlighted row.
     cursor: usize,
+    /// Esc closed it (`take_cancelled`).
+    cancelled: bool,
+    /// Go to the highlighted row in the next frame, as an arrow key would:
+    /// the one shown was deleted and another took its place.
+    go_to_cursor: bool,
     /// The highlighted row is the one last gone to, so the next `Enter`
     /// moves on.
     shown: bool,
@@ -460,6 +602,14 @@ pub struct FindBar {
 /// Most rows shown at once, of words and of pictures.
 const ROWS: usize = 8;
 const PICTURE_ROWS: usize = 7;
+/// With pictures that show the typed words: label and tag rows, then
+/// picture rows.
+const WORD_ROWS_WITH_PICTURES: usize = 4;
+const WORD_PICTURE_ROWS: usize = 4;
+/// Room beside a suggested picture's row for its two buttons, and
+/// beside a copy's row for its delete button.
+const SUGGESTION_BUTTONS: f32 = 112.0;
+const DELETE_BUTTON: f32 = 60.0;
 /// Height of a picture's row, and of its thumbnail.
 const PICTURE_ROW: f32 = 40.0;
 const PICTURE_THUMB: f32 = 32.0;
@@ -482,6 +632,7 @@ impl FindBar {
     /// Open it, with the last query selected.
     pub fn open(&mut self) {
         self.open = true;
+        self.cancelled = false;
         self.shown = false;
         self.restart = true;
         self.focus_pending = true;
@@ -508,6 +659,7 @@ impl FindBar {
         if let Some(c) = &mut self.copies {
             *c = Copies::default();
         }
+        self.words = WordPictures::default();
     }
 
     /// Open it with nothing typed, so it lists every tag.
@@ -555,6 +707,57 @@ impl FindBar {
         }
     }
 
+    /// A copy listed was deleted (`Request::DeleteCopy`): take it out of
+    /// its set, and move the copies after it on that layer down one, as
+    /// the layer's shapes did. A set left with one copy goes. The
+    /// highlight stays on the copy it was on; if that was the one deleted,
+    /// it moves to the copy that took its place, and the bar goes there.
+    pub fn forget_copy(&mut self, slide: usize, layer: usize, shape: usize) {
+        let Some(c) = self.copies.as_mut() else { return };
+        let cursor = self.cursor;
+        let mut deleted_lit = false;
+        // Each copy kept, its set, and where it was.
+        let mut kept: Vec<(PictureHit, usize, usize)> = Vec::new();
+        for (set_no, range) in c.sets.iter().enumerate() {
+            for (k, h) in c.results[range.clone()].iter().enumerate() {
+                let was = range.start + k;
+                let mut h = h.clone();
+                if let Found::Tagged { shapes, .. } = &mut h.hit.found {
+                    if h.hit.slide == slide && h.hit.layer == layer {
+                        if shapes.first() == Some(&shape) {
+                            deleted_lit |= was == cursor;
+                            continue;
+                        }
+                        shapes.iter_mut().filter(|s| **s > shape).for_each(|s| *s -= 1);
+                    }
+                }
+                kept.push((h, set_no, was));
+            }
+        }
+        c.results.clear();
+        c.sets.clear();
+        // Where each listed copy was, in the new list's order.
+        let mut was_at: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < kept.len() {
+            let set_no = kept[i].1;
+            let end = kept[i..].iter().position(|k| k.1 != set_no).map_or(kept.len(), |p| i + p);
+            if end - i > 1 {
+                let start = c.results.len();
+                c.results.extend(kept[i..end].iter().map(|k| k.0.clone()));
+                was_at.extend(kept[i..end].iter().map(|k| k.2));
+                c.sets.push(start..c.results.len());
+            }
+            i = end;
+        }
+        // The copy the highlight was on, else the first after it, else
+        // the last.
+        self.cursor = was_at.iter().position(|&w| w >= cursor).unwrap_or(was_at.len().saturating_sub(1));
+        if deleted_lit && !was_at.is_empty() {
+            self.go_to_cursor = true;
+        }
+    }
+
     /// What a click on the bar asked for, once.
     pub fn take_request(&mut self) -> Option<Request> {
         self.request.take()
@@ -597,6 +800,72 @@ impl FindBar {
         self.retire_thumbs();
     }
 
+    /// The words to find pictures of: what is typed, while open and
+    /// finding words (not a picture, not copies, not only `#tags`).
+    pub fn words_query(&self) -> Option<&str> {
+        let q = self.query.trim();
+        let tags_only = q.split_whitespace().all(|w| w.starts_with('#'));
+        (self.open && self.rows().is_none() && !q.is_empty() && !tags_only).then_some(q)
+    }
+
+    /// The tag to suggest pictures for: a single `#tag` typed, while open
+    /// and finding words.
+    pub fn tag_query(&self) -> Option<String> {
+        let q = self.query.trim();
+        let one = q.split_whitespace().count() == 1;
+        let tag = q.strip_prefix('#').filter(|t| one && !t.is_empty() && !t.contains('#'))?;
+        (self.open && self.rows().is_none()).then(|| tag.to_string())
+    }
+
+    /// What the suggestions for `tag` were found from, if they are for it.
+    pub fn tag_suggestions_for(&self, tag: &str) -> Option<(u64, usize)> {
+        (self.words.tag.as_deref() == Some(tag)).then_some(self.words.results_for).flatten()
+    }
+
+    /// The pictures that probably carry `tag`, found from `key`; dropped
+    /// if something else is typed by now.
+    pub fn set_tag_suggestions(&mut self, tag: &str, key: (u64, usize), results: Vec<PictureHit>) {
+        if self.tag_query().as_deref() != Some(tag) {
+            return;
+        }
+        self.words.query = self.query.trim().to_string();
+        self.words.tag = Some(tag.to_string());
+        self.words.results = results;
+        self.words.results_for = Some(key);
+    }
+
+    /// What the pictures for the typed words were found from, if they
+    /// are for `query`.
+    pub fn word_pictures_for(&self, query: &str) -> Option<(u64, usize)> {
+        (self.words.query == query && self.words.tag.is_none()).then_some(self.words.results_for).flatten()
+    }
+
+    /// The pictures that show `query`, found from `key`; dropped if other
+    /// words are typed by now. The highlighted row stays highlighted.
+    pub fn set_word_pictures(&mut self, query: &str, key: (u64, usize), results: Vec<PictureHit>) {
+        if self.query.trim() != query {
+            return;
+        }
+        self.words.query = query.to_string();
+        self.words.tag = None;
+        self.words.results = results;
+        self.words.results_for = Some(key);
+    }
+
+    /// Say `note` after the count (`None` once the pictures are in).
+    pub fn set_words_note(&mut self, note: Option<String>) {
+        self.words.note = note;
+    }
+
+    /// The typed words' pictures, if they are for what is typed.
+    fn word_rows(&self) -> &[PictureHit] {
+        if self.rows().is_none() && self.words.query == self.query.trim() {
+            &self.words.results
+        } else {
+            &[]
+        }
+    }
+
     /// It is open, looking for pictures like one.
     pub fn has_picture(&self) -> bool {
         self.open && self.picture.is_some()
@@ -631,28 +900,25 @@ impl FindBar {
         }
     }
 
-    /// The row a key moves to and goes to, if a key did: `Enter` the next
-    /// (or the highlighted one, not gone to yet), `Shift+Enter` the one
-    /// before, `↑` / `↓` the row above or below. Wraps around at the ends.
-    fn step(&mut self, n: usize, next: bool, prev: bool, up: bool, down: bool) -> Option<usize> {
-        if n == 0 {
+    /// The row an arrow key goes to, if one was pressed: `↓` the row
+    /// below, `↑` (or `Shift+Enter`) the row above — or the highlighted
+    /// row itself while it has not been gone to, so the first press shows
+    /// the first match. Wraps around at the ends.
+    fn step(&mut self, n: usize, up: bool, down: bool) -> Option<usize> {
+        if n == 0 || !(up || down) {
             return None;
         }
         self.cursor = self.cursor.min(n - 1);
-        let to = if next {
-            if self.shown { (self.cursor + 1) % n } else { self.cursor }
-        } else if prev {
-            if self.shown { (self.cursor + n - 1) % n } else { self.cursor }
-        } else if down {
-            (self.cursor + 1) % n
-        } else if up {
-            (self.cursor + n - 1) % n
-        } else {
-            return None;
-        };
-        self.cursor = to;
+        if self.shown {
+            self.cursor = if down { (self.cursor + 1) % n } else { (self.cursor + n - 1) % n };
+        }
         self.shown = true;
-        Some(to)
+        Some(self.cursor)
+    }
+
+    /// Esc closed it: the app goes back to where find started. Once.
+    pub fn take_cancelled(&mut self) -> bool {
+        std::mem::take(&mut self.cancelled)
     }
 
     /// Draw the bar while open; the match to go to, if one was picked.
@@ -690,6 +956,7 @@ impl FindBar {
         };
         let (prev, next, up, down, esc) = if self.tag_renaming.is_some() { Default::default() } else { ctx.input_mut(keys) };
         if esc {
+            self.cancelled = true;
             self.close();
             return None;
         }
@@ -702,8 +969,20 @@ impl FindBar {
         if self.restart {
             restart(self, &hits);
         }
-        let n = self.rows().map_or(hits.len(), <[PictureHit]>::len);
-        let mut picked = self.step(n, next, prev, up, down);
+        let n = self.rows().map_or(hits.len() + self.word_rows().len(), <[PictureHit]>::len);
+        let mut picked = self.step(n, up || prev, down);
+        if std::mem::take(&mut self.go_to_cursor) && picked.is_none() && n > 0 {
+            self.cursor = self.cursor.min(n - 1);
+            self.shown = true;
+            picked = Some(self.cursor);
+        }
+        // Enter: go to the highlighted match and stay there.
+        let confirm = next && n > 0 && picked.is_none();
+        if confirm {
+            self.cursor = self.cursor.min(n - 1);
+            self.shown = true;
+            picked = Some(self.cursor);
+        }
         let mut to_copies = false;
 
         let top = ctx.memory(|m| m.area_rect(egui::Id::new("osn_toolbar"))).map_or(70.0, |r| r.bottom() + 10.0);
@@ -753,6 +1032,8 @@ impl FindBar {
                         hits = search(&self.query);
                         restart(self, &hits);
                         picked = None;
+                        self.words.results.clear();
+                        self.words.results_for = None;
                     }
                     ui.add_space(4.0);
                     let status = if let Some(c) = &self.copies {
@@ -769,7 +1050,7 @@ impl FindBar {
                             format!("{} of {m}", self.cursor + 1)
                         } else {
                             let sets = c.sets.len();
-                            format!("{sets} {} of copies, {m} pictures — Enter goes to each in turn", if sets == 1 { "set" } else { "sets" })
+                            format!("{sets} {} of copies, {m} pictures — arrow keys to look, Enter to stay", if sets == 1 { "set" } else { "sets" })
                         }
                     } else if let Some(p) = &self.picture {
                         let n = p.results.len();
@@ -781,7 +1062,7 @@ impl FindBar {
                         } else if n == 1 {
                             "1 picture like this — Enter goes there".to_string()
                         } else {
-                            format!("{n} pictures like this — Enter goes to each in turn")
+                            format!("{n} pictures like this — arrow keys to look, Enter to stay")
                         };
                         match reading {
                             Some((r, t)) => format!("{s} · reading pictures, {r} of {t}"),
@@ -789,14 +1070,21 @@ impl FindBar {
                         }
                     } else if self.query.trim().is_empty() {
                         "Type a label's words or a tag — or paste or drop a picture to find ones like it".to_string()
-                    } else if hits.is_empty() {
-                        "No label says that, and nothing is tagged so".to_string()
-                    } else if self.shown {
-                        format!("{} of {}", self.cursor + 1, hits.len())
-                    } else if hits.len() == 1 {
-                        "1 found — Enter goes there".to_string()
                     } else {
-                        format!("{} found — Enter goes to each in turn", hits.len())
+                        let total = hits.len() + self.word_rows().len();
+                        let s = if total == 0 {
+                            "No label says that, and nothing is tagged so".to_string()
+                        } else if self.shown {
+                            format!("{} of {total}", self.cursor + 1)
+                        } else if total == 1 {
+                            "1 found — Enter goes there".to_string()
+                        } else {
+                            format!("{total} found — arrow keys to look, Enter to stay")
+                        };
+                        match &self.words.note {
+                            Some(note) => format!("{s} · {note}"),
+                            None => s,
+                        }
                     };
                     let status = match unread {
                         0 => status,
@@ -839,7 +1127,21 @@ impl FindBar {
                             }
                             let texture = thumb(ui.ctx(), &mut self.thumbs, &h.png, &mut budget);
                             let label = format!("Copy {} of {}", k - set.start + 1, set.len());
-                            if picture_row(ui, h, k == self.cursor, texture.as_ref(), &name, Some(&label)) {
+                            let mut go = false;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let w = (ui.available_width() - DELETE_BUTTON).max(120.0);
+                                ui.allocate_ui(Vec2::new(w, PICTURE_ROW), |ui| go = picture_row(ui, h, k == self.cursor, texture.as_ref(), &name, Some(&label)));
+                                let tip = format!("Delete this copy from slide {} — the other copies stay; Ctrl+Z there brings it back", h.hit.slide + 1);
+                                if ui.button("Delete").on_hover_text(tip).clicked() {
+                                    if let Found::Tagged { shapes, .. } = &h.hit.found {
+                                        if let [shape] = shapes[..] {
+                                            self.request = Some(Request::DeleteCopy { slide: h.hit.slide, layer: h.hit.layer, shape, png: Arc::clone(&h.png) });
+                                        }
+                                    }
+                                }
+                            });
+                            if go {
                                 self.cursor = k;
                                 self.shown = true;
                                 picked = Some(k);
@@ -868,8 +1170,11 @@ impl FindBar {
                         }
                         return;
                     }
-                    let first = self.cursor.saturating_sub(ROWS - 1);
-                    for (k, h) in hits.iter().enumerate().skip(first).take(ROWS) {
+                    // With pictures too, each list gets a few rows.
+                    let pictures = self.word_rows().len();
+                    let rows = if pictures > 0 { WORD_ROWS_WITH_PICTURES } else { ROWS };
+                    let first = if self.cursor < hits.len() { self.cursor.saturating_sub(rows - 1) } else { hits.len().saturating_sub(rows) };
+                    for (k, h) in hits.iter().enumerate().skip(first).take(rows) {
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::click());
                         let lit = k == self.cursor;
                         if lit || resp.hovered() {
@@ -889,9 +1194,59 @@ impl FindBar {
                             picked = Some(k);
                         }
                     }
-                    if hits.len() > first + ROWS {
-                        let more = hits.len() - first - ROWS;
+                    if hits.len() > first + rows {
+                        let more = hits.len() - first - rows;
                         ui.label(egui::RichText::new(format!("{more} more below")).small().color(theme::TEXT_MUTED));
+                    }
+                    if pictures > 0 {
+                        ui.add_space(4.0);
+                        let title = match &self.words.tag {
+                            Some(t) => format!("Could be #{t} — not tagged so yet"),
+                            None => "Pictures that show it".to_string(),
+                        };
+                        ui.label(egui::RichText::new(title).small().color(theme::TEXT_MUTED));
+                        let at = self.cursor.checked_sub(hits.len());
+                        let first = at.map_or(0, |a| a.saturating_sub(WORD_PICTURE_ROWS - 1));
+                        let mut budget = THUMBS_PER_FRAME;
+                        let rows_here: Vec<(usize, PictureHit)> = self.word_rows().iter().cloned().enumerate().skip(first).take(WORD_PICTURE_ROWS).collect();
+                        for (k, h) in rows_here {
+                            let texture = thumb(ui.ctx(), &mut self.thumbs, &h.png, &mut budget);
+                            let label = match (&self.words.tag, h.likely) {
+                                (Some(_), true) => format!("Likely · {:.0}%", h.likeness.score * 100.0),
+                                (Some(_), false) => format!("Maybe · {:.0}%", h.likeness.score * 100.0),
+                                (None, _) => format!("{:.0}% match", h.likeness.score * 100.0),
+                            };
+                            let row = hits.len() + k;
+                            let lit = row == self.cursor;
+                            let go = match (self.words.tag.clone(), &h.hit.found) {
+                                (Some(tag), Found::Tagged { shapes, .. }) if shapes.len() == 1 => {
+                                    let (slide, layer, shape) = (h.hit.slide, h.hit.layer, shapes[0]);
+                                    let mut go = false;
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        let w = (ui.available_width() - SUGGESTION_BUTTONS).max(120.0);
+                                        ui.allocate_ui(Vec2::new(w, PICTURE_ROW), |ui| go = picture_row(ui, &h, lit, texture.as_ref(), &name, Some(&label)));
+                                        if ui.button("Tag").on_hover_text(format!("Tag it #{tag}")).clicked() {
+                                            self.request = Some(Request::TagPicture { slide, layer, shape, tag: tag.clone() });
+                                        }
+                                        if ui.button("Not this").on_hover_text(format!("It is not #{tag}: don't suggest it for it again")).clicked() {
+                                            self.request = Some(Request::NotThis { slide, layer, shape, tag: tag.clone() });
+                                        }
+                                    });
+                                    go
+                                }
+                                _ => picture_row(ui, &h, lit, texture.as_ref(), &name, Some(&label)),
+                            };
+                            if go {
+                                self.cursor = row;
+                                self.shown = true;
+                                picked = Some(row);
+                            }
+                        }
+                        if pictures > first + WORD_PICTURE_ROWS {
+                            let more = pictures - first - WORD_PICTURE_ROWS;
+                            ui.label(egui::RichText::new(format!("{more} more below")).small().color(theme::TEXT_MUTED));
+                        }
                     }
                 });
             });
@@ -906,10 +1261,14 @@ impl FindBar {
             self.find_copies();
             return None;
         }
-        match self.rows() {
+        let hit = match self.rows() {
             Some(rows) => picked.and_then(|k| rows.get(k)).map(|h| h.hit.clone()),
-            None => picked.and_then(|k| hits.get(k).cloned()),
+            None => picked.and_then(|k| hits.get(k).cloned().or_else(|| self.word_rows().get(k - hits.len()).map(|h| h.hit.clone()))),
+        };
+        if confirm && hit.is_some() {
+            self.close();
         }
+        hit
     }
 }
 
@@ -1179,6 +1538,118 @@ fn row_text(h: &Hit, width: f32) -> LayoutJob {
 mod tests {
     use super::*;
 
+    /// Real slides and vectors: takes the tag off every 5th picture tagged
+    /// `OSN_TEST_TAG` (in memory only) and counts how many of those the
+    /// suggestions bring back, and where.
+    #[test]
+    #[ignore = "needs a scratch OSN_DATA_DIR with slides and picture-vectors.bin, and OSN_MODEL_DIR"]
+    fn tag_suggestions_on_real_slides() {
+        use crate::persistence::{load_canvas, LoadOutcome, LoadProgress};
+        assert!(std::env::var_os("OSN_DATA_DIR").is_some() && std::env::var_os("OSN_MODEL_DIR").is_some());
+        let tag = std::env::var("OSN_TEST_TAG").unwrap_or_else(|_| "widisuuuu".into());
+        let progress = LoadProgress::default();
+        let mut slides: Vec<Canvas> = (0..400).filter_map(|i| if let LoadOutcome::Loaded(c) = load_canvas(i, 0, &progress) { Some(c) } else { None }).collect();
+        let hide = std::env::var_os("OSN_TEST_NO_HIDE").is_none();
+        let (mut hidden, mut seen) = (Vec::new(), 0);
+        for (si, c) in slides.iter_mut().enumerate() {
+            for (li, l) in c.layers.iter_mut().enumerate() {
+                for (shi, s) in l.shapes.iter_mut().enumerate() {
+                    if matches!(s, Shape::Raster { kind: RasterKind::Image, .. }) && s.tags().iter().any(|t| same_tag(t, &tag)) {
+                        if hide && seen % 5 == 2 {
+                            s.set_tags(&[]);
+                            hidden.push((si, li, shi));
+                        }
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        assert!(!hide || !hidden.is_empty(), "no picture tagged #{tag}");
+        println!("{} slides read, {} hidden", slides.len(), hidden.len());
+        let mut vectors = crate::canvas::picture_vectors::PictureVectors::default();
+        let start = std::time::Instant::now();
+        loop {
+            vectors.tick(slides.iter(), true, false);
+            let (read, total) = vectors.progress();
+            if total > 0 && read >= total {
+                break;
+            }
+            assert!(start.elapsed().as_secs() < 900, "still reading: {}", vectors.status());
+            if start.elapsed().as_millis() % 10_000 < 100 {
+                println!("{} slides, {}", slides.len(), vectors.status());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let all = || slides.iter().enumerate();
+        let pool = TagPool::gather(&tag, all(), |_| false, |png| vectors.vector(png), |_| false);
+        let found = pool.suggest(all());
+        let t: Vec<&[f32]> = pool.tagged.iter().map(|v| &v[..]).collect();
+        let (bar, maybe, median, top) = crate::tools::tag_suggest::explain(&t, pool.places.iter().enumerate().map(|(i, p)| (i, &p.4[..])), 8);
+        let file_of = |si: usize, li: usize, shi: usize| match slides.get(si).and_then(|c| c.layers.get(li)?.shapes.get(shi)) {
+            Some(Shape::Raster { picture: Some(p), .. }) => p.file.clone(),
+            _ => "-".into(),
+        };
+        let top: Vec<String> = top.iter().map(|(i, c)| { let p = &pool.places[*i]; format!("{c:.3}@slide{}:{}", p.0 + 1, file_of(p.0, p.1, p.2)) }).collect();
+        if std::env::var_os("OSN_TEST_NO_HIDE").is_some() {
+            for (si, c) in slides.iter().enumerate() {
+                for (li, l) in c.layers.iter().enumerate() {
+                    for (shi, s) in l.shapes.iter().enumerate() {
+                        if s.tags().iter().any(|t| same_tag(t, &tag)) {
+                            println!("tagged {}", file_of(si, li, shi));
+                        }
+                    }
+                }
+            }
+        }
+        println!("bar {bar:.3}, maybe {maybe:.3}, candidates' median {median:.3}, {} candidates; closest: {}", pool.places.len(), top.join(" "));
+        println!("suggested: {}", found.iter().map(|h| format!("{:.3}{}", h.likeness.score, if h.likely { "" } else { "?" })).collect::<Vec<_>>().join(" "));
+        let ranks: Vec<usize> = found
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| matches!(&h.hit.found, Found::Tagged { shapes, .. } if hidden.contains(&(h.hit.slide, h.hit.layer, shapes[0]))))
+            .map(|(r, _)| r + 1)
+            .collect();
+        println!("#{tag}: {} tagged, {} hidden; {} suggested, {} of them hidden ones, at ranks {ranks:?}", pool.counts().0, hidden.len(), found.len(), ranks.len());
+        assert!(!hide || !ranks.is_empty(), "no hidden picture came back");
+    }
+
+    #[test]
+    fn deleting_a_copy_takes_it_out_and_moves_the_rest_down() {
+        let copy = Likeness { kind: Kind::Duplicate, score: 1.0, way: Default::default(), other_crop: false };
+        let mut c = Canvas::default();
+        c.layers[0].shapes.extend((0..6).map(|i| label([0.0, i as f32 * 10.0], "x")));
+        let hit = |slide: usize, shape: usize| picture_hit(&c, slide, 0, shape, copy, Arc::new(Vec::new())).unwrap();
+        let places = |bar: &FindBar| -> Vec<(usize, usize)> {
+            bar.copies.as_ref().unwrap().results.iter().map(|h| match &h.hit.found {
+                Found::Tagged { shapes, .. } => (h.hit.slide, shapes[0]),
+                _ => unreachable!(),
+            }).collect()
+        };
+        let mut bar = FindBar::default();
+        bar.find_copies();
+        bar.set_copies(vec![vec![hit(1, 1), hit(1, 4), hit(2, 0)], vec![hit(1, 2), hit(3, 5)]], (1, 1));
+        // The highlight is on slide 2's copy (row 2).
+        bar.cursor = 2;
+        // Slide 1's shape 2 goes: its set is down to one and goes too;
+        // slide 1's shape 4 is now shape 3. The highlight stays put.
+        bar.forget_copy(1, 0, 2);
+        assert_eq!(places(&bar), [(1, 1), (1, 3), (2, 0)]);
+        assert_eq!(bar.copies.as_ref().unwrap().sets, [0..3]);
+        assert_eq!(bar.cursor, 2);
+        assert!(!bar.go_to_cursor, "another row went: nothing to go to");
+        // The highlighted copy itself goes: the highlight moves to what
+        // took its place (here the last row), and the bar goes there.
+        bar.cursor = 1;
+        bar.forget_copy(1, 0, 3);
+        assert_eq!(places(&bar), [(1, 1), (2, 0)]);
+        assert_eq!(bar.cursor, 1);
+        assert!(bar.go_to_cursor);
+        bar.go_to_cursor = false;
+        bar.forget_copy(2, 0, 0);
+        assert!(places(&bar).is_empty(), "the last copy is not a set of copies");
+        assert!(!bar.go_to_cursor, "nothing left to go to");
+    }
+
     fn label(at: [f32; 2], text: &str) -> Shape {
         Shape::Text {
             pos: at,
@@ -1353,17 +1824,19 @@ mod tests {
     }
 
     #[test]
-    fn enter_walks_the_matches_and_arrows_move() {
+    fn the_first_arrow_shows_the_highlighted_match_then_arrows_move() {
         let mut bar = FindBar::default();
-        // The highlighted match first, then on, wrapping round.
-        assert_eq!(bar.step(3, true, false, false, false), Some(0));
-        assert_eq!(bar.step(3, true, false, false, false), Some(1));
-        assert_eq!(bar.step(3, true, false, false, false), Some(2));
-        assert_eq!(bar.step(3, true, false, false, false), Some(0));
-        assert_eq!(bar.step(3, false, true, false, false), Some(2), "Shift+Enter goes back");
-        assert_eq!(bar.step(3, false, false, true, false), Some(1));
-        assert_eq!(bar.step(3, false, false, false, true), Some(2));
-        assert_eq!(bar.step(3, false, false, false, false), None);
-        assert_eq!(bar.step(0, true, false, false, false), None);
+        // Down first shows the highlighted match itself, then moves on.
+        assert_eq!(bar.step(3, false, true), Some(0));
+        assert_eq!(bar.step(3, false, true), Some(1));
+        assert_eq!(bar.step(3, false, true), Some(2));
+        assert_eq!(bar.step(3, false, true), Some(0), "wraps round");
+        assert_eq!(bar.step(3, true, false), Some(2));
+        assert_eq!(bar.step(3, false, false), None);
+        assert_eq!(bar.step(0, false, true), None);
+        // Up first shows the highlighted one too.
+        let mut bar = FindBar { cursor: 1, ..Default::default() };
+        assert_eq!(bar.step(3, true, false), Some(1));
+        assert_eq!(bar.step(3, true, false), Some(0));
     }
 }

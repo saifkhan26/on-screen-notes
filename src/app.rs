@@ -229,6 +229,8 @@ pub struct OnScreenNotesApp {
     find: ui::find_bar::FindBar,
     /// The label find just went to, flashing.
     find_flash: Option<find::FindFlash>,
+    /// Where find started, while it is open: Esc goes back there.
+    find_start: Option<find::FindStart>,
     /// The slides' pictures read for finding ones like a picture; read
     /// only once find is given one.
     picture_index: crate::canvas::picture_index::PictureIndex,
@@ -239,6 +241,13 @@ pub struct OnScreenNotesApp {
     find_paste_prev: bool,
     /// A file dropped on find, being read.
     find_reading: Option<similar::FindReading>,
+    /// The pictures that show the words typed in find, being found.
+    word_search: Option<similar::WordSearch>,
+    /// Pictures turned down for a tag; read once picture search needs them.
+    tag_rejections: Option<crate::persistence::tag_rejections::Rejections>,
+    /// The picture (and vectors generation) the tag row's likely tags are
+    /// for.
+    likely_for: Option<((usize, usize, usize), u64)>,
     /// The slides' pictures being gathered into sets of copies for find.
     copies_job: Option<similar::CopiesJob>,
     /// The selection's tags being typed on the arrange bar. Keys go to
@@ -660,10 +669,14 @@ impl OnScreenNotesApp {
             commands: Default::default(),
             find: Default::default(),
             find_flash: None,
+            find_start: None,
             picture_index: Default::default(),
             picture_vectors: Default::default(),
             find_paste_prev: false,
             find_reading: None,
+            word_search: None,
+            tag_rejections: None,
+            likely_for: None,
             copies_job: None,
             tag_edit: None,
             pinned_last_rect: None,
@@ -909,6 +922,7 @@ impl eframe::App for OnScreenNotesApp {
                 let pinned = self.selection_pinned();
                 let grouped = self.selection_grouped();
                 let open_move = std::mem::take(&mut self.move_picker_pending);
+                self.fill_likely_tags();
                 let keys = &self.hotkeys_cfg;
                 let row = picture.map(|_| ui::arrange_bar::ColourRow {
                     shown: self.picture_colours.as_ref().map(|p| p.colours.as_slice()),
@@ -1191,6 +1205,8 @@ impl eframe::App for OnScreenNotesApp {
     /// With glow it would be `(&mut self, Option<&glow::Context>)`. Since we
     /// build with `wgpu` only, the no-arg form is correct.
     fn on_exit(&mut self) {
+        // Picture search's threads stop before ONNX Runtime is unloaded.
+        self.picture_vectors.stop();
         // A pad still open goes into its slide first.
         self.close_pad(false);
         // Shutdown path: block until every dirty canvas is on disk.

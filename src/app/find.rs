@@ -13,6 +13,13 @@ pub(super) struct FindFlash {
     since: Instant,
 }
 
+/// Where find started: the slide shown then, and each slide's view as it
+/// was before find first moved it, so Esc can put everything back.
+pub(super) struct FindStart {
+    slide: usize,
+    views: Vec<(usize, ([f32; 2], f32))>,
+}
+
 /// How long the flash lasts, the part of it spent closing in on the
 /// label, and the part at the end spent fading.
 const FLASH: f32 = 1.6;
@@ -32,10 +39,17 @@ impl OnScreenNotesApp {
         self.poll_find_reading(ctx);
         if !self.find.is_open() {
             self.find_paste_prev = false;
+            self.find_start = None;
             return;
+        }
+        if self.find_start.is_none() {
+            let (slide, c) = (self.canvases.active_index(), self.canvases.active());
+            self.find_start = Some(FindStart { slide, views: vec![(slide, (c.pan, c.zoom))] });
         }
         self.take_find_paste(ctx);
         let reading = self.update_picture_results(ctx).or_else(|| self.update_copies(ctx));
+        self.update_word_pictures(ctx);
+        self.update_tag_suggestions();
         let canvases = &self.canvases;
         let unread = (0..canvases.count()).filter(|&i| canvases.slide(i).is_none()).count();
         let picked = self.find.show(
@@ -50,9 +64,19 @@ impl OnScreenNotesApp {
         if let Some(hit) = picked {
             self.go_to_find_hit(&hit, ctx);
         }
+        if self.find.take_cancelled() {
+            self.back_to_find_start(ctx);
+        }
+        // Closed any other way: stay where it went.
+        if !self.find.is_open() {
+            self.find_start = None;
+        }
         match self.find.take_request() {
             Some(ui::find_bar::Request::SelectExtras { slide, layer, shapes }) => self.select_extras(slide, layer, shapes, ctx),
             Some(ui::find_bar::Request::Tag(a)) => self.apply_tag_action(a),
+            Some(ui::find_bar::Request::TagPicture { slide, layer, shape, tag }) => self.tag_suggested(slide, layer, shape, &tag),
+            Some(ui::find_bar::Request::NotThis { slide, layer, shape, tag }) => self.reject_suggested(slide, layer, shape, &tag),
+            Some(ui::find_bar::Request::DeleteCopy { slide, layer, shape, png }) => self.delete_copy(slide, layer, shape, &png),
             None => {}
         }
     }
@@ -61,6 +85,11 @@ impl OnScreenNotesApp {
     /// it had if the match fits and can be made out there, else at one
     /// where it can — a label read, an object seen. It flashes once there.
     fn go_to_find_hit(&mut self, hit: &Hit, ctx: &egui::Context) {
+        if let (Some(start), Some(c)) = (&mut self.find_start, self.canvases.slide(hit.slide)) {
+            if !start.views.iter().any(|v| v.0 == hit.slide) {
+                start.views.push((hit.slide, (c.pan, c.zoom)));
+            }
+        }
         if hit.slide != self.canvases.active_index() {
             self.canvases.go_to(hit.slide);
         }
@@ -97,6 +126,26 @@ impl OnScreenNotesApp {
         if hit.hidden {
             let msg = format!("That is on layer {}, which is hidden", hit.layer + 1);
             self.toast = Some((msg, Instant::now()));
+        }
+    }
+
+    /// Esc closed find: put back every view it moved and go back to the
+    /// slide it started from, gliding when that is the slide shown.
+    fn back_to_find_start(&mut self, ctx: &egui::Context) {
+        let Some(start) = self.find_start.take() else { return };
+        self.find_flash = None;
+        self.view_glide = None;
+        for &(slide, (pan, zoom)) in &start.views {
+            if slide != start.slide {
+                self.canvases.set_view(slide, pan, zoom);
+            }
+        }
+        let Some(&(_, view)) = start.views.iter().find(|v| v.0 == start.slide) else { return };
+        if start.slide == self.canvases.active_index() {
+            self.glide_view(view, ctx);
+        } else {
+            self.canvases.go_to(start.slide);
+            self.canvases.set_view(start.slide, view.0, view.1);
         }
     }
 

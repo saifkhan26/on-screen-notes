@@ -233,7 +233,12 @@ fn decode_args(tools: &Tools, path: &Path, info: &VideoInfo, start: u64, size: [
 
 /// One frame of the poster for an import: frame 0 at `size`.
 pub fn grab_first_frame(tools: &Tools, path: &Path, info: &VideoInfo, size: [u32; 2]) -> Result<image::RgbaImage> {
-    let mut args = decode_args(tools, path, info, 0, size);
+    grab_frame(tools, path, info, 0, size)
+}
+
+/// Frame `frame` of `info`'s stream at `size`.
+pub fn grab_frame(tools: &Tools, path: &Path, info: &VideoInfo, frame: u64, size: [u32; 2]) -> Result<image::RgbaImage> {
+    let mut args = decode_args(tools, path, info, frame, size);
     // `-frames:v 1` must come before the output name.
     let out_name = args.pop().unwrap_or_default();
     args.extend(["-frames:v".into(), "1".into(), out_name]);

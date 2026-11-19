@@ -10,6 +10,7 @@
 
 mod blobs;
 pub mod paths;
+pub mod tag_rejections;
 pub mod vectors;
 
 use crate::canvas::canvas::Canvas;

@@ -91,6 +91,10 @@ pub struct TagEdit {
     /// Every tag in the app with how many objects carry it, most used
     /// first: what the row suggests. The app fills it in.
     pub known: Vec<(String, usize)>,
+    /// Tags the selected picture probably has, and how closely it fits
+    /// each (`tools::tag_suggest::fits`), most likely first. The app fills
+    /// it in while picture search is on.
+    pub likely: Vec<(String, f32)>,
 }
 
 impl TagEdit {
@@ -101,7 +105,7 @@ impl TagEdit {
         if !text.is_empty() {
             text.push(' ');
         }
-        TagEdit { text, was: current.iter().map(|(t, _)| t.clone()).collect(), focus: true, known: Vec::new() }
+        TagEdit { text, was: current.iter().map(|(t, _)| t.clone()).collect(), focus: true, known: Vec::new(), likely: Vec::new() }
     }
 
     /// Where the tag being typed starts: after the last space or comma.
@@ -356,6 +360,22 @@ fn tag_row(ui: &mut egui::Ui, edit: &mut TagEdit) -> Option<Option<String>> {
         if parse_row(&edit.text).iter().any(|(_, some)| *some) {
             let note = "tag* — stays only on the objects that have it; take the * off to put it on all";
             ui.label(egui::RichText::new(note).small().color(theme::TEXT_MUTED));
+        }
+        let typed = parse_row(&edit.text);
+        let likely: Vec<(String, f32)> =
+            edit.likely.iter().filter(|(t, _)| !typed.iter().any(|(h, _)| crate::canvas::units::same_tag(h, t))).cloned().collect();
+        if !likely.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new("Looks like").small().color(theme::TEXT_MUTED));
+                for (tag, close) in &likely {
+                    let text = egui::RichText::new(format!("#{tag} {:.0}%", close * 100.0)).small().color(crate::ui::media_filter::TAG_COLOUR);
+                    let tip = format!("It looks like the pictures tagged #{tag}. Click to add it");
+                    if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
+                        picked = Some(tag.clone());
+                    }
+                }
+            });
         }
         let offered = edit.suggestions(SUGGESTED);
         if !offered.is_empty() {
@@ -680,7 +700,7 @@ mod tests {
 
     fn edit(text: &str) -> TagEdit {
         let known = [("pose", 9), ("ref", 4), ("portrait", 6), ("prop", 1), ("hands", 2)];
-        TagEdit { text: text.into(), was: Vec::new(), focus: false, known: known.iter().map(|(t, n)| (t.to_string(), *n)).collect() }
+        TagEdit { text: text.into(), was: Vec::new(), focus: false, known: known.iter().map(|(t, n)| (t.to_string(), *n)).collect(), likely: Vec::new() }
     }
 
     #[test]

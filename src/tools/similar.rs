@@ -532,14 +532,24 @@ pub fn search<'a>(
     out
 }
 
-/// Most pictures listed by subject.
+/// Most pictures listed by subject, or for typed words.
 const MOST_BY_SUBJECT: usize = 24;
+const MOST_BY_WORDS: usize = 24;
 /// How far from the typical picture towards the closest one a picture
-/// must be to list by subject. How close "typical" is depends on the
-/// query: measured 2026-11-18 on 7,186 reference pictures, a picture's
-/// median likeness to the rest ran from 0.36 to 0.68 and its closest
-/// from 0.63 to 0.94, so no fixed bar fits every query.
+/// must be to be listed. How close "typical" is depends on the query:
+/// measured 2026-11-18 on 7,186 reference pictures, a picture's median
+/// likeness to the rest ran from 0.36 to 0.68 and its closest from 0.63
+/// to 0.94, so no fixed bar fits every query. Words stand out less
+/// (closest 0.11–0.16 over a median of 0.03–0.09), so their bar is
+/// higher up.
 const SUBJECT_CUT: f32 = 0.5;
+const WORDS_CUT: f32 = 0.6;
+/// Least likeness the closest picture must have for any to be listed for
+/// typed words: below it the model gives the words under 0.1% odds of
+/// showing in it. Real words on 1,639 references reached 0.109 to 0.158;
+/// "the" 0.082, "spreadsheet invoice total" 0.055. (Some nonsense, such
+/// as "zzz", reaches 0.111 and still lists its closest.)
+const WORDS_LEAST: f32 = 0.09;
 /// Likeness at which two listed pictures are the same picture: only the
 /// first is listed.
 const SAME_PICTURE: f32 = 0.985;
@@ -549,17 +559,39 @@ const SAME_PICTURE: f32 = 0.985;
 /// alike first, each with a score from 0 (typical) to 1 (the same). A
 /// picture that is the same as one listed already is left out.
 pub fn by_subject<'v>(query: &[f32], others: impl IntoIterator<Item = (usize, &'v [f32])>) -> Vec<(usize, f32)> {
+    closest(query, others, SUBJECT_CUT, f32::MIN, MOST_BY_SUBJECT, |like, median, _| (like - median) / (1.0 - median).max(1e-6))
+}
+
+/// The pictures among `others` that show typed words whose vector is
+/// `words`, most likely first, each with a score from 0 (typical) to 1
+/// (the closest). A picture the same as one listed already is left out.
+pub fn by_words<'v>(words: &[f32], others: impl IntoIterator<Item = (usize, &'v [f32])>) -> Vec<(usize, f32)> {
+    closest(words, others, WORDS_CUT, WORDS_LEAST, MOST_BY_WORDS, |like, median, top| (like - median) / (top - median).max(1e-6))
+}
+
+/// The `most` of `others` closest to `query`, past `cut` of the way from
+/// the median to the closest, none unless the closest reaches `least`;
+/// `score(likeness, median, closest)` for each.
+fn closest<'v>(
+    query: &[f32],
+    others: impl IntoIterator<Item = (usize, &'v [f32])>,
+    cut: f32,
+    least: f32,
+    most: usize,
+    score: impl Fn(f32, f32, f32) -> f32,
+) -> Vec<(usize, f32)> {
     let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
     let mut all: Vec<(usize, &[f32], f32)> = others.into_iter().map(|(id, v)| (id, v, dot(query, v))).collect();
-    if all.is_empty() {
+    all.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let Some(&(_, _, top)) = all.first() else { return Vec::new() };
+    if top < least {
         return Vec::new();
     }
-    all.sort_by(|a, b| b.2.total_cmp(&a.2));
     let median = all[all.len() / 2].2;
-    let cut = median + SUBJECT_CUT * (all[0].2 - median);
+    let bar = median + cut * (top - median);
     let mut kept: Vec<(usize, &[f32], f32)> = Vec::new();
     for (id, v, like) in all {
-        if like < cut || like <= median || kept.len() == MOST_BY_SUBJECT {
+        if like < bar || like <= median || kept.len() == most {
             break;
         }
         if kept.iter().any(|k| dot(k.1, v) >= SAME_PICTURE) {
@@ -567,13 +599,37 @@ pub fn by_subject<'v>(query: &[f32], others: impl IntoIterator<Item = (usize, &'
         }
         kept.push((id, v, like));
     }
-    kept.into_iter().map(|(id, _, like)| (id, ((like - median) / (1.0 - median).max(1e-6)).clamp(0.0, 1.0))).collect()
+    kept.into_iter().map(|(id, _, like)| (id, score(like, median, top).clamp(0.0, 1.0))).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// A vector of length 1 whose likeness to `toward(0, 0.0)` is `like`,
+    /// the rest of it along its own `axis` (so pictures differ).
+    fn liking(like: f32, axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0; 16];
+        v[0] = like;
+        v[axis] = (1.0 - like * like).sqrt();
+        v
+    }
+
+    #[test]
+    fn by_words_lists_the_pictures_that_stand_out() {
+        let mut w = vec![0.0; 16];
+        w[0] = 1.0;
+        // Typical pictures near 0.05; two stand out.
+        let likes = [0.04, 0.05, 0.05, 0.06, 0.05, 0.15, 0.13, 0.08];
+        let others: Vec<Vec<f32>> = likes.iter().enumerate().map(|(i, &l)| liking(l, i + 1)).collect();
+        let found = by_words(&w, others.iter().enumerate().map(|(i, v)| (i, v.as_slice())));
+        assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), [5, 6]);
+        assert!((found[0].1 - 1.0).abs() < 1e-6 && found[1].1 < 1.0);
+        // Words nothing shows: none, however the rest compare.
+        let weak: Vec<Vec<f32>> = [0.02, 0.08, 0.03].iter().enumerate().map(|(i, &l)| liking(l, i + 1)).collect();
+        assert!(by_words(&w, weak.iter().enumerate().map(|(i, v)| (i, v.as_slice()))).is_empty());
+    }
 
     /// A vector of length 1 pointing mostly along `axis`, `lean` of the
     /// way towards the next one.

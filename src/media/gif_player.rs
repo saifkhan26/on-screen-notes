@@ -112,6 +112,25 @@ fn fit_scale(size: [u32; 2], frames: u32, budget: usize) -> f64 {
     if bytes <= budget as f64 { 1.0 } else { (budget as f64 / bytes).sqrt() }
 }
 
+/// `n` frames spread evenly through the GIF (the middle of each `n`th
+/// of it), composited, at full size.
+pub fn spread_frames(path: &Path, n: usize) -> Result<Vec<image::RgbaImage>> {
+    use image::AnimationDecoder;
+    let total = scan(path)?.frames.max(1) as usize;
+    let picks: Vec<usize> = (0..n).map(|i| (((2 * i + 1) * total) / (2 * n)).min(total - 1)).collect();
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let dec = image::codecs::gif::GifDecoder::new(BufReader::new(file)).context("reading GIF")?;
+    let mut out = Vec::new();
+    for (k, frame) in dec.into_frames().enumerate().take(total) {
+        if picks.contains(&k) {
+            out.push(frame.context("decoding GIF frame")?.into_buffer());
+        } else if k > *picks.last().unwrap_or(&0) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// The first frame, composited, at full size — the poster for an
 /// import.
 pub fn first_frame(path: &Path) -> Result<image::RgbaImage> {

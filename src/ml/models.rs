@@ -2,8 +2,10 @@
 //! on: ONNX Runtime with DirectML (Microsoft's `onnxruntime-directml`
 //! package from PyPI, 25 MB, of which two DLLs are kept), and the vision
 //! model's picture half (Google's SigLIP 2, Apache-2.0, as exported to
-//! ONNX by the `onnx-community` on Hugging Face): half size for the GPU
-//! (189 MB), full size for the CPU (378 MB).
+//! ONNX by the `onnx-community` on Hugging Face) at half size, 189 MB,
+//! which the GPU and the CPU both run. Searching by typed words fetches
+//! the model's text half (565 MB) and its tokenizer (4 MB) the first
+//! time it is used.
 //!
 //! Each comes from a fixed version, and is checked against the size and
 //! SHA-256 it was published with before it is used. Fetching uses the
@@ -38,8 +40,8 @@ pub const RUNTIME: Download = Download {
     what: "the runtime",
 };
 
-/// The model's picture half at half size, for the GPU.
-pub const GPU_MODEL: Download = Download {
+/// The model's picture half, at half size.
+pub const VISION_MODEL: Download = Download {
     file: "siglip2-base-patch32-256-vision-fp16.onnx",
     url: "https://huggingface.co/onnx-community/siglip2-base-patch32-256-ONNX/resolve/7efccb86b5b6601bfe9e14326e1c11b40b68d44c/onnx/vision_model_fp16.onnx",
     size: 189_374_263,
@@ -47,13 +49,22 @@ pub const GPU_MODEL: Download = Download {
     what: "the model",
 };
 
-/// The model's picture half at full size, for the CPU.
-pub const CPU_MODEL: Download = Download {
-    file: "siglip2-base-patch32-256-vision.onnx",
-    url: "https://huggingface.co/onnx-community/siglip2-base-patch32-256-ONNX/resolve/7efccb86b5b6601bfe9e14326e1c11b40b68d44c/onnx/vision_model.onnx",
-    size: 378_478_689,
-    sha256: "0ddb7507cfcb54c2cd503029949add9dc6586de67164bb69c2c09588cdcc9719",
-    what: "the model",
+/// The model's text half, at half size: typed words to a vector.
+pub const TEXT_MODEL: Download = Download {
+    file: "siglip2-base-patch32-256-text-fp16.onnx",
+    url: "https://huggingface.co/onnx-community/siglip2-base-patch32-256-ONNX/resolve/7efccb86b5b6601bfe9e14326e1c11b40b68d44c/onnx/text_model_fp16.onnx",
+    size: 564_862_230,
+    sha256: "3f8149272095410332433ca84f2c99611ed4679429eff43fbf3983ea15664ef3",
+    what: "the text model",
+};
+
+/// The text half's SentencePiece tokenizer (`ml::tokenizer`).
+pub const TOKENIZER: Download = Download {
+    file: "siglip2-tokenizer.model",
+    url: "https://huggingface.co/google/siglip2-base-patch32-256/resolve/94dffa8cb1179de3e03f091dbc3917e5d5a9ae84/tokenizer.model",
+    size: 4_241_003,
+    sha256: "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+    what: "the tokenizer",
 };
 
 /// The libraries kept out of `RUNTIME`.
@@ -217,7 +228,7 @@ mod tests {
 
     #[test]
     fn every_download_is_pinned() {
-        for d in [RUNTIME, GPU_MODEL, CPU_MODEL] {
+        for d in [RUNTIME, VISION_MODEL, TEXT_MODEL, TOKENIZER] {
             assert_eq!(d.sha256.len(), 64, "{}", d.file);
             assert!(d.url.starts_with("https://") && d.size > 0, "{}", d.file);
         }

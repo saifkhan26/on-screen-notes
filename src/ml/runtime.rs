@@ -3,9 +3,10 @@
 //! (DirectML, any DirectX 12 card) or the CPU.
 //!
 //! Measured 2026-11-18 on an RTX 2060 / Ryzen 5 3600X, per picture in
-//! batches: GPU 4–10 ms (the half-size model), CPU 59–66 ms on 4 threads
-//! (the full-size model: the half-size one does not load on the CPU).
-//! Both give the same vectors (cosine ≥ 0.997).
+//! batches, half-size model: GPU 4–10 ms, CPU 50–55 ms on 4 threads. Both
+//! give the vectors a full-size run gives (cosine ≥ 0.997). On the CPU
+//! only ONNX Runtime's basic graph rewrites are used: a later fusion
+//! (`SimplifiedLayerNormFusion`) breaks on half-size models.
 
 use super::prep::{unit, DIM, LEN, SIDE};
 use ort::session::Session;
@@ -111,7 +112,13 @@ impl Engine {
             }
             #[cfg(not(target_os = "windows"))]
             Device::Gpu => return Err("no GPU runtime on this system".into()),
-            Device::Cpu => b = b.with_intra_threads(threads.max(1)).map_err(say)?,
+            Device::Cpu => {
+                b = b
+                    .with_intra_threads(threads.max(1))
+                    .map_err(say)?
+                    .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level1)
+                    .map_err(say)?;
+            }
         }
         let session = b.commit_from_file(model).map_err(say)?;
         let input = session.inputs().first().ok_or("the model takes no input")?.name().to_string();
@@ -140,6 +147,27 @@ impl Engine {
         let (_, v) = out[self.output.as_str()].try_extract_tensor::<f32>().map_err(say)?;
         if v.len() != n * DIM {
             return Err(format!("the model gave {} numbers for {n} pictures", v.len()));
+        }
+        Ok(v.chunks_exact(DIM).map(unit).collect())
+    }
+
+    /// The vectors of texts as token ids (`tokenizer::LEN` each), length
+    /// 1, in the same order: for the text half.
+    pub fn embed_ids(&mut self, texts: &[Vec<i64>]) -> Result<Vec<Vec<f32>>, String> {
+        let n = texts.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let len = super::tokenizer::LEN;
+        let data: Vec<i64> = texts.iter().flat_map(|t| t.iter().copied()).collect();
+        if data.len() != n * len {
+            return Err(format!("token ids must come {len} a text"));
+        }
+        let tensor = Tensor::from_array(([n, len], data)).map_err(say)?;
+        let out = self.session.run(ort::inputs![self.input.as_str() => tensor]).map_err(say)?;
+        let (_, v) = out[self.output.as_str()].try_extract_tensor::<f32>().map_err(say)?;
+        if v.len() != n * DIM {
+            return Err(format!("the text model gave {} numbers for {n} texts", v.len()));
         }
         Ok(v.chunks_exact(DIM).map(unit).collect())
     }

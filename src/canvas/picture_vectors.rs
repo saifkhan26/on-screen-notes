@@ -6,10 +6,16 @@
 //! Off until turned on in the settings: the first time, it fetches the
 //! runtime and the model (`ml::models`, about 215 MB). Then every picture
 //! is read once, in the background: a stored picture from its file in the
-//! media folder (the part its crop shows), any other from the bytes its
-//! slide keeps (a video's or GIF's poster, a small picture whole). Its
+//! media folder (the part its crop shows), a video or GIF from `FRAMES`
+//! frames spread through it and its poster, their vectors averaged — so
+//! it is found by what it mostly shows, not only by how it starts — and
+//! any other from the bytes its slide keeps (a small picture whole). Its
 //! vector is kept in the data folder (`persistence::vectors`), so a
 //! picture is read once ever, not once a run.
+//!
+//! Typed words get a vector too, from the model's text half
+//! (`ml::tokenizer`), fetched the first time words are looked for, so
+//! find can list the pictures that show what was typed.
 //!
 //! Threads: a few read and prepare pictures (`ml::prep`), pausing while
 //! the pen draws; one runs the model (`ml::runtime`), on the GPU when it
@@ -18,10 +24,11 @@
 
 use crate::canvas::board_link::Fnv;
 use crate::canvas::canvas::Canvas;
-use crate::canvas::shape::{PictureRef, RasterKind, Shape};
+use crate::canvas::shape::{MediaKind, MediaRef, PictureRef, RasterKind, Shape};
 use crate::ml::models::{self, Download};
 use crate::ml::prep;
 use crate::ml::runtime::{self, Device, Engine};
+use crate::ml::tokenizer::Tokenizer;
 use crate::persistence::vectors::VectorCache;
 use image::RgbaImage;
 use std::collections::{HashMap, HashSet};
@@ -42,11 +49,17 @@ const IDLE: Duration = Duration::from_secs(60);
 const QUEUE: usize = 32;
 /// The vectors file in the data folder.
 const FILE: &str = "picture-vectors.bin";
+/// Frames read from each video and GIF, spread through it, besides its
+/// poster. Part of its key: another count reads them again.
+const FRAMES: usize = 6;
 
 /// Where a picture is read from.
 enum Source {
     /// Its file in the media folder, the part shown.
     Stored(PictureRef),
+    /// A video or GIF in the media folder, and its poster's bytes (read
+    /// alone if the frames cannot be: no ffmpeg, say).
+    Media { file: String, kind: MediaKind, poster: Arc<Vec<u8>> },
     /// The bytes its slide keeps.
     Bytes(Arc<Vec<u8>>),
 }
@@ -58,14 +71,22 @@ struct Job {
 
 struct Prepped {
     key: Arc<str>,
-    data: Vec<f32>,
+    /// One prepared picture, or a video's or GIF's frames, whose vectors
+    /// are averaged.
+    frames: Vec<Vec<f32>>,
 }
 
-/// A picture find looks for others like, read before anything waiting.
-struct Ask {
-    id: u64,
-    img: RgbaImage,
+/// What find asks for, read before anything waiting.
+enum Ask {
+    /// A picture's vector, to find others like it.
+    Picture { id: u64, img: RgbaImage },
+    /// Typed words' vector, to find pictures that show them.
+    Words { id: u64, text: String },
 }
+
+/// Words are read as each of these, the vectors averaged: a word alone
+/// matches pictures less well than a phrase about a picture.
+const WORD_TEMPLATES: [&str; 3] = ["{}", "a drawing of {}", "an illustration of {}"];
 
 enum Out {
     /// A picture's vector; `None` when it could not be read.
@@ -80,6 +101,22 @@ enum Stage {
     Starting,
     Ready(Device),
     Failed(String),
+}
+
+/// How far getting the text half going is.
+#[derive(Debug, Clone)]
+enum Words {
+    Idle,
+    Fetching(Download),
+    Ready,
+    Failed(String),
+}
+
+/// The text half, in the model thread.
+struct TextSide {
+    tok: Tokenizer,
+    model: PathBuf,
+    engine: Option<Engine>,
 }
 
 enum Slot {
@@ -101,14 +138,30 @@ struct Pipe {
     asks: Sender<Ask>,
     out: Receiver<Out>,
     stage: Arc<Mutex<Stage>>,
+    words: Arc<Mutex<Words>>,
     got: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// Longest the threads are waited for when it stops.
+const STOP_WAIT: Duration = Duration::from_secs(3);
+
 impl Drop for Pipe {
+    /// Stop the threads and wait for them, a while: ONNX Runtime unloaded
+    /// at exit while a thread still holds a session can hang the exit.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + STOP_WAIT;
+        while self.threads.iter().any(|t| !t.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for t in self.threads.drain(..) {
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
     }
 }
 
@@ -136,11 +189,13 @@ fn readers() -> usize {
 }
 
 /// What a picture is known by, here and in the vectors file: a stored
-/// picture by its file and crop, any other by its bytes.
-fn key_of(png: &[u8], picture: Option<&PictureRef>) -> Arc<str> {
-    match picture {
-        Some(p) => format!("file:{}:{:?}", p.file, p.crop).into(),
-        None => format!("bytes:{:016x}:{}", Fnv::of(png), png.len()).into(),
+/// picture by its file and crop, a video or GIF by its file (and how many
+/// frames are read of it), any other by its bytes.
+fn key_of(png: &[u8], picture: Option<&PictureRef>, media: Option<&MediaRef>) -> Arc<str> {
+    match (picture, media) {
+        (Some(p), _) => format!("file:{}:{:?}", p.file, p.crop).into(),
+        (None, Some(m)) => format!("media:{}:{FRAMES}", m.file).into(),
+        (None, None) => format!("bytes:{:016x}:{}", Fnv::of(png), png.len()).into(),
     }
 }
 
@@ -196,12 +251,12 @@ impl PictureVectors {
         let (mut total, mut read) = (0, 0);
         for c in slides {
             for s in c.layers.iter().flat_map(|l| &l.shapes) {
-                let Shape::Raster { png, kind: RasterKind::Image, picture, .. } = s else { continue };
+                let Shape::Raster { png, kind: RasterKind::Image, picture, media, .. } = s else { continue };
                 let addr = Arc::as_ptr(png) as usize;
                 let key = match self.seen.get(&addr) {
                     Some(seen) => Arc::clone(&seen.key),
                     None => {
-                        let key = key_of(png, picture.as_deref());
+                        let key = key_of(png, picture.as_deref(), media.as_deref());
                         self.seen.insert(addr, Seen { png: Arc::downgrade(png), key: Arc::clone(&key) });
                         key
                     }
@@ -214,9 +269,10 @@ impl PictureVectors {
                     Some(Slot::Got(_) | Slot::Unreadable) => read += 1,
                     Some(Slot::Waiting) => {}
                     None => {
-                        let source = match picture.as_deref() {
-                            Some(p) => Source::Stored(p.clone()),
-                            None => Source::Bytes(Arc::clone(png)),
+                        let source = match (picture.as_deref(), media.as_deref()) {
+                            (Some(p), _) => Source::Stored(p.clone()),
+                            (None, Some(m)) => Source::Media { file: m.file.clone(), kind: m.kind, poster: Arc::clone(png) },
+                            (None, None) => Source::Bytes(Arc::clone(png)),
                         };
                         if jobs.send(Job { key: Arc::clone(&key), source }).is_ok() {
                             self.known.insert(key, Slot::Waiting);
@@ -245,6 +301,11 @@ impl PictureVectors {
         self.generation += 1;
     }
 
+    /// Stop the threads, waiting for them a while: before the app exits.
+    pub fn stop(&mut self) {
+        self.pipe = None;
+    }
+
     /// It is on.
     pub fn is_on(&self) -> bool {
         self.pipe.is_some()
@@ -259,15 +320,46 @@ impl PictureVectors {
         }
     }
 
+    /// What the picture these bytes are is known by (`key_of`), once seen.
+    pub fn key(&self, png: &Arc<Vec<u8>>) -> Option<Arc<str>> {
+        self.seen.get(&(Arc::as_ptr(png) as usize)).map(|s| Arc::clone(&s.key))
+    }
+
     /// Ask for `img`'s vector, ahead of everything waiting; see `answer`.
     pub fn ask(&mut self, img: &RgbaImage) -> Option<u64> {
-        let pipe = self.pipe.as_ref()?;
         let img = prep::shrink(img);
+        self.send_ask(|id| Ask::Picture { id, img })
+    }
+
+    /// Ask for the vector of typed `words`; see `answer`. The first time,
+    /// the text half is fetched (`words_status`).
+    pub fn ask_words(&mut self, words: &str) -> Option<u64> {
+        let text = words.trim().to_string();
+        self.send_ask(|id| Ask::Words { id, text })
+    }
+
+    fn send_ask(&mut self, ask: impl FnOnce(u64) -> Ask) -> Option<u64> {
+        let pipe = self.pipe.as_ref()?;
         self.next_ask += 1;
         let id = self.next_ask;
-        pipe.asks.send(Ask { id, img }).ok()?;
+        pipe.asks.send(ask(id)).ok()?;
         self.asked.insert(id);
         Some(id)
+    }
+
+    /// While the text half is fetched, or when it could not start: where
+    /// it is, in a few words, for find.
+    pub fn words_status(&self) -> Option<String> {
+        let p = self.pipe.as_ref()?;
+        let words = lock(&p.words).clone();
+        match words {
+            Words::Fetching(d) => {
+                let got = p.got.load(Ordering::Relaxed).min(d.size);
+                Some(format!("Downloading {} ({} MB) — {}%", d.what, d.size / 1_000_000, got * 100 / d.size.max(1)))
+            }
+            Words::Failed(e) => Some(format!("Couldn't search pictures by words: {e}")),
+            Words::Idle | Words::Ready => None,
+        }
     }
 
     /// The vector asked for as `id`: `None` while it is being read,
@@ -300,6 +392,9 @@ impl PictureVectors {
     /// There is work under way: the app should keep ticking.
     pub fn busy(&self) -> bool {
         let Some(p) = &self.pipe else { return false };
+        if matches!(*lock(&p.words), Words::Fetching(_)) {
+            return true;
+        }
         match &*lock(&p.stage) {
             Stage::Failed(_) => false,
             Stage::Ready(_) => self.read < self.total || !self.asked.is_empty(),
@@ -335,23 +430,27 @@ fn start() -> Pipe {
     let (asks, asks_rx) = mpsc::channel::<Ask>();
     let (out_tx, out) = mpsc::channel::<Out>();
     let stage = Arc::new(Mutex::new(Stage::Starting));
+    let words = Arc::new(Mutex::new(Words::Idle));
     let got = Arc::new(AtomicU64::new(0));
     let paused = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let jobs_rx = Arc::new(Mutex::new(jobs_rx));
     let media = crate::persistence::paths::media_dir().ok();
+    let mut threads = Vec::new();
     for i in 0..readers() {
         let (rx, to_model, out, paused, stop, media) = (Arc::clone(&jobs_rx), to_model.clone(), out_tx.clone(), Arc::clone(&paused), Arc::clone(&stop), media.clone());
-        if let Err(e) = std::thread::Builder::new().name(format!("osn-vectors-read-{i}")).spawn(move || reader(&rx, &to_model, &out, &paused, &stop, media.as_deref())) {
-            log::warn!("could not start a picture reading thread: {e}");
+        match std::thread::Builder::new().name(format!("osn-vectors-read-{i}")).spawn(move || reader(&rx, &to_model, &out, &paused, &stop, media.as_deref())) {
+            Ok(t) => threads.push(t),
+            Err(e) => log::warn!("could not start a picture reading thread: {e}"),
         }
     }
     drop(to_model);
-    let (st, g, sp) = (Arc::clone(&stage), Arc::clone(&got), Arc::clone(&stop));
-    if let Err(e) = std::thread::Builder::new().name("osn-vectors-model".into()).spawn(move || model_thread(&prepped, &asks_rx, &out_tx, &st, &g, &sp)) {
-        *lock(&stage) = Stage::Failed(format!("could not start: {e}"));
+    let state = State { stage: Arc::clone(&stage), words: Arc::clone(&words), got: Arc::clone(&got), stop: Arc::clone(&stop) };
+    match std::thread::Builder::new().name("osn-vectors-model".into()).spawn(move || model_thread(&prepped, &asks_rx, &out_tx, &state)) {
+        Ok(t) => threads.push(t),
+        Err(e) => *lock(&stage) = Stage::Failed(format!("could not start: {e}")),
     }
-    Pipe { jobs, asks, out, stage, got, paused, stop }
+    Pipe { jobs, asks, out, stage, words, got, paused, stop, threads }
 }
 
 fn reader(jobs: &Mutex<Receiver<Job>>, to_model: &SyncSender<Prepped>, out: &Sender<Out>, paused: &AtomicBool, stop: &AtomicBool, media: Option<&Path>) {
@@ -367,10 +466,11 @@ fn reader(jobs: &Mutex<Receiver<Job>>, to_model: &SyncSender<Prepped>, out: &Sen
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&job.source, media))).ok().flatten();
-        let sent = match img {
-            Some(img) => to_model.send(Prepped { key: job.key, data: prep::prep(&img) }).is_ok(),
-            None => out.send(Out::Vector(job.key, None)).is_ok(),
+        let frames = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&job.source, media))).ok().unwrap_or_default();
+        let sent = if frames.is_empty() {
+            out.send(Out::Vector(job.key, None)).is_ok()
+        } else {
+            to_model.send(Prepped { key: job.key, frames: frames.iter().map(prep::prep).collect() }).is_ok()
         };
         if !sent {
             return;
@@ -378,23 +478,67 @@ fn reader(jobs: &Mutex<Receiver<Job>>, to_model: &SyncSender<Prepped>, out: &Sen
     }
 }
 
-/// The picture `source` holds; a stored one's crop shrunk for reading
-/// (`prep::read_side`).
-fn read(source: &Source, media: Option<&Path>) -> Option<RgbaImage> {
+/// The picture `source` holds — a stored one's crop shrunk for reading
+/// (`prep::read_side`) — or a video's or GIF's poster and frames. Empty
+/// when nothing could be read.
+fn read(source: &Source, media: Option<&Path>) -> Vec<RgbaImage> {
+    let picture = |b: &[u8]| image::load_from_memory(b).ok().map(|i| i.to_rgba8());
     match source {
         Source::Stored(p) => {
-            let path = media?.join(&p.file);
-            let img = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?.to_rgba8();
-            let [_, _, w, h] = p.crop.unwrap_or([0, 0, img.width(), img.height()]);
-            Some(p.view(&img, prep::read_side(w, h)))
+            let Some(path) = media.map(|m| m.join(&p.file)) else { return Vec::new() };
+            let img = image::ImageReader::open(path).ok().and_then(|r| r.with_guessed_format().ok()).and_then(|r| r.decode().ok());
+            img.map(|img| {
+                let img = img.to_rgba8();
+                let [_, _, w, h] = p.crop.unwrap_or([0, 0, img.width(), img.height()]);
+                p.view(&img, prep::read_side(w, h))
+            })
+            .into_iter()
+            .collect()
         }
-        Source::Bytes(b) => Some(image::load_from_memory(b).ok()?.to_rgba8()),
+        Source::Media { file, kind, poster } => {
+            let mut frames: Vec<RgbaImage> = picture(poster).into_iter().collect();
+            if let Some(path) = media.map(|m| m.join(file)) {
+                match spread(&path, *kind) {
+                    Ok(more) => frames.extend(more.iter().map(prep::shrink)),
+                    Err(e) => log::info!("picture search reads only the poster of {file}: {e}"),
+                }
+            }
+            frames
+        }
+        Source::Bytes(b) => picture(b).into_iter().collect(),
     }
 }
 
-fn model_thread(prepped: &Receiver<Prepped>, asks: &Receiver<Ask>, out: &Sender<Out>, stage: &Mutex<Stage>, got: &AtomicU64, stop: &AtomicBool) {
-    let set = |s: Stage| *lock(stage) = s;
-    let (model, device, first) = match setup(&set, got, stop) {
+/// `FRAMES` frames spread through the video or GIF at `path`.
+fn spread(path: &Path, kind: MediaKind) -> anyhow::Result<Vec<RgbaImage>> {
+    use crate::media::video_player;
+    match kind {
+        MediaKind::Gif => crate::media::gif_player::spread_frames(path, FRAMES),
+        MediaKind::Video => {
+            let tools = crate::media::ffmpeg::tools().ok_or_else(|| anyhow::anyhow!("no ffmpeg"))?;
+            let info = video_player::probe(&tools, path)?;
+            let total = info.frame_estimate().unwrap_or(1).max(1);
+            // Short side at twice what the model reads, as for pictures.
+            let [w, h] = info.size;
+            let s = ((2 * prep::SIDE) as f64 / f64::from(w.min(h).max(1))).min(1.0);
+            let size = [((f64::from(w) * s).round() as u32).max(2) & !1, ((f64::from(h) * s).round() as u32).max(2) & !1];
+            (0..FRAMES as u64).map(|i| video_player::grab_frame(&tools, path, &info, ((2 * i + 1) * total) / (2 * FRAMES as u64), size)).collect()
+        }
+    }
+}
+
+/// What the model thread shares with the app.
+struct State {
+    stage: Arc<Mutex<Stage>>,
+    words: Arc<Mutex<Words>>,
+    got: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+}
+
+fn model_thread(prepped: &Receiver<Prepped>, asks: &Receiver<Ask>, out: &Sender<Out>, st: &State) {
+    let (got, stop) = (&*st.got, &*st.stop);
+    let set = |s: Stage| *lock(&st.stage) = s;
+    let (dir, model, device, first) = match setup(&set, got, stop) {
         Ok(x) => x,
         Err(e) => {
             if !stop.load(Ordering::Relaxed) {
@@ -408,28 +552,55 @@ fn model_thread(prepped: &Receiver<Prepped>, asks: &Receiver<Ask>, out: &Sender<
     set(Stage::Ready(device));
     let batch = if device == Device::Gpu { BATCH_GPU } else { BATCH_CPU };
     let mut engine = Some(first);
+    let mut text: Option<TextSide> = None;
     let mut last_work = Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
         if let Ok(a) = asks.try_recv() {
-            let v = run(&mut engine, &model, device, &[prep::prep(&a.img)]).ok().and_then(|mut v| v.pop());
+            let (id, v) = match a {
+                Ask::Picture { id, img } => (id, run(&mut engine, &model, device, &[prep::prep(&img)]).ok().and_then(|mut v| v.pop())),
+                Ask::Words { id, text: words } => {
+                    let v = words_vector(&mut text, &dir, device, &words, st);
+                    if let Err(e) = &v {
+                        if !stop.load(Ordering::Relaxed) {
+                            log::warn!("picture search could not read words: {e}");
+                            *lock(&st.words) = Words::Failed(e.clone());
+                        }
+                    }
+                    (id, v.ok())
+                }
+            };
             last_work = Instant::now();
-            if out.send(Out::Answer(a.id, v)).is_err() {
+            if out.send(Out::Answer(id, v)).is_err() {
                 return;
             }
             continue;
         }
         match prepped.recv_timeout(Duration::from_millis(50)) {
             Ok(first) => {
+                // Up to `batch` frames, whole items only.
                 let mut items = vec![first];
-                items.extend(prepped.try_iter().take(batch - 1));
-                let data: Vec<Vec<f32>> = items.iter_mut().map(|p| std::mem::take(&mut p.data)).collect();
+                let mut frames = items[0].frames.len();
+                while frames < batch {
+                    match prepped.try_recv() {
+                        Ok(p) => {
+                            frames += p.frames.len();
+                            items.push(p);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let counts: Vec<usize> = items.iter().map(|p| p.frames.len()).collect();
+                let data: Vec<Vec<f32>> = items.iter_mut().flat_map(|p| std::mem::take(&mut p.frames)).collect();
                 let vectors = run(&mut engine, &model, device, &data);
                 let n = items.len();
                 let sent = match vectors {
-                    Ok(vs) => items.into_iter().zip(vs).all(|(p, v)| out.send(Out::Vector(p.key, Some(v))).is_ok()),
+                    Ok(vs) => {
+                        let mut vs = vs.into_iter();
+                        items.into_iter().zip(counts).all(|(p, k)| out.send(Out::Vector(p.key, Some(mean(vs.by_ref().take(k))))).is_ok())
+                    }
                     Err(e) => {
                         log::warn!("picture search could not read {n} pictures: {e}");
                         items.into_iter().all(|p| out.send(Out::Vector(p.key, None)).is_ok())
@@ -441,14 +612,27 @@ fn model_thread(prepped: &Receiver<Prepped>, asks: &Receiver<Ask>, out: &Sender<
                 last_work = Instant::now();
             }
             Err(RecvTimeoutError::Timeout) => {
-                if engine.is_some() && last_work.elapsed() > IDLE {
+                let text_open = text.as_ref().is_some_and(|t| t.engine.is_some());
+                if (engine.is_some() || text_open) && last_work.elapsed() > IDLE {
                     engine = None;
+                    if let Some(t) = &mut text {
+                        t.engine = None;
+                    }
                     log::info!("picture search let go of the model after a minute idle");
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// The average of vectors, length 1: a video's from its frames'.
+fn mean(vs: impl Iterator<Item = Vec<f32>>) -> Vec<f32> {
+    let mut sum = vec![0.0; prep::DIM];
+    for v in vs {
+        sum.iter_mut().zip(v).for_each(|(s, x)| *s += x);
+    }
+    prep::unit(&sum)
 }
 
 /// Run `pictures` through the model, opening it again if it was let go.
@@ -459,34 +643,65 @@ fn run(engine: &mut Option<Engine>, model: &Path, device: Device, pictures: &[Ve
     engine.as_mut().expect("opened above").embed(pictures)
 }
 
-/// Fetch what is missing, load the runtime and open the model: on the GPU
-/// when it can, else on the CPU.
-fn setup(set: &dyn Fn(Stage), got: &AtomicU64, stop: &AtomicBool) -> Result<(PathBuf, Device, Engine), String> {
-    let dir = models::dir()?;
-    let fetch = |d: &Download| {
-        if !dir.join(d.file).is_file() {
-            set(Stage::Fetching(*d));
+/// The vector of typed `words`: each of `WORD_TEMPLATES`, averaged. The
+/// first time, the text half is fetched and opened.
+fn words_vector(text: &mut Option<TextSide>, dir: &Path, device: Device, words: &str, st: &State) -> Result<Vec<f32>, String> {
+    if text.is_none() {
+        let mut fetched = Vec::new();
+        for d in [models::TOKENIZER, models::TEXT_MODEL] {
+            if !dir.join(d.file).is_file() {
+                *lock(&st.words) = Words::Fetching(d);
+            }
+            fetched.push(models::fetch(&d, dir, &st.got, &st.stop)?);
         }
-        let path = models::fetch(d, &dir, got, stop);
-        set(Stage::Starting);
-        path
-    };
+        let tok = std::fs::read(&fetched[0]).map_err(|e| e.to_string()).and_then(|b| Tokenizer::parse(&b))?;
+        *text = Some(TextSide { tok, model: fetched.pop().expect("two fetched"), engine: None });
+        *lock(&st.words) = Words::Ready;
+    }
+    let t = text.as_mut().expect("set above");
+    if t.engine.is_none() {
+        t.engine = Some(match Engine::open(&t.model, device, readers()) {
+            Ok(e) => e,
+            Err(e) if device == Device::Gpu => {
+                log::warn!("the GPU could not run the text model, using the CPU: {e}");
+                Engine::open(&t.model, Device::Cpu, readers())?
+            }
+            Err(e) => return Err(e),
+        });
+    }
+    let words = words.to_lowercase();
+    let ids: Vec<Vec<i64>> = WORD_TEMPLATES.iter().map(|w| t.tok.model_ids(&w.replace("{}", &words))).collect();
+    let vs = t.engine.as_mut().expect("opened above").embed_ids(&ids)?;
+    let mut sum = vec![0.0; prep::DIM];
+    for v in &vs {
+        sum.iter_mut().zip(v).for_each(|(s, x)| *s += x);
+    }
+    Ok(prep::unit(&sum))
+}
+
+/// Fetch what is missing, load the runtime and open the model: on the GPU
+/// when it can, else on the CPU. The same half-size model runs on both.
+fn setup(set: &dyn Fn(Stage), got: &AtomicU64, stop: &AtomicBool) -> Result<(PathBuf, PathBuf, Device, Engine), String> {
+    let dir = models::dir()?;
     if !models::runtime_present(&dir) {
         set(Stage::Fetching(models::RUNTIME));
         models::fetch_runtime(&dir, got, stop)?;
         set(Stage::Starting);
     }
     runtime::load(&dir)?;
+    if !dir.join(models::VISION_MODEL.file).is_file() {
+        set(Stage::Fetching(models::VISION_MODEL));
+    }
+    let model = models::fetch(&models::VISION_MODEL, &dir, got, stop)?;
+    set(Stage::Starting);
     if runtime::gpu_available() {
-        let model = fetch(&models::GPU_MODEL)?;
         match Engine::open(&model, Device::Gpu, 1) {
-            Ok(e) => return Ok((model, Device::Gpu, e)),
+            Ok(e) => return Ok((dir, model, Device::Gpu, e)),
             Err(e) => log::warn!("the GPU could not run the model, using the CPU: {e}"),
         }
     }
-    let model = fetch(&models::CPU_MODEL)?;
     let e = Engine::open(&model, Device::Cpu, readers())?;
-    Ok((model, Device::Cpu, e))
+    Ok((dir, model, Device::Cpu, e))
 }
 
 #[cfg(test)]
@@ -496,11 +711,11 @@ mod tests {
     #[test]
     fn a_stored_picture_is_known_by_its_file_and_crop_others_by_their_bytes() {
         let p = PictureRef { file: "00ab.png".into(), size: [10, 10], crop: Some([1, 2, 3, 4]), mirror: false };
-        assert_eq!(&*key_of(b"preview", Some(&p)), "file:00ab.png:Some([1, 2, 3, 4])");
+        assert_eq!(&*key_of(b"preview", Some(&p), None), "file:00ab.png:Some([1, 2, 3, 4])");
         let whole = PictureRef { crop: None, ..p.clone() };
-        assert_ne!(key_of(b"x", Some(&whole)), key_of(b"x", Some(&p)), "another crop is another picture");
-        assert_eq!(key_of(b"same", None), key_of(b"same", None));
-        assert_ne!(key_of(b"same", None), key_of(b"other", None));
+        assert_ne!(key_of(b"x", Some(&whole), None), key_of(b"x", Some(&p), None), "another crop is another picture");
+        assert_eq!(key_of(b"same", None, None), key_of(b"same", None, None));
+        assert_ne!(key_of(b"same", None, None), key_of(b"other", None, None));
     }
 
     /// Runs the real model: `OSN_MODEL_DIR` must hold it (or fetch it) and
@@ -553,6 +768,106 @@ mod tests {
         assert!(v.status().starts_with("Ready"), "{}", v.status());
         v.tick([&c], false, false);
         assert!(!v.is_on());
+    }
+
+    /// Runs the text half on the vectors kept in a scratch `OSN_DATA_DIR`
+    /// and prints what typed words find: real words should list pictures,
+    /// nonsense few or none.
+    #[test]
+    #[ignore = "runs the model; needs OSN_MODEL_DIR and a scratch OSN_DATA_DIR with picture-vectors.bin"]
+    fn words_find_pictures() {
+        assert!(std::env::var_os("OSN_DATA_DIR").is_some() && std::env::var_os("OSN_MODEL_DIR").is_some());
+        let c = Canvas::default();
+        let mut v = PictureVectors::default();
+        v.tick([&c], true, false);
+        let kept: Vec<Arc<[f32]>> = v.known.values().filter_map(|s| if let Slot::Got(x) = s { Some(Arc::clone(x)) } else { None }).collect();
+        assert!(!kept.is_empty(), "no vectors kept in OSN_DATA_DIR");
+        let mut nonsense_most = 0;
+        for (words, real) in [
+            ("rough pencil sketch", true),
+            ("legs", true),
+            ("hands", true),
+            ("seen from behind", true),
+            ("red hair", true),
+            ("girl with a sword", true),
+            ("anatomy study", true),
+            ("full body", true),
+            ("lying down", true),
+            ("black and white", true),
+            ("feet", true),
+            ("zzz", false),
+            ("the", false),
+            ("asdf", false),
+            ("purple elephant spaceship", false),
+            ("qwzx vbnm", false),
+            ("spreadsheet invoice total", false),
+        ] {
+            let start = Instant::now();
+            let id = v.ask_words(words).expect("asked");
+            let vector = loop {
+                assert!(start.elapsed() < Duration::from_secs(900), "{}", v.words_status().unwrap_or_default());
+                std::thread::sleep(Duration::from_millis(50));
+                v.tick([&c], true, false);
+                if let Some(a) = v.answer(id) {
+                    break a.expect("words read");
+                }
+            };
+            let likes: Vec<f32> = kept.iter().map(|k| k.iter().zip(vector.iter()).map(|(a, b)| a * b).sum()).collect();
+            let top = likes.iter().cloned().fold(f32::MIN, f32::max);
+            let found = crate::tools::similar::by_words(&vector, kept.iter().enumerate().map(|(i, k)| (i, &k[..])));
+            let odds: Vec<String> = found.iter().take(5).map(|f| format!("{:.3}", f.1)).collect();
+            let mut sorted = likes.clone();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let at = |f: f32| sorted[((sorted.len() - 1) as f32 * f) as usize];
+            println!("{words:28} {:5.0} ms  top {top:.3} 10th {:.3} 1% {:.3} 10% {:.3} median {:.3}  listed {:2}  odds {}", start.elapsed().as_millis(), sorted[9.min(sorted.len() - 1)], at(0.01), at(0.1), at(0.5), found.len(), odds.join(" "));
+            if real {
+                assert!(!found.is_empty(), "{words}: nothing listed");
+            } else {
+                nonsense_most = nonsense_most.max(found.len());
+            }
+        }
+        println!("nonsense listed at most {nonsense_most}");
+    }
+
+    /// Reads the videos and GIFs on a scratch slide by their frames, and
+    /// says how far each one's vector is from its poster's alone.
+    #[test]
+    #[ignore = "runs the model and ffmpeg; needs OSN_MODEL_DIR and a scratch OSN_DATA_DIR with videos"]
+    fn videos_are_read_by_their_frames() {
+        use crate::persistence::{load_canvas, LoadOutcome, LoadProgress};
+        assert!(std::env::var_os("OSN_DATA_DIR").is_some() && std::env::var_os("OSN_MODEL_DIR").is_some());
+        let LoadOutcome::Loaded(c) = load_canvas(0, 0, &LoadProgress::default()) else { panic!("no slide 0") };
+        let mut v = PictureVectors::default();
+        let start = Instant::now();
+        loop {
+            v.tick([&c], true, false);
+            let (read, total) = v.progress();
+            if total > 0 && read >= total {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(600), "{}", v.status());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("{} read in {:.1} s", v.progress().1, start.elapsed().as_secs_f32());
+        let mut media = 0;
+        for s in c.layers.iter().flat_map(|l| &l.shapes) {
+            let Shape::Raster { png, media: Some(m), .. } = s else { continue };
+            media += 1;
+            let whole = v.vector(png).expect("read");
+            let poster = image::load_from_memory(png).unwrap().to_rgba8();
+            let id = v.ask(&poster).unwrap();
+            let alone = loop {
+                v.tick([&c], true, false);
+                if let Some(a) = v.answer(id) {
+                    break a.expect("poster read");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let like: f32 = whole.iter().zip(alone.iter()).map(|(a, b)| a * b).sum();
+            println!("{:?} {}: likeness of frames to poster {like:.3}", m.kind, m.file);
+            assert!(like > 0.3 && like < 0.9999, "frames should add to the poster, not replace or equal it: {like}");
+        }
+        assert!(media > 0, "no videos or GIFs on slide 0");
     }
 
     #[test]

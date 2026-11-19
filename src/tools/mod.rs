@@ -22,6 +22,7 @@ pub mod picture_colours;
 pub mod select_tool;
 pub mod shape_snap;
 pub mod similar;
+pub mod tag_suggest;
 pub mod shape_tool;
 
 use crate::canvas::canvas::Canvas;

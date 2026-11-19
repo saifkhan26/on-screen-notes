@@ -647,6 +647,15 @@ impl CanvasManager {
         (&mut c.pan, &mut c.zoom)
     }
 
+    /// Put slide `idx`'s view at `pan` / `zoom`, as `active_view_mut`
+    /// does for the shown one: not an edit. Nothing for a slide not read.
+    pub fn set_view(&mut self, idx: usize, pan: [f32; 2], zoom: f32) {
+        if let Some(Some(c)) = self.canvases.get_mut(idx) {
+            c.pan = pan;
+            c.zoom = zoom;
+        }
+    }
+
     /// Read-only access to the active canvas (used by renderer +
     /// screenshot); a blank stand-in while it opens.
     pub fn active(&self) -> &Canvas {
@@ -1072,6 +1081,39 @@ impl CanvasManager {
             }
             (out != tags).then_some(out)
         })
+    }
+
+    /// Give the shape at `idx`, `li`, `shape` tag `tag` too, in one undo
+    /// step on its slide. False when its slide is locked or not read, it
+    /// is not there, or it has the tag already.
+    pub fn add_tag(&mut self, idx: usize, li: usize, shape: usize, tag: &str) -> bool {
+        if self.is_locked(idx) {
+            return false;
+        }
+        let Some(c) = self.canvases.get_mut(idx).and_then(|c| c.as_mut()) else { return false };
+        let Some(s) = c.layers.get(li).and_then(|l| l.shapes.get(shape)) else { return false };
+        if s.tags().iter().any(|t| same_tag(t, tag)) {
+            return false;
+        }
+        let mut tags = s.tags().to_vec();
+        tags.push(tag.to_string());
+        c.set_tags_each(li, &[], &[(shape, tags)])
+    }
+
+    /// Delete the shape at `idx`, `li`, `shape` in one undo step on its
+    /// slide, if it is still the picture whose bytes are `png`. False when
+    /// its slide is locked or not read, or it is not there any more.
+    pub fn delete_picture(&mut self, idx: usize, li: usize, shape: usize, png: &std::sync::Arc<Vec<u8>>) -> bool {
+        if self.is_locked(idx) {
+            return false;
+        }
+        let Some(c) = self.canvases.get_mut(idx).and_then(|c| c.as_mut()) else { return false };
+        let still = matches!(c.layers.get(li).and_then(|l| l.shapes.get(shape)), Some(shape::Shape::Raster { png: p, .. }) if std::sync::Arc::ptr_eq(p, png));
+        if !still {
+            return false;
+        }
+        c.delete_objects(li, &[], &[shape]);
+        true
     }
 
     /// Take tag `tag` off every object of every slide read. See `retag`.

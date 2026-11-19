@@ -4,7 +4,9 @@
 //! same pose, the same kind of study — get numbers that point the same
 //! way (`tools::similar::by_subject`).
 //!
-//! * `prep` makes a picture ready for the model.
+//! * `prep` makes a picture ready for the model; `tokenizer` cuts typed
+//!   words into the pieces the model's text half reads, so words can be
+//!   matched with pictures too.
 //! * `runtime` loads ONNX Runtime and runs the model, on the GPU through
 //!   DirectML when it can, else on the CPU.
 //! * `models` fetches the runtime and the model the first time picture
@@ -16,3 +18,6 @@
 pub mod models;
 pub mod prep;
 pub mod runtime;
+pub mod tokenizer;
+#[cfg(test)]
+mod tokenizer_cases;

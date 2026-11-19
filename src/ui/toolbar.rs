@@ -1285,7 +1285,11 @@ fn settings_btn(
                  objects around it, and a line shows each. Hold Alt to move it freely",
             );
             ui.checkbox(picture_search, "Picture search").on_hover_text(
-                "Find's pictures like this one lists pictures of the same subject — the same                  character, pose or kind of study — besides its copies. A vision model                  (SigLIP 2) reads every picture once, in the background, on the GPU or else                  the CPU. The first time it downloads about 215 MB",
+                "Find's pictures like this one lists pictures of the same subject — the same \
+                 character, pose or kind of study — besides its copies, and typed words also \
+                 find the pictures that show them. A vision model (SigLIP 2) reads every \
+                 picture once, in the background, on the GPU or else the CPU. The first time \
+                 it downloads about 215 MB, and 570 MB more the first time words are looked for",
             );
             if *picture_search {
                 ui.label(egui::RichText::new(picture_status).small().color(theme::TEXT_MUTED));

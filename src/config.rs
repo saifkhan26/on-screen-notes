@@ -188,9 +188,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub dim_unselected: bool,
     /// Picture search: find's "pictures like this" lists pictures of the
-    /// same subject, from a vision model run on the GPU or CPU
-    /// (`canvas::picture_vectors`). Off until switched on in the settings,
-    /// as it downloads about 215 MB the first time.
+    /// same subject, and typed words find the pictures that show them,
+    /// from a vision model run on the GPU or CPU (`canvas::picture_vectors`).
+    /// Off until switched on in the settings, as it downloads about 215 MB
+    /// the first time, and 570 MB more the first time words are looked for.
     #[serde(default)]
     pub picture_search: bool,
 
