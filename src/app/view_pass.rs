@@ -292,7 +292,10 @@ impl OnScreenNotesApp {
                 None
             };
             drop(pinned);
+            let window_ui = self.config.slide_window_ui;
+            let in_window = self.canvases.in_view();
             let show_media_bars = self.ws.ui_visible
+                && !(in_window && window_ui.hide_media_bars)
                 && show_selection
                 && !self.recorder.is_recording()
                 && self.ws.tool.in_progress_stroke.is_none()
@@ -397,7 +400,10 @@ impl OnScreenNotesApp {
 
             self.run_keys(ctx, keys, slides, canvas_rect, &media_objs, media_selected);
 
-            self.show_layer_panel(ctx);
+            // The slide window's View menu can leave it out.
+            if !(self.canvases.in_view() && self.config.slide_window_ui.hide_layers) {
+                self.show_layer_panel(ctx);
+            }
         }
 
         // ---- Laser-stroke pruning ----------------------------------------

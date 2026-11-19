@@ -495,7 +495,15 @@ impl OnScreenNotesApp {
                     ui::slide_window::opening(ctx);
                 }
             }
-            let (stays, picked) = ui::slide_window::chrome(ctx, &mut win, &self.canvases, ws.ui_visible, &ws.tool, &mut self.config.palette);
+            let (stays, picked) = ui::slide_window::chrome(
+                ctx,
+                &mut win,
+                &self.canvases,
+                ws.ui_visible,
+                &ws.tool,
+                &mut self.config.palette,
+                &mut self.config.slide_window_ui,
+            );
             open &= stays;
             if picked.is_some() {
                 ws.picked_colour = picked;

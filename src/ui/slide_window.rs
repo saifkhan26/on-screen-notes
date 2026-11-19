@@ -401,12 +401,20 @@ pub fn chrome(
     card_shown: bool,
     tool: &crate::tools::ActiveTool,
     palette: &mut [[u8; 4]],
+    parts: &mut crate::config::SlideWindowUi,
 ) -> (bool, Option<[u8; 4]>) {
     resize_edges(ctx);
-    if !card_shown {
+    if !card_shown || (parts.bar_autohide && !bar_wanted(ctx)) {
         return (true, None);
     }
-    card(ctx, win, manager, tool, palette)
+    card(ctx, win, manager, tool, palette, parts)
+}
+
+/// An auto-hiding bar shows: the pointer is near the window's top (where
+/// the bar was), or one of its menus is open.
+fn bar_wanted(ctx: &egui::Context) -> bool {
+    let reach = bar_bottom(ctx).unwrap_or(56.0) + 24.0;
+    ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y <= reach) || ctx.memory(|m| m.any_popup_open())
 }
 
 /// The bar's area id: the toolbar's, so the arrange bar, find and the
@@ -529,6 +537,7 @@ fn card(
     manager: &CanvasManager,
     tool: &crate::tools::ActiveTool,
     palette: &mut [[u8; 4]],
+    parts: &mut crate::config::SlideWindowUi,
 ) -> (bool, Option<[u8; 4]>) {
     let mut open = true;
     let mut picked = None;
@@ -616,6 +625,7 @@ fn card(
                     if text_btn(ui, "On top", "Keep this window above every other window, not only the overlay", win.on_top) {
                         win.on_top = !win.on_top;
                     }
+                    view_menu(ui, parts);
                     if close_btn(ui) {
                         open = false;
                     }
@@ -623,6 +633,42 @@ fn card(
             });
         });
     (open, picked)
+}
+
+/// The View menu: which parts of its UI the window shows. Kept in the
+/// config, so a window opened later looks the same.
+fn view_menu(ui: &mut egui::Ui, parts: &mut crate::config::SlideWindowUi) {
+    let popup = ui.make_persistent_id("osn_slide_window_view");
+    let open = ui.memory(|m| m.is_popup_open(popup));
+    let eye = egui::Image::new(egui::include_image!("../../assets/icons/eye.svg"));
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
+    let bg = if open {
+        theme::ACCENT
+    } else if response.hovered() {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+    let icon = rect.shrink(rect.width() * 0.22);
+    eye.tint(theme::TEXT_PRIMARY).fit_to_exact_size(icon.size()).paint_at(ui, icon);
+    let response = response.on_hover_text("What this window shows — Tab hides all of it");
+    if response.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup));
+    }
+    egui::popup_below_widget(ui, popup, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+        ui.set_min_width(250.0);
+        ui.label(egui::RichText::new("Show in this window").small().color(theme::TEXT_MUTED));
+        let mut layers = !parts.hide_layers;
+        if ui.checkbox(&mut layers, "Layer panel").changed() {
+            parts.hide_layers = !layers;
+        }
+        let mut media = !parts.hide_media_bars;
+        if ui.checkbox(&mut media, "Video and GIF controls").changed() {
+            parts.hide_media_bars = !media;
+        }
+        ui.checkbox(&mut parts.bar_autohide, "Hide this bar until the pointer nears the top");
+    });
 }
 
 /// Six dots at the card's start; dragging them moves the window.

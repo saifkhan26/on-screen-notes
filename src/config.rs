@@ -187,6 +187,9 @@ pub struct AppConfig {
     /// everything else on the slide fades back. Off until switched on.
     #[serde(default)]
     pub dim_unselected: bool,
+    /// What the slide window leaves out of its UI (its bar's View menu).
+    #[serde(default)]
+    pub slide_window_ui: SlideWindowUi,
     /// Picture search: find's "pictures like this" lists pictures of the
     /// same subject, and typed words find the pictures that show them,
     /// from a vision model run on the GPU or CPU (`canvas::picture_vectors`).
@@ -240,6 +243,19 @@ pub fn default_palette() -> Vec<[u8; 4]> {
     ]
 }
 
+/// The parts of its UI the slide window leaves out, from its bar's View
+/// menu. All shown at first; Tab still hides everything at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlideWindowUi {
+    /// No layer panel.
+    pub hide_layers: bool,
+    /// No play bars on videos and GIFs.
+    pub hide_media_bars: bool,
+    /// The bar shows only while the pointer is near the window's top.
+    pub bar_autohide: bool,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -269,6 +285,7 @@ impl Default for AppConfig {
             shape_snap: true,
             smart_guides: true,
             dim_unselected: false,
+            slide_window_ui: SlideWindowUi::default(),
             picture_search: false,
             pack_mode: PackMode::default(),
             beside_fit: BesideFit::default(),
