@@ -13,7 +13,7 @@ impl OnScreenNotesApp {
         if empty {
             self.delete_slide(idx);
         } else {
-            self.confirm_delete = Some(idx);
+            self.ws.confirm_delete = Some(idx);
         }
     }
 
@@ -25,8 +25,8 @@ impl OnScreenNotesApp {
         }
         let before = self.canvases.count();
         self.canvases.delete_active();
-        self.view_glide = None;
-        self.peek = None;
+        self.ws.view_glide = None;
+        self.ws.peek = None;
         // The slide window follows its slide to its new number, or
         // closes with it.
         if self.canvases.count() < before && self.slide_window.as_mut().is_some_and(|w| !w.slide_removed(idx)) {
@@ -37,9 +37,9 @@ impl OnScreenNotesApp {
     /// "Delete this slide?", while one is waiting on it. Enter (or the
     /// delete key again) deletes, Esc keeps it.
     pub(super) fn show_delete_confirm(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.confirm_delete else { return };
+        let Some(idx) = self.ws.confirm_delete else { return };
         if idx >= self.canvases.count() {
-            self.confirm_delete = None;
+            self.ws.confirm_delete = None;
             return;
         }
         let only = self.canvases.count() == 1;
@@ -105,10 +105,10 @@ impl OnScreenNotesApp {
             });
         match decision {
             Some(true) => {
-                self.confirm_delete = None;
+                self.ws.confirm_delete = None;
                 self.delete_slide(idx);
             }
-            Some(false) => self.confirm_delete = None,
+            Some(false) => self.ws.confirm_delete = None,
             None => {}
         }
     }
@@ -126,24 +126,24 @@ impl OnScreenNotesApp {
             w.renumber(map);
         }
         self.overlay_cache.slides_moved(map);
-        if let Some(g) = self.view_glide.as_mut() {
+        if let Some(g) = self.ws.view_glide.as_mut() {
             g.slide = map(g.slide);
         }
-        if let Some(p) = self.peek.as_mut() {
+        if let Some(p) = self.ws.peek.as_mut() {
             p.slide = map(p.slide);
         }
-        if let Some(p) = self.picture_colours.as_mut() {
+        if let Some(p) = self.ws.picture_colours.as_mut() {
             p.at.0 = map(p.at.0);
         }
-        if let Some(c) = self.confirm_delete.as_mut() {
+        if let Some(c) = self.ws.confirm_delete.as_mut() {
             *c = map(*c);
         }
         // Their undo entries are where they were; only the run's slide
         // number is out of date.
-        self.restyle_run = None;
-        self.nudge_run = None;
+        self.ws.restyle_run = None;
+        self.ws.nudge_run = None;
         // The selection is on the slide still shown, now numbered anew.
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
     /// How the lock key reads, for messages ("Ctrl+R" unless rebound).
@@ -174,13 +174,13 @@ impl OnScreenNotesApp {
         if locked {
             // Nothing half-done carries on into the lock: a stroke or
             // shape being drawn, a move, a layer drag.
-            self.tool.cancel();
-            self.eraser_override.cancel();
-            self.mouse_gesture = false;
-            self.pen_using_eraser = false;
-            self.pin_tool.clear();
-            self.layer_xform = None;
-            self.pan_drag_anchor = None;
+            self.ws.tool.cancel();
+            self.ws.eraser_override.cancel();
+            self.ws.mouse_gesture = false;
+            self.ws.pen_using_eraser = false;
+            self.ws.pin_tool.clear();
+            self.ws.layer_xform = None;
+            self.ws.pan_drag_anchor = None;
         }
         let msg = if locked {
             format!("Slide {} locked — drag to pan, wheel to zoom · {} unlocks", i + 1, self.lock_key())
@@ -209,7 +209,7 @@ impl OnScreenNotesApp {
             None => self.progress_since = None,
         }
         let work = work.filter(|_| self.progress_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(150)));
-        let locked = self.canvases.is_locked(idx) && self.ui_visible;
+        let locked = self.canvases.is_locked(idx) && self.ws.ui_visible;
         // Kept out of screenshots and captures like the rest of the chrome.
         let capturing = self.pending_screenshot.is_some()
             || self.pending_freeze.is_some()
@@ -220,7 +220,7 @@ impl OnScreenNotesApp {
         }
         // Under the toolbar while it shows.
         let toolbar = ctx.memory(|m| m.area_rect(egui::Id::new("osn_toolbar")));
-        let top = toolbar.filter(|_| self.ui_visible).map_or(12.0, |r| r.max.y + 8.0);
+        let top = toolbar.filter(|_| self.ws.ui_visible).map_or(12.0, |r| r.max.y + 8.0);
         let key = self.lock_key();
         let mut unlock = false;
         egui::Area::new(egui::Id::new("osn_slide_status"))

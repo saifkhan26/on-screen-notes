@@ -10,9 +10,9 @@ impl OnScreenNotesApp {
         use crate::tools::arrange::Arrange;
         use interaction::action_keys::KeyAction as K;
         let say = |app: &mut Self, msg: String| app.toast = Some((msg, Instant::now()));
-        let selecting = self.tool.kind == crate::tools::ToolKind::Select
-            && !self.tool.select.sel.is_empty()
-            && self.tool.select.gesture.is_none();
+        let selecting = self.ws.tool.kind == crate::tools::ToolKind::Select
+            && !self.ws.tool.select.sel.is_empty()
+            && self.ws.tool.select.gesture.is_none();
         match action {
             K::Arrange(op) => {
                 if selecting && self.may_edit() {
@@ -49,19 +49,19 @@ impl OnScreenNotesApp {
             }
             K::MoveToSlide => {
                 if selecting {
-                    self.move_picker_pending = true;
+                    self.ws.move_picker_pending = true;
                 }
             }
             K::Colour(i) => {
                 if let Some(&c) = self.config.palette.get(i) {
-                    let (color, size) = (self.tool.color, self.tool.size);
-                    self.tool.color = c;
+                    let (color, size) = (self.ws.tool.color, self.ws.tool.size);
+                    self.ws.tool.color = c;
                     self.restyle_selection(color, size);
                 }
             }
             K::Size(n) => {
-                let (color, size) = (self.tool.color, self.tool.size);
-                interaction::zoom_pan::nudge_size(&mut self.tool, f32::from(n));
+                let (color, size) = (self.ws.tool.color, self.ws.tool.size);
+                interaction::zoom_pan::nudge_size(&mut self.ws.tool, f32::from(n));
                 self.restyle_selection(color, size);
             }
             K::InsertMedia => self.open_media_dialog(),
@@ -73,7 +73,7 @@ impl OnScreenNotesApp {
             K::HighlightTagged => self.media_filter.tagged = !self.media_filter.tagged,
             K::HighlightGone => self.media_filter.gone = !self.media_filter.gone,
             K::ResyncPureRef => {
-                self.commands.close();
+                self.ws.commands.close();
                 self.start_resync(self.canvases.active_index());
             }
             K::SelectHighlighted => {
@@ -118,7 +118,7 @@ impl OnScreenNotesApp {
             K::ToggleSlidePanel => {
                 self.config.slide_panel_open = !self.config.slide_panel_open;
                 if self.config.slide_panel_open {
-                    self.ui_visible = true;
+                    self.ws.ui_visible = true;
                 }
             }
             K::ToggleSlideOrder => {
@@ -162,13 +162,13 @@ impl OnScreenNotesApp {
                 }
             }
             K::PinGoToSlide => {
-                if let Some(id) = self.pin_tool.selected {
+                if let Some(id) = self.ws.pin_tool.selected {
                     let area = self.overlay_cache.canvas_rect(ctx).size();
                     self.open_pin_slide(id, area);
                 }
             }
             K::PinThisSlideOnly => {
-                if let Some(id) = self.pin_tool.selected {
+                if let Some(id) = self.ws.pin_tool.selected {
                     if let Some(local) = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| p.pin.local) {
                         self.set_pin_local(id, !local);
                     }
@@ -193,8 +193,8 @@ impl OnScreenNotesApp {
             }
             K::Tag => {
                 if selecting {
-                    self.ui_visible = true;
-                    self.tag_edit = Some(ui::arrange_bar::TagEdit::new(&self.selection_tags()));
+                    self.ws.ui_visible = true;
+                    self.ws.tag_edit = Some(ui::arrange_bar::TagEdit::new(&self.selection_tags()));
                 }
             }
             K::PictureColours => {
@@ -214,20 +214,20 @@ impl OnScreenNotesApp {
                 }
             }
             K::FindCopies => {
-                self.commands.close();
-                self.find.find_copies();
+                self.ws.commands.close();
+                self.ws.find.find_copies();
             }
             K::TextBox => {
-                self.tool.text_box = !self.tool.text_box;
+                self.ws.tool.text_box = !self.ws.tool.text_box;
                 self.apply_text_box_to_selection();
-                let msg = if self.tool.text_box { "Text in a box: on" } else { "Text in a box: off" };
+                let msg = if self.ws.tool.text_box { "Text in a box: on" } else { "Text in a box: off" };
                 say(self, msg.to_string());
             }
             K::Onion => self.toggle_onion(),
-            K::CommandPalette => self.commands.open(),
+            K::CommandPalette => self.ws.commands.open(),
             K::Find => {
-                self.commands.close();
-                self.find.open();
+                self.ws.commands.close();
+                self.ws.find.open();
             }
             K::Group(on) => {
                 if selecting {
@@ -235,8 +235,8 @@ impl OnScreenNotesApp {
                 }
             }
             K::TagList => {
-                self.commands.close();
-                self.find.open_tags();
+                self.ws.commands.close();
+                self.ws.find.open_tags();
             }
             K::MoveSlide(step) => {
                 let from = self.canvases.active_index();
@@ -261,22 +261,22 @@ impl OnScreenNotesApp {
         match cmd {
             C::Key(k) => self.apply_key_action(k, ctx),
             C::Tool(kind, style) => {
-                self.tool.kind = kind;
+                self.ws.tool.kind = kind;
                 if let Some(s) = style {
-                    self.tool.style = s;
+                    self.ws.tool.style = s;
                 }
             }
-            C::Eyedropper => self.tool.eyedropper_pending = true,
+            C::Eyedropper => self.ws.tool.eyedropper_pending = true,
             // An open pad takes undo and redo for its own strokes.
-            C::Undo | C::Redo if self.pad.is_open() => self.pad_undo(cmd == C::Redo),
+            C::Undo | C::Redo if self.ws.pad.is_open() => self.pad_undo(cmd == C::Redo),
             // While cropping they wait: Esc first.
-            C::Undo | C::Redo if self.crop.is_open() => {}
+            C::Undo | C::Redo if self.ws.crop.is_open() => {}
             C::Undo | C::Redo => {
                 if self.may_edit() {
                     let c = self.canvases.active_mut();
                     if cmd == C::Undo { c.undo() } else { c.redo() }
-                    self.restyle_run = None;
-                    self.nudge_run = None;
+                    self.ws.restyle_run = None;
+                    self.ws.nudge_run = None;
                 }
             }
             C::ClearLayer => {
@@ -292,9 +292,9 @@ impl OnScreenNotesApp {
             C::LockSlide => self.toggle_lock(),
             C::RenameSlide => {
                 let i = self.canvases.active_index();
-                self.slide_panel.start_rename(i, self.canvases.name(i));
+                self.ws.slide_panel.start_rename(i, self.canvases.name(i));
                 self.config.slide_panel_open = true;
-                self.ui_visible = true;
+                self.ws.ui_visible = true;
             }
             C::ResetView => {
                 let (pan, zoom) = self.canvases.active_view_mut();
@@ -306,7 +306,7 @@ impl OnScreenNotesApp {
                     self.queue_freeze(ppp);
                 }
             }
-            C::ToggleUi => self.ui_visible = !self.ui_visible,
+            C::ToggleUi => self.ws.ui_visible = !self.ws.ui_visible,
             C::TogglePins => self.set_pins_hidden(!self.canvases.pins_hidden()),
             C::Duplicate => sel(self, SelAction::Duplicate),
             C::CopyToNewSlide => sel(self, SelAction::CopyToNewSlide),
@@ -316,7 +316,7 @@ impl OnScreenNotesApp {
             C::DeleteSelection => sel(self, SelAction::Delete),
             C::ShapeSnap => {
                 self.config.shape_snap = !self.config.shape_snap;
-                self.tool.shape_snap = self.config.shape_snap;
+                self.ws.tool.shape_snap = self.config.shape_snap;
                 let msg = if self.config.shape_snap { "Shape snap on" } else { "Shape snap off" };
                 self.toast = Some((msg.to_string(), Instant::now()));
             }

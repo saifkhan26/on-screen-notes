@@ -19,16 +19,16 @@ impl OnScreenNotesApp {
         }
         let canvas = self.canvases.active_index();
         let layer = self.canvases.active().active_layer;
-        match self.layer_xform {
+        match self.ws.layer_xform {
             // Wheel-zoomed first, now dragging: same target, so keep
             // accumulating into the gesture already in flight instead
             // of throwing its scale away.
             Some(x) if x.canvas == canvas && x.layer == layer => {}
             Some(_) => {
                 self.commit_layer_xform();
-                self.layer_xform = Some(LayerXform::new(canvas, layer));
+                self.ws.layer_xform = Some(LayerXform::new(canvas, layer));
             }
-            None => self.layer_xform = Some(LayerXform::new(canvas, layer)),
+            None => self.ws.layer_xform = Some(LayerXform::new(canvas, layer)),
         }
     }
 
@@ -37,7 +37,7 @@ impl OnScreenNotesApp {
     /// which gesture is in flight.
     pub(super) fn apply_pan_delta(&mut self, dx: f32, dy: f32) {
         let zoom = self.canvases.active().zoom.max(1e-6);
-        if let Some(x) = self.layer_xform.as_mut() {
+        if let Some(x) = self.ws.layer_xform.as_mut() {
             // A layer delta ends up added to canvas-local geometry, so
             // the view zoom has to come back out of it — otherwise the
             // layer would race ahead of the cursor at zoom > 1. Canvas
@@ -56,12 +56,12 @@ impl OnScreenNotesApp {
     /// before any drag. The accumulated scale is clamped so the preview
     /// can't run away past what `transform_layer` will accept.
     pub(super) fn apply_layer_zoom(&mut self, s: f32, pivot: [f32; 2]) {
-        if self.layer_xform.is_none() {
+        if self.ws.layer_xform.is_none() {
             let canvas = self.canvases.active_index();
             let layer = self.canvases.active().active_layer;
-            self.layer_xform = Some(LayerXform::new(canvas, layer));
+            self.ws.layer_xform = Some(LayerXform::new(canvas, layer));
         }
-        let Some(x) = self.layer_xform.as_mut() else { return };
+        let Some(x) = self.ws.layer_xform.as_mut() else { return };
         // Clamp against the layer's *total* scale, not just this
         // gesture's, so ten gestures of 2× stop at the same ceiling one
         // long gesture would.
@@ -83,7 +83,7 @@ impl OnScreenNotesApp {
     /// layer's geometry. No-op unless a gesture is actually in flight,
     /// so it is safe to call from every gesture-end path.
     pub(super) fn commit_layer_xform(&mut self) {
-        let Some(x) = self.layer_xform.take() else { return };
+        let Some(x) = self.ws.layer_xform.take() else { return };
         // Canvas nav (←/→) is not gated on Space, so the user can walk
         // off the sheet mid-gesture. The preview was showing on a
         // canvas they have since left — drop the transform rather than
@@ -102,7 +102,7 @@ impl OnScreenNotesApp {
     /// The in-flight layer gesture in the form the renderer wants, or
     /// `None` when there is no gesture or it belongs to another canvas.
     pub(super) fn layer_xform_for_render(&self) -> Option<(usize, f32, [f32; 2])> {
-        self.layer_xform
+        self.ws.layer_xform
             .filter(|x| x.canvas == self.canvases.active_index())
             .map(|x| (x.layer, x.scale, x.offset))
     }

@@ -68,7 +68,7 @@ impl OnScreenNotesApp {
         if do_capture {
             if let Some(ps) = self.pending_screenshot.take() {
                 self.do_screenshot(&ps);
-                self.ui_visible = ps.ui_visible_before;
+                self.ws.ui_visible = ps.ui_visible_before;
                 self.config.bg_opacity = ps.bg_opacity_before;
             }
         }
@@ -87,7 +87,7 @@ impl OnScreenNotesApp {
         };
         if let Some((ppp, ui_prev, bg_prev)) = do_freeze {
             self.do_freeze(ppp);
-            self.ui_visible = ui_prev;
+            self.ws.ui_visible = ui_prev;
             self.config.bg_opacity = bg_prev;
             self.pending_freeze = None;
         }
@@ -113,7 +113,7 @@ impl OnScreenNotesApp {
         if do_lasso {
             if let Some(ps) = self.pending_lasso.take() {
                 self.do_lasso_capture(ps.pixels_per_point, ps.pan, ps.zoom, &ps.polygon);
-                self.ui_visible = ps.ui_visible_before;
+                self.ws.ui_visible = ps.ui_visible_before;
                 self.config.bg_opacity = ps.bg_opacity_before;
             }
         }
@@ -179,7 +179,7 @@ impl OnScreenNotesApp {
         // config. A new stroke begun this frame will lock-in the
         // current options at pen-down; an in-progress stroke keeps the
         // snapshot it was started with.
-        self.tool.smoothing = self.config.smoothing;
+        self.ws.tool.smoothing = self.config.smoothing;
         // Push the render-side fan-corner toggle so the ribbon mesh
         // builder can read it lock-free on the hot path.
         crate::canvas::render::set_fan_corners(
@@ -257,11 +257,11 @@ impl OnScreenNotesApp {
             }
         }
         // Esc also closes the layer-preview popup, and lets go of a pin.
-        if self.show_layer_preview && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.show_layer_preview = false;
+        if self.ws.show_layer_preview && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.ws.show_layer_preview = false;
         }
-        if self.pin_tool.selected.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.pin_tool.clear();
+        if self.ws.pin_tool.selected.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.ws.pin_tool.clear();
         }
         if self.pin_picking {
             // Force click-through so the visible click lands on the
@@ -333,7 +333,7 @@ impl OnScreenNotesApp {
             let z_held = ctx.input(|i| i.key_down(egui::Key::Z));
             let z_ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
             // A "z" typed into a slide name is not the loupe.
-            let z_modal = z_held && !z_ctrl && !self.slide_panel.is_renaming();
+            let z_modal = z_held && !z_ctrl && !self.ws.slide_panel.is_renaming();
             if z_modal && self.loupe.is_none() {
                 match ui::loupe::LoupeState::start_live(ctx, self.osn_hwnd) {
                     Ok(l) => self.loupe = Some(l),
@@ -428,7 +428,7 @@ impl OnScreenNotesApp {
             // It looks like the overlay, and follows it live.
             let look = ui::slide_window::Look {
                 background: ui::slide_window::Look::background(self.config.bg_color, self.config.bg_opacity),
-                chrome: self.ui_visible,
+                chrome: self.ws.ui_visible,
                 owner: self.osn_hwnd,
             };
             // Where the canvas is on screen, for a selection dragged out of
@@ -441,9 +441,9 @@ impl OnScreenNotesApp {
                 origin_px: [l as f32 + canvas_min.x * ppp, t as f32 + canvas_min.y * ppp],
                 ppp,
             });
-            let dragging_selection = self.tool.kind == crate::tools::ToolKind::Select
-                && !self.tool.select.sel.is_empty()
-                && matches!(self.tool.select.gesture, Some(crate::tools::select_tool::Gesture::Move { .. }));
+            let dragging_selection = self.ws.tool.kind == crate::tools::ToolKind::Select
+                && !self.ws.tool.select.sel.is_empty()
+                && matches!(self.ws.tool.select.gesture, Some(crate::tools::select_tool::Gesture::Move { .. }));
             let drop_hover = dragging_selection
                 && win.hwnd() != 0
                 && crate::platform::cursor_pos().is_some_and(|(x, y)| crate::platform::top_level_window_at(x, y) == win.hwnd());
@@ -466,7 +466,7 @@ impl OnScreenNotesApp {
                 self.config.smoothing_level.position_passes(),
                 &self.media,
                 &look,
-                &mut self.tool,
+                &mut self.ws.tool,
                 &input,
             );
             if let Some(msg) = win.take_notice() {
@@ -517,7 +517,7 @@ impl OnScreenNotesApp {
     pub(super) fn show_layer_panel(&mut self, ctx: &egui::Context) {
         // ---- Layer panel ---------------------------------------------
         // Hidden when the master UI toggle is off.
-        if self.ui_visible {
+        if self.ws.ui_visible {
             let canvas_idx = self.canvases.active_index();
             // Pass the manager, not `active_mut()`: taking the mutable
             // canvas borrow every frame just to paint would flag it
@@ -534,7 +534,7 @@ impl OnScreenNotesApp {
         // active layer. Toggled by the `canvas.preview_layer`
         // hotkey (`q` by default). Esc closes (handled earlier in
         // this frame).
-        if self.show_layer_preview {
+        if self.ws.show_layer_preview {
             let canvas_idx = self.canvases.active_index();
             let active_li = self.canvases.active().active_layer;
             let layer_clone = self.canvases.active().layers[active_li].clone();

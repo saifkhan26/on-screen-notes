@@ -11,8 +11,8 @@ impl OnScreenNotesApp {
         // A pen gesture in another app's window is swallowed
         // (`pen_blocked`); it needs no frames here, let alone uncapped
         // ones while the user draws elsewhere.
-        (self.pen.is_down() && !self.pen_blocked)
-            || self.tool.in_progress_stroke.is_some()
+        (self.pen.is_down() && !self.ws.pen_blocked)
+            || self.ws.tool.in_progress_stroke.is_some()
             // Drawing in the slide window: its frames are the main
             // window's (an immediate viewport).
             || self.slide_window.as_ref().is_some_and(|w| w.busy())
@@ -28,21 +28,21 @@ impl OnScreenNotesApp {
     /// in flight shows progress.
     pub(super) fn needs_steady_frames(&self, ctx: &egui::Context) -> bool {
         let canvas = self.canvases.active();
-        self.mouse_gesture
+        self.ws.mouse_gesture
             || ctx.input(|i| i.pointer.any_down())
-            || self.tool.select.gesture.is_some()
-            || self.layer_xform.is_some()
-            || self.pan_drag_anchor.is_some()
-            || self.middle_pan_anchor.is_some()
+            || self.ws.tool.select.gesture.is_some()
+            || self.ws.layer_xform.is_some()
+            || self.ws.pan_drag_anchor.is_some()
+            || self.ws.middle_pan_anchor.is_some()
             || self.region_select.is_some()
             || self.loupe.is_some()
             // Polls the mouse button itself while the overlay is
             // click-through, so it gets no input events.
             || self.pin_picking
             || self.pen.seen_within(PEN_NEARBY)
-            || !self.tool.laser_strokes.is_empty()
+            || !self.ws.tool.laser_strokes.is_empty()
             // The lasso's dashes march.
-            || !self.tool.lasso.points().is_empty()
+            || !self.ws.tool.lasso.points().is_empty()
             || !self.pureref_jobs.is_empty()
             || !self.media_imports.is_empty()
             || self.canvases.is_loading()

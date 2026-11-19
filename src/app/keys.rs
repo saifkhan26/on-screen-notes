@@ -93,7 +93,7 @@ impl OnScreenNotesApp {
         // dispatcher so typing "t" / "Ctrl+Z" lands in the label,
         // not as a tool change or an undo.
         // A slide name being typed owns the keys the same way.
-        let text_consumed = slides.typing || interaction::route_text_input(ctx, &mut self.tool, &mut self.canvases);
+        let text_consumed = slides.typing || interaction::route_text_input(ctx, &mut self.ws.tool, &mut self.canvases);
 
         // Select-tool commands found in this frame's events. They
         // are only collected inside the input closure and run after
@@ -116,9 +116,9 @@ impl OnScreenNotesApp {
         // With objects selected a nudge key moves them and does
         // nothing else, even when it is a slide or layer key too (the
         // arrows are, by default).
-        let nudge_live = self.tool.kind == crate::tools::ToolKind::Select
-            && !self.tool.select.sel.is_empty()
-            && self.tool.select.gesture.is_none();
+        let nudge_live = self.ws.tool.kind == crate::tools::ToolKind::Select
+            && !self.ws.tool.select.sel.is_empty()
+            && self.ws.tool.select.gesture.is_none();
         // Likewise a hop key selects the next object and does nothing
         // else, even when it is a slide or layer key too (the arrows are,
         // by default) or a tool or media key; and inside a group the step-out key goes
@@ -126,10 +126,10 @@ impl OnScreenNotesApp {
         // drop the selection). Enter closes a lasso polygon, not this.
         let step_out_live = nudge_live && {
             let c = self.canvases.active();
-            c.layers.get(c.active_layer).is_some_and(|l| crate::tools::hop::inside_group(l, &self.tool.select.sel).is_some())
+            c.layers.get(c.active_layer).is_some_and(|l| crate::tools::hop::inside_group(l, &self.ws.tool.select.sel).is_some())
         };
-        let step_in_live = self.tool.select.gesture.is_none()
-            && !matches!(self.tool.kind, crate::tools::ToolKind::LassoErase | crate::tools::ToolKind::LassoSelect);
+        let step_in_live = self.ws.tool.select.gesture.is_none()
+            && !matches!(self.ws.tool.kind, crate::tools::ToolKind::LassoErase | crate::tools::ToolKind::LassoSelect);
         // An edit key on a slide that takes no edits, to say why
         // nothing happened.
         let mut refused = false;
@@ -142,7 +142,7 @@ impl OnScreenNotesApp {
             let shift = mods.shift;
             // "Delete this slide?", the command palette, the find bar
             // and the tag row take the keys while they are up.
-            if text_consumed || self.confirm_delete.is_some() || self.commands.is_open() || self.find.is_open() || self.tag_edit.is_some() {
+            if text_consumed || self.ws.confirm_delete.is_some() || self.ws.commands.is_open() || self.ws.find.is_open() || self.ws.tag_edit.is_some() {
                 // Still allow scroll-wheel events (handled below
                 // outside this for-loop) but drop key events.
                 // Falling through to the wheel block below means
@@ -219,7 +219,7 @@ impl OnScreenNotesApp {
                 }
                 if let egui::Event::Key { key, pressed: true, .. } = ev {
                     // Tool switch shortcuts.
-                    interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
+                    interaction::react_tool_shortcut(*key, mods, &mut self.ws.tool, keys);
                     let collected = key_actions.len();
                     interaction::action_keys::collect(*key, mods, keys, &mut key_actions);
                     let nudged = nudge_live
@@ -231,7 +231,7 @@ impl OnScreenNotesApp {
                     // the one before may have gone to another slide.
                     let editable = self.canvases.active_editable();
                     if editable {
-                        self.canvases.edit_active(|c| interaction::react_lasso_keys(*key, mods, &mut self.tool, c));
+                        self.canvases.edit_active(|c| interaction::react_lasso_keys(*key, mods, &mut self.ws.tool, c));
                     }
                     // Canvas + layer navigation. A slide's active layer is
                     // part of it, so it stays put on a locked slide.
@@ -244,7 +244,7 @@ impl OnScreenNotesApp {
                     // Toggle floating UI chrome.
                     if let Some(b) = keys.canvas.toggle_ui {
                         if b.matches(*key, mods) {
-                            self.ui_visible = !self.ui_visible;
+                            self.ws.ui_visible = !self.ws.ui_visible;
                         }
                     }
                     if keys.canvas.toggle_pins.is_some_and(|b| b.matches(*key, mods)) {
@@ -277,15 +277,15 @@ impl OnScreenNotesApp {
                             self.canvases.active_mut().undo();
                             // The entry a size-slider run or a run of
                             // nudges was being folded into may be gone now.
-                            self.restyle_run = None;
-                            self.nudge_run = None;
+                            self.ws.restyle_run = None;
+                            self.ws.nudge_run = None;
                         }
                     }
                     if let Some(b) = keys.canvas.redo {
                         if b.matches(*key, mods) {
                             self.canvases.active_mut().redo();
-                            self.restyle_run = None;
-                            self.nudge_run = None;
+                            self.ws.restyle_run = None;
+                            self.ws.nudge_run = None;
                         }
                     }
                     if let Some(b) = keys.canvas.clear_layer {
@@ -326,7 +326,7 @@ impl OnScreenNotesApp {
                     }
                     if let Some(b) = keys.canvas.preview_layer {
                         if b.matches(*key, mods) {
-                            self.show_layer_preview = !self.show_layer_preview;
+                            self.ws.show_layer_preview = !self.ws.show_layer_preview;
                         }
                     }
                     // Same as the layer panel's eye. Said in a toast
@@ -418,7 +418,7 @@ impl OnScreenNotesApp {
                         ctrl,
                         shift,
                         space_held,
-                        &mut self.tool,
+                        &mut self.ws.tool,
                         &mut self.canvases,
                         &mut self.config.bg_opacity,
                     );
@@ -439,10 +439,10 @@ impl OnScreenNotesApp {
         let chord = crate::platform::paste_chord_down() && ctx.input(|i| i.focused);
         // Not into a text field (find, the tag row, …): Ctrl+V pastes
         // text there.
-        if chord && !self.paste_chord_prev && !text_consumed && !ctx.wants_keyboard_input() {
+        if chord && !self.ws.paste_chord_prev && !text_consumed && !ctx.wants_keyboard_input() {
             sel_actions.push(SelAction::PasteImage);
         }
-        self.paste_chord_prev = chord;
+        self.ws.paste_chord_prev = chord;
         if !sel_actions.is_empty() {
             let ppp = ctx.pixels_per_point();
             for action in sel_actions {
@@ -496,9 +496,9 @@ impl OnScreenNotesApp {
         if rename_slide {
             // The name field lives in the panel, so bring it up.
             let i = self.canvases.active_index();
-            self.slide_panel.start_rename(i, self.canvases.name(i));
+            self.ws.slide_panel.start_rename(i, self.canvases.name(i));
             self.config.slide_panel_open = true;
-            self.ui_visible = true;
+            self.ws.ui_visible = true;
         }
         if !media_keys.is_empty() {
             let pointer = ctx.input(|i| i.pointer.hover_pos());

@@ -53,11 +53,11 @@ impl OnScreenNotesApp {
     /// Find pictures like the selected picture, else like the picture on
     /// the clipboard; with neither, open find and say how to give one.
     pub(super) fn find_similar(&mut self) {
-        self.commands.close();
+        self.ws.commands.close();
         if let Some(at) = self.selected_picture() {
             self.find_like_shape(at);
         } else if !self.find_like_clipboard() {
-            self.find.open();
+            self.ws.find.open();
             self.toast = Some(("Select, paste or drop a picture to find ones like it".to_string(), Instant::now()));
         }
     }
@@ -70,7 +70,7 @@ impl OnScreenNotesApp {
         let origin = Origin { at: Some(at), file: picture.as_deref().cloned() };
         let query = image::load_from_memory(png).ok().and_then(|img| PictureQuery::new(&img.to_rgba8(), "the selected picture", origin));
         match query {
-            Some(q) => self.find.find_picture(q),
+            Some(q) => self.ws.find.find_picture(q),
             None => self.toast = Some(("Couldn't read this picture".to_string(), Instant::now())),
         }
     }
@@ -81,7 +81,7 @@ impl OnScreenNotesApp {
         let Some(rgba) = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned()) else { return false };
         match PictureQuery::new(&rgba, "the pasted picture", Origin::default()) {
             Some(q) => {
-                self.find.find_picture(q);
+                self.ws.find.find_picture(q);
                 true
             }
             None => false,
@@ -94,8 +94,8 @@ impl OnScreenNotesApp {
     /// the chord itself is watched, as `run_keys` does.
     pub(super) fn take_find_paste(&mut self, ctx: &egui::Context) {
         let chord = crate::platform::paste_chord_down() && ctx.input(|i| i.focused);
-        let pressed = chord && !self.find_paste_prev;
-        self.find_paste_prev = chord;
+        let pressed = chord && !self.ws.find_paste_prev;
+        self.ws.find_paste_prev = chord;
         // Elsewhere the paste event is the only cue.
         let event = !cfg!(target_os = "windows") && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
         if (pressed || event) && self.find_like_clipboard() {
@@ -116,24 +116,24 @@ impl OnScreenNotesApp {
             let _ = tx.send(image::open(&path).ok().map(|i| i.to_rgba8()));
         });
         match spawned {
-            Ok(_) => self.find_reading = Some(FindReading { name, rx }),
+            Ok(_) => self.ws.find_reading = Some(FindReading { name, rx }),
             Err(e) => log::warn!("could not read {name} for find: {e}"),
         }
     }
 
     /// Take in a dropped file once read.
     pub(super) fn poll_find_reading(&mut self, ctx: &egui::Context) {
-        let Some(r) = &self.find_reading else { return };
+        let Some(r) = &self.ws.find_reading else { return };
         match r.rx.try_recv() {
             Ok(img) => {
                 let name = r.name.clone();
-                self.find_reading = None;
+                self.ws.find_reading = None;
                 match img.and_then(|img| PictureQuery::new(&img, &name, Origin::default())) {
-                    Some(q) => self.find.find_picture(q),
+                    Some(q) => self.ws.find.find_picture(q),
                     None => self.toast = Some((format!("Couldn't read {name}"), Instant::now())),
                 }
             }
-            Err(TryRecvError::Disconnected) => self.find_reading = None,
+            Err(TryRecvError::Disconnected) => self.ws.find_reading = None,
             Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(30)),
         }
     }
@@ -142,14 +142,14 @@ impl OnScreenNotesApp {
     /// slide's first) and bring the matches up to date. Returns how many
     /// are read, of how many.
     pub(super) fn update_picture_results(&mut self, ctx: &egui::Context) -> Option<(usize, usize)> {
-        if !self.find.has_picture() {
+        if !self.ws.find.has_picture() {
             return None;
         }
         let canvases = &self.canvases;
         let active = canvases.active_index();
         let order = std::iter::once(active).chain((0..canvases.count()).filter(|&i| i != active));
         let slides: Vec<&crate::canvas::canvas::Canvas> = order.filter_map(|i| canvases.slide(i)).collect();
-        self.picture_index.tick(slides.iter().copied(), !self.find.has_picture_results());
+        self.picture_index.tick(slides.iter().copied(), !self.ws.find.has_picture_results());
         let read_slides = slides.len();
         let has_vector = self.query_vector();
         let canvases = &self.canvases;
@@ -157,7 +157,7 @@ impl OnScreenNotesApp {
         // Fresh results when a signature or vector comes in, or the
         // query's own vector does.
         let key = (index.generation() ^ vectors.generation().rotate_left(32) ^ (u64::from(has_vector) << 63), read_slides);
-        self.find.update_pictures(key, |q| {
+        self.ws.find.update_pictures(key, |q| {
             ui::find_bar::picture_search(q, (0..canvases.count()).filter_map(|i| canvases.slide(i).map(|c| (i, c))), |png| index.get(png), |png| vectors.vector(png))
         });
         let (read, total) = index.progress();
@@ -173,7 +173,7 @@ impl OnScreenNotesApp {
     /// picture's own if it is on a slide and read, else read now, ahead
     /// of the pictures waiting. Whether it is known.
     fn query_vector(&mut self) -> bool {
-        let Some(q) = self.find.picture_mut() else { return false };
+        let Some(q) = self.ws.find.picture_mut() else { return false };
         if q.has_vector() {
             return true;
         }
@@ -207,19 +207,19 @@ impl OnScreenNotesApp {
     /// words' vector once typing pauses, and list the pictures that show
     /// them after the label and tag matches.
     pub(super) fn update_word_pictures(&mut self, ctx: &egui::Context) {
-        let words = match self.find.words_query() {
+        let words = match self.ws.find.words_query() {
             Some(w) if self.picture_vectors.is_on() => w.to_string(),
             _ => {
-                self.word_search = None;
-                self.find.set_words_note(None);
+                self.ws.word_search = None;
+                self.ws.find.set_words_note(None);
                 return;
             }
         };
-        if self.word_search.as_ref().is_none_or(|w| w.words != words) {
-            self.word_search = Some(WordSearch { words: words.clone(), since: Instant::now(), asked: None, vector: None, failed: false });
+        if self.ws.word_search.as_ref().is_none_or(|w| w.words != words) {
+            self.ws.word_search = Some(WordSearch { words: words.clone(), since: Instant::now(), asked: None, vector: None, failed: false });
         }
         let vectors = &mut self.picture_vectors;
-        let w = self.word_search.as_mut().expect("set above");
+        let w = self.ws.word_search.as_mut().expect("set above");
         if w.vector.is_none() && !w.failed {
             match w.asked {
                 None if w.since.elapsed() >= WORD_PAUSE => w.asked = vectors.ask_words(&words),
@@ -232,7 +232,7 @@ impl OnScreenNotesApp {
             }
         }
         let note = vectors.words_status().or_else(|| (w.vector.is_none() && !w.failed).then(|| "looking at pictures…".to_string()));
-        self.find.set_words_note(note);
+        self.ws.find.set_words_note(note);
         let Some(v) = w.vector.clone() else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return;
@@ -240,9 +240,9 @@ impl OnScreenNotesApp {
         let canvases = &self.canvases;
         let read = (0..canvases.count()).filter(|&i| canvases.slide(i).is_some()).count();
         let key = (vectors.generation(), read);
-        if self.find.word_pictures_for(&words) != Some(key) {
+        if self.ws.find.word_pictures_for(&words) != Some(key) {
             let found = ui::find_bar::word_picture_search(&v, (0..canvases.count()).filter_map(|i| canvases.slide(i).map(|c| (i, c))), |png| vectors.vector(png));
-            self.find.set_word_pictures(&words, key, found);
+            self.ws.find.set_word_pictures(&words, key, found);
         }
     }
 
@@ -251,7 +251,7 @@ impl OnScreenNotesApp {
     /// (`tools::tag_suggest`), leaving out those turned down for it and
     /// those on locked slides.
     pub(super) fn update_tag_suggestions(&mut self) {
-        let Some(tag) = self.find.tag_query() else { return };
+        let Some(tag) = self.ws.find.tag_query() else { return };
         if !self.picture_vectors.is_on() {
             return;
         }
@@ -267,7 +267,7 @@ impl OnScreenNotesApp {
         );
         let (tagged, turned_down) = pool.counts();
         let key = (vectors.generation() ^ ((tagged as u64) << 40) ^ ((turned_down as u64) << 20), slides().count());
-        if self.find.tag_suggestions_for(&tag) == Some(key) {
+        if self.ws.find.tag_suggestions_for(&tag) == Some(key) {
             return;
         }
         let hits = pool.suggest(slides());
@@ -279,16 +279,16 @@ impl OnScreenNotesApp {
         } else {
             None
         };
-        self.find.set_words_note(note);
-        self.find.set_tag_suggestions(&tag, key, hits);
+        self.ws.find.set_words_note(note);
+        self.ws.find.set_tag_suggestions(&tag, key, hits);
     }
 
     /// While the tag row is open on one picture and picture search is on:
     /// offer the tags it probably has (`tools::tag_suggest::fits`), worked
     /// out once for that picture.
     pub(super) fn fill_likely_tags(&mut self) {
-        let Some(at) = self.selected_picture().filter(|_| self.tag_edit.is_some() && self.picture_vectors.is_on()) else {
-            self.likely_for = None;
+        let Some(at) = self.selected_picture().filter(|_| self.ws.tag_edit.is_some() && self.picture_vectors.is_on()) else {
+            self.ws.likely_for = None;
             return;
         };
         let png = match self.canvases.slide(at.0).and_then(|c| c.layers.get(at.1)?.shapes.get(at.2)) {
@@ -298,7 +298,7 @@ impl OnScreenNotesApp {
         let vectors = &self.picture_vectors;
         let Some(v) = vectors.vector(&png) else { return };
         let key = (at, vectors.generation());
-        if self.likely_for == Some(key) {
+        if self.ws.likely_for == Some(key) {
             return;
         }
         let own: Vec<String> = self.canvases.slide(at.0).and_then(|c| c.layers.get(at.1)?.shapes.get(at.2)).map(|s| s.tags().to_vec()).unwrap_or_default();
@@ -338,10 +338,10 @@ impl OnScreenNotesApp {
             .collect();
         likely.sort_by(|a, b| b.1.total_cmp(&a.1));
         likely.truncate(LIKELY_TAGS);
-        if let Some(e) = self.tag_edit.as_mut() {
+        if let Some(e) = self.ws.tag_edit.as_mut() {
             e.likely = likely;
         }
-        self.likely_for = Some(key);
+        self.ws.likely_for = Some(key);
     }
 
     /// Delete one copy from the duplicates list, wherever it is.
@@ -356,10 +356,10 @@ impl OnScreenNotesApp {
         }
         // A selection on that slide may name shapes that moved down one.
         if slide == self.canvases.active_index() {
-            self.tool.select.sel = crate::canvas::hit::Selection::default();
-            self.tool.select.rebind(slide, self.canvases.active());
+            self.ws.tool.select.sel = crate::canvas::hit::Selection::default();
+            self.ws.tool.select.rebind(slide, self.canvases.active());
         }
-        self.find.forget_copy(slide, layer, shape);
+        self.ws.find.forget_copy(slide, layer, shape);
         self.toast = Some((format!("Deleted from slide {} — Ctrl+Z there brings it back", slide + 1), Instant::now()));
     }
 
@@ -410,8 +410,8 @@ impl OnScreenNotesApp {
     /// into sets off the UI thread, again whenever pictures come or go.
     /// Returns how many pictures are read, of how many.
     pub(super) fn update_copies(&mut self, ctx: &egui::Context) -> Option<(usize, usize)> {
-        if !self.find.has_copies() {
-            self.copies_job = None;
+        if !self.ws.find.has_copies() {
+            self.ws.copies_job = None;
             return None;
         }
         let canvases = &self.canvases;
@@ -419,16 +419,16 @@ impl OnScreenNotesApp {
         let order = std::iter::once(active).chain((0..canvases.count()).filter(|&i| i != active));
         let slides: Vec<&crate::canvas::canvas::Canvas> = order.filter_map(|i| canvases.slide(i)).collect();
         let unread = canvases.count() - slides.len();
-        let first_look = self.find.copies_found_for().is_none() && self.copies_job.is_none();
+        let first_look = self.ws.find.copies_found_for().is_none() && self.ws.copies_job.is_none();
         self.picture_index.tick(slides.iter().copied(), first_look);
         let index = &self.picture_index;
         let key = (index.generation(), slides.len());
         let (read, total) = index.progress();
 
-        let done = self.copies_job.as_ref().map(|j| j.rx.try_recv());
+        let done = self.ws.copies_job.as_ref().map(|j| j.rx.try_recv());
         match done {
             Some(Ok(sets)) => {
-                let job = self.copies_job.take().expect("a job is running");
+                let job = self.ws.copies_job.take().expect("a job is running");
                 let copy = similar::Likeness { kind: similar::Kind::Duplicate, score: 1.0, way: Default::default(), other_crop: false };
                 let sets: Vec<Vec<ui::find_bar::PictureHit>> = sets
                     .into_iter()
@@ -442,14 +442,14 @@ impl OnScreenNotesApp {
                     })
                     .filter(|set| set.len() > 1)
                     .collect();
-                self.find.set_copies(sets, job.key);
+                self.ws.find.set_copies(sets, job.key);
             }
-            Some(Err(TryRecvError::Disconnected)) => self.copies_job = None,
+            Some(Err(TryRecvError::Disconnected)) => self.ws.copies_job = None,
             Some(Err(TryRecvError::Empty)) | None => {}
         }
 
         let settled = read == total && unread == 0;
-        if settled && self.copies_job.is_none() && self.find.copies_found_for() != Some(key) {
+        if settled && self.ws.copies_job.is_none() && self.ws.find.copies_found_for() != Some(key) {
             // In slide order, so each set lists its copies that way.
             let mut items = Vec::new();
             let mut places = Vec::new();
@@ -478,11 +478,11 @@ impl OnScreenNotesApp {
                 let _ = tx.send(sets);
             });
             match spawned {
-                Ok(_) => self.copies_job = Some(CopiesJob { rx, places, key }),
+                Ok(_) => self.ws.copies_job = Some(CopiesJob { rx, places, key }),
                 Err(e) => log::warn!("could not start looking for copies: {e}"),
             }
         }
-        if !settled || self.copies_job.is_some() {
+        if !settled || self.ws.copies_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         Some((read, total))
@@ -502,11 +502,11 @@ impl OnScreenNotesApp {
         }
         self.canvases.active_mut().active_layer = layer;
         let n = shapes.len();
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
-        self.find.close();
+        self.ws.tool.kind = crate::tools::ToolKind::Select;
+        self.ws.tool.select.gesture = None;
+        self.ws.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
+        self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        self.ws.find.close();
         self.zoom_to_selection(ctx);
         let what = if n == 1 { "1 extra copy" } else { "extra copies" };
         let msg = if n == 1 { format!("{what} selected — Delete removes it") } else { format!("{n} {what} selected — Delete removes them") };

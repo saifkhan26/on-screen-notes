@@ -63,10 +63,10 @@ impl OnScreenNotesApp {
         self.region_select = Some(RegionSelect {
             start: None,
             current: egui::Pos2::ZERO,
-            ui_visible_before: self.ui_visible,
+            ui_visible_before: self.ws.ui_visible,
             purpose,
         });
-        self.ui_visible = false;
+        self.ws.ui_visible = false;
     }
 
     /// Handle the interactive region-selection overlay for one frame: read
@@ -88,7 +88,7 @@ impl OnScreenNotesApp {
 
         // Esc cancels: restore the chrome, leave the tint untouched.
         if esc {
-            self.ui_visible = rs.ui_visible_before;
+            self.ws.ui_visible = rs.ui_visible_before;
             self.region_select = None;
             return;
         }
@@ -105,7 +105,7 @@ impl OnScreenNotesApp {
                 let sel = egui::Rect::from_two_pos(start, rs.current);
                 let ppp = ctx.pixels_per_point().max(0.01);
                 if rs.purpose == BoxFor::SlideWindow {
-                    self.ui_visible = rs.ui_visible_before;
+                    self.ws.ui_visible = rs.ui_visible_before;
                     self.region_select = None;
                     // A click, not a box: nothing to show.
                     if sel.width() >= 8.0 && sel.height() >= 8.0 {
@@ -127,7 +127,7 @@ impl OnScreenNotesApp {
                     // capture re-applies `bg_color` at the stored opacity.
                     self.config.bg_opacity = 0.0;
                 } else {
-                    self.ui_visible = rs.ui_visible_before;
+                    self.ws.ui_visible = rs.ui_visible_before;
                 }
                 self.region_select = None;
                 return;
@@ -214,14 +214,14 @@ impl OnScreenNotesApp {
     pub(super) fn queue_freeze(&mut self, pixels_per_point: f32) {
         if self.pending_freeze.is_some() { return; }
         self.pending_freeze = Some(PendingShot {
-            ui_visible_before: self.ui_visible,
+            ui_visible_before: self.ws.ui_visible,
             bg_opacity_before: self.config.bg_opacity,
             frames_to_wait: 2,
             pixels_per_point,
             bg_color: self.config.bg_color,
             region_rect: None,
         });
-        self.ui_visible = false;
+        self.ws.ui_visible = false;
         self.config.bg_opacity = 0.0;
     }
 
@@ -256,7 +256,7 @@ impl OnScreenNotesApp {
         if self.pending_lasso.is_some() { return; }
         let canvas = self.canvases.active();
         self.pending_lasso = Some(PendingLasso {
-            ui_visible_before: self.ui_visible,
+            ui_visible_before: self.ws.ui_visible,
             bg_opacity_before: self.config.bg_opacity,
             frames_to_wait: 2,
             pixels_per_point,
@@ -264,7 +264,7 @@ impl OnScreenNotesApp {
             zoom: canvas.zoom,
             polygon,
         });
-        self.ui_visible = false;
+        self.ws.ui_visible = false;
         self.config.bg_opacity = 0.0;
     }
 
@@ -328,12 +328,12 @@ impl OnScreenNotesApp {
             // Stop: finalise encoder (writes GIF trailer) + clipboard
             // copy, then restore UI.
             self.recorder.stop_and_encode();
-            self.ui_visible = self.ui_visible_before_record;
+            self.ws.ui_visible = self.ui_visible_before_record;
         } else {
             // Start: snapshot UI state, hide chrome, kick off
             // recorder with the destination dir captured up front.
-            self.ui_visible_before_record = self.ui_visible;
-            self.ui_visible = false;
+            self.ui_visible_before_record = self.ws.ui_visible;
+            self.ws.ui_visible = false;
             let dir = self
                 .config
                 .screenshot_dir

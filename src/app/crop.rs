@@ -49,7 +49,7 @@ impl CropState {
 impl OnScreenNotesApp {
     /// The cropped picture, where it is now.
     fn crop_target(&self) -> Option<(&Shape, usize)> {
-        let e = self.crop.edit.as_ref()?;
+        let e = self.ws.crop.edit.as_ref()?;
         let layer = self.canvases.slide(e.slide)?.layers.get(e.layer)?;
         let is = |s: &Shape| matches!(s, Shape::Raster { png, .. } if Arc::as_ptr(png) as usize == e.key);
         let i = if layer.shapes.get(e.shape).is_some_and(is) { e.shape } else { layer.shapes.iter().position(is)? };
@@ -75,32 +75,32 @@ impl OnScreenNotesApp {
         }
         let key = Arc::as_ptr(png) as usize;
         self.close_pad(false);
-        self.crop.edit = Some(CropEdit { slide, layer, shape, key, rect: CropRect::WHOLE, held: None });
+        self.ws.crop.edit = Some(CropEdit { slide, layer, shape, key, rect: CropRect::WHOLE, held: None });
         // Its selection handles would sit on the crop's.
-        self.tool.select.sel = Default::default();
-        self.tool.select.gesture = None;
+        self.ws.tool.select.sel = Default::default();
+        self.ws.tool.select.gesture = None;
         self.toast = Some(("Drag the edges or corners. Enter crops, Esc cancels".to_string(), Instant::now()));
     }
 
     /// Once a frame: leave crop mode if its slide, the Select tool or the
     /// picture went.
     pub(super) fn crop_frame_start(&mut self) {
-        let Some(e) = self.crop.edit.as_ref() else { return };
+        let Some(e) = self.ws.crop.edit.as_ref() else { return };
         let gone = self.canvases.active_index() != e.slide
-            || self.tool.kind != crate::tools::ToolKind::Select
+            || self.ws.tool.kind != crate::tools::ToolKind::Select
             || !self.canvases.active_editable()
             || self.crop_target().is_none();
         if gone {
-            self.crop.edit = None;
+            self.ws.crop.edit = None;
         }
     }
 
     /// Leave crop mode with the picture selected again.
     fn end_crop(&mut self, at: Option<usize>) {
-        let Some(e) = self.crop.edit.take() else { return };
+        let Some(e) = self.ws.crop.edit.take() else { return };
         if let Some(i) = at {
-            self.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes: vec![i] };
-            self.tool.select.rebind(e.slide, self.canvases.active());
+            self.ws.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes: vec![i] };
+            self.ws.tool.select.rebind(e.slide, self.canvases.active());
         }
     }
 
@@ -112,7 +112,7 @@ impl OnScreenNotesApp {
 
     /// Replace the picture at `at` with `new`, one undo step.
     fn replace_cropped(&mut self, at: usize, new: Shape) {
-        let Some(e) = self.crop.edit.as_ref() else { return };
+        let Some(e) = self.ws.crop.edit.as_ref() else { return };
         let layer = e.layer;
         self.canvases.edit_active(|c| {
             if let Some(l) = c.layers.get_mut(layer) {
@@ -129,10 +129,10 @@ impl OnScreenNotesApp {
     /// Keep what is inside the rectangle.
     fn apply_crop(&mut self) {
         let Some((shape, at)) = self.crop_target().map(|(s, i)| (s.clone(), i)) else {
-            self.crop.edit = None;
+            self.ws.crop.edit = None;
             return;
         };
-        let rect = self.crop.edit.as_ref().map_or(CropRect::WHOLE, |e| e.rect);
+        let rect = self.ws.crop.edit.as_ref().map_or(CropRect::WHOLE, |e| e.rect);
         if !rect.is_whole() {
             match crop::apply(&shape, rect) {
                 Some(new) => self.replace_cropped(at, new),
@@ -167,7 +167,7 @@ impl OnScreenNotesApp {
         };
         self.replace_cropped(at, new);
         // Go on cropping what is now all of it.
-        if let Some(e) = self.crop.edit.as_mut() {
+        if let Some(e) = self.ws.crop.edit.as_mut() {
             e.key = key;
             e.shape = at;
             e.rect = CropRect::WHOLE;
@@ -177,9 +177,9 @@ impl OnScreenNotesApp {
 
     /// A pen or mouse step, in canvas units. `true` when crop mode took it.
     pub(super) fn crop_pointer(&mut self, ev: PenEvent) -> bool {
-        if self.crop.swallow {
+        if self.ws.crop.swallow {
             if matches!(ev, PenEvent::Up(_)) {
-                self.crop.swallow = false;
+                self.ws.crop.swallow = false;
             }
             return true;
         }
@@ -187,7 +187,7 @@ impl OnScreenNotesApp {
         let obb = shape.obb();
         let min = crop::shown_px(shape).map_or([0.01, 0.01], crop::min_share);
         let zoom = self.canvases.active().zoom.max(1e-3);
-        let Some(e) = self.crop.edit.as_mut() else { return false };
+        let Some(e) = self.ws.crop.edit.as_mut() else { return false };
         match ev {
             PenEvent::Down(s) => match crop::grab_at(obb, e.rect, s.pos, REACH / zoom) {
                 Some(g) => e.held = Some((g, e.rect, obb.to_local(s.pos))),
@@ -199,7 +199,7 @@ impl OnScreenNotesApp {
                     if !on_picture {
                         // Off the picture: keep the crop, like clicking away.
                         self.apply_crop();
-                        self.crop.swallow = true;
+                        self.ws.crop.swallow = true;
                     }
                 }
             },
@@ -218,7 +218,7 @@ impl OnScreenNotesApp {
 
     /// While cropping: Enter crops, Esc cancels, and undo and redo wait.
     pub(super) fn crop_keys(&mut self, ctx: &egui::Context) {
-        if self.crop.edit.is_none() || ctx.wants_keyboard_input() {
+        if self.ws.crop.edit.is_none() || ctx.wants_keyboard_input() {
             return;
         }
         let shortcut = |b: Option<crate::input::hotkeys_config::Binding>| {
@@ -239,7 +239,7 @@ impl OnScreenNotesApp {
     /// handles, and the bar.
     pub(super) fn crop_chrome(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) {
         let Some((shape, _)) = self.crop_target() else { return };
-        let Some(e) = self.crop.edit.as_ref() else { return };
+        let Some(e) = self.ws.crop.edit.as_ref() else { return };
         let c = self.canvases.active();
         let to_screen = |p: [f32; 2]| egui::pos2(canvas_rect.min.x + c.pan[0] + p[0] * c.zoom, canvas_rect.min.y + c.pan[1] + p[1] * c.zoom);
         let obb = shape.obb();

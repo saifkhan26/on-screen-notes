@@ -8,17 +8,17 @@ impl OnScreenNotesApp {
     /// the active layer selected.
     pub(super) fn select_only_shape(&mut self, index: usize) {
         use crate::canvas::hit::ObjRef;
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel.set_only(ObjRef::Shape(index));
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        self.ws.tool.kind = crate::tools::ToolKind::Select;
+        self.ws.tool.select.gesture = None;
+        self.ws.tool.select.sel.set_only(ObjRef::Shape(index));
+        self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
     /// Clones of the selected objects on the active layer.
     pub(super) fn selected_objects(&self) -> (Vec<crate::canvas::stroke::Stroke>, Vec<crate::canvas::shape::Shape>) {
         let c = self.canvases.active();
         let Some(layer) = c.layers.get(c.active_layer) else { return (Vec::new(), Vec::new()) };
-        let sel = &self.tool.select.sel;
+        let sel = &self.ws.tool.select.sel;
         (
             sel.strokes.iter().filter_map(|&i| layer.strokes.get(i).cloned()).collect(),
             sel.shapes.iter().filter_map(|&i| layer.shapes.get(i).cloned()).collect(),
@@ -52,10 +52,10 @@ impl OnScreenNotesApp {
         let c = self.canvases.active_mut();
         let li = c.active_layer;
         let placed = c.insert_objects(li, strokes, shapes);
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = placed;
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        self.ws.tool.kind = crate::tools::ToolKind::Select;
+        self.ws.tool.select.gesture = None;
+        self.ws.tool.select.sel = placed;
+        self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
     /// Select every object the media filter highlights. A selection
@@ -73,10 +73,10 @@ impl OnScreenNotesApp {
         if li != c.active_layer {
             self.canvases.active_mut().active_layer = li;
         }
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = crate::canvas::hit::Selection { strokes, shapes };
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        self.ws.tool.kind = crate::tools::ToolKind::Select;
+        self.ws.tool.select.gesture = None;
+        self.ws.tool.select.sel = crate::canvas::hit::Selection { strokes, shapes };
+        self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
     /// Select everything on the active layer with the Select tool; when
@@ -90,10 +90,10 @@ impl OnScreenNotesApp {
         if li != c.active_layer {
             self.canvases.active_mut().active_layer = li;
         }
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = sel;
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        self.ws.tool.kind = crate::tools::ToolKind::Select;
+        self.ws.tool.select.gesture = None;
+        self.ws.tool.select.sel = sel;
+        self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
     /// The layer a fresh selection goes on: the active one, or when it is
@@ -116,7 +116,7 @@ impl OnScreenNotesApp {
     pub(super) fn hop_selection(&mut self, dir: crate::tools::hop::Dir, ctx: &egui::Context) {
         let c = self.canvases.active();
         let Some(layer) = c.layers.get(c.active_layer) else { return };
-        let sel = &self.tool.select.sel;
+        let sel = &self.ws.tool.select.sel;
         match crate::tools::hop::hop(layer, sel, dir) {
             Some(next) => self.take_hopped(next, ctx),
             None => {
@@ -130,11 +130,11 @@ impl OnScreenNotesApp {
     /// then go from member to member. With nothing selected (any tool),
     /// select the group or object in the middle of the view.
     pub(super) fn step_in(&mut self, ctx: &egui::Context) {
-        let selecting = self.tool.kind == crate::tools::ToolKind::Select && !self.tool.select.sel.is_empty();
+        let selecting = self.ws.tool.kind == crate::tools::ToolKind::Select && !self.ws.tool.select.sel.is_empty();
         if selecting {
             let c = self.canvases.active();
             let Some(layer) = c.layers.get(c.active_layer) else { return };
-            if let Some(member) = crate::tools::hop::step_in(layer, &self.tool.select.sel) {
+            if let Some(member) = crate::tools::hop::step_in(layer, &self.ws.tool.select.sel) {
                 self.take_hopped(member, ctx);
             }
             return;
@@ -158,7 +158,7 @@ impl OnScreenNotesApp {
     pub(super) fn step_out(&mut self, ctx: &egui::Context) {
         let c = self.canvases.active();
         let Some(layer) = c.layers.get(c.active_layer) else { return };
-        if let Some(group) = crate::tools::hop::step_out(layer, &self.tool.select.sel) {
+        if let Some(group) = crate::tools::hop::step_out(layer, &self.ws.tool.select.sel) {
             self.take_hopped(group, ctx);
         }
     }
@@ -166,10 +166,10 @@ impl OnScreenNotesApp {
     /// `sel` (on the active layer) is the Select tool's selection now,
     /// glided on screen if it is not.
     fn take_hopped(&mut self, sel: crate::canvas::hit::Selection, ctx: &egui::Context) {
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = sel;
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        self.ws.tool.kind = crate::tools::ToolKind::Select;
+        self.ws.tool.select.gesture = None;
+        self.ws.tool.select.sel = sel;
+        self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
         if let Some(b) = self.selection_bounds() {
             self.bring_into_view(b, ctx);
         }
@@ -186,10 +186,10 @@ impl OnScreenNotesApp {
         let (pan, zoom) = { let c = self.canvases.active(); (c.pan, c.zoom) };
         let (canvas, sel) = crate::canvas::canvas::Canvas::with_objects(strokes, shapes, pan, zoom);
         let idx = self.canvases.push_canvas(canvas);
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = sel;
-        self.tool.select.rebind(idx, self.canvases.active());
+        self.ws.tool.kind = crate::tools::ToolKind::Select;
+        self.ws.tool.select.gesture = None;
+        self.ws.tool.select.sel = sel;
+        self.ws.tool.select.rebind(idx, self.canvases.active());
         let what = if count == 1 { "1 object".to_string() } else { format!("{count} objects") };
         self.toast = Some((format!("Copied {what} to new slide {}", idx + 1), Instant::now()));
     }
@@ -202,8 +202,8 @@ impl OnScreenNotesApp {
     /// refused), so it is not the Select tool's.
     pub(super) fn drop_on_slide_window(&mut self, screen: [f32; 2], ppp: f32) -> bool {
         use crate::tools::select_tool::Gesture;
-        let Some(Gesture::Move { start, .. }) = self.tool.select.gesture else { return false };
-        if self.tool.kind != crate::tools::ToolKind::Select || self.tool.select.sel.is_empty() {
+        let Some(Gesture::Move { start, .. }) = self.ws.tool.select.gesture else { return false };
+        if self.ws.tool.kind != crate::tools::ToolKind::Select || self.ws.tool.select.sel.is_empty() {
             return false;
         }
         let Some(win) = self.slide_window.as_mut() else { return false };
@@ -211,7 +211,7 @@ impl OnScreenNotesApp {
             return false;
         }
         let Some((to, target, window_scale)) = win.canvas_at(screen) else { return false };
-        self.tool.select.gesture = None;
+        self.ws.tool.select.gesture = None;
         if win.locked() {
             self.toast = Some(("The slide window is locked — unlock it on its card to move objects there".to_string(), Instant::now()));
             return true;
@@ -223,7 +223,7 @@ impl OnScreenNotesApp {
         let from = self.canvases.active_index();
         let (li, zoom) = { let c = self.canvases.active(); (c.active_layer, c.zoom) };
         let m = ui::slide_edit::drop_mapping(start, target, zoom * ppp / window_scale.max(1e-6));
-        let sel = std::mem::take(&mut self.tool.select.sel);
+        let sel = std::mem::take(&mut self.ws.tool.select.sel);
         match self.canvases.drop_objects(from, to, li, &sel.strokes, &sel.shapes, &m) {
             Some(placed) => {
                 let n = placed.strokes.len() + placed.shapes.len();
@@ -233,7 +233,7 @@ impl OnScreenNotesApp {
                     self.toast = Some((format!("Moved {what} to slide {}", to + 1), Instant::now()));
                 }
             }
-            None => self.tool.select.sel = sel,
+            None => self.ws.tool.select.sel = sel,
         }
         true
     }
@@ -250,11 +250,11 @@ impl OnScreenNotesApp {
             return;
         }
         let li = self.canvases.active().active_layer;
-        let sel = std::mem::take(&mut self.tool.select.sel);
-        self.tool.select.gesture = None;
+        let sel = std::mem::take(&mut self.ws.tool.select.sel);
+        self.ws.tool.select.gesture = None;
         let count = self.canvases.move_objects_to(to, li, &sel.strokes, &sel.shapes);
         if count == 0 {
-            self.tool.select.sel = sel;
+            self.ws.tool.select.sel = sel;
             return;
         }
         let what = if count == 1 { "1 object".to_string() } else { format!("{count} objects") };
@@ -270,7 +270,7 @@ impl OnScreenNotesApp {
         let c = self.canvases.active();
         let li = c.active_layer;
         let Some(layer) = c.layers.get(li) else { return };
-        let (strokes, shapes) = crate::tools::arrange::plan(layer, &self.tool.select.sel, op, c.zoom);
+        let (strokes, shapes) = crate::tools::arrange::plan(layer, &self.ws.tool.select.sel, op, c.zoom);
         if !self.canvases.active_mut().move_objects_each(li, &strokes, &shapes) {
             self.toast = Some(("Nothing to move".to_string(), std::time::Instant::now()));
         }
@@ -292,7 +292,7 @@ impl OnScreenNotesApp {
             (area[0] + area[2] - pan[0]) / zoom,
             (area[1] + area[3] - pan[1]) / zoom,
         ];
-        let (strokes, shapes, block) = crate::tools::arrange::plan_pack(layer, &self.tool.select.sel, self.config.pack_mode, view, zoom);
+        let (strokes, shapes, block) = crate::tools::arrange::plan_pack(layer, &self.ws.tool.select.sel, self.config.pack_mode, view, zoom);
         let moved = self.canvases.active_mut().move_objects_each(li, &strokes, &shapes);
         // Half a screen pixel of slack for f32 rounding.
         let slack = 0.5 / zoom;
@@ -307,12 +307,12 @@ impl OnScreenNotesApp {
 
     /// Canvas box around the Select tool's selection, if there is one.
     pub(super) fn selection_bounds(&self) -> Option<[f32; 4]> {
-        if self.tool.kind != crate::tools::ToolKind::Select || self.tool.select.sel.is_empty() {
+        if self.ws.tool.kind != crate::tools::ToolKind::Select || self.ws.tool.select.sel.is_empty() {
             return None;
         }
         let c = self.canvases.active();
         let layer = c.layers.get(c.active_layer)?;
-        let sel = &self.tool.select.sel;
+        let sel = &self.ws.tool.select.sel;
         sel.strokes
             .iter()
             .filter_map(|&i| layer.strokes.get(i)?.bounds())
@@ -332,7 +332,7 @@ impl OnScreenNotesApp {
         } else {
             crate::canvas::affine::Affine::scale_about(mid, -1.0, 1.0)
         };
-        let sel = self.tool.select.sel.clone();
+        let sel = self.ws.tool.select.sel.clone();
         let c = self.canvases.active_mut();
         let li = c.active_layer;
         c.transform_objects(li, &sel.strokes, &sel.shapes, &m);
@@ -343,13 +343,13 @@ impl OnScreenNotesApp {
     /// with it and stays turned (`Shape::turn`).
     pub(super) fn rotate_selection(&mut self, right: bool) {
         let c = self.canvases.active();
-        let Some(frame) = c.layers.get(c.active_layer).and_then(|l| self.tool.select.frame(l, c.zoom)) else { return };
+        let Some(frame) = c.layers.get(c.active_layer).and_then(|l| self.ws.tool.select.frame(l, c.zoom)) else { return };
         if !self.may_edit() {
             return;
         }
         let quarter = if right { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
         let m = crate::canvas::affine::Affine::rotate_about(frame.center, quarter);
-        let sel = self.tool.select.sel.clone();
+        let sel = self.ws.tool.select.sel.clone();
         let c = self.canvases.active_mut();
         let li = c.active_layer;
         c.transform_objects(li, &sel.strokes, &sel.shapes, &m);
@@ -357,19 +357,19 @@ impl OnScreenNotesApp {
 
     /// Selected text labels, with the Select tool.
     pub(super) fn selected_text(&self) -> Vec<usize> {
-        if self.tool.kind != crate::tools::ToolKind::Select {
+        if self.ws.tool.kind != crate::tools::ToolKind::Select {
             return Vec::new();
         }
         let c = self.canvases.active();
         let Some(layer) = c.layers.get(c.active_layer) else { return Vec::new() };
-        self.tool.select.sel.shapes.iter().copied().filter(|&i| matches!(layer.shapes.get(i), Some(Shape::Text { .. }))).collect()
+        self.ws.tool.select.sel.shapes.iter().copied().filter(|&i| matches!(layer.shapes.get(i), Some(Shape::Text { .. }))).collect()
     }
 
     /// The text-box switch was flipped: the selected labels follow it.
     pub(super) fn apply_text_box_to_selection(&mut self) {
         let texts = self.selected_text();
         if texts.is_empty() || !self.may_edit() { return; }
-        let on = self.tool.text_box;
+        let on = self.ws.tool.text_box;
         let c = self.canvases.active_mut();
         let li = c.active_layer;
         c.set_text_box(li, &texts, on);
@@ -378,8 +378,8 @@ impl OnScreenNotesApp {
     /// `(slide, layer, shape)` of the selected picture, when the
     /// selection is one picture (or video, or GIF) and nothing else.
     pub(super) fn selected_picture(&self) -> Option<(usize, usize, usize)> {
-        let sel = &self.tool.select.sel;
-        if self.tool.kind != crate::tools::ToolKind::Select || !sel.strokes.is_empty() || sel.shapes.len() != 1 {
+        let sel = &self.ws.tool.select.sel;
+        if self.ws.tool.kind != crate::tools::ToolKind::Select || !sel.strokes.is_empty() || sel.shapes.len() != 1 {
             return None;
         }
         let c = self.canvases.active();
@@ -395,8 +395,8 @@ impl OnScreenNotesApp {
     /// them. A video or GIF gives the colours of the frame it shows.
     pub(super) fn toggle_picture_colours(&mut self) {
         let Some(at) = self.selected_picture() else { return };
-        if self.picture_colours.as_ref().is_some_and(|p| p.at == at) {
-            self.picture_colours = None;
+        if self.ws.picture_colours.as_ref().is_some_and(|p| p.at == at) {
+            self.ws.picture_colours = None;
             return;
         }
         let c = self.canvases.active();
@@ -415,14 +415,14 @@ impl OnScreenNotesApp {
         };
         let k = self.config.palette.len().max(1);
         let colours = crate::tools::picture_colours::picture_colours(&img, k);
-        self.picture_colours = Some(PictureColours { at, colours });
+        self.ws.picture_colours = Some(PictureColours { at, colours });
     }
 
     /// The picture's colours become the toolbar's palette, the same
     /// number of swatches as before (so the colour keys keep their
     /// places); the old palette can come back with "Restore palette".
     pub(super) fn keep_picture_colours(&mut self) {
-        let Some(p) = &self.picture_colours else { return };
+        let Some(p) = &self.ws.picture_colours else { return };
         if p.colours.is_empty() { return; }
         // Fewer colours than swatches: the rest keep what they had.
         let new: Vec<[u8; 4]> = if self.config.palette.is_empty() {
@@ -431,14 +431,14 @@ impl OnScreenNotesApp {
             self.config.palette.iter().enumerate().map(|(i, old)| p.colours.get(i).copied().unwrap_or(*old)).collect()
         };
         let before = std::mem::replace(&mut self.config.palette, new);
-        if self.palette_before.is_none() {
-            self.palette_before = Some(before);
+        if self.ws.palette_before.is_none() {
+            self.ws.palette_before = Some(before);
         }
         self.toast = Some(("These colours are the palette now".to_string(), Instant::now()));
     }
 
     pub(super) fn restore_palette(&mut self) {
-        if let Some(before) = self.palette_before.take() {
+        if let Some(before) = self.ws.palette_before.take() {
             self.config.palette = before;
             self.toast = Some(("Palette restored".to_string(), Instant::now()));
         }
@@ -449,7 +449,7 @@ impl OnScreenNotesApp {
         let c = self.canvases.active();
         let li = c.active_layer;
         let Some(layer) = c.layers.get(li) else { return };
-        let (strokes, shapes) = crate::tools::arrange::plan_sizes(layer, &self.tool.select.sel, m, c.zoom);
+        let (strokes, shapes) = crate::tools::arrange::plan_sizes(layer, &self.ws.tool.select.sel, m, c.zoom);
         if !self.canvases.active_mut().transform_objects_each(li, &strokes, &shapes) {
             self.toast = Some(("Already that size".to_string(), std::time::Instant::now()));
         }
@@ -461,16 +461,17 @@ impl OnScreenNotesApp {
     pub(super) fn nudge_selection(&mut self, px: [f32; 2], pixels_per_point: f32) {
         const RUN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
         let idx = self.canvases.active_index();
-        let sel = self.tool.select.sel.clone();
+        let sel = self.ws.tool.select.sel.clone();
         let c = self.canvases.active_mut();
         let li = c.active_layer;
         let per_px = 1.0 / (c.zoom.max(1e-3) * pixels_per_point.max(1e-3));
         let now = Instant::now();
         let merge = self
+            .ws
             .nudge_run
             .is_some_and(|(i, len, at)| i == idx && len == c.undo_log.len() && now - at < RUN_GAP);
         if c.nudge_objects(li, &sel.strokes, &sel.shapes, [px[0] * per_px, px[1] * per_px], merge) {
-            self.nudge_run = Some((idx, c.undo_log.len(), now));
+            self.ws.nudge_run = Some((idx, c.undo_log.len(), now));
         }
     }
 
@@ -478,7 +479,7 @@ impl OnScreenNotesApp {
     pub(super) fn selection_grouped(&self) -> bool {
         let c = self.canvases.active();
         let Some(layer) = c.layers.get(c.active_layer) else { return false };
-        let sel = &self.tool.select.sel;
+        let sel = &self.ws.tool.select.sel;
         sel.strokes.iter().any(|&i| layer.strokes.get(i).is_some_and(|s| s.group != 0))
             || sel.shapes.iter().any(|&i| layer.shapes.get(i).is_some_and(|s| s.group() != 0))
     }
@@ -486,7 +487,7 @@ impl OnScreenNotesApp {
     /// Make the selection one group (`on`), or take it out of its groups:
     /// one undo step. The selection stays as it is.
     pub(super) fn group_selection(&mut self, on: bool) {
-        let sel = self.tool.select.sel.clone();
+        let sel = self.ws.tool.select.sel.clone();
         let n = sel.strokes.len() + sel.shapes.len();
         if on && n < 2 {
             self.toast = Some(("Select two or more objects to group them".to_string(), Instant::now()));
@@ -513,7 +514,7 @@ impl OnScreenNotesApp {
         use crate::canvas::units::same_tag;
         let c = self.canvases.active();
         let Some(layer) = c.layers.get(c.active_layer) else { return Vec::new() };
-        let sel = &self.tool.select.sel;
+        let sel = &self.ws.tool.select.sel;
         let strokes = sel.strokes.iter().filter_map(|&i| layer.strokes.get(i)).map(|s| s.tags.as_slice());
         let shapes = sel.shapes.iter().filter_map(|&i| layer.shapes.get(i)).map(|s| s.tags());
         let each: Vec<&[String]> = strokes.chain(shapes).collect();
@@ -533,7 +534,7 @@ impl OnScreenNotesApp {
     /// the rest. One undo step.
     pub(super) fn tag_selection(&mut self, was: Vec<String>, now: Vec<(String, bool)>) {
         use crate::canvas::units::retagged;
-        let sel = self.tool.select.sel.clone();
+        let sel = self.ws.tool.select.sel.clone();
         if sel.is_empty() || !self.may_edit() {
             return;
         }
@@ -570,7 +571,7 @@ impl OnScreenNotesApp {
     pub(super) fn selection_pinned(&self) -> bool {
         let c = self.canvases.active();
         let Some(layer) = c.layers.get(c.active_layer) else { return false };
-        let sel = &self.tool.select.sel;
+        let sel = &self.ws.tool.select.sel;
         !sel.is_empty()
             && sel.strokes.iter().all(|&i| layer.strokes.get(i).is_some_and(|s| s.pin != 0))
             && sel.shapes.iter().all(|&i| layer.shapes.get(i).is_some_and(|s| s.pin() != 0))
@@ -580,29 +581,29 @@ impl OnScreenNotesApp {
     /// toolbar swatch that held the old pen colour, so the picked colour
     /// stays one click away. With no such swatch only the pen changes.
     pub(super) fn take_picked_color(&mut self, c: [u8; 4]) {
-        let old = self.tool.color;
+        let old = self.ws.tool.color;
         if let Some(slot) = self.config.palette.iter_mut().find(|s| **s == old) {
             *slot = c;
         }
-        self.tool.color = c;
+        self.ws.tool.color = c;
     }
 
     /// Apply a toolbar colour / size change to the selected objects.
     /// `prev_*` are the tool's values before the toolbar ran this frame.
     pub(super) fn restyle_selection(&mut self, prev_color: [u8; 4], prev_size: f32) {
-        if self.tool.kind != crate::tools::ToolKind::Select || self.tool.select.sel.is_empty() {
+        if self.ws.tool.kind != crate::tools::ToolKind::Select || self.ws.tool.select.sel.is_empty() {
             return;
         }
-        let color = (self.tool.color != prev_color).then_some(self.tool.color);
-        let width = ((self.tool.size - prev_size).abs() > 1e-4).then_some(self.tool.size);
+        let color = (self.ws.tool.color != prev_color).then_some(self.ws.tool.color);
+        let width = ((self.ws.tool.size - prev_size).abs() > 1e-4).then_some(self.ws.tool.size);
         if color.is_none() && width.is_none() { return; }
         let idx = self.canvases.active_index();
-        let sel = self.tool.select.sel.clone();
+        let sel = self.ws.tool.select.sel.clone();
         let c = self.canvases.active_mut();
         let li = c.active_layer;
         // Fold a run of size ticks into the entry the first one made.
-        let merge = color.is_none() && self.restyle_run == Some((idx, c.undo_log.len()));
+        let merge = color.is_none() && self.ws.restyle_run == Some((idx, c.undo_log.len()));
         c.restyle_objects(li, &sel.strokes, &sel.shapes, color, width, merge);
-        self.restyle_run = (width.is_some() && color.is_none()).then_some((idx, c.undo_log.len()));
+        self.ws.restyle_run = (width.is_some() && color.is_none()).then_some((idx, c.undo_log.len()));
     }
 }

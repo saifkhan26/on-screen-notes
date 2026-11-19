@@ -9,8 +9,8 @@ impl OnScreenNotesApp {
     /// can be dragged where it should stay; its bar can then keep it to
     /// this slide.
     pub(super) fn toggle_pin_selection(&mut self) {
-        let sel = self.tool.select.sel.clone();
-        if self.tool.kind != crate::tools::ToolKind::Select || sel.is_empty() { return; }
+        let sel = self.ws.tool.select.sel.clone();
+        if self.ws.tool.kind != crate::tools::ToolKind::Select || sel.is_empty() { return; }
         let li = self.canvases.active().active_layer;
         if self.selection_pinned() {
             if self.canvases.unpin_objects(li, &sel.strokes, &sel.shapes) {
@@ -19,9 +19,9 @@ impl OnScreenNotesApp {
         } else if let Some(id) = self.canvases.pin_objects(li, &sel.strokes, &sel.shapes, [24.0, 24.0], false) {
             // A new pin must be seen to be placed.
             self.canvases.set_pins_hidden(false);
-            self.tool.select.sel.clear();
-            self.tool.select.gesture = None;
-            self.pin_tool.selected = Some(id);
+            self.ws.tool.select.sel.clear();
+            self.ws.tool.select.gesture = None;
+            self.ws.pin_tool.selected = Some(id);
             self.toast = Some(("Pinned to every slide — drag the pin where it should stay".to_string(), Instant::now()));
         }
     }
@@ -47,7 +47,7 @@ impl OnScreenNotesApp {
         if hidden == self.canvases.pins_hidden() { return; }
         self.canvases.set_pins_hidden(hidden);
         if hidden {
-            self.pin_tool.clear();
+            self.ws.pin_tool.clear();
         }
         let msg = if hidden { "Pins hidden — Shift+P shows them again" } else { "Pins shown" };
         self.toast = Some((msg.to_string(), Instant::now()));
@@ -56,9 +56,9 @@ impl OnScreenNotesApp {
     /// Unpin the selected pin. Its objects stay on their slide, where the
     /// unpin is an undo step.
     pub(super) fn unpin_selected_pin(&mut self) {
-        let Some(id) = self.pin_tool.selected else { return };
+        let Some(id) = self.ws.pin_tool.selected else { return };
         let slide = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| p.slide);
-        self.pin_tool.clear();
+        self.ws.pin_tool.clear();
         if self.canvases.unpin(id) {
             let msg = match slide {
                 Some(s) if s != self.canvases.active_index() => format!("Unpinned — the objects stay on slide {}", s + 1),
@@ -77,7 +77,7 @@ impl OnScreenNotesApp {
         let found = find(self.canvases.pinned()).or_else(|| find(self.canvases.global_pins()));
         let Some((slide, members, anchor)) = found else { return };
         self.canvases.go_to(slide);
-        self.pin_tool.clear();
+        self.ws.pin_tool.clear();
         // Only the view moves, so the slide is not flagged for the autosave.
         let (pan, zoom) = self.canvases.active_view_mut();
         *pan = [area.x * 0.5 - anchor[0] * *zoom, area.y * 0.5 - anchor[1] * *zoom];
@@ -91,10 +91,10 @@ impl OnScreenNotesApp {
         if self.canvases.active().active_layer != li {
             self.canvases.active_mut().active_layer = li;
         }
-        self.tool.kind = crate::tools::ToolKind::Select;
-        self.tool.select.gesture = None;
-        self.tool.select.sel = sel;
-        self.tool.select.rebind(slide, self.canvases.active());
+        self.ws.tool.kind = crate::tools::ToolKind::Select;
+        self.ws.tool.select.gesture = None;
+        self.ws.tool.select.sel = sel;
+        self.ws.tool.select.rebind(slide, self.canvases.active());
         self.toast = Some((format!("Slide {} — the pin's objects are selected", slide + 1), Instant::now()));
     }
 
@@ -109,20 +109,20 @@ impl OnScreenNotesApp {
         use crate::input::pen::PenEvent;
         match ev {
             PenEvent::Down(_) => {
-                if self.tool.kind != crate::tools::ToolKind::Select { return false; }
+                if self.ws.tool.kind != crate::tools::ToolKind::Select { return false; }
                 let pinned = self.canvases.pinned();
-                let press = self.pin_tool.press(q, &pinned);
+                let press = self.ws.pin_tool.press(q, &pinned);
                 drop(pinned);
                 match press {
                     Press::Missed => false,
                     Press::Took => {
-                        if let Some(id) = self.pin_tool.selected {
+                        if let Some(id) = self.ws.pin_tool.selected {
                             self.canvases.pin_board().raise(id);
                         }
                         // A pin and the slide's objects are never selected
                         // together.
-                        self.tool.select.sel.clear();
-                        self.tool.select.gesture = None;
+                        self.ws.tool.select.sel.clear();
+                        self.ws.tool.select.gesture = None;
                         true
                     }
                     Press::Open(id) => {
@@ -131,15 +131,15 @@ impl OnScreenNotesApp {
                     }
                 }
             }
-            PenEvent::Move(_) | PenEvent::Up(_) if self.pin_tool.busy() => {
+            PenEvent::Move(_) | PenEvent::Up(_) if self.ws.pin_tool.busy() => {
                 let board = self.canvases.pin_board();
                 if matches!(ev, PenEvent::Up(_)) {
-                    self.pin_tool.release(q, snap, board);
-                    if let Some(pin) = self.pin_tool.selected.and_then(|id| board.get_mut(id)) {
+                    self.ws.pin_tool.release(q, snap, board);
+                    if let Some(pin) = self.ws.pin_tool.selected.and_then(|id| board.get_mut(id)) {
                         pin.center = [pin.center[0].clamp(0.0, area.x.max(0.0)), pin.center[1].clamp(0.0, area.y.max(0.0))];
                     }
                 } else {
-                    self.pin_tool.drag(q, snap, board);
+                    self.ws.pin_tool.drag(q, snap, board);
                 }
                 true
             }
@@ -150,8 +150,8 @@ impl OnScreenNotesApp {
     /// The selected pin's bar: where its objects are, and buttons to go
     /// there, show it on one slide or every slide, or unpin it.
     pub(super) fn show_pin_bar(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.pin_tool.selected else { return };
-        if !self.ui_visible || self.tool.kind != crate::tools::ToolKind::Select || self.pin_tool.dragging() { return; }
+        let Some(id) = self.ws.pin_tool.selected else { return };
+        if !self.ws.ui_visible || self.ws.tool.kind != crate::tools::ToolKind::Select || self.ws.pin_tool.dragging() { return; }
         let Some((slide, local)) = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| (p.slide, p.pin.local)) else { return };
         match ui::arrange_bar::show_pin(ctx, slide, slide == self.canvases.active_index(), local) {
             Some(ui::arrange_bar::PinBarAction::Open) => {

@@ -53,7 +53,7 @@ impl OnScreenNotesApp {
     /// Select tool, write down everything that decides where it goes.
     pub(super) fn press_log_before(&self, ctx: &egui::Context, pen_events: &[crate::input::pen::PenEvent], g: &Gates) -> Option<Press> {
         use crate::input::pen::PenEvent;
-        if self.tool.kind != crate::tools::ToolKind::Select {
+        if self.ws.tool.kind != crate::tools::ToolKind::Select {
             return None;
         }
         let pen_down = pen_events.iter().find_map(|e| match e {
@@ -87,24 +87,24 @@ impl OnScreenNotesApp {
         let _ = write!(
             s,
             " | mouse_gesture={} mouse_was_down={} pen_blocked={} pen_picking={} pen_using_eraser={} eyedropper={}",
-            self.mouse_gesture, self.mouse_was_down, self.pen_blocked, self.pen_picking, self.pen_using_eraser, self.tool.eyedropper_pending,
+            self.ws.mouse_gesture, self.ws.mouse_was_down, self.ws.pen_blocked, self.ws.pen_picking, self.ws.pen_using_eraser, self.ws.tool.eyedropper_pending,
         );
         let _ = write!(
             s,
             " | region_select={} loupe={} crop=[{}] pad=[{}] pin_sel={:?} pin_busy={} sel_gesture={} sel_n={}",
             self.region_select.is_some(),
             self.loupe.is_some(),
-            self.crop.debug(),
-            self.pad.debug(),
-            self.pin_tool.selected,
-            self.pin_tool.busy(),
-            self.tool.select.gesture.is_some(),
-            self.tool.select.sel.strokes.len() + self.tool.select.sel.shapes.len(),
+            self.ws.crop.debug(),
+            self.ws.pad.debug(),
+            self.ws.pin_tool.selected,
+            self.ws.pin_tool.busy(),
+            self.ws.tool.select.gesture.is_some(),
+            self.ws.tool.select.sel.strokes.len() + self.ws.tool.select.sel.shapes.len(),
         );
         let _ = write!(
             s,
             " | slide_window={} pinned_hwnd={:?} pin_picking={} overlay_visible={} ui_visible={}",
-            self.slide_window.is_some(), self.pinned_hwnd, self.pin_picking, self.overlay_visible, self.ui_visible,
+            self.slide_window.is_some(), self.pinned_hwnd, self.pin_picking, self.overlay_visible, self.ws.ui_visible,
         );
         ctx.input(|i| {
             let _ = write!(
@@ -144,12 +144,12 @@ impl OnScreenNotesApp {
     /// nothing with the Select tool (no gesture, no pin taken).
     pub(super) fn press_log_after(&self, press: Option<Press>) {
         let Some(press) = press else { return };
-        if self.tool.kind != crate::tools::ToolKind::Select || self.tool.select.gesture.is_some() || self.pin_tool.busy() {
+        if self.ws.tool.kind != crate::tools::ToolKind::Select || self.ws.tool.select.gesture.is_some() || self.ws.pin_tool.busy() {
             return;
         }
         let line = format!(
             "{} | after: mouse_gesture={} pen_blocked={} pen_using_eraser={}\n",
-            press.line, self.mouse_gesture, self.pen_blocked, self.pen_using_eraser,
+            press.line, self.ws.mouse_gesture, self.ws.pen_blocked, self.ws.pen_using_eraser,
         );
         if let Ok(dir) = crate::persistence::paths::data_dir() {
             append_capped(&dir.join("input-debug.log"), &line, MAX_LOG_BYTES);

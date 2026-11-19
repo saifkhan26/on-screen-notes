@@ -26,7 +26,7 @@ impl OnScreenNotesApp {
         use crate::canvas::shape::MediaKind;
         if crate::media::import::media_kind(&path) == Some(MediaKind::Video) && crate::media::ffmpeg::tools().is_none() {
             self.media_waiting.push((path, at));
-            self.media_ui.ffmpeg_window = true;
+            self.ws.media_ui.ffmpeg_window = true;
             return;
         }
         let mut job = crate::media::import::ImportJob::start(path, at);
@@ -86,7 +86,7 @@ impl OnScreenNotesApp {
 
         let (dropped, hovering) = ctx.input(|i| (i.raw.dropped_files.clone(), !i.raw.hovered_files.is_empty()));
         // Dropped on find: look for pictures like it, insert nothing.
-        if !dropped.is_empty() && self.find.is_open() {
+        if !dropped.is_empty() && self.ws.find.is_open() {
             if let Some(path) = dropped.into_iter().find_map(|f| f.path) {
                 self.find_like_file(path);
             }
@@ -113,7 +113,7 @@ impl OnScreenNotesApp {
                 .interactable(false)
                 .show(ctx, |ui| {
                     ui::theme::card_frame().inner_margin(egui::Margin::symmetric(16.0, 10.0)).show(ui, |ui| {
-                        ui.label(if self.find.is_open() {
+                        ui.label(if self.ws.find.is_open() {
                             "Drop a picture to find ones like it"
                         } else {
                             "Drop to insert picture / video / GIF, or open a PureRef board"
@@ -142,7 +142,7 @@ impl OnScreenNotesApp {
                 }
                 Err(ImportError::NeedsFfmpeg) => {
                     self.media_waiting.push((path, at));
-                    self.media_ui.ffmpeg_window = true;
+                    self.ws.media_ui.ffmpeg_window = true;
                 }
                 Err(ImportError::Failed(e)) => {
                     log::warn!("import of {name} failed: {e}");
@@ -312,10 +312,10 @@ impl OnScreenNotesApp {
         let shapes: Vec<usize> = added.iter().filter(|(l, _)| *l == li).map(|&(_, i)| i).collect();
         let selected = active && !shapes.is_empty();
         if selected {
-            self.tool.kind = crate::tools::ToolKind::Select;
-            self.tool.select.gesture = None;
-            self.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
-            self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+            self.ws.tool.kind = crate::tools::ToolKind::Select;
+            self.ws.tool.select.gesture = None;
+            self.ws.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
+            self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
         }
         self.toast = Some((resync_message(name, slide, &report, selected), Instant::now()));
     }
@@ -434,7 +434,7 @@ impl OnScreenNotesApp {
             for (path, at) in std::mem::take(&mut self.media_waiting) {
                 self.start_media_import(path, at);
             }
-        } else if !self.media_ui.ffmpeg_window {
+        } else if !self.ws.media_ui.ffmpeg_window {
             // Set-up window closed without FFmpeg: give up on those.
             self.media_waiting.clear();
         }

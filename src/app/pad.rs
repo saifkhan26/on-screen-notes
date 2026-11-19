@@ -96,18 +96,18 @@ impl OnScreenNotesApp {
     /// last frame, put the open one away if its slide, tool or picture
     /// went, follow the picture, and have the canvas show it live.
     pub(super) fn pad_frame_start(&mut self) {
-        for id in self.pad.retired.drain(..) {
+        for id in self.ws.pad.retired.drain(..) {
             pad_gpu::free_texture(id);
         }
-        if let Some(e) = self.pad.edit.as_ref() {
+        if let Some(e) = self.ws.pad.edit.as_ref() {
             let leave = self.canvases.active_index() != e.slide
                 || !self.canvases.active_editable()
-                || !matches!(self.tool.kind, ToolKind::Pen | ToolKind::Eraser);
+                || !matches!(self.ws.tool.kind, ToolKind::Pen | ToolKind::Eraser);
             if leave {
                 self.close_pad(false);
             }
         }
-        if let Some(e) = self.pad.edit.as_mut() {
+        if let Some(e) = self.ws.pad.edit.as_mut() {
             let found = self
                 .canvases
                 .slide(e.slide)
@@ -123,19 +123,19 @@ impl OnScreenNotesApp {
                 None => {
                     // Gone from under it (nothing should do that while it
                     // is open): what was drawn since the last save is lost.
-                    let e = self.pad.edit.take().expect("checked above");
-                    self.pad.retired.push(e.session.texture_id());
+                    let e = self.ws.pad.edit.take().expect("checked above");
+                    self.ws.pad.retired.push(e.session.texture_id());
                     self.toast = Some(("The picture being drawn on went away".to_string(), Instant::now()));
                 }
             }
         }
-        self.overlay_cache.set_pad(self.pad.shown());
+        self.overlay_cache.set_pad(self.ws.pad.shown());
     }
 
     /// The picture store moved the open pad's bytes to the media folder:
     /// follow them to the slide's new (preview) bytes.
     pub(super) fn pad_follow_store(&mut self, swaps: &[(Arc<Vec<u8>>, crate::canvas::shape::PictureRef)]) {
-        let Some(e) = self.pad.edit.as_mut() else { return };
+        let Some(e) = self.ws.pad.edit.as_mut() else { return };
         if !swaps.iter().any(|(from, _)| Arc::as_ptr(from) as usize == e.key) {
             return;
         }
@@ -190,7 +190,7 @@ impl OnScreenNotesApp {
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         let layer = self.canvases.active().active_layer;
-        if let Some(&i) = self.tool.select.sel.shapes.first() {
+        if let Some(&i) = self.ws.tool.select.sel.shapes.first() {
             self.open_pad(layer, i);
         }
     }
@@ -257,11 +257,11 @@ impl OnScreenNotesApp {
         let Some(session) = Session::new(pixels, w, h, paper.is_some()) else {
             return say(self, "The GPU could not open the picture for drawing");
         };
-        let prev_tool = self.tool.kind;
+        let prev_tool = self.ws.tool.kind;
         if !matches!(prev_tool, ToolKind::Pen | ToolKind::Eraser) {
-            self.tool.kind = ToolKind::Pen;
+            self.ws.tool.kind = ToolKind::Pen;
         }
-        self.pad.edit = Some(PadEdit {
+        self.ws.pad.edit = Some(PadEdit {
             session,
             slide,
             layer,
@@ -281,7 +281,7 @@ impl OnScreenNotesApp {
         if lifted {
             self.set_pad_paper(pad::WHITE, false);
         }
-        self.overlay_cache.set_pad(self.pad.shown());
+        self.overlay_cache.set_pad(self.ws.pad.shown());
         self.toast = Some(("Drawing on the picture: pen, pencil, Ctrl to erase. Esc when done".to_string(), Instant::now()));
         true
     }
@@ -290,8 +290,8 @@ impl OnScreenNotesApp {
     /// there for the whole time it was open. `restore_tool` gives back the
     /// tool it was opened from (Esc does; a tool picked to leave it stays).
     pub(super) fn close_pad(&mut self, restore_tool: bool) {
-        let Some(mut e) = self.pad.edit.take() else { return };
-        self.pad.retired.push(e.session.texture_id());
+        let Some(mut e) = self.ws.pad.edit.take() else { return };
+        self.ws.pad.retired.push(e.session.texture_id());
         self.overlay_cache.set_pad(None);
         let saved = self.pad_write(&mut e);
         if e.session.edits > 0 || e.paper_changed {
@@ -310,7 +310,7 @@ impl OnScreenNotesApp {
             }
         }
         if restore_tool {
-            self.tool.kind = e.prev_tool;
+            self.ws.tool.kind = e.prev_tool;
         }
     }
 
@@ -357,36 +357,36 @@ impl OnScreenNotesApp {
     /// A pen or mouse step, in canvas units. `true` when the pad took it:
     /// a pad is open, or a press outside one just put it away.
     pub(super) fn pad_pointer(&mut self, ev: PenEvent, erase: bool) -> bool {
-        if self.pad.swallow {
+        if self.ws.pad.swallow {
             if matches!(ev, PenEvent::Up(_)) {
-                self.pad.swallow = false;
+                self.ws.pad.swallow = false;
             }
             return true;
         }
-        if self.pad.edit.is_none() {
+        if self.ws.pad.edit.is_none() {
             return false;
         }
         if let PenEvent::Down(s) = ev {
-            if !self.pad.edit.as_ref().is_some_and(|e| e.frame.contains(s.pos)) {
+            if !self.ws.pad.edit.as_ref().is_some_and(|e| e.frame.contains(s.pos)) {
                 self.close_pad(false);
-                self.pad.swallow = true;
+                self.ws.pad.swallow = true;
                 return true;
             }
         }
-        let brush = if erase || self.tool.kind == ToolKind::Eraser {
+        let brush = if erase || self.ws.tool.kind == ToolKind::Eraser {
             Brush::Eraser
         } else {
-            match self.tool.style {
+            match self.ws.tool.style {
                 StrokeStyle::Pencil | StrokeStyle::Airbrush => Brush::Pencil,
                 _ => Brush::Pen,
             }
         };
         // The tool's size is on screen: a diameter, the eraser's a radius.
         let zoom = self.canvases.active().zoom.max(1e-3);
-        let on_screen = if brush == Brush::Eraser { self.tool.size.max(2.0) } else { self.tool.size * 0.5 };
-        let color = self.tool.color;
+        let on_screen = if brush == Brush::Eraser { self.ws.tool.size.max(2.0) } else { self.ws.tool.size * 0.5 };
+        let color = self.ws.tool.color;
         let curve = crate::canvas::stroke::pressure_curve();
-        let Some(e) = self.pad.edit.as_mut() else { return false };
+        let Some(e) = self.ws.pad.edit.as_mut() else { return false };
         let r_max = on_screen / zoom * e.frame.px_per_unit();
         let mut stamps = Vec::new();
         match ev {
@@ -406,9 +406,9 @@ impl OnScreenNotesApp {
         if matches!(ev, PenEvent::Up(_)) && e.walk.take().is_some() {
             e.session.end();
             if e.saved_at.elapsed() >= SNAPSHOT_EVERY {
-                let mut taken = self.pad.edit.take().expect("open");
+                let mut taken = self.ws.pad.edit.take().expect("open");
                 let _ = self.pad_write(&mut taken);
-                self.pad.edit = Some(taken);
+                self.ws.pad.edit = Some(taken);
             }
         }
         true
@@ -416,14 +416,14 @@ impl OnScreenNotesApp {
 
     /// Draw this frame's stamps (after the pen and mouse were handed out).
     pub(super) fn pad_flush(&mut self) {
-        if let Some(e) = self.pad.edit.as_mut() {
+        if let Some(e) = self.ws.pad.edit.as_mut() {
             e.session.flush();
         }
     }
 
     /// Take back (or redo) the open pad's last stroke.
     pub(super) fn pad_undo(&mut self, redo: bool) {
-        if let Some(e) = self.pad.edit.as_mut() {
+        if let Some(e) = self.ws.pad.edit.as_mut() {
             e.session.undo(redo);
         }
     }
@@ -432,7 +432,7 @@ impl OnScreenNotesApp {
     /// its strokes. Taken out of the frame's keys before anything else
     /// sees them.
     pub(super) fn pad_keys(&mut self, ctx: &egui::Context) {
-        if self.pad.edit.is_none() || ctx.wants_keyboard_input() {
+        if self.ws.pad.edit.is_none() || ctx.wants_keyboard_input() {
             return;
         }
         let shortcut = |b: Option<crate::input::hotkeys_config::Binding>| {
@@ -453,7 +453,7 @@ impl OnScreenNotesApp {
     /// Give the open pad paper `p` (straight RGBA, alpha its opacity), in
     /// its slide at once. `remember` keeps it for the next new pad.
     fn set_pad_paper(&mut self, p: [u8; 4], remember: bool) {
-        let Some(e) = self.pad.edit.as_mut() else { return };
+        let Some(e) = self.ws.pad.edit.as_mut() else { return };
         e.paper = Some(p);
         e.paper_changed = true;
         let (slide, layer, key, hint) = (e.slide, e.layer, e.key, e.shape);
@@ -474,7 +474,7 @@ impl OnScreenNotesApp {
     /// for a pad the paper bar: its colour (a few one tap away, or any)
     /// and opacity.
     pub(super) fn pad_chrome(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) {
-        let Some(e) = self.pad.edit.as_ref() else { return };
+        let Some(e) = self.ws.pad.edit.as_ref() else { return };
         let c = self.canvases.active();
         let to_screen = |p: [f32; 2]| egui::pos2(canvas_rect.min.x + c.pan[0] + p[0] * c.zoom, canvas_rect.min.y + c.pan[1] + p[1] * c.zoom);
         let corners: Vec<egui::Pos2> = e.frame.obb.corners().into_iter().map(to_screen).collect();
