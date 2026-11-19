@@ -44,6 +44,8 @@ pub enum KeyAction {
     ToggleSlidePanel,
     ToggleSlideOrder,
     SlideWindow,
+    /// Drag a box on the canvas for the slide window to show.
+    SlideWindowRegion,
     NewLayer,
     DeleteLayer,
     /// Move the active layer one place up (+1) or down (−1).
@@ -68,6 +70,8 @@ pub enum KeyAction {
     FindSimilar,
     /// Crop the selected picture or pad.
     Crop,
+    /// Show the selection in the slide window.
+    OpenInWindow,
     /// Text labels in a box, or not.
     TextBox,
     /// Move the active slide one place toward the first (−1) or last (+1).
@@ -130,6 +134,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (a.tag, KeyAction::Tag),
         (a.find_similar, KeyAction::FindSimilar),
         (a.crop, KeyAction::Crop),
+        (a.open_in_window, KeyAction::OpenInWindow),
         (a.dim_unselected, KeyAction::DimUnselected),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));
@@ -172,6 +177,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.toggle_slide_panel, KeyAction::ToggleSlidePanel),
         (c.toggle_slide_order, KeyAction::ToggleSlideOrder),
         (c.slide_window, KeyAction::SlideWindow),
+        (c.slide_window_region, KeyAction::SlideWindowRegion),
         (c.new_layer, KeyAction::NewLayer),
         (c.delete_layer, KeyAction::DeleteLayer),
         (c.move_layer_up, KeyAction::MoveLayer(1)),

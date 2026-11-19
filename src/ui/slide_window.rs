@@ -51,6 +51,10 @@ const CARD_INSET: f32 = 50.0;
 const EDGE: f32 = 6.0;
 /// Frames to look for the window's handle after it opens.
 const FIND_FRAMES: u32 = 120;
+/// The window's size when it first opens on a slide, and the least it
+/// can be made, in points.
+const START_SIZE: Vec2 = Vec2::new(720.0, 480.0);
+pub const MIN_SIZE: Vec2 = Vec2::new(520.0, 240.0);
 
 /// The open slide window: which slide it shows and how.
 pub struct SlideWindow {
@@ -59,8 +63,19 @@ pub struct SlideWindow {
     /// and its scale — like `Canvas::pan` / `zoom`, but this window's.
     pan: [f32; 2],
     zoom: f32,
-    /// Fit the slide to the window on the next frame.
+    /// Fit the slide to the window on the next frame: its region if it
+    /// has one, else all of it.
     fit_pending: bool,
+    /// The next fit shows all of the slide even though it has a region.
+    fit_whole: bool,
+    /// The part of the slide the window was opened on (a box dragged on
+    /// the canvas, or a selection), in slide units: what Fit goes back
+    /// to. Only for this slide; showing another one drops it.
+    region: Option<[f32; 4]>,
+    /// Where the window opened on screen and its size, in points, when it
+    /// popped out over a region; `None` for the usual size, wherever the
+    /// system puts it. Asked for on opening only: moves and resizes stick.
+    place: Option<egui::Rect>,
     /// Stay above every other window, not only the overlay.
     on_top: bool,
     /// Show the global pins, and no slide, instead of the slide; the
@@ -108,6 +123,9 @@ impl SlideWindow {
             pan: [0.0; 2],
             zoom: 1.0,
             fit_pending: true,
+            fit_whole: false,
+            region: None,
+            place: None,
             on_top: false,
             pins: false,
             hwnd: 0,
@@ -116,6 +134,26 @@ impl SlideWindow {
             last_rect: egui::Rect::NOTHING,
             last_ppp: 1.0,
         }
+    }
+
+    /// A window popped out over `region` of slide `slide` (slide units):
+    /// it opens at `place` (screen points, see `pop_out_rect`) seen through
+    /// `pan` / `zoom`, which keep the region where it was on the canvas.
+    pub fn popped_out(slide: usize, region: [f32; 4], place: egui::Rect, pan: [f32; 2], zoom: f32, cfg: &crate::config::AppConfig) -> Self {
+        Self { pan, zoom, fit_pending: false, region: Some(region), place: Some(place), ..Self::new(slide, cfg) }
+    }
+
+    /// Show `region` of slide `slide` (slide units), fitted to the window
+    /// where it is now; the global pins give way to the slide.
+    pub fn aim(&mut self, slide: usize, region: [f32; 4]) {
+        if self.pins {
+            self.pins = false;
+            self.edit.drop_pin_selection();
+        }
+        self.slide = slide;
+        self.region = Some(region);
+        self.fit_pending = true;
+        self.fit_whole = false;
     }
 
     /// The slide shown, and its point under screen point `screen`
@@ -178,10 +216,12 @@ impl SlideWindow {
         self.pins
     }
 
-    /// Show slide `idx` instead, fitted to the window.
+    /// Show slide `idx` instead, fitted to the window. The region was the
+    /// other slide's, so it goes.
     pub fn set_slide(&mut self, idx: usize) {
         if idx != self.slide {
             self.slide = idx;
+            self.region = None;
             self.fit_pending = true;
         }
     }
@@ -230,16 +270,20 @@ pub fn show(
 
     // Not shown on the window; Alt+Tab and the handle search use it.
     let title = if win.pins { "Slide window · global pins".to_string() } else { format!("Slide {}", slide_label(manager, win.slide)) };
-    let builder = egui::ViewportBuilder::default()
+    let mut builder = egui::ViewportBuilder::default()
         .with_title(title)
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(true)
         .with_taskbar(false)
-        // Size on first opening only; the user's resizes stick after.
-        .with_inner_size([720.0, 480.0])
-        .with_min_inner_size([520.0, 240.0])
+        // Size (and place) on first opening only: the builder stays the
+        // same every frame after, so the user's moves and resizes stick.
+        .with_inner_size(win.place.map_or(START_SIZE, |r| r.size()))
+        .with_min_inner_size(MIN_SIZE)
         .with_window_level(if win.on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal });
+    if let Some(r) = win.place {
+        builder = builder.with_position(r.min);
+    }
     let open = ctx.show_viewport_immediate(SlideWindow::viewport_id(), builder, |ctx, class| {
         // A backend with one window would draw this over the canvas.
         // Desktop eframe always makes a real window.
@@ -417,9 +461,19 @@ fn card(ctx: &egui::Context, win: &mut SlideWindow, manager: &CanvasManager) -> 
                         win.fit_pending = true;
                     }
                     ui.add_space(8.0);
-                    let fit_tip = if win.pins { "Fit the pins to the window — or double-click" } else { "Fit the slide to the window — or double-click it" };
+                    let fit_tip = if win.pins {
+                        "Fit the pins to the window — or double-click"
+                    } else if win.region.is_some() {
+                        "Back to the region this window was opened on — or double-click"
+                    } else {
+                        "Fit the slide to the window — or double-click it"
+                    };
                     if text_btn(ui, "Fit", fit_tip, false) {
                         win.fit_pending = true;
+                    }
+                    if win.region.is_some() && !win.pins && text_btn(ui, "All", "Fit the whole slide. Fit goes back to the region", false) {
+                        win.fit_pending = true;
+                        win.fit_whole = true;
                     }
                     ui.label(egui::RichText::new(zoom_label(win.zoom)).color(theme::TEXT_MUTED));
                     ui.add_space(8.0);
@@ -542,8 +596,16 @@ fn canvas_area(
         win.edit.pointer(ctx, &response, manager, view, &mut win.pan, editable, input, win.hwnd, main_tool);
         let drag_pans = win.edit.drag_pans(editable, input, ctx);
         if navigate(ctx, win, rect, &response, drag_pans) {
-            if let Some(slide) = manager.slide(win.slide) {
-                fit(win, slide, rect.size(), top);
+            let whole = std::mem::take(&mut win.fit_whole);
+            match win.region {
+                // A small region blows up as far as the canvas goes: the
+                // user picked it.
+                Some(r) if !whole => fit_bounds(win, r, rect.size(), top, crate::interaction::zoom_pan::MAX_ZOOM),
+                _ => {
+                    if let Some(slide) = manager.slide(win.slide) {
+                        fit(win, slide, rect.size(), top);
+                    }
+                }
             }
         }
         let view = crate::ui::slide_edit::View { pan: win.pan, zoom: win.zoom, ..view };
@@ -773,6 +835,23 @@ fn zoom_about(win: &mut SlideWindow, factor: f32, at: Vec2) {
     win.pan = [at.x - cx * z_new, at.y - cy * z_new];
 }
 
+/// Where a window popped out over `region` (points, like `screen`)
+/// goes: over it, at least `min` in size and grown about its middle if
+/// smaller, no bigger than `screen`, and moved inside it.
+pub fn pop_out_rect(region: egui::Rect, min: Vec2, screen: egui::Rect) -> egui::Rect {
+    let r = egui::Rect::from_center_size(region.center(), region.size().max(min).min(screen.size()));
+    let shift = |lo: f32, hi: f32, a: f32, b: f32| {
+        if a < lo || b - a >= hi - lo {
+            lo - a
+        } else if b > hi {
+            hi - b
+        } else {
+            0.0
+        }
+    };
+    r.translate(Vec2::new(shift(screen.min.x, screen.max.x, r.min.x, r.max.x), shift(screen.min.y, screen.max.y, r.min.y, r.max.y)))
+}
+
 /// Everything the slide's visible layers paint, in slide coordinates.
 fn content_bounds(slide: &Canvas) -> Option<[f32; 4]> {
     slide
@@ -858,6 +937,46 @@ mod tests {
         fit(&mut w, &slide, Vec2::new(448.0, 448.0), CARD_INSET);
         let a = [w.pan[0] + 100.0 * w.zoom, w.pan[1] + 100.0 * w.zoom];
         assert!(a[1] >= CARD_INSET + FIT_MARGIN - 1.0, "top edge clears the card");
+    }
+
+    #[test]
+    fn a_pop_out_sits_over_its_region_and_stays_on_screen() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1920.0, 1080.0));
+        let big = egui::Rect::from_min_size(egui::pos2(300.0, 200.0), Vec2::new(800.0, 500.0));
+        assert_eq!(pop_out_rect(big, MIN_SIZE, screen), big, "a region past the least size: exactly over it");
+
+        let small = egui::Rect::from_center_size(egui::pos2(900.0, 500.0), Vec2::new(100.0, 60.0));
+        let r = pop_out_rect(small, MIN_SIZE, screen);
+        assert_eq!(r.size(), MIN_SIZE);
+        assert_eq!(r.center(), small.center(), "grown about its middle");
+
+        let corner = egui::Rect::from_min_size(egui::pos2(1880.0, 1050.0), Vec2::new(30.0, 20.0));
+        let r = pop_out_rect(corner, MIN_SIZE, screen);
+        assert!(screen.contains_rect(r), "pushed back on screen: {r:?}");
+        assert!(r.contains_rect(corner), "still over the region");
+
+        let huge = egui::Rect::from_min_size(egui::pos2(-50.0, -20.0), Vec2::new(2400.0, 1400.0));
+        assert_eq!(pop_out_rect(huge, MIN_SIZE, screen), screen, "too big: the whole screen");
+        let wide = egui::Rect::from_min_size(egui::pos2(0.0, 200.0), Vec2::new(1600.0, 340.0));
+        let r = pop_out_rect(wide, MIN_SIZE, screen);
+        assert!(screen.contains_rect(r) && r.width() == 1600.0 && r.min.y == 200.0, "wide: kept in place, on screen: {r:?}");
+        let wider = egui::Rect::from_min_size(egui::pos2(400.0, 200.0), Vec2::new(2000.0, 340.0));
+        assert_eq!(pop_out_rect(wider, MIN_SIZE, screen).x_range(), screen.x_range(), "wider than the screen: as wide as it");
+    }
+
+    #[test]
+    fn fit_goes_back_to_the_region_until_another_slide_shows() {
+        let mut w = SlideWindow::new(2, &crate::config::AppConfig::default());
+        w.aim(2, [100.0, 100.0, 300.0, 200.0]);
+        assert!(w.fit_pending && w.region.is_some());
+        w.set_slide(2);
+        assert!(w.region.is_some(), "same slide: kept");
+        w.set_slide(3);
+        assert!(w.region.is_none(), "another slide: the region was not its");
+
+        w.pins = true;
+        w.aim(0, [0.0, 0.0, 10.0, 10.0]);
+        assert!(!w.pins && w.slide == 0, "a region shows its slide, not the pins");
     }
 
     #[test]

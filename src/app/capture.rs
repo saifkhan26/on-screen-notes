@@ -51,6 +51,12 @@ impl OnScreenNotesApp {
     /// aims over a still-visible desktop — it is dropped only at the moment
     /// the region is confirmed, then re-composited into the saved image.
     pub(super) fn begin_region_select(&mut self) {
+        self.begin_box(BoxFor::Screenshot);
+    }
+
+    /// Drag out a box over the screen for `purpose`; the UI hides while
+    /// it is dragged (see `update_region_select`).
+    pub(super) fn begin_box(&mut self, purpose: BoxFor) {
         if self.region_select.is_some() || self.pending_screenshot.is_some() {
             return;
         }
@@ -58,22 +64,24 @@ impl OnScreenNotesApp {
             start: None,
             current: egui::Pos2::ZERO,
             ui_visible_before: self.ui_visible,
+            purpose,
         });
         self.ui_visible = false;
     }
 
     /// Handle the interactive region-selection overlay for one frame: read
     /// the drag, draw the dimmed rubber-band, and on release turn the
-    /// selection into a region `pending_screenshot` (or cancel). No-op when
-    /// no selection is active.
+    /// selection into a region `pending_screenshot`, or show it in the
+    /// slide window (or cancel). No-op when no selection is active.
     pub(super) fn update_region_select(&mut self, ctx: &egui::Context) {
         let Some(mut rs) = self.region_select else { return };
 
-        let (pressed, released, esc, pos) = ctx.input(|i| {
+        // Esc is taken, so it cancels only the box (not the selection too).
+        let (pressed, released, esc, pos) = ctx.input_mut(|i| {
             (
                 i.pointer.primary_pressed(),
                 i.pointer.primary_released(),
-                i.key_pressed(egui::Key::Escape),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
                 i.pointer.latest_pos().or(i.pointer.interact_pos()),
             )
         });
@@ -96,6 +104,15 @@ impl OnScreenNotesApp {
             if let Some(start) = rs.start {
                 let sel = egui::Rect::from_two_pos(start, rs.current);
                 let ppp = ctx.pixels_per_point().max(0.01);
+                if rs.purpose == BoxFor::SlideWindow {
+                    self.ui_visible = rs.ui_visible_before;
+                    self.region_select = None;
+                    // A click, not a box: nothing to show.
+                    if sel.width() >= 8.0 && sel.height() >= 8.0 {
+                        self.show_box_in_window(ctx, sel);
+                    }
+                    return;
+                }
                 // Reject a too-small drag (a stray click) — treat as cancel.
                 if sel.width() * ppp >= 4.0 && sel.height() * ppp >= 4.0 {
                     self.pending_screenshot = Some(PendingShot {
@@ -153,28 +170,38 @@ impl OnScreenNotesApp {
             let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
             let pts = [sel.left_top(), sel.right_top(), sel.right_bottom(), sel.left_bottom(), sel.left_top()];
             crate::canvas::render::paint_dashed_polyline(&painter, &pts, stroke, 1.0);
-            // Dimension label in physical pixels (what the PNG will be).
-            let ppp = ctx.pixels_per_point().max(0.01);
-            let wpx = (sel.width() * ppp).round() as i32;
-            let hpx = (sel.height() * ppp).round() as i32;
-            let label_pos = egui::pos2(sel.left(), (sel.top() - 6.0).max(screen.top() + 2.0));
-            painter.text(
-                label_pos,
-                egui::Align2::LEFT_BOTTOM,
-                format!("{wpx} × {hpx}"),
-                egui::FontId::proportional(14.0),
-                egui::Color32::WHITE,
-            );
+            if rs.purpose == BoxFor::Screenshot {
+                // Dimension label in physical pixels (what the PNG will be).
+                let ppp = ctx.pixels_per_point().max(0.01);
+                let wpx = (sel.width() * ppp).round() as i32;
+                let hpx = (sel.height() * ppp).round() as i32;
+                let label_pos = egui::pos2(sel.left(), (sel.top() - 6.0).max(screen.top() + 2.0));
+                painter.text(
+                    label_pos,
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{wpx} × {hpx}"),
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::WHITE,
+                );
+            }
         } else {
             // Before the first drag: dim everything + a hint.
             painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(70));
-            painter.text(
-                screen.center(),
-                egui::Align2::CENTER_CENTER,
-                "Drag to select a screenshot region  ·  Esc to cancel",
-                egui::FontId::proportional(18.0),
-                egui::Color32::WHITE,
-            );
+            match rs.purpose {
+                BoxFor::Screenshot => {
+                    let hint = "Drag to select a screenshot region  ·  Esc to cancel";
+                    painter.text(screen.center(), egui::Align2::CENTER_CENTER, hint, egui::FontId::proportional(18.0), egui::Color32::WHITE);
+                }
+                BoxFor::SlideWindow => {
+                    // Near the top, on a pill: an open slide window may
+                    // cover the middle of the screen.
+                    let hint = "Drag a box to show it in the slide window  ·  Esc to cancel";
+                    let galley = painter.layout_no_wrap(hint.to_string(), egui::FontId::proportional(18.0), egui::Color32::WHITE);
+                    let pill = egui::Rect::from_center_size(egui::pos2(screen.center().x, screen.top() + 60.0), galley.size() + egui::vec2(28.0, 14.0));
+                    painter.rect_filled(pill, 10.0, ui::theme::GLASS_FILL);
+                    painter.galley(pill.center() - galley.size() * 0.5, galley, egui::Color32::WHITE);
+                }
+            }
         }
         // Keep the frame live for the dashed animation + drag tracking.
         ctx.request_repaint();

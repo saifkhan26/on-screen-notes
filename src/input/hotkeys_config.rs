@@ -497,6 +497,8 @@ pub struct CanvasSection {
     #[serde(default)] pub toggle_slide_order: String,
     /// Show the active slide in the slide window, or close the window.
     #[serde(default)] pub slide_window: String,
+    /// Drag a box on the canvas: the slide window shows that part.
+    #[serde(default)] pub slide_window_region: String,
     #[serde(default)] pub new_layer: String,
     /// The active layer goes, as with the layer panel's bin: no undo.
     #[serde(default)] pub delete_layer: String,
@@ -589,6 +591,8 @@ pub struct ArrangeSection {
     pub dim_unselected: String,
     /// Crop the selected picture or drawing pad.
     pub crop: String,
+    /// Show the selection in the slide window.
+    pub open_in_window: String,
 }
 
 impl Default for CanvasSection {
@@ -656,6 +660,7 @@ impl Default for CanvasSection {
             toggle_slide_panel: String::new(),
             toggle_slide_order: String::new(),
             slide_window: String::new(),
+            slide_window_region: String::new(),
             new_layer: String::new(),
             delete_layer: String::new(),
             move_layer_up: String::new(),
@@ -740,8 +745,9 @@ fn d_media_next_frame() -> String { "period".into() }
 /// slides; 7 groups; 8 onion skin; 9 the command palette; 10 find and tags;
 /// 11 select all (and lists finding like pictures and duplicates);
 /// 12 resync from PureRef; 13 hopping from object to object; 14 dimming
-/// what is not selected; 15 cropping a picture.
-const FORMAT: u32 = 15;
+/// what is not selected; 15 cropping a picture; 16 the slide window on a
+/// box or the selection.
+const FORMAT: u32 = 16;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -843,6 +849,7 @@ pub struct ArrangeBindings {
     pub find_similar: Option<Binding>,
     pub dim_unselected: Option<Binding>,
     pub crop: Option<Binding>,
+    pub open_in_window: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -908,6 +915,7 @@ pub struct CanvasBindings {
     pub toggle_slide_panel: Option<Binding>,
     pub toggle_slide_order: Option<Binding>,
     pub slide_window: Option<Binding>,
+    pub slide_window_region: Option<Binding>,
     pub new_layer: Option<Binding>,
     pub delete_layer: Option<Binding>,
     pub move_layer_up: Option<Binding>,
@@ -1036,6 +1044,7 @@ impl HotkeysConfig {
                 find_similar: p("arrange.find_similar", &ar.find_similar),
                 dim_unselected: p("arrange.dim_unselected", &ar.dim_unselected),
                 crop: p("arrange.crop", &ar.crop),
+                open_in_window: p("arrange.open_in_window", &ar.open_in_window),
             },
             canvas: CanvasBindings {
                 undo:          p("canvas.undo",          &self.canvas.undo),
@@ -1122,6 +1131,7 @@ impl HotkeysConfig {
                 toggle_slide_panel: p("canvas.toggle_slide_panel", &cv.toggle_slide_panel),
                 toggle_slide_order: p("canvas.toggle_slide_order", &cv.toggle_slide_order),
                 slide_window:       p("canvas.slide_window",       &cv.slide_window),
+                slide_window_region: p("canvas.slide_window_region", &cv.slide_window_region),
                 new_layer:          p("canvas.new_layer",          &cv.new_layer),
                 delete_layer:       p("canvas.delete_layer",       &cv.delete_layer),
                 move_layer_up:      p("canvas.move_layer_up",      &cv.move_layer_up),
@@ -1428,6 +1438,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("arrange", "find_similar")          => "Find pictures like the selected one (or the copied one): copies, edits, similar",
         ("arrange", "dim_unselected")        => "Dim the rest: while objects are selected, everything else fades back",
         ("arrange", "crop")                  => "Crop the selected picture or drawing pad (drag its edges; Enter crops, Esc cancels)",
+        ("arrange", "open_in_window")        => "Show the selection in the slide window (pops out over it if the window is closed)",
 
         ("canvas", "undo")                 => "Undo",
         ("canvas", "redo")                 => "Redo",
@@ -1495,6 +1506,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "toggle_slide_panel")   => "Fold / unfold the slide panel",
         ("canvas", "toggle_slide_order")   => "Ctrl+Tab: slides in order, or recently used first",
         ("canvas", "slide_window")         => "Show the slide in the slide window, or close it",
+        ("canvas", "slide_window_region")  => "Drag a box on the canvas: the slide window shows that part (pops out over it if closed)",
         ("canvas", "new_layer")            => "New layer",
         ("canvas", "delete_layer")         => "Delete the active layer (no undo)",
         ("canvas", "move_layer_up")        => "Active layer one place up (clears the undo history)",
@@ -1743,7 +1755,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 15"));
+        assert!(up.contains("version = 16"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1752,7 +1764,7 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 15\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 16\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
         assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
@@ -1789,7 +1801,7 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 15\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 16\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
@@ -1926,7 +1938,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 15\n\n\
+             version = 16\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1947,13 +1959,13 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 15\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 16\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 15");
-        assert_eq!(upgrade_text("", 0), "version = 15\n");
+        assert_eq!(new, "version = 16");
+        assert_eq!(upgrade_text("", 0), "version = 16\n");
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub enum BarAction {
     /// Turn the selection a quarter turn right (`true`, clockwise) or left.
     Rotate(bool),
     ZoomToSelection,
+    /// Show the selection in the slide window.
+    OpenInWindow,
     /// Show the selected picture's colours, or hide them.
     PictureColours,
     /// Find pictures like the selected one.
@@ -271,6 +273,10 @@ pub fn show(
                     }
                     if let Some(to) = move_btn(ui, slides, keys.arrange.move_to_slide, open_move) {
                         picked = Some(BarAction::MoveToSlide(to));
+                    }
+                    let tip = with_key("Show in the slide window — it pops out over the selection, or the open one shows it", k.open_in_window);
+                    if icon_btn(ui, egui::include_image!("../../assets/icons/open-in-window.svg"), true, &tip) {
+                        picked = Some(BarAction::OpenInWindow);
                     }
                     let tip = if pinned {
                         "Unpin — stop showing these as a pin"

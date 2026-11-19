@@ -43,6 +43,8 @@ pub enum SlideAction {
     Add,
     /// Show the slide in the slide window (`ui::slide_window`).
     OpenWindow(usize),
+    /// Go to the slide and drag a box on it for the slide window to show.
+    OpenRegion(usize),
     /// Move slide `.0` to place `.1`, the slides between shifting along.
     Move(usize, usize),
     /// Bring the slide up to date with its PureRef board.
@@ -315,6 +317,10 @@ fn slide_row(
     response.context_menu(|ui| {
         if ui.button("Open in a window").clicked() {
             action = Some(SlideAction::OpenWindow(i));
+            ui.close_menu();
+        }
+        if ui.button("Open a part in a window…").on_hover_text("Drag a box on the slide: the slide window shows that part").clicked() {
+            action = Some(SlideAction::OpenRegion(i));
             ui.close_menu();
         }
         let (label, tip) = match &board {

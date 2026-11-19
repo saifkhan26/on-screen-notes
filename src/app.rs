@@ -41,6 +41,7 @@ mod find;
 mod similar;
 mod pad;
 mod crop;
+mod window_region;
 mod press_log;
 
 pub struct OnScreenNotesApp {
@@ -424,6 +425,17 @@ struct RegionSelect {
     current: egui::Pos2,
     /// `ui_visible` at selection start, restored if the user cancels.
     ui_visible_before: bool,
+    /// What the box is for.
+    purpose: BoxFor,
+}
+
+/// What a box dragged over the screen is for (`RegionSelect`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoxFor {
+    /// A screenshot of what is inside it.
+    Screenshot,
+    /// The slide window shows that part of the slide.
+    SlideWindow,
 }
 
 /// State held while a lasso-select capture is in flight. Carries the
@@ -957,6 +969,7 @@ impl eframe::App for OnScreenNotesApp {
                     Some(BarAction::Flip(vertical)) => self.flip_selection(vertical),
                     Some(BarAction::Rotate(right)) => self.rotate_selection(right),
                     Some(BarAction::ZoomToSelection) => self.zoom_to_selection(ctx),
+                    Some(BarAction::OpenInWindow) => self.show_selection_in_window(ctx),
                     Some(BarAction::PictureColours) => self.toggle_picture_colours(),
                     Some(BarAction::FindSimilar) => self.find_similar(),
                     Some(BarAction::Crop) => self.start_crop(),

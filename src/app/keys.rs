@@ -485,6 +485,12 @@ impl OnScreenNotesApp {
                 }
                 None => self.slide_window = Some(ui::slide_window::SlideWindow::new(i, &self.config)),
             },
+            Some(ui::slide_panel::SlideAction::OpenRegion(i)) => {
+                if i != self.canvases.active_index() {
+                    self.canvases.go_to(i);
+                }
+                self.begin_window_region();
+            }
             None => {}
         }
         if rename_slide {

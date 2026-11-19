@@ -135,6 +135,7 @@ impl OnScreenNotesApp {
                     self.slide_window = Some(ui::slide_window::SlideWindow::new(self.canvases.active_index(), &self.config));
                 }
             }
+            K::SlideWindowRegion => self.begin_window_region(),
             K::NewLayer => {
                 if self.may_edit() {
                     self.canvases.active_mut().add_layer();
@@ -205,6 +206,11 @@ impl OnScreenNotesApp {
             K::Crop => {
                 if selecting {
                     self.start_crop();
+                }
+            }
+            K::OpenInWindow => {
+                if selecting {
+                    self.show_selection_in_window(ctx);
                 }
             }
             K::FindCopies => {

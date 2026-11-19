@@ -130,6 +130,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         add("Turn left 90°", s, a.rotate_left, C::Key(K::Rotate(false)));
         add("Turn right 90°", s, a.rotate_right, C::Key(K::Rotate(true)));
         add("Zoom to the selection", s, c.zoom_to_selection, C::Key(K::ZoomToSelection));
+        add("Show the selection in the slide window", s, a.open_in_window, C::Key(K::OpenInWindow));
         add("Dim the rest on / off (fade what is not selected)", s, a.dim_unselected, C::Key(K::DimUnselected));
         add("Tag the selection (find knows it by its tags)", s, a.tag, C::Key(K::Tag));
         for (dir, key) in crate::tools::hop::Dir::ALL.into_iter().zip(c.hop) {
@@ -226,6 +227,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Move the slide down", sl, c.move_slide_down, C::Key(K::MoveSlide(1)));
     add("Freeze the screen into a new layer", sl, c.freeze_frame, C::FreezeFrame);
     add("Open the slide window / close it", sl, c.slide_window, C::Key(K::SlideWindow));
+    add("Show a part of the slide in the slide window (drag a box)", sl, c.slide_window_region, C::Key(K::SlideWindowRegion));
     add("Fold / unfold the slide panel", sl, c.toggle_slide_panel, C::Key(K::ToggleSlidePanel));
     add("Every tag (find, rename, remove)", sl, c.tag_list, C::Key(K::TagList));
     add("Ctrl+Tab: slides in order / recently used", sl, c.toggle_slide_order, C::Key(K::ToggleSlideOrder));

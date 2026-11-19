@@ -714,6 +714,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Flip top to bottom",       a.flip_vertical),
             ("A picture's colours",      a.picture_colours),
             ("Dim the rest on / off",    a.dim_unselected),
+            ("Selection in slide window", a.open_in_window),
         ])),
         ("Panels & pins", bound(vec![
             ("New slide",                c.new_slide),
@@ -722,6 +723,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Fold / unfold slide panel", c.toggle_slide_panel),
             ("Ctrl+Tab: in order / recent", c.toggle_slide_order),
             ("Slide window open / close", c.slide_window),
+            ("Slide window on a box",    c.slide_window_region),
             ("New layer",                c.new_layer),
             ("Delete layer (no undo)",   c.delete_layer),
             ("Pin: go to its slide",     c.pin_go_to_slide),
