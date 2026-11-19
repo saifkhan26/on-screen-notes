@@ -512,6 +512,18 @@ pub fn show(
             let predicted = tool.in_progress_stroke.as_ref().map(predict_ahead);
             let preview_stroke_ref = predicted.as_ref();
 
+            // On the pins board the pins go under its ink, whatever layer
+            // that is on: ink is drawn over them there.
+            let on_board = manager.on_board();
+            let paint_pins = |painter: &egui::Painter| {
+                for (p, textures) in pinned.iter().zip(&pin_textures) {
+                    render::paint_pinned(painter, rect.min, p.canvas, p.members, p.pin.rigid(p.anchor()), p.pin.scale, position_passes, textures);
+                }
+            };
+            if on_board {
+                paint_pins(ui.painter());
+            }
+
             render::paint_canvas_egui(
                 ui.painter(),
                 rect.min,
@@ -528,18 +540,9 @@ pub fn show(
             );
 
             // Pins, over the slide and in the order they were last
-            // touched.
-            for (p, textures) in pinned.iter().zip(&pin_textures) {
-                render::paint_pinned(
-                    ui.painter(),
-                    rect.min,
-                    p.canvas,
-                    p.members,
-                    p.pin.rigid(p.anchor()),
-                    p.pin.scale,
-                    position_passes,
-                    textures,
-                );
+            // touched — on the pins board, under its ink (see above).
+            if !on_board {
+                paint_pins(ui.painter());
             }
 
             // Live preview of the in-progress text edit. Painted via

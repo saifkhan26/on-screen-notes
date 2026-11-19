@@ -194,6 +194,15 @@ pub struct OnScreenNotesApp {
     /// Where the main window's canvas is, for the slide window's frame:
     /// a selection dragged out of the window lands there.
     main_canvas: Option<MainCanvas>,
+    /// The pins window: the one place pins show (the canvas and the slide
+    /// window show none), on the pins board, with its own state.
+    pins_window: Option<ui::slide_window::SlideWindow>,
+    pins_ws: Option<workspace::Workspace>,
+    /// The window whose frame is running now, if not the overlay's.
+    running: Option<WindowKind>,
+    /// A pin double-clicked (or "Go to its slide") on the pins board: the
+    /// main window goes to its slide once the slide window's frame is over.
+    pin_to_open: Option<u64>,
     /// Objects dropped on the main window from the slide window's frame,
     /// to select there once that frame is over: their slide, and them.
     main_select: Option<(usize, crate::canvas::hit::Selection)>,
@@ -319,6 +328,15 @@ struct RegionSelect {
     ui_visible_before: bool,
     /// What the box is for.
     purpose: BoxFor,
+}
+
+/// The app's second windows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WindowKind {
+    /// The slide window: any slide, or part of one.
+    Slide,
+    /// The pins window: the pins and the pins board.
+    Pins,
 }
 
 /// The main window's canvas, as the slide window's frame sees it.
@@ -579,6 +597,10 @@ impl OnScreenNotesApp {
             window_close: false,
             main_canvas: None,
             main_select: None,
+            pin_to_open: None,
+            pins_window: None,
+            pins_ws: None,
+            running: None,
             media_imports: Vec::new(),
             media_waiting: Vec::new(),
             media_dialog: None,
@@ -697,7 +719,7 @@ impl eframe::App for OnScreenNotesApp {
             self.show_slide_status(ctx);
         }
 
-        self.show_slide_window(ctx);
+        self.show_windows(ctx);
 
         self.autosave();
 

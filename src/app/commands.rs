@@ -129,7 +129,7 @@ impl OnScreenNotesApp {
                 say(self, msg.to_string());
             }
             K::SlideWindow => {
-                if self.canvases.in_view() {
+                if self.running == Some(WindowKind::Slide) {
                     // Pressed in the slide window: it closes.
                     self.window_close = true;
                 } else if self.slide_window.is_some() {
@@ -175,6 +175,10 @@ impl OnScreenNotesApp {
                     if let Some(local) = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| p.pin.local) {
                         self.set_pin_local(id, !local);
                     }
+                } else if selecting && self.selection_pinned() {
+                    // Pinned objects selected where they are: their pins.
+                    let local = self.selection_pin_local() != Some(true);
+                    self.set_selection_pin_local(local);
                 }
             }
             K::Nudge(px) => {
@@ -313,7 +317,7 @@ impl OnScreenNotesApp {
                 }
             }
             C::ToggleUi => self.ws.ui_visible = !self.ws.ui_visible,
-            C::TogglePins => self.set_pins_hidden(!self.canvases.pins_hidden()),
+            C::TogglePins => self.toggle_pins_window(),
             C::Duplicate => sel(self, SelAction::Duplicate),
             C::CopyToNewSlide => sel(self, SelAction::CopyToNewSlide),
             C::TogglePin => sel(self, SelAction::TogglePin),

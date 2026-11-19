@@ -466,8 +466,9 @@ impl OnScreenNotesApp {
         if refused {
             self.may_edit();
         }
+        // Shift+P opens the pins window or closes it.
         if toggle_pins {
-            self.set_pins_hidden(!self.canvases.pins_hidden());
+            self.toggle_pins_window();
         }
         match slides.action {
             Some(ui::slide_panel::SlideAction::GoTo(i)) => self.canvases.go_to(i),

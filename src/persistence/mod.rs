@@ -263,6 +263,40 @@ pub fn load_views() -> Vec<SlideView> {
     })
 }
 
+/// Write the pins board's ink (the slide window's Pins view draws it, the
+/// main window shows it over every slide) to `canvases/board.ron`, in a
+/// slide's format. Not a slide: `max_canvas_index` and the slide files
+/// never see it.
+pub fn save_board(canvas: &Canvas) -> Result<()> {
+    let path = paths::canvases_dir()?.join("board.ron");
+    let serialized = serialize_canvas(canvas)?;
+    atomic_write(&path, serialized.as_bytes())
+}
+
+/// The ink `save_board` wrote; empty (and not dirty, so nothing is
+/// written until it is drawn on) when there is none. A file that does not
+/// read is copied aside first, so the next save cannot lose it.
+pub fn load_board(position_passes: usize) -> Canvas {
+    let empty = || Canvas { dirty: false, ..Canvas::default() };
+    let Ok(path) = paths::canvases_dir().map(|d| d.join("board.ron")) else { return empty() };
+    let Ok(s) = std::fs::read_to_string(&path) else { return empty() };
+    match parse_canvas_counting(&s, position_passes, None) {
+        Ok(mut c) => {
+            c.dirty = false;
+            c
+        }
+        Err(e) => {
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let aside = path.with_file_name(format!("board.ron.unreadable-{stamp}"));
+            match std::fs::copy(&path, &aside) {
+                Ok(_) => log::warn!("board.ron could not be read ({e}); kept as {}", aside.display()),
+                Err(c) => log::warn!("board.ron could not be read ({e}) nor copied aside ({c})"),
+            }
+            empty()
+        }
+    }
+}
+
 /// Write every pin's place to `canvases/pins.ron`. Kept apart from the
 /// slides for the same reason as the views: moving a pin is not an edit
 /// of the slide its objects live on. Each slide stores which of its

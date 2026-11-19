@@ -296,7 +296,7 @@ pub struct PinBoard {
     hidden: bool,
     /// The global pins show in the slide window instead of on the
     /// canvas (its "Pins" toggle). Not saved: the slide window is not.
-    globals_away: bool,
+    away: bool,
     /// Size of the canvas area, points: pins are shown inside it.
     area: Option<[f32; 2]>,
 }
@@ -383,11 +383,11 @@ impl PinBoard {
     }
 
     /// The pins that have objects to show on slide `active`, bottom to
-    /// top: the global ones and its own local ones — only its local ones
-    /// while the global pins are away in the slide window. None while
-    /// the pins are hidden, so nothing draws, plays or grabs them then.
+    /// top: its own local ones, and the global ones unless they are away
+    /// in the pins window. None while the pins are hidden, so nothing
+    /// draws, plays or grabs them on the canvas then.
     pub fn pinned<'a>(&'a self, canvases: &'a [Option<Canvas>], active: usize) -> Vec<Pinned<'a>> {
-        self.shown(canvases, |pin, slide| if pin.local { slide == active } else { !self.globals_away })
+        self.shown(canvases, |pin, slide| if pin.local { slide == active } else { !self.away })
     }
 
     /// The global pins, bottom to top, wherever they show; none while the
@@ -419,10 +419,10 @@ impl PinBoard {
             .collect()
     }
 
-    /// Show the global pins in the slide window instead of on the canvas,
-    /// or back on the canvas.
-    pub fn set_globals_away(&mut self, away: bool) {
-        self.globals_away = away;
+    /// The global pins show in the pins window only, not on the canvas
+    /// (`pinned` keeps the local ones), or on the canvas again.
+    pub fn set_away(&mut self, away: bool) {
+        self.away = away;
     }
 
     /// The canvas area is `area` points across: every pin shows wholly
@@ -437,7 +437,8 @@ impl PinBoard {
     /// Some pin has objects to show on slide `active` (hidden or not).
     pub fn any(&self, active: usize) -> bool {
         self.located.iter().any(|(id, &(slide, _))| {
-            slide == active || self.pins.iter().any(|p| p.id == *id && !p.local)
+            let local = self.pins.iter().any(|p| p.id == *id && p.local);
+            if local { slide == active } else { !self.away }
         })
     }
 

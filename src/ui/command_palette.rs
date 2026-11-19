@@ -203,7 +203,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Zoom to fit the slide", v, c.zoom_to_fit, C::Key(K::ZoomToFit));
     add("Reset zoom and pan", v, c.reset_view, C::ResetView);
     add("Hide / show the toolbar and panels", v, c.toggle_ui, C::ToggleUi);
-    add("Hide / show every pin", v, c.toggle_pins, C::TogglePins);
+    add("Open the pins window / close it", v, c.toggle_pins, C::TogglePins);
     add("Onion skin on / off (GIFs and videos)", v, c.media_onion, C::Key(K::Onion));
     add("Highlight pictures", v, tb.highlight[0], C::Key(K::Highlight(crate::canvas::shape::MediaType::Picture)));
     add("Highlight GIFs", v, tb.highlight[1], C::Key(K::Highlight(crate::canvas::shape::MediaType::Gif)));

@@ -32,10 +32,8 @@
 //! "On top" is the user's choice, off at first.
 
 use crate::canvas::canvas::Canvas;
-use crate::canvas::render;
 use crate::canvas::CanvasManager;
 use crate::interaction::zoom_pan::MIN_ZOOM;
-use crate::ui::overlay::OverlayCache;
 use crate::ui::theme;
 use egui::{Color32, Rounding, Vec2};
 
@@ -47,6 +45,9 @@ const FIT_MAX_ZOOM: f32 = 4.0;
 /// Toolbar button metrics, so the card matches the main toolbar.
 const BTN: f32 = 28.0;
 const BTN_ROUND: f32 = 7.0;
+/// The pins window's title: not shown, Alt+Tab and the handle search use
+/// it. Not starting "Slide ", which the slide window's search looks for.
+const PINS_TITLE: &str = "Pins window";
 /// Width of the band along each edge that resizes the window.
 const EDGE: f32 = 6.0;
 /// Frames to look for the window's handle after it opens.
@@ -86,15 +87,15 @@ pub struct SlideWindow {
     lock_told: bool,
     /// Something to tell the user, for the app's toast.
     notice: Option<String>,
-    /// Show the global pins, and no slide, instead of the slide; the
-    /// canvas then leaves them out (`CanvasManager::set_globals_away`).
+    /// The pins window: it shows the pins and the pins board, never a
+    /// slide.
     pins: bool,
     /// The window's native handle once found (0 before; Windows only).
     hwnd: isize,
     /// Frames spent looking for it.
     find_tries: u32,
     /// The window's own copy of the tool and its gestures in flight.
-    edit: crate::ui::slide_edit::WindowEdit,
+    pen: crate::ui::slide_edit::WindowPen,
     /// The canvas area last frame, window points, and the window's points
     /// per pixel: where a drop from the canvas lands (`canvas_at`).
     last_rect: egui::Rect,
@@ -108,8 +109,6 @@ pub struct SlideWindow {
 pub struct Look {
     /// The overlay's tint: its background colour at its opacity.
     pub background: Color32,
-    /// The app's UI shows (Tab hides it, and captures do).
-    pub chrome: bool,
 }
 
 impl Look {
@@ -126,7 +125,7 @@ impl Look {
 
 impl SlideWindow {
     /// A window on slide `slide`, fitted to it.
-    pub fn new(slide: usize, cfg: &crate::config::AppConfig) -> Self {
+    pub fn new(slide: usize, _cfg: &crate::config::AppConfig) -> Self {
         Self {
             slide,
             pan: [0.0; 2],
@@ -142,11 +141,29 @@ impl SlideWindow {
             pins: false,
             hwnd: 0,
             find_tries: 0,
-            edit: crate::ui::slide_edit::WindowEdit::new(cfg),
+            pen: Default::default(),
             last_rect: egui::Rect::NOTHING,
             last_ppp: 1.0,
             canvas_rect: None,
         }
+    }
+
+    /// The pins window: the pins and the pins board, fitted to them.
+    pub fn pins_window(cfg: &crate::config::AppConfig) -> Self {
+        Self { pins: true, ..Self::new(0, cfg) }
+    }
+
+    /// The viewport this window is drawn in.
+    pub fn viewport(&self) -> egui::ViewportId {
+        if self.pins {
+            Self::pins_viewport_id()
+        } else {
+            Self::viewport_id()
+        }
+    }
+
+    pub fn pins_viewport_id() -> egui::ViewportId {
+        egui::ViewportId::from_hash_of("osn_pins_window")
     }
 
     /// A window popped out over `region` of slide `slide` (slide units):
@@ -161,7 +178,6 @@ impl SlideWindow {
     pub fn aim(&mut self, slide: usize, region: [f32; 4]) {
         if self.pins {
             self.pins = false;
-            self.edit.drop_pin_selection();
         }
         self.slide = slide;
         self.region = Some(region);
@@ -188,7 +204,7 @@ impl SlideWindow {
 
     /// What the window has to tell the user, once.
     pub fn take_notice(&mut self) -> Option<String> {
-        self.notice.take().or_else(|| self.edit.take_notice())
+        self.notice.take()
     }
 
     /// Looking only: nothing on its slide, or its pins, can change here.
@@ -199,17 +215,12 @@ impl SlideWindow {
     /// Take the pen gestures that start over this window out of the
     /// canvas's `events`, to replay here (see `WindowEdit::claim_pen`).
     pub fn claim_pen(&mut self, events: &mut Vec<crate::input::pen::PenEvent>, client_origin: [i32; 2]) {
-        self.edit.claim_pen(events, client_origin, self.hwnd);
-    }
-
-    /// A pin double-clicked here, for the app to go to its slide.
-    pub fn take_open_pin(&mut self) -> Option<u64> {
-        self.edit.take_open_pin()
+        self.pen.claim(events, client_origin, self.hwnd);
     }
 
     /// A pen or mouse gesture is drawing or moving something here.
     pub fn busy(&self) -> bool {
-        self.edit.busy()
+        self.pen.busy()
     }
 
     pub fn viewport_id() -> egui::ViewportId {
@@ -221,8 +232,7 @@ impl SlideWindow {
         self.hwnd
     }
 
-    /// The window shows the global pins instead of a slide, so the canvas
-    /// should not.
+    /// The pins window.
     pub fn shows_pins(&self) -> bool {
         self.pins
     }
@@ -263,7 +273,7 @@ impl SlideWindow {
     /// and resizes stick; size and place count on opening only.
     pub fn builder(&self, manager: &CanvasManager) -> egui::ViewportBuilder {
         // Not shown on the window; Alt+Tab and the handle search use it.
-        let title = if self.pins { "Slide window · global pins".to_string() } else { format!("Slide {}", slide_label(manager, self.slide)) };
+        let title = if self.pins { PINS_TITLE.to_string() } else { format!("Slide {}", slide_label(manager, self.slide)) };
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_decorations(false)
@@ -291,18 +301,37 @@ impl SlideWindow {
     }
 
     /// For the video players: the slide shown, the view, and where the
-    /// window's canvas is (window points). `None` while the pins show.
+    /// window's canvas is (window points). The Pins view gives `canvas::BOARD` for the pins board.
     pub fn media_view(&self) -> Option<(usize, [f32; 2], f32, egui::Rect)> {
-        if self.pins {
-            return None;
-        }
-        self.canvas_rect.map(|r| (self.slide, self.pan, self.zoom, r))
+        let slide = if self.pins { crate::canvas::BOARD } else { self.slide };
+        self.canvas_rect.map(|r| (slide, self.pan, self.zoom, r))
     }
 
     /// Before the window's frame runs on its slide: fit it if that was
     /// asked for — its region, else all of it — below `top`, the room the
     /// toolbar takes. Waits for the slide to be read.
     pub fn before_pass(&mut self, ctx: &egui::Context, manager: &CanvasManager, top: f32) {
+        if self.pins {
+            // The pins window: its pins and the board's ink, no bigger
+            // than on the canvas, where the pins were sized.
+            if std::mem::take(&mut self.fit_pending) {
+                let size = self.canvas_rect.map_or(ctx.screen_rect().size(), |r| r.size());
+                let bounds = manager
+                    .window_pins()
+                    .iter()
+                    .map(|p| p.frame().aabb())
+                    .chain(content_bounds(manager.board()))
+                    .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
+                match bounds {
+                    Some(b) => fit_bounds(self, b, size, top, 1.0),
+                    None => {
+                        self.pan = [0.0, top];
+                        self.zoom = 1.0;
+                    }
+                }
+            }
+            return;
+        }
         if !self.fit_pending || manager.slide(self.slide).is_none() {
             return;
         }
@@ -331,7 +360,7 @@ impl SlideWindow {
     /// or keys may have gone to another, whose region this is not) and
     /// its view there; `ppp` for drops from the canvas (`canvas_at`).
     pub fn after_pass(&mut self, slide: usize, pan: [f32; 2], zoom: f32, ppp: f32) {
-        if slide != self.slide {
+        if slide != crate::canvas::BOARD && slide != self.slide {
             self.slide = slide;
             self.region = None;
         }
@@ -344,7 +373,7 @@ impl SlideWindow {
     /// This frame's pen events over the window (see `claim_pen`), in its
     /// client points, and its client area's top-left on screen.
     pub fn take_pen_events(&mut self, ppp: f32) -> (Vec<crate::input::pen::PenEvent>, [i32; 2]) {
-        self.edit.take_pen_events(self.hwnd, ppp)
+        self.pen.take(self.hwnd, ppp)
     }
 
     /// Locked: the first press with a tool that would draw says how to
@@ -363,7 +392,7 @@ impl SlideWindow {
     pub fn find_handle(&mut self, owner: isize) {
         if self.hwnd == 0 && self.find_tries < FIND_FRAMES && owner != 0 {
             self.find_tries += 1;
-            self.hwnd = crate::platform::own_window_titled("Slide ", owner);
+            self.hwnd = crate::platform::own_window_titled(if self.pins { PINS_TITLE } else { "Slide " }, owner);
             if self.hwnd != 0 {
                 crate::platform::set_owner(self.hwnd, owner);
                 // Rounded corners, like the overlay and any Windows 11 window.
@@ -569,7 +598,7 @@ fn card(
                         // card keeps its size.
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(2.0 * BTN + 6.0 + PICKER_W, BTN), egui::Sense::hover());
                         let text = egui::Pos2::new(rect.min.x + 8.0, rect.center().y);
-                        ui.painter().text(text, egui::Align2::LEFT_CENTER, "Global pins", egui::FontId::proportional(14.0), theme::TEXT_PRIMARY);
+                        ui.painter().text(text, egui::Align2::LEFT_CENTER, "Pins", egui::FontId::proportional(14.0), theme::TEXT_PRIMARY);
                     } else {
                         // The window has no slide panel: this picks.
                         let count = manager.count();
@@ -593,25 +622,14 @@ fn card(
                     };
                     if toggle_btn(ui, lock, win.locked, tip) {
                         win.locked = !win.locked;
-                        win.edit.drop_pin_selection();
-                    }
-                    let tip = if win.pins {
-                        "Showing the pins on every slide here. Click to show the slide again and give the pins back to the main window"
-                    } else {
-                        "Show the pins on every slide here, without a slide. They leave the main window while this is on"
-                    };
-                    if text_btn(ui, "Pins", tip, win.pins) {
-                        win.pins = !win.pins;
-                        win.edit.drop_pin_selection();
-                        win.fit_pending = true;
                     }
                     ui.add_space(8.0);
                     let fit_tip = if win.pins {
-                        "Fit the pins to the window — or double-click"
+                        "Fit the pins and the board's ink to the window"
                     } else if win.region.is_some() {
-                        "Back to the region this window was opened on — or double-click"
+                        "Back to the region this window was opened on"
                     } else {
-                        "Fit the slide to the window — or double-click it"
+                        "Fit the slide to the window"
                     };
                     if text_btn(ui, "Fit", fit_tip, false) {
                         win.fit_pending = true;
@@ -761,101 +779,6 @@ fn zoom_label(zoom: f32) -> String {
     if pct < 10.0 { format!("{pct:.1}%") } else { format!("{pct:.0}%") }
 }
 
-/// The global pins alone, laid out as they are on the canvas, under the
-/// window's own pan and zoom (`fit` gathers them into view). With the
-/// Select tool they move, resize and turn here as on the canvas.
-#[allow(clippy::too_many_arguments)]
-pub fn pins_frame(
-    ctx: &egui::Context,
-    win: &mut SlideWindow,
-    cache: &mut OverlayCache,
-    manager: &mut CanvasManager,
-    position_passes: usize,
-    media: &crate::media::MediaHub,
-    look: &Look,
-    top: f32,
-    main_tool: &mut crate::tools::ActiveTool,
-    input: &crate::ui::slide_edit::Input,
-) {
-    win.edit.follow(main_tool);
-    egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-        win.last_rect = rect;
-        win.last_ppp = ctx.pixels_per_point();
-        // With the Select tool the pins move, resize and turn here as on
-        // the canvas (see `WindowEdit::pins_pointer`); any other press
-        // pans, so a plain drag is not `navigate`'s.
-        win.edit.pins_keys(ctx, manager, main_tool, input.keys, !win.locked);
-        let origin = rect.min + Vec2::new(win.pan[0], win.pan[1]);
-        win.edit.pins_pointer(ctx, &response, manager, origin, win.zoom, &mut win.pan, input, win.hwnd, !win.locked);
-        if navigate(ctx, win, rect, &response, false) {
-            let bounds = manager
-                .global_pins()
-                .iter()
-                .map(|p| p.frame().aabb())
-                .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
-            if let Some(b) = bounds {
-                // No bigger than on the canvas: they were sized there.
-                fit_bounds(win, b, rect.size(), top, 1.0);
-            }
-        }
-
-        let pins = manager.global_pins();
-        if pins.is_empty() {
-            let text = if manager.pins_hidden() { "Pins are hidden — Shift+P shows them" } else { "No pins on every slide yet — Ctrl+P pins a selection" };
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(14.0), theme::TEXT_MUTED);
-        } else {
-            let origin = rect.min + Vec2::new(win.pan[0], win.pan[1]);
-            let textures = cache.pin_textures(ctx, &pins, rect, origin, win.zoom, media, false);
-            let painter = ui.painter_at(rect);
-            for (p, textures) in pins.iter().zip(&textures) {
-                // The pin's own scale times the window's zoom; its turn
-                // and place (`rigid`) are the canvas's, so the layout
-                // is kept.
-                render::paint_pinned(&painter, origin, p.canvas, p.members, p.pin.rigid(p.anchor()), p.pin.scale * win.zoom, position_passes, textures);
-            }
-            // Outlines, badges and the selected pin's handles, as on the
-            // canvas with the Select tool, drawn on the pins as the window
-            // shows them so the handles keep their size on screen.
-            if look.chrome && !win.locked && win.edit.tool().kind == crate::tools::ToolKind::Select {
-                let o = [origin.x, origin.y];
-                let shown: Vec<crate::canvas::pins::Pin> = pins.iter().map(|p| p.pin.viewed(o, win.zoom)).collect();
-                let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: *s, ..*p }).collect();
-                let marks = crate::ui::overlay::PinMarks { selected: win.edit.selected_pin(), outlines: true };
-                crate::ui::overlay::paint_pin_marks(ui, &painter, egui::Pos2::ZERO, &view, marks);
-            }
-        }
-    });
-}
-
-/// Pan with a drag, zoom with the wheel about the pointer; true when the
-/// view should be fitted (asked for, or a double-click).
-/// Pan with a middle-button drag, or with a plain drag when `drag_pans`
-/// (the tool does not draw here); zoom with the wheel about the
-/// pointer. True when the view should be fitted: asked for, or a
-/// double-click that is not the tool's.
-fn navigate(ctx: &egui::Context, win: &mut SlideWindow, rect: egui::Rect, response: &egui::Response, drag_pans: bool) -> bool {
-    let fit = std::mem::take(&mut win.fit_pending) || (drag_pans && response.double_clicked());
-    let panning = response.dragged_by(egui::PointerButton::Middle) || (drag_pans && response.dragged_by(egui::PointerButton::Primary));
-    if panning {
-        let d = response.drag_delta();
-        win.pan[0] += d.x;
-        win.pan[1] += d.y;
-    }
-    if let Some(p) = response.hover_pos() {
-        let steps = ctx.input(wheel_steps);
-        if steps.abs() > 1e-4 {
-            zoom_about(win, 1.10_f32.powf(steps), p - rect.min);
-        }
-        if panning {
-            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-        } else if drag_pans {
-            ctx.set_cursor_icon(egui::CursorIcon::Grab);
-        }
-    }
-    fit
-}
-
 /// Bands along the window's edges and corners that resize it, as a frame
 /// would: each a small area of its own over everything else, so presses
 /// anywhere else still reach the canvas.
@@ -891,38 +814,6 @@ fn resize_edges(ctx: &egui::Context) {
                 }
             });
     }
-}
-
-/// Wheel input this frame as zoom steps of 1.10×, the canvas's own rule
-/// (`interaction::zoom_pan`): one per wheel notch, and a trackpad pinch
-/// in proportion. Ctrl + wheel arrives both as a wheel event and as
-/// egui's zoom, so the zoom is only counted without Ctrl.
-fn wheel_steps(i: &egui::InputState) -> f32 {
-    let mut steps: f32 = i
-        .events
-        .iter()
-        .filter_map(|e| match e {
-            egui::Event::MouseWheel { delta, .. } => Some(delta.y),
-            _ => None,
-        })
-        .sum();
-    let pinch = i.zoom_delta();
-    if !i.modifiers.ctrl && (pinch - 1.0).abs() > 1e-4 {
-        steps += pinch.ln() / 1.10_f32.ln();
-    }
-    steps
-}
-
-/// Scale the view by `factor` about `at` (from the canvas area's
-/// top-left), keeping the slide point under it in place.
-fn zoom_about(win: &mut SlideWindow, factor: f32, at: Vec2) {
-    use crate::interaction::zoom_pan::MAX_ZOOM;
-    let z_old = win.zoom;
-    let z_new = (z_old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-    let cx = (at.x - win.pan[0]) / z_old;
-    let cy = (at.y - win.pan[1]) / z_old;
-    win.zoom = z_new;
-    win.pan = [at.x - cx * z_new, at.y - cy * z_new];
 }
 
 /// Where a window popped out over `region` (points, like `screen`)
@@ -987,18 +878,6 @@ mod tests {
         assert!(w.slide_removed(1), "an earlier slide: one down");
         assert_eq!(w.slide, 2);
         assert!(!w.slide_removed(2), "the slide shown: the window goes");
-    }
-
-    #[test]
-    fn zooming_keeps_the_point_under_the_pointer() {
-        let mut w = SlideWindow::new(0, &crate::config::AppConfig::default());
-        w.pan = [30.0, -20.0];
-        w.zoom = 0.5;
-        let at = Vec2::new(200.0, 120.0);
-        let before = [(at.x - w.pan[0]) / w.zoom, (at.y - w.pan[1]) / w.zoom];
-        zoom_about(&mut w, 1.1_f32.powi(3), at);
-        let after = [(at.x - w.pan[0]) / w.zoom, (at.y - w.pan[1]) / w.zoom];
-        assert!((before[0] - after[0]).abs() < 1e-3 && (before[1] - after[1]).abs() < 1e-3);
     }
 
     #[test]

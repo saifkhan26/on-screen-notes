@@ -252,9 +252,9 @@ fn pins_btn(ui: &mut egui::Ui, hidden: &mut bool) -> bool {
     let icon_rect = rect.shrink(rect.width() * 0.22);
     egui::Image::new(icon).tint(theme::TEXT_PRIMARY).fit_to_exact_size(icon_rect.size()).paint_at(ui, icon_rect);
     let tooltip = if *hidden {
-        "Pinned objects are hidden — click to show them again (Shift+P)"
+        "Pins are hidden — click to show them again"
     } else {
-        "Hide all pins (Shift+P). Their originals stay on their own slides"
+        "Hide all pins. Their originals stay on their own slides"
     };
     let response = response.on_hover_text(tooltip);
     if response.clicked() {
@@ -857,7 +857,7 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Copy / cut / paste (pictures too)", s("Ctrl+C / X / V")),
             ("To front / to back",          k2(c.bring_front, c.send_back)),
             ("Copy to a new slide",         k(c.copy_to_new_slide)),
-            ("Pin / unpin; hide all pins",  format!("{}; {}", k(c.pin_selection), k(c.toggle_pins))),
+            ("Pin / unpin; pins window",  format!("{}; {}", k(c.pin_selection), k(c.toggle_pins))),
             ("Arrange, flip, a picture's colours", s("bar under the toolbar")),
             ("Recolour / resize",           s("palette / size slider")),
         ]),

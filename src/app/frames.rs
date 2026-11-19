@@ -17,6 +17,8 @@ impl OnScreenNotesApp {
             // window's (an immediate viewport).
             || self.slide_window.as_ref().is_some_and(|w| w.busy())
             || self.window_ws.as_ref().is_some_and(|w| w.tool.in_progress_stroke.is_some() || w.tool.select.gesture.is_some())
+            || self.pins_window.as_ref().is_some_and(|w| w.busy())
+            || self.pins_ws.as_ref().is_some_and(|w| w.tool.in_progress_stroke.is_some() || w.tool.select.gesture.is_some() || w.pin_tool.busy())
             || self.pending_screenshot.is_some()
             || self.pending_freeze.is_some()
             || self.pending_lasso.is_some()

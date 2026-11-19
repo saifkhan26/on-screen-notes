@@ -9,6 +9,10 @@ impl OnScreenNotesApp {
     /// can be dragged where it should stay; its bar can then keep it to
     /// this slide.
     pub(super) fn toggle_pin_selection(&mut self) {
+        if self.canvases.on_board() {
+            self.toast = Some(("The pins board's ink is in the pins window already".to_string(), Instant::now()));
+            return;
+        }
         let sel = self.ws.tool.select.sel.clone();
         if self.ws.tool.kind != crate::tools::ToolKind::Select || sel.is_empty() { return; }
         let li = self.canvases.active().active_layer;
@@ -19,26 +23,82 @@ impl OnScreenNotesApp {
         } else if let Some(id) = self.canvases.pin_objects(li, &sel.strokes, &sel.shapes, [24.0, 24.0], false) {
             // A new pin must be seen to be placed.
             self.canvases.set_pins_hidden(false);
-            self.ws.tool.select.sel.clear();
+            // The objects stay selected: the arrange bar now offers this
+            // slide or every slide for their pin.
             self.ws.tool.select.gesture = None;
-            self.ws.pin_tool.selected = Some(id);
-            self.toast = Some(("Pinned to every slide — drag the pin where it should stay".to_string(), Instant::now()));
+            // Pins show in the pins window only: it opens to show this one.
+            if self.pins_window.is_none() && self.running != Some(WindowKind::Pins) {
+                self.pins_window = Some(ui::slide_window::SlideWindow::pins_window(&self.config));
+            }
+            if let Some(ws) = self.pins_ws.as_mut() {
+                ws.pin_tool.selected = Some(id);
+            }
+            self.toast = Some(("Pinned — it shows in the pins window, on every slide".to_string(), Instant::now()));
         }
     }
 
-    /// Show pin `id` on its own slide only (`local`), or on every slide.
-    /// Not an edit of any slide: only `pins.ron` is written.
+    /// Open the pins window, the one place global pins show, or close it
+    /// (Shift+P). Pressed in it, it closes once its frame is over.
+    pub(super) fn toggle_pins_window(&mut self) {
+        if self.running == Some(WindowKind::Pins) {
+            self.window_close = true;
+        } else if self.pins_window.take().is_none() {
+            self.pins_window = Some(ui::slide_window::SlideWindow::pins_window(&self.config));
+        }
+    }
+
+    /// The pins the Select tool's selection is in, on the active slide's
+    /// active layer.
+    fn selection_pin_ids(&self) -> Vec<u64> {
+        let c = self.canvases.active();
+        let Some(layer) = c.layers.get(c.active_layer) else { return Vec::new() };
+        let sel = &self.ws.tool.select.sel;
+        let mut ids: Vec<u64> = sel
+            .strokes
+            .iter()
+            .filter_map(|&i| layer.strokes.get(i).map(|s| s.pin))
+            .chain(sel.shapes.iter().filter_map(|&i| layer.shapes.get(i).map(|s| s.pin())))
+            .filter(|&id| id != 0)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Whether the selection's pins show on this slide only (`Some(true)`),
+    /// on every slide (`Some(false)`), or some each way (`None`).
+    pub(super) fn selection_pin_local(&mut self) -> Option<bool> {
+        let ids = self.selection_pin_ids();
+        let board = self.canvases.pin_board();
+        let mut scopes = ids.iter().filter_map(|&id| board.get_mut(id).map(|p| p.local));
+        let first = scopes.next()?;
+        scopes.all(|l| l == first).then_some(first)
+    }
+
+    /// Show the selection's pins on their slide only, or on every slide.
+    pub(super) fn set_selection_pin_local(&mut self, local: bool) {
+        for id in self.selection_pin_ids() {
+            self.set_pin_local(id, local);
+        }
+    }
+
+    /// Show pin `id` on its own slide only (`local`, on the main window),
+    /// or on every slide (in the pins window). Not an edit of any slide:
+    /// only `pins.ron` is written.
     pub(super) fn set_pin_local(&mut self, id: u64, local: bool) {
         let Some(slide) = self.canvases.pin_board().members(id).map(|(s, _)| s) else { return };
         let Some(pin) = self.canvases.pin_board().get_mut(id) else { return };
         if pin.local == local { return; }
         pin.local = local;
         let msg = match local {
-            false => "Pinned to every slide".to_string(),
-            true if slide == self.canvases.active_index() => "Pinned to this slide only".to_string(),
-            true => format!("Pinned to slide {} only", slide + 1),
+            false => "Pinned to every slide — it shows in the pins window".to_string(),
+            true => format!("Pinned to slide {} only — it shows there, on the main window", slide + 1),
         };
         self.toast = Some((msg, Instant::now()));
+        // A pin made global goes to the pins window: it opens to show it.
+        if !local && self.pins_window.is_none() && self.running != Some(WindowKind::Pins) {
+            self.pins_window = Some(ui::slide_window::SlideWindow::pins_window(&self.config));
+        }
     }
 
     /// Hide every pin, or show them again. Hiding lets go of a selected
@@ -49,7 +109,7 @@ impl OnScreenNotesApp {
         if hidden {
             self.ws.pin_tool.clear();
         }
-        let msg = if hidden { "Pins hidden — Shift+P shows them again" } else { "Pins shown" };
+        let msg = if hidden { "Pins hidden — the toolbar's pin button shows them again" } else { "Pins shown" };
         self.toast = Some((msg.to_string(), Instant::now()));
     }
 
@@ -72,6 +132,12 @@ impl OnScreenNotesApp {
     /// moved into the middle of the canvas area (`area` across). The zoom
     /// stays as it was.
     pub(super) fn open_pin_slide(&mut self, id: u64, area: egui::Vec2) {
+        // From the pins board: the main window goes there once the slide
+        // window's frame is over.
+        if self.canvases.on_board() {
+            self.pin_to_open = Some(id);
+            return;
+        }
         // A global pin may be away in the slide window, out of `pinned`.
         let find = |pins: Vec<crate::canvas::pins::Pinned>| pins.iter().find(|p| p.pin.id == id).map(|p| (p.slide, p.members.to_vec(), p.anchor()));
         let found = find(self.canvases.pinned()).or_else(|| find(self.canvases.global_pins()));
@@ -130,6 +196,32 @@ impl OnScreenNotesApp {
                         true
                     }
                 }
+            }
+            PenEvent::Move(_) | PenEvent::Up(_) if self.ws.pin_tool.busy() && self.canvases.on_board() => {
+                // The pins show as the window sees them: move a copy so,
+                // then write the place back as the canvas has it, kept on
+                // the main window's canvas area.
+                let Some((pan, zoom)) = self.canvases.board_view() else { return true };
+                let area = self.main_canvas.map_or(area, |m| m.rect.size());
+                let shown: Vec<crate::canvas::pins::Pin> = self.canvases.pinned().iter().map(|p| p.pin).collect();
+                let mut scratch = crate::canvas::pins::PinBoard::scratch(shown);
+                let up = matches!(ev, PenEvent::Up(_));
+                if up {
+                    self.ws.pin_tool.release(q, snap, &mut scratch);
+                } else {
+                    self.ws.pin_tool.drag(q, snap, &mut scratch);
+                }
+                let Some(id) = self.ws.pin_tool.selected else { return true };
+                let Some(moved) = scratch.get_mut(id).map(|p| p.unviewed(pan, zoom)) else { return true };
+                if let Some(pin) = self.canvases.pin_board().get_mut(id) {
+                    pin.center = moved.center;
+                    pin.scale = moved.scale;
+                    pin.angle = moved.angle;
+                    if up {
+                        pin.center = [pin.center[0].clamp(0.0, area.x.max(0.0)), pin.center[1].clamp(0.0, area.y.max(0.0))];
+                    }
+                }
+                true
             }
             PenEvent::Move(_) | PenEvent::Up(_) if self.ws.pin_tool.busy() => {
                 let board = self.canvases.pin_board();

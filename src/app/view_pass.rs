@@ -146,6 +146,7 @@ impl OnScreenNotesApp {
             {
                 use ui::arrange_bar::BarAction;
                 let pinned = self.selection_pinned();
+                let pin_local = if pinned { self.selection_pin_local() } else { None };
                 let grouped = self.selection_grouped();
                 let open_move = std::mem::take(&mut self.ws.move_picker_pending);
                 self.fill_likely_tags();
@@ -163,6 +164,7 @@ impl OnScreenNotesApp {
                     ctx,
                     selected_count,
                     pinned,
+                    pin_local,
                     &self.canvases,
                     &mut self.config.arrange_apart,
                     &mut self.config.dim_unselected,
@@ -180,6 +182,7 @@ impl OnScreenNotesApp {
                     Some(BarAction::CopyToNewSlide) => self.copy_selection_to_new_slide(),
                     Some(BarAction::MoveToSlide(to)) => self.move_selection_to(to),
                     Some(BarAction::TogglePin) => self.toggle_pin_selection(),
+                    Some(BarAction::PinScope(local)) => self.set_selection_pin_local(local),
                     Some(BarAction::Flip(vertical)) => self.flip_selection(vertical),
                     Some(BarAction::Rotate(right)) => self.rotate_selection(right),
                     Some(BarAction::ZoomToSelection) => self.zoom_to_selection(ctx),

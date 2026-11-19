@@ -16,9 +16,9 @@ impl OnScreenNotesApp {
         self.overlay_cache.carry_pictures(&stored);
         self.pad_follow_store(&stored);
         self.canvases.refresh_pins();
-        // The global pins are on the canvas, or in the slide window when
-        // its "Pins" toggle is on; never both.
-        self.canvases.set_globals_away(self.slide_window.as_ref().is_some_and(|w| w.shows_pins()));
+        // Global pins show in the pins window only; local ones stay on
+        // their slide on the canvas.
+        self.canvases.set_pins_away(true);
         // Every pin shows wholly on the canvas area, whatever its size now.
         let area = self.overlay_cache.canvas_rect(ctx).size();
         self.canvases.set_pin_area([area.x, area.y]);
@@ -232,6 +232,9 @@ impl OnScreenNotesApp {
         if let Some(win) = self.slide_window.as_mut() {
             win.claim_pen(&mut pen_events, client_origin);
         }
+        if let Some(win) = self.pins_window.as_mut() {
+            win.claim_pen(&mut pen_events, client_origin);
+        }
         (pen_events, client_origin)
     }
 
@@ -414,30 +417,69 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// The slide window, after the overlay drew this frame (it shares the
-    /// overlay's texture cache), looking like the overlay and following it
-    /// live. On a slide it runs the app's own frame (`view_pass`) with its
-    /// own state (`window_ws`): its slide is the active one meanwhile
-    /// (`CanvasManager::enter_view`), so its toolbar, panels, tools and keys
-    /// are the overlay's. The global pins, in its Pins view, keep their own
-    /// code (`ui::slide_window::pins_frame`).
-    pub(super) fn show_slide_window(&mut self, ctx: &egui::Context) {
-        let Some(mut win) = self.slide_window.take() else {
+    /// The slide window and the pins window, after the overlay drew this
+    /// frame (they share its texture cache), looking like the overlay and
+    /// following it live. Each runs the app's own frame (`view_pass`)
+    /// with its own state: its slide, or for the pins window the pins
+    /// board, is the active one meanwhile (`CanvasManager::enter_view`,
+    /// `enter_board`), so its tools and keys are the overlay's.
+    pub(super) fn show_windows(&mut self, ctx: &egui::Context) {
+        if self.slide_window.is_none() {
             self.window_ws = None;
-            return;
-        };
-        if self.canvases.count() == 0 {
-            self.window_ws = None;
+        }
+        if self.pins_window.is_none() {
+            self.pins_ws = None;
+        }
+        if self.slide_window.is_none() && self.pins_window.is_none() {
             return;
         }
-        // After the overlay drew this frame: the window shares its
+        if self.canvases.count() == 0 {
+            self.slide_window = None;
+            self.pins_window = None;
+            return;
+        }
+        // After the overlay drew this frame: the windows share its
         // texture cache, whose once-a-frame start the overlay ran — or,
         // with the overlay hidden, runs here.
         if !self.overlay_visible {
             self.overlay_cache.begin_frame(ctx);
         }
+        self.main_canvas = crate::platform::client_rect(self.osn_hwnd).map(|(l, t, _, _)| MainCanvas {
+            rect: self.overlay_cache.canvas_rect(ctx),
+            origin_px: [l as f32, t as f32],
+            ppp: ctx.pixels_per_point(),
+        });
+        for kind in [WindowKind::Slide, WindowKind::Pins] {
+            let (win, ws) = match kind {
+                WindowKind::Slide => (self.slide_window.take(), self.window_ws.take()),
+                WindowKind::Pins => (self.pins_window.take(), self.pins_ws.take()),
+            };
+            let Some(win) = win else { continue };
+            let (win, ws) = self.run_window(ctx, kind, win, ws);
+            match kind {
+                WindowKind::Slide => {
+                    self.slide_window = win;
+                    self.window_ws = ws;
+                }
+                WindowKind::Pins => {
+                    self.pins_window = win;
+                    self.pins_ws = ws;
+                }
+            }
+        }
+    }
+
+    /// One frame of a second window: `win` with its state `ws` (made if
+    /// it has none yet). Both back, or none once the window was closed.
+    fn run_window(
+        &mut self,
+        ctx: &egui::Context,
+        kind: WindowKind,
+        mut win: ui::slide_window::SlideWindow,
+        ws: Option<workspace::Workspace>,
+    ) -> (Option<ui::slide_window::SlideWindow>, Option<workspace::Workspace>) {
         win.keep_in_range(&mut self.canvases);
-        let mut ws = self.window_ws.take().unwrap_or_else(|| {
+        let mut ws = ws.unwrap_or_else(|| {
             let tool = ActiveTool::from_config(&self.config);
             let mut eraser = ActiveTool::from_config(&self.config);
             eraser.kind = crate::tools::ToolKind::Eraser;
@@ -446,23 +488,10 @@ impl OnScreenNotesApp {
         // It looks like the overlay, and follows it live.
         let look = ui::slide_window::Look {
             background: ui::slide_window::Look::background(self.config.bg_color, self.config.bg_opacity),
-            chrome: ws.ui_visible,
         };
-        // For the Pins view: the canvas area's size, which a pin moved
-        // there is kept inside.
-        let main_area = {
-            let s = self.overlay_cache.canvas_rect(ctx).size();
-            [s.x, s.y]
-        };
-        let pen_owns_pointer = self.pen.is_down() || self.pen.used_within(PEN_OWNS_POINTER);
-        self.main_canvas = crate::platform::client_rect(self.osn_hwnd).map(|(l, t, _, _)| MainCanvas {
-            rect: self.overlay_cache.canvas_rect(ctx),
-            origin_px: [l as f32, t as f32],
-            ppp: ctx.pixels_per_point(),
-        });
-        let passes = self.config.smoothing_level.position_passes();
         let builder = win.builder(&self.canvases);
-        let open = ctx.show_viewport_immediate(ui::slide_window::SlideWindow::viewport_id(), builder, |ctx, class| {
+        self.running = Some(kind);
+        let open = ctx.show_viewport_immediate(win.viewport(), builder, |ctx, class| {
             // A backend with one window would draw this over the canvas.
             // Desktop eframe always makes a real window.
             if class == egui::ViewportClass::Embedded {
@@ -470,30 +499,30 @@ impl OnScreenNotesApp {
             }
             let mut open = !ctx.input(|i| i.viewport().close_requested());
             ui::slide_window::paint_background(ctx, look.background);
-            if win.shows_pins() {
-                let input = ui::slide_edit::Input { pen_owns_pointer, keys: &self.hotkeys_cfg, main_area };
-                let top = if ws.ui_visible { ui::slide_window::bar_bottom(ctx).map_or(56.0, |b| b + 6.0) } else { 0.0 };
-                ui::slide_window::pins_frame(ctx, &mut win, &mut self.overlay_cache, &mut self.canvases, passes, &self.media, &look, top, &mut ws.tool, &input);
+            // Room the window's bar takes, kept clear when fitting.
+            let top = if ws.ui_visible { ui::slide_window::bar_bottom(ctx).map_or(56.0, |b| b + 6.0) } else { 0.0 };
+            win.before_pass(ctx, &self.canvases, top);
+            win.lock_hint(ctx, ws.tool.kind);
+            let (events, origin) = win.take_pen_events(ctx.pixels_per_point());
+            let (slide, pan, zoom) = win.view();
+            // The pins window works on the pins board like a slide.
+            let entered = if win.shows_pins() {
+                self.canvases.enter_board(pan, zoom, win.locked())
             } else {
-                // Room the window's bar takes, kept clear when fitting.
-                let top = if ws.ui_visible { ui::slide_window::bar_bottom(ctx).map_or(56.0, |b| b + 6.0) } else { 0.0 };
-                win.before_pass(ctx, &self.canvases, top);
-                win.lock_hint(ctx, ws.tool.kind);
-                let (events, origin) = win.take_pen_events(ctx.pixels_per_point());
-                let (slide, pan, zoom) = win.view();
-                if self.canvases.enter_view(slide, pan, zoom, win.locked()).is_some() {
-                    std::mem::swap(&mut self.ws, &mut ws);
-                    self.ws.hwnd = win.hwnd();
-                    self.overlay_cache.enter_child(win.canvas_rect_mut());
-                    self.view_pass(ctx, &events, origin, true);
-                    self.overlay_cache.leave_child(win.canvas_rect_mut());
-                    std::mem::swap(&mut self.ws, &mut ws);
-                    if let Some((s, p, z)) = self.canvases.leave_view() {
-                        win.after_pass(s, p, z, ctx.pixels_per_point());
-                    }
-                } else {
-                    ui::slide_window::opening(ctx);
+                self.canvases.enter_view(slide, pan, zoom, win.locked())
+            };
+            if entered.is_some() {
+                std::mem::swap(&mut self.ws, &mut ws);
+                self.ws.hwnd = win.hwnd();
+                self.overlay_cache.enter_child(win.canvas_rect_mut());
+                self.view_pass(ctx, &events, origin, true);
+                self.overlay_cache.leave_child(win.canvas_rect_mut());
+                std::mem::swap(&mut self.ws, &mut ws);
+                if let Some((s, p, z)) = self.canvases.leave_view() {
+                    win.after_pass(s, p, z, ctx.pixels_per_point());
                 }
+            } else {
+                ui::slide_window::opening(ctx);
             }
             let (stays, picked) = ui::slide_window::chrome(
                 ctx,
@@ -510,8 +539,9 @@ impl OnScreenNotesApp {
             }
             open
         });
+        self.running = None;
         win.find_handle(self.osn_hwnd);
-        // Dropped on the main window from the slide window: selected there.
+        // Dropped on the main window from this one: selected there.
         if let Some((slide, placed)) = self.main_select.take() {
             if slide == self.canvases.active_index() {
                 if let Some(c) = self.canvases.slide(slide) {
@@ -525,7 +555,9 @@ impl OnScreenNotesApp {
         if let Some(msg) = win.take_notice() {
             self.toast = Some((msg, Instant::now()));
         }
-        if let Some(id) = win.take_open_pin() {
+        // A pin double-clicked in the pins window: the main window goes to
+        // its slide.
+        if let Some(id) = self.pin_to_open.take() {
             let area = self.overlay_cache.canvas_rect(ctx).size();
             self.open_pin_slide(id, area);
         }
@@ -533,10 +565,9 @@ impl OnScreenNotesApp {
         // overlay's next one, never in the window's own pass.
         self.ws.pad.take_retired(&mut ws.pad);
         if open && !std::mem::take(&mut self.window_close) {
-            self.slide_window = Some(win);
-            self.window_ws = Some(ws);
+            (Some(win), Some(ws))
         } else {
-            self.window_ws = None;
+            (None, None)
         }
     }
 
@@ -545,18 +576,28 @@ impl OnScreenNotesApp {
     /// paints. `view` is the overlay's canvas area; the slide window's is
     /// where it drew last frame.
     pub(super) fn sync_media(&mut self, ctx: &egui::Context, view: egui::Rect) {
-        let mut pins = self.canvases.pinned();
-        // Pinned videos play wherever their pins are, the slide window's
-        // Pins view included; its pins count as placed on the canvas.
-        if self.slide_window.as_ref().is_some_and(|w| w.shows_pins()) {
-            pins.extend(self.canvases.global_pins());
-        }
+        // The pins play in the pins window, as it shows them.
+        let pins_view = self.pins_window.as_ref().and_then(|w| w.media_view());
+        let pins: Vec<crate::canvas::pins::Pinned> = match pins_view {
+            Some((_, pan, zoom, _)) => self
+                .canvases
+                .window_pins()
+                .into_iter()
+                .map(|p| crate::canvas::pins::Pinned { pin: p.pin.viewed(pan, zoom), ..p })
+                .collect(),
+            None => Vec::new(),
+        };
+        // The main window's own: its slide and that slide's local pins.
+        let local = self.canvases.pinned();
         let c = self.canvases.active();
-        let mut views = vec![crate::media::ShownIn { canvas: c, pan: c.pan, zoom: c.zoom, pins: &pins, view }];
+        let mut views = vec![crate::media::ShownIn { canvas: c, pan: c.pan, zoom: c.zoom, pins: &local, view }];
         if let Some((idx, pan, zoom, rect)) = self.slide_window.as_ref().and_then(|w| w.media_view()) {
             if let Some(c) = self.canvases.slide(idx) {
                 views.push(crate::media::ShownIn { canvas: c, pan, zoom, pins: &[], view: rect });
             }
+        }
+        if let Some((_, pan, zoom, rect)) = pins_view {
+            views.push(crate::media::ShownIn { canvas: self.canvases.board(), pan, zoom, pins: &pins, view: rect });
         }
         self.media.sync_views(ctx, &views, ctx.pixels_per_point());
     }

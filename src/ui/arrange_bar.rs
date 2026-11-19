@@ -28,6 +28,9 @@ fn with_key(tip: &str, key: Option<Binding>) -> String {
 /// What a click on the bar asks for.
 pub enum BarAction {
     Arrange(Arrange),
+    /// The selection's pins show on this slide only (`true`) or on every
+    /// slide.
+    PinScope(bool),
     /// Give every selected object this width or height.
     Match(Match),
     CopyToNewSlide,
@@ -180,6 +183,9 @@ pub fn show(
     ctx: &egui::Context,
     count: usize,
     pinned: bool,
+    // While `pinned`: the pins show on this slide only (`Some(true)`), on
+    // every slide (`Some(false)`), or some each way (`None`).
+    pin_local: Option<bool>,
     slides: &CanvasManager,
     apart: &mut bool,
     dim: &mut bool,
@@ -281,11 +287,22 @@ pub fn show(
                     let tip = if pinned {
                         "Unpin — stop showing these as a pin"
                     } else {
-                        "Pin to every slide — the objects stay here, and a pin you can move and resize shows them on every slide; its bar can keep it to this slide"
+                        "Pin — the objects stay here, and the pins window shows them on every slide; or keep the pin to this slide, on the main window, from the choice that comes up"
                     };
                     let tip = with_key(tip, keys.canvas.pin_selection);
                     if toggle_btn(ui, egui::include_image!("../../assets/icons/pin.svg"), pinned, &tip) {
                         picked = Some(BarAction::TogglePin);
+                    }
+                    // Where a pin of these shows: this slide or every one.
+                    if pinned {
+                        let only = with_key("Show the pin on this slide only, here on the main window", keys.canvas.pin_this_slide_only);
+                        if ui.selectable_label(pin_local == Some(true), "This slide").on_hover_text(only).clicked() {
+                            picked = Some(BarAction::PinScope(true));
+                        }
+                        let every = with_key("Show the pin on every slide, in the pins window", keys.canvas.pin_this_slide_only);
+                        if ui.selectable_label(pin_local == Some(false), "Every slide").on_hover_text(every).clicked() {
+                            picked = Some(BarAction::PinScope(false));
+                        }
                     }
                     let tip = with_key("Tags — words find (Ctrl+F) knows the selection by", k.tag);
                     let mut open = toggle_btn(ui, egui::include_image!("../../assets/icons/tag.svg"), tag_edit.is_some(), &tip);

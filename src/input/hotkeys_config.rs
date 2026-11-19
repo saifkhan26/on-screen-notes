@@ -1480,7 +1480,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "group")                => "Make the selection one group (selects, moves and arranges as one)",
         ("canvas", "ungroup")              => "Take the selection out of its groups",
         ("canvas", "pin_selection")        => "Pin the selection to every slide, or unpin it",
-        ("canvas", "toggle_pins")          => "Hide / show every pin",
+        ("canvas", "toggle_pins")          => "Open the pins window (pins on every slide; draw there too), or close it",
         ("canvas", "bring_front")          => "Selection to the front",
         ("canvas", "send_back")            => "Selection to the back",
         ("canvas", "nudge_left_1px")       => "Selection 1 px left (wins over slide / layer keys while selected)",
