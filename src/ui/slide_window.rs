@@ -8,7 +8,9 @@
 //! resizing are the card's grip and the window's edges, since there is no
 //! frame to drag.
 //!
-//! The toolbar's tool works here too, on the slide shown (see
+//! The window opens locked, for looking only: a drag pans and nothing
+//! can be changed here by accident. The lock on its card unlocks it.
+//! Unlocked, the toolbar's tool works here too, on the slide shown (see
 //! `slide_edit`): draw, erase (Ctrl), shapes, laser, select. Wheel zooms;
 //! middle-drag or Space+drag pans, and a plain drag pans on a locked
 //! slide or with a tool the window cannot use yet. In Pins mode the
@@ -54,7 +56,7 @@ const FIND_FRAMES: u32 = 120;
 /// The window's size when it first opens on a slide, and the least it
 /// can be made, in points.
 const START_SIZE: Vec2 = Vec2::new(720.0, 480.0);
-pub const MIN_SIZE: Vec2 = Vec2::new(520.0, 240.0);
+pub const MIN_SIZE: Vec2 = Vec2::new(580.0, 240.0);
 
 /// The open slide window: which slide it shows and how.
 pub struct SlideWindow {
@@ -78,6 +80,14 @@ pub struct SlideWindow {
     place: Option<egui::Rect>,
     /// Stay above every other window, not only the overlay.
     on_top: bool,
+    /// Looking only: no edits here until the user unlocks it. Every
+    /// window opens locked; showing another slide or region keeps it as
+    /// it is.
+    locked: bool,
+    /// The user was told once that a drag pans because it is locked.
+    lock_told: bool,
+    /// Something to tell the user, for the app's toast.
+    notice: Option<String>,
     /// Show the global pins, and no slide, instead of the slide; the
     /// canvas then leaves them out (`CanvasManager::set_globals_away`).
     pins: bool,
@@ -127,6 +137,9 @@ impl SlideWindow {
             region: None,
             place: None,
             on_top: false,
+            locked: true,
+            lock_told: false,
+            notice: None,
             pins: false,
             hwnd: 0,
             find_tries: 0,
@@ -182,7 +195,12 @@ impl SlideWindow {
 
     /// What the window has to tell the user, once.
     pub fn take_notice(&mut self) -> Option<String> {
-        self.edit.take_notice()
+        self.notice.take().or_else(|| self.edit.take_notice())
+    }
+
+    /// Looking only: nothing on its slide, or its pins, can change here.
+    pub fn locked(&self) -> bool {
+        self.locked
     }
 
     /// Take the pen gestures that start over this window out of the
@@ -450,6 +468,16 @@ fn card(ctx: &egui::Context, win: &mut SlideWindow, manager: &CanvasManager) -> 
                             win.set_slide(i);
                         }
                     }
+                    let lock = egui::Image::new(egui::include_image!("../../assets/icons/lock.svg"));
+                    let tip = if win.locked {
+                        "Locked — this window is for looking: a drag pans, nothing changes here. Click to edit in it"
+                    } else {
+                        "Unlocked — the toolbar's tool works here. Click to lock it again"
+                    };
+                    if toggle_btn(ui, lock, win.locked, tip) {
+                        win.locked = !win.locked;
+                        win.edit.drop_pin_selection();
+                    }
                     let tip = if win.pins {
                         "Showing the pins on every slide here. Click to show the slide again and give the pins back to the main window"
                     } else {
@@ -518,6 +546,23 @@ fn icon_btn(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str, enabled: boo
     let icon = rect.shrink(rect.width() * 0.22);
     img.tint(tint).fit_to_exact_size(icon.size()).paint_at(ui, icon);
     response.on_hover_text(tooltip).clicked() && enabled
+}
+
+/// A toolbar-style icon button lit while `on`; true when clicked.
+fn toggle_btn(ui: &mut egui::Ui, img: egui::Image<'_>, on: bool, tooltip: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
+    let bg = if on {
+        theme::ACCENT
+    } else if response.hovered() {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+    let tint = if on { theme::TEXT_PRIMARY } else { theme::TEXT_MUTED };
+    let icon = rect.shrink(rect.width() * 0.22);
+    img.tint(tint).fit_to_exact_size(icon.size()).paint_at(ui, icon);
+    response.on_hover_text(tooltip).clicked()
 }
 
 /// A toolbar-style button with a word on it, lit while `selected`.
@@ -590,7 +635,11 @@ fn canvas_area(
         }
         win.last_rect = rect;
         win.last_ppp = ctx.pixels_per_point();
-        let editable = !manager.is_locked(win.slide);
+        let editable = !win.locked && !manager.is_locked(win.slide);
+        if win.locked && !win.lock_told && response.drag_started_by(egui::PointerButton::Primary) && crate::ui::slide_edit::supported(main_tool.kind) {
+            win.lock_told = true;
+            win.notice = Some("The slide window is locked, so a drag pans. Its lock button unlocks it for editing".to_string());
+        }
         let view = crate::ui::slide_edit::View { slide: win.slide, rect, pan: win.pan, zoom: win.zoom };
         win.edit.keys(ctx, manager, view, editable, main_tool, input.keys);
         win.edit.pointer(ctx, &response, manager, view, &mut win.pan, editable, input, win.hwnd, main_tool);
@@ -667,7 +716,13 @@ fn canvas_area(
         if input.drop_hover {
             let accent = Color32::from_rgb(86, 160, 255);
             painter.rect_stroke(rect.shrink(3.0), Rounding::same(10.0), egui::Stroke::new(3.0, accent));
-            let text = if editable { format!("Drop to move to slide {}", win.slide + 1) } else { format!("Slide {} is locked", win.slide + 1) };
+            let text = if editable {
+                format!("Drop to move to slide {}", win.slide + 1)
+            } else if win.locked {
+                "This window is locked — unlock it to drop here".to_string()
+            } else {
+                format!("Slide {} is locked", win.slide + 1)
+            };
             let at = egui::pos2(rect.center().x, rect.max.y - 28.0);
             let galley = painter.layout_no_wrap(text, egui::FontId::proportional(14.0), theme::TEXT_PRIMARY);
             let pill = egui::Rect::from_center_size(at, galley.size() + Vec2::new(20.0, 10.0));
@@ -702,9 +757,9 @@ fn pins_area(
         // With the Select tool the pins move, resize and turn here as on
         // the canvas (see `WindowEdit::pins_pointer`); any other press
         // pans, so a plain drag is not `navigate`'s.
-        win.edit.pins_keys(ctx, manager, main_tool, input.keys);
+        win.edit.pins_keys(ctx, manager, main_tool, input.keys, !win.locked);
         let origin = rect.min + Vec2::new(win.pan[0], win.pan[1]);
-        win.edit.pins_pointer(ctx, &response, manager, origin, win.zoom, &mut win.pan, input, win.hwnd);
+        win.edit.pins_pointer(ctx, &response, manager, origin, win.zoom, &mut win.pan, input, win.hwnd, !win.locked);
         if navigate(ctx, win, rect, &response, false) {
             let bounds = manager
                 .global_pins()
@@ -734,7 +789,7 @@ fn pins_area(
             // Outlines, badges and the selected pin's handles, as on the
             // canvas with the Select tool, drawn on the pins as the window
             // shows them so the handles keep their size on screen.
-            if look.chrome && win.edit.tool().kind == crate::tools::ToolKind::Select {
+            if look.chrome && !win.locked && win.edit.tool().kind == crate::tools::ToolKind::Select {
                 let o = [origin.x, origin.y];
                 let shown: Vec<crate::canvas::pins::Pin> = pins.iter().map(|p| p.pin.viewed(o, win.zoom)).collect();
                 let view: Vec<crate::canvas::pins::Pinned> = pins.iter().zip(&shown).map(|(p, s)| crate::canvas::pins::Pinned { pin: *s, ..*p }).collect();
@@ -977,6 +1032,19 @@ mod tests {
         w.pins = true;
         w.aim(0, [0.0, 0.0, 10.0, 10.0]);
         assert!(!w.pins && w.slide == 0, "a region shows its slide, not the pins");
+    }
+
+    #[test]
+    fn every_window_opens_locked_and_keeps_its_lock_when_aimed() {
+        let cfg = crate::config::AppConfig::default();
+        let mut w = SlideWindow::new(0, &cfg);
+        assert!(w.locked());
+        let p = SlideWindow::popped_out(0, [0.0; 4], egui::Rect::from_min_size(egui::Pos2::ZERO, MIN_SIZE), [0.0; 2], 1.0, &cfg);
+        assert!(p.locked(), "a pop-out too");
+        w.locked = false;
+        w.aim(1, [0.0, 0.0, 50.0, 50.0]);
+        w.set_slide(2);
+        assert!(!w.locked(), "aiming the open window keeps the user's unlock");
     }
 
     #[test]

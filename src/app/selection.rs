@@ -212,6 +212,10 @@ impl OnScreenNotesApp {
         }
         let Some((to, target, window_scale)) = win.canvas_at(screen) else { return false };
         self.tool.select.gesture = None;
+        if win.locked() {
+            self.toast = Some(("The slide window is locked — unlock it on its card to move objects there".to_string(), Instant::now()));
+            return true;
+        }
         if self.canvases.is_locked(to) {
             self.toast = Some((format!("Slide {} is locked — unlock it to move objects there", to + 1), Instant::now()));
             return true;

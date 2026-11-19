@@ -214,8 +214,10 @@ impl WindowEdit {
         pan: &mut [f32; 2],
         input: &Input,
         hwnd: isize,
+        editable: bool,
     ) {
-        let select = self.tool.kind == ToolKind::Select;
+        // Locked, any press pans.
+        let select = editable && self.tool.kind == ToolKind::Select;
         let ids: Vec<u64> = manager.global_pins().iter().map(|p| p.pin.id).collect();
         if !select || self.pin_tool.selected.is_some_and(|id| !ids.contains(&id)) {
             self.pin_tool.clear();
@@ -359,7 +361,7 @@ impl WindowEdit {
 
     /// Pins mode keys: Delete unpins the selected pin (its objects stay
     /// on their slide), Esc lets go of it, the tool keys pick the tool.
-    pub fn pins_keys(&mut self, ctx: &egui::Context, manager: &mut CanvasManager, main: &mut ActiveTool, keys: &ParsedHotkeys) {
+    pub fn pins_keys(&mut self, ctx: &egui::Context, manager: &mut CanvasManager, main: &mut ActiveTool, keys: &ParsedHotkeys, editable: bool) {
         let events: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
@@ -371,7 +373,7 @@ impl WindowEdit {
         });
         for (key, mods) in events {
             if matches!(key, egui::Key::Delete | egui::Key::Backspace) {
-                if let Some(id) = self.pin_tool.selected {
+                if let Some(id) = self.pin_tool.selected.filter(|_| editable) {
                     let slide = manager.pin_board().members(id).map(|(s, _)| s);
                     self.pin_tool.clear();
                     if manager.unpin(id) {
