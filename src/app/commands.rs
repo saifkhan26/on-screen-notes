@@ -335,6 +335,12 @@ impl OnScreenNotesApp {
                 let msg = if self.config.shape_snap { "Shape snap on" } else { "Shape snap off" };
                 self.toast = Some((msg.to_string(), Instant::now()));
             }
+            C::KeepProportions => {
+                self.config.keep_proportions = !self.config.keep_proportions;
+                self.ws.tool.select.keep_proportions = self.config.keep_proportions;
+                let msg = if self.config.keep_proportions { "Keep proportions on" } else { "Keep proportions off: handles stretch" };
+                self.toast = Some((msg.to_string(), Instant::now()));
+            }
             C::GoTo(i) => self.canvases.go_to(i),
             C::NewPad => self.new_pad(ctx, canvas_rect),
             C::DrawOnPicture => self.draw_on_selected_picture(),

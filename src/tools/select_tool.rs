@@ -50,8 +50,9 @@ const GROUP_BRIDGE_PX: f32 = 12.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handle {
     /// Resize handle at `(x, y)` on the frame, each of −1, 0 or 1 in the
-    /// frame's own axes. Both non-zero is a corner (proportional
-    /// resize); one zero is a side (stretch along one axis).
+    /// frame's own axes. Both non-zero is a corner; one zero is a side.
+    /// Both keep the selection's proportions while `keep_proportions` is
+    /// on; off, a corner stretches both ways and a side along one axis.
     Scale { x: i8, y: i8 },
     Rotate,
 }
@@ -65,8 +66,9 @@ pub enum Gesture {
     Marquee { start: [f32; 2], cur: [f32; 2], click_target: Option<CanvasHit> },
     Move { start: [f32; 2], cur: [f32; 2] },
     /// `frame` is the selection frame as it stood at pen-down; the
-    /// resize is measured against it for the whole gesture.
-    Resize { x: i8, y: i8, frame: Obb, cur: [f32; 2] },
+    /// resize is measured against it for the whole gesture. `stretch`:
+    /// the proportions may change (taken at pen-down, see `begin_gesture`).
+    Resize { x: i8, y: i8, frame: Obb, cur: [f32; 2], stretch: bool },
     Rotate { frame: Obb, start: [f32; 2], cur: [f32; 2] },
 }
 
@@ -118,6 +120,9 @@ pub struct SelectState {
     pub alt: bool,
     /// Smart guides on (the settings' switch), pushed in by the app.
     pub guides_on: bool,
+    /// Resizing keeps the selection's proportions (the settings' switch,
+    /// on by default), pushed in by the app.
+    pub keep_proportions: bool,
     /// What the selection being moved can line up with, taken when the
     /// move began.
     guides: Option<Guides>,
@@ -256,14 +261,21 @@ impl SelectState {
         Some(frame)
     }
 
-    /// Whether the side handles (one-axis stretch) are offered. They are
-    /// only shown where the stretch can be stored exactly: a single
-    /// shape stretches along its own sides, and strokes / lines / arrows
-    /// / unrotated boxes stretch along the canvas axes. Text has one
-    /// font size for both axes, and a box turned relative to the frame
-    /// would have to shear, so those selections resize from the corners
-    /// only.
+    /// Whether the side handles are offered. Keeping proportions, a side
+    /// scales the whole selection evenly, which any selection can take.
+    /// Otherwise a side stretches along one axis, so they show only where
+    /// that can be stored (`stretchable`).
     fn side_handles(&self, layer: &Layer) -> bool {
+        self.keep_proportions || self.stretchable(layer)
+    }
+
+    /// Whether the selection can be stretched (its proportions changed)
+    /// exactly: a single shape stretches along its own sides, and strokes
+    /// / lines / arrows / unrotated boxes stretch along the canvas axes.
+    /// Text has one font size for both axes, and a box turned relative to
+    /// the frame would have to shear, so those selections always keep
+    /// their proportions.
+    fn stretchable(&self, layer: &Layer) -> bool {
         let shape = |i: &usize| layer.shapes.get(*i);
         if self.sel.strokes.is_empty() && self.sel.shapes.len() == 1 {
             return !matches!(shape(&self.sel.shapes[0]), Some(Shape::Text { .. }) | None);
@@ -323,24 +335,31 @@ impl SelectState {
                 }
                 Affine::rotate_about(c, angle)
             }
-            Gesture::Resize { x, y, frame, cur } => {
+            Gesture::Resize { x, y, frame, cur, stretch } => {
                 let [hw, hh] = frame.half;
                 let q = frame.to_local(cur);
-                // The handle opposite the one being dragged stays put.
+                // The handle opposite the one being dragged stays put (for
+                // a side, the middle of the opposite side).
                 let anchor = [-(x as f32) * hw, -(y as f32) * hh];
-                let (sx, sy) = if x != 0 && y != 0 {
-                    // Corner: project the pointer onto the frame's
-                    // diagonal so the resize stays proportional however
-                    // the pointer wanders off it.
-                    let diag = [2.0 * x as f32 * hw, 2.0 * y as f32 * hh];
-                    let s = ((q[0] - anchor[0]) * diag[0] + (q[1] - anchor[1]) * diag[1])
-                        / (diag[0] * diag[0] + diag[1] * diag[1]);
-                    let s = s.max(MIN_SCALE);
-                    (s, s)
-                } else if x != 0 {
-                    (((q[0] - anchor[0]) / (2.0 * x as f32 * hw)).max(MIN_SCALE), 1.0)
-                } else {
-                    (1.0, ((q[1] - anchor[1]) / (2.0 * y as f32 * hh)).max(MIN_SCALE))
+                // How far the pointer has taken each axis the handle pulls.
+                let along_x = || ((q[0] - anchor[0]) / (2.0 * x as f32 * hw)).max(MIN_SCALE);
+                let along_y = || ((q[1] - anchor[1]) / (2.0 * y as f32 * hh)).max(MIN_SCALE);
+                let (sx, sy) = match (x != 0, y != 0) {
+                    (true, true) if stretch => (along_x(), along_y()),
+                    (true, true) => {
+                        // Corner: project the pointer onto the frame's
+                        // diagonal so the resize stays proportional however
+                        // the pointer wanders off it.
+                        let diag = [2.0 * x as f32 * hw, 2.0 * y as f32 * hh];
+                        let s = ((q[0] - anchor[0]) * diag[0] + (q[1] - anchor[1]) * diag[1])
+                            / (diag[0] * diag[0] + diag[1] * diag[1]);
+                        let s = s.max(MIN_SCALE);
+                        (s, s)
+                    }
+                    (true, false) if stretch => (along_x(), 1.0),
+                    (true, false) => (along_x(), along_x()),
+                    (false, _) if stretch => (1.0, along_y()),
+                    (false, _) => (along_y(), along_y()),
                 };
                 // Into the frame's own axes, scale about the anchor, and
                 // back out.
@@ -598,7 +617,10 @@ impl SelectState {
         if let (Some(h), Some(frame)) = (self.handle_at(p, canvas), self.frame(layer, canvas.zoom)) {
             self.gesture = Some(match h {
                 Handle::Rotate => Gesture::Rotate { frame, start: p, cur: p },
-                Handle::Scale { x, y } => Gesture::Resize { x, y, frame, cur: p },
+                Handle::Scale { x, y } => {
+                    let stretch = !self.keep_proportions && self.stretchable(layer);
+                    Gesture::Resize { x, y, frame, cur: p, stretch }
+                }
             });
             return;
         }
@@ -852,10 +874,22 @@ mod tests {
         c
     }
 
+    /// The tool as the app sets it up: keeping proportions (the default).
     fn tool(c: &Canvas) -> SelectState {
-        let mut t = SelectState::default();
+        let mut t = SelectState { keep_proportions: true, ..Default::default() };
         t.sync(true, 0, c);
         t
+    }
+
+    fn raster_box(c: &Canvas) -> ([f32; 2], [f32; 2]) {
+        match &c.layers[0].shapes[0] {
+            Shape::Raster { pos, size, .. } => (*pos, *size),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn near(a: [f32; 2], b: [f32; 2]) -> bool {
+        (a[0] - b[0]).abs() < 1e-2 && (a[1] - b[1]).abs() < 1e-2
     }
 
     fn click(t: &mut SelectState, c: &mut Canvas, p: [f32; 2]) {
@@ -1022,17 +1056,38 @@ mod tests {
     }
 
     #[test]
-    fn side_handle_stretches_one_axis() {
+    fn a_side_handle_scales_evenly_about_the_opposite_side() {
         let mut c = Canvas::default();
         c.layers[0].shapes.push(image([0.0, 0.0], [100.0, 50.0]));
         let mut t = tool(&c);
         click(&mut t, &mut c, [50.0, 25.0]);
-        // Right-hand side handle, pulled 50 px further right.
+        // Right-hand side handle, pulled 50 px further right: half as big
+        // again both ways, the left side's middle staying put.
         t.begin([100.0, 25.0], &mut c);
-        assert!(matches!(t.gesture, Some(Gesture::Resize { x: 1, y: 0, .. })));
+        assert!(matches!(t.gesture, Some(Gesture::Resize { x: 1, y: 0, stretch: false, .. })));
         t.end([150.0, 25.0], &mut c);
-        assert!(matches!(&c.layers[0].shapes[0], Shape::Raster { size, .. }
-            if (size[0] - 150.0).abs() < 1e-2 && (size[1] - 50.0).abs() < 1e-2));
+        let (pos, size) = raster_box(&c);
+        assert!(near(size, [150.0, 75.0]), "{size:?}");
+        assert!(near(pos, [0.0, -12.5]), "{pos:?}");
+    }
+
+    #[test]
+    fn with_proportions_off_the_handles_stretch() {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(image([0.0, 0.0], [100.0, 50.0]));
+        let mut t = tool(&c);
+        t.keep_proportions = false;
+        click(&mut t, &mut c, [50.0, 25.0]);
+        // Right-hand side handle: along one axis only.
+        t.begin([100.0, 25.0], &mut c);
+        assert!(matches!(t.gesture, Some(Gesture::Resize { x: 1, y: 0, stretch: true, .. })));
+        t.end([150.0, 25.0], &mut c);
+        assert!(near(raster_box(&c).1, [150.0, 50.0]), "{:?}", raster_box(&c));
+        // Bottom-right corner: each way as far as the pointer goes.
+        t.begin([150.0, 50.0], &mut c);
+        t.end([300.0, 60.0], &mut c);
+        let (pos, size) = raster_box(&c);
+        assert!(near(pos, [0.0, 0.0]) && near(size, [300.0, 60.0]), "{pos:?} {size:?}");
     }
 
     #[test]
@@ -1156,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_selection_with_text_gets_corner_handles_only() {
+    fn text_in_a_selection_never_stretches() {
         let mut c = Canvas::default();
         c.layers[0].strokes.push(stroke([0.0, 0.0], [100.0, 0.0]));
         c.layers[0].shapes.push(Shape::Text {
@@ -1170,13 +1225,19 @@ mod tests {
         });
         let mut t = tool(&c);
         t.sel = Selection { strokes: vec![0], shapes: vec![0] };
-        let scale_handles = t
-            .chrome(&c)
-            .handles
-            .iter()
-            .filter(|(_, h)| matches!(h, Handle::Scale { .. }))
-            .count();
-        assert_eq!(scale_handles, 4);
+        let scale_handles = |t: &SelectState| {
+            t.chrome(&c).handles.iter().filter(|(_, h)| matches!(h, Handle::Scale { .. })).count()
+        };
+        // Keeping proportions, its sides scale it evenly: all eight.
+        assert_eq!(scale_handles(&t), 8);
+        // Stretching, text can't follow: corners only, and they keep
+        // its proportions.
+        t.keep_proportions = false;
+        assert_eq!(scale_handles(&t), 4);
+        let corner = t.chrome(&c).handles[2].0;
+        t.begin(corner, &mut c);
+        assert!(matches!(t.gesture, Some(Gesture::Resize { x: 1, y: 1, stretch: false, .. })));
+        t.cancel();
         // Strokes alone can stretch, so all eight are offered.
         t.sel = Selection { strokes: vec![0], shapes: vec![] };
         assert_eq!(t.chrome(&c).handles.len(), 9);

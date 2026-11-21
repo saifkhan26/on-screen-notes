@@ -88,7 +88,7 @@ impl OnScreenNotesApp {
                     &mut self.config.pressure_curve,
                     &mut self.config.ui_scale,
                     &mut self.config.accent,
-                    (&mut self.config.shape_snap, &mut self.config.smart_guides),
+                    (&mut self.config.shape_snap, &mut self.config.smart_guides, &mut self.config.keep_proportions),
                     (&mut self.config.beside_fit, &mut self.config.beside_side),
                     (&mut self.config.picture_search, picture_status.as_str()),
                     &mut self.pinned_hwnd,
@@ -107,6 +107,7 @@ impl OnScreenNotesApp {
             self.set_pins_hidden(pins_hidden);
             self.ws.tool.shape_snap = self.config.shape_snap;
             self.ws.tool.select.guides_on = self.config.smart_guides;
+            self.ws.tool.select.keep_proportions = self.config.keep_proportions;
             if self.ws.tool.text_box != prev_text_box {
                 self.apply_text_box_to_selection();
             }

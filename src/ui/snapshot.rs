@@ -232,7 +232,7 @@ mod tests {
             crate::ui::toolbar::show(
                 ctx, &mut tool, &mut cfg.bg_opacity, &mut cfg.bg_color, &mut pal, &mut cfg.smoothing_level, &mut cfg.smoothing,
                 &mut cfg.pressure_curve, &mut cfg.ui_scale, &mut cfg.accent,
-                (&mut cfg.shape_snap, &mut cfg.smart_guides),
+                (&mut cfg.shape_snap, &mut cfg.smart_guides, &mut cfg.keep_proportions),
                 (&mut cfg.beside_fit, &mut cfg.beside_side), (&mut cfg.picture_search, ""),
                 &mut pin, &mut picking, &mut insert, &mut filter, &counts, &mut select, None, false, &keys,
             );

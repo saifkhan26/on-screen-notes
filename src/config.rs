@@ -183,6 +183,11 @@ pub struct AppConfig {
     /// around it. On unless turned off in the settings.
     #[serde(default = "default_shape_snap")]
     pub smart_guides: bool,
+    /// Resizing a selection keeps its proportions, from the corners and
+    /// the sides alike. On unless turned off in the settings; off, the
+    /// handles stretch it where its objects can be stretched.
+    #[serde(default = "default_shape_snap")]
+    pub keep_proportions: bool,
     /// The arrange bar's "dim the rest": while objects are selected,
     /// everything else on the slide fades back. Off until switched on.
     #[serde(default)]
@@ -361,6 +366,7 @@ impl Default for AppConfig {
             arrange_apart: true,
             shape_snap: true,
             smart_guides: true,
+            keep_proportions: true,
             ui_scale: 1.0,
             accent: default_accent(),
             dim_unselected: false,

@@ -42,8 +42,9 @@ pub fn show(
     // colour (`config.accent`), in the settings popup.
     ui_scale: &mut f32,
     accent: &mut [u8; 3],
-    // Shape snap and smart guides on / off, in the settings popup.
-    snaps: (&mut bool, &mut bool),
+    // Shape snap, smart guides and keep proportions on / off, in the
+    // settings popup.
+    snaps: (&mut bool, &mut bool, &mut bool),
     // New media beside the selected picture: what it matches and which
     // side, in the settings popup.
     beside: (&mut BesideFit, &mut BesideSide),
@@ -151,6 +152,7 @@ pub fn show(
                         accent,
                         shape_snap: snaps.0,
                         smart_guides: snaps.1,
+                        keep_proportions: snaps.2,
                         beside_fit: beside.0,
                         beside_side: beside.1,
                         picture_search: picture_search.0,
@@ -922,6 +924,7 @@ struct Settings<'a> {
     accent: &'a mut [u8; 3],
     shape_snap: &'a mut bool,
     smart_guides: &'a mut bool,
+    keep_proportions: &'a mut bool,
     beside_fit: &'a mut BesideFit,
     beside_side: &'a mut BesideSide,
     picture_search: &'a mut bool,
@@ -1154,6 +1157,7 @@ fn pen_page(ui: &mut egui::Ui, s: Settings) {
 fn editing_page(ui: &mut egui::Ui, s: Settings) {
     theme::section(ui, "Selection");
     theme::setting_row(ui, "Smart guides", Some("A selection being moved lines up with the objects round it. Hold Alt to move it freely"), |ui| theme::switch(ui, s.smart_guides));
+    theme::setting_row(ui, "Keep proportions", Some("Resizing keeps the shape. Off, the sides stretch it — text, and objects turned differently, always keep theirs"), |ui| theme::switch(ui, s.keep_proportions));
 
     theme::section(ui, "New pictures");
     theme::setting_block(
@@ -1247,7 +1251,7 @@ mod tests {
             &mut cfg.pressure_curve,
             &mut cfg.ui_scale,
             &mut cfg.accent,
-            (&mut cfg.shape_snap, &mut cfg.smart_guides),
+            (&mut cfg.shape_snap, &mut cfg.smart_guides, &mut cfg.keep_proportions),
             (&mut cfg.beside_fit, &mut cfg.beside_side),
             (&mut cfg.picture_search, "Reading pictures: 12 of 340"),
             &mut pin,

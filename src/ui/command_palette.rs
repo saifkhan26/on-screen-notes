@@ -43,6 +43,7 @@ pub enum Command {
     ToBack,
     DeleteSelection,
     ShapeSnap,
+    KeepProportions,
     GoTo(usize),
     /// A new drawing pad (white paper) in the middle of the view.
     NewPad,
@@ -185,6 +186,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Clear the active layer", e, c.clear_layer, C::ClearLayer);
     add("Text in a box on / off", e, tb.text_box, C::Key(K::TextBox));
     add("Shape snap on / off", e, None, C::ShapeSnap);
+    add("Keep proportions on / off (resizing)", e, None, C::KeepProportions);
     add("Insert a picture, video, GIF or PureRef board", e, tb.insert_media, C::Key(K::InsertMedia));
     add("New drawing pad (paper to draw on with the pen and pencil)", e, None, C::NewPad);
     add("Pen size up", e, tb.size_up, C::Key(K::Size(1)));
