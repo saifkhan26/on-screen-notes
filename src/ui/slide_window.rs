@@ -43,8 +43,8 @@ const FIT_MARGIN: f32 = 24.0;
 /// without its lines turning into bars.
 const FIT_MAX_ZOOM: f32 = 4.0;
 /// Toolbar button metrics, so the card matches the main toolbar.
-const BTN: f32 = 28.0;
-const BTN_ROUND: f32 = 7.0;
+const BTN: f32 = 30.0;
+const BTN_ROUND: f32 = theme::CONTROL_ROUNDING;
 /// The pins window's title: not shown, Alt+Tab and the handle search use
 /// it. Not starting "Slide ", which the slide window's search looks for.
 const PINS_TITLE: &str = "Pins window";
@@ -124,6 +124,14 @@ impl Look {
 }
 
 impl SlideWindow {
+    /// Scale the window's view by `f`, as `CanvasManager::scale_views`
+    /// does the slides': the UI size changed by `1 / f`.
+    pub fn scale_view(&mut self, f: f32) {
+        use crate::interaction::zoom_pan::{MAX_ZOOM, MIN_ZOOM};
+        self.pan = [self.pan[0] * f, self.pan[1] * f];
+        self.zoom = (self.zoom * f).clamp(MIN_ZOOM, MAX_ZOOM);
+    }
+
     /// A window on slide `slide`, fitted to it.
     pub fn new(slide: usize, _cfg: &crate::config::AppConfig) -> Self {
         Self {
@@ -517,7 +525,7 @@ fn slide_picker(ui: &mut egui::Ui, current: usize, manager: &CanvasManager) -> O
     let bg = if open {
         theme::ACCENT
     } else if response.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
@@ -585,7 +593,7 @@ fn card(
                     ui.add_space(4.0);
                     let mut colour = tool.color;
                     for (i, slot) in palette.iter_mut().enumerate() {
-                        let (edited, _) = crate::ui::toolbar::colour_swatch(ui, &mut colour, *slot, i);
+                        let (edited, _) = crate::ui::toolbar::colour_swatch(ui, &mut colour, *slot, i, None);
                         *slot = edited;
                     }
                     if colour != tool.color {
@@ -663,7 +671,7 @@ fn view_menu(ui: &mut egui::Ui, parts: &mut crate::config::SlideWindowUi) {
     let bg = if open {
         theme::ACCENT
     } else if response.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
@@ -712,7 +720,7 @@ fn grip(ui: &mut egui::Ui) {
 fn icon_btn(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str, enabled: bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     if enabled && response.hovered() {
-        ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), Color32::from_white_alpha(22));
+        ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), theme::HOVER);
     }
     let tint = if enabled { theme::TEXT_PRIMARY } else { Color32::from_white_alpha(60) };
     let icon = rect.shrink(rect.width() * 0.22);
@@ -726,7 +734,7 @@ fn toggle_btn(ui: &mut egui::Ui, img: egui::Image<'_>, on: bool, tooltip: &str) 
     let bg = if on {
         theme::ACCENT
     } else if response.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
@@ -745,7 +753,7 @@ fn text_btn(ui: &mut egui::Ui, text: &str, tooltip: &str, selected: bool) -> boo
     let bg = if selected {
         theme::ACCENT
     } else if response.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
@@ -759,7 +767,7 @@ fn text_btn(ui: &mut egui::Ui, text: &str, tooltip: &str, selected: bool) -> boo
 fn close_btn(ui: &mut egui::Ui) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), Color32::from_white_alpha(22));
+        ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), theme::HOVER);
     }
     let r = rect.shrink(rect.width() * 0.34);
     let stroke = egui::Stroke::new(1.6, theme::TEXT_PRIMARY);

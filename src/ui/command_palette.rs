@@ -15,7 +15,7 @@ use crate::interaction::action_keys::KeyAction;
 use crate::tools::arrange::{Align, Arrange, Match};
 use crate::tools::ToolKind;
 use crate::ui::theme;
-use egui::{Color32, Vec2};
+use egui::Vec2;
 
 /// What running an entry does.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -203,6 +203,9 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Zoom to fit the slide", v, c.zoom_to_fit, C::Key(K::ZoomToFit));
     add("Reset zoom and pan", v, c.reset_view, C::ResetView);
     add("Hide / show the toolbar and panels", v, c.toggle_ui, C::ToggleUi);
+    add("UI bigger (toolbar, panels; slides keep their size)", v, c.ui_scale_up, C::Key(K::UiScale(1)));
+    add("UI smaller", v, c.ui_scale_down, C::Key(K::UiScale(-1)));
+    add("UI size back to 100 %", v, c.ui_scale_reset, C::Key(K::UiScale(0)));
     add("Open the pins window / close it", v, c.toggle_pins, C::TogglePins);
     add("Onion skin on / off (GIFs and videos)", v, c.media_onion, C::Key(K::Onion));
     add("Highlight pictures", v, tb.highlight[0], C::Key(K::Highlight(crate::canvas::shape::MediaType::Picture)));
@@ -391,6 +394,9 @@ impl Palette {
                     ui.set_width(WIDTH - 16.0);
                     let edit = egui::TextEdit::singleline(&mut self.query)
                         .hint_text("Type a command — a few letters will do")
+                        .font(egui::FontId::proportional(15.0))
+                        .margin(egui::vec2(10.0, 8.0))
+                        .frame(false)
                         .desired_width(f32::INFINITY);
                     let r = ui.add(edit);
                     if std::mem::take(&mut self.focus_pending) || !r.has_focus() {
@@ -399,7 +405,9 @@ impl Palette {
                     if r.changed() {
                         self.cursor = 0;
                     }
-                    ui.add_space(4.0);
+                    let rule = ui.available_rect_before_wrap();
+                    ui.painter().hline(rule.x_range(), rule.top(), egui::Stroke::new(1.0, theme::HAIRLINE));
+                    ui.add_space(6.0);
                     if list.is_empty() {
                         ui.label(egui::RichText::new("No command matches").color(theme::TEXT_MUTED));
                         return;
@@ -410,14 +418,15 @@ impl Palette {
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::click());
                         let lit = k == self.cursor || resp.hovered();
                         if lit {
-                            ui.painter().rect_filled(rect, egui::Rounding::same(5.0), if k == self.cursor { theme::ACCENT } else { Color32::from_white_alpha(16) });
+                            ui.painter().rect_filled(rect, egui::Rounding::same(theme::CONTROL_ROUNDING), if k == self.cursor { theme::ACCENT } else { theme::HOVER });
                         }
                         let y = rect.center().y;
                         ui.painter().text(egui::pos2(rect.left() + 8.0, y), egui::Align2::LEFT_CENTER, &e.label, egui::FontId::proportional(13.5), theme::TEXT_PRIMARY);
                         let right = match &e.keys {
                             Some(k) => {
-                                let g = ui.painter().text(egui::pos2(rect.right() - 8.0, y), egui::Align2::RIGHT_CENTER, k, egui::FontId::monospace(11.5), Color32::from_rgb(232, 200, 200));
-                                g.left() - 10.0
+                                let g = ui.painter().text(egui::pos2(rect.right() - 10.0, y), egui::Align2::RIGHT_CENTER, k, egui::FontId::monospace(11.5), theme::TEXT_PRIMARY);
+                                ui.painter().rect_filled(g.expand2(egui::vec2(5.0, 2.0)), egui::Rounding::same(5.0), theme::SURFACE);
+                                g.left() - 14.0
                             }
                             None => rect.right() - 8.0,
                         };

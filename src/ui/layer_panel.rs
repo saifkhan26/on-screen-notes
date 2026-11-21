@@ -40,14 +40,7 @@ pub fn show(
         .show(ctx, |ui| {
             // Tighter card frame than the global card — kills the
             // extra padding so the panel stays a slim icon-strip.
-            egui::Frame {
-                inner_margin: egui::Margin::symmetric(4.0, 4.0),
-                outer_margin: egui::Margin::ZERO,
-                rounding: Rounding::same(10.0),
-                shadow: theme::card_shadow(),
-                fill: theme::GLASS_FILL,
-                stroke: egui::Stroke::NONE,
-            }
+            theme::panel_frame()
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
                 ui.add_enabled_ui(editable, |ui| ui.vertical(|ui| {
@@ -231,7 +224,7 @@ fn add_row(ui: &mut egui::Ui) -> egui::Response {
     );
     let painter = ui.painter();
     let bg = if response.hovered() {
-        Color32::from_white_alpha(18)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };

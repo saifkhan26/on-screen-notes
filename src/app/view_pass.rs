@@ -86,6 +86,7 @@ impl OnScreenNotesApp {
                     &mut self.config.smoothing_level,
                     &mut self.config.smoothing,
                     &mut self.config.pressure_curve,
+                    &mut self.config.ui_scale,
                     (&mut self.config.shape_snap, &mut self.config.smart_guides),
                     (&mut self.config.beside_fit, &mut self.config.beside_side),
                     (&mut self.config.picture_search, picture_status.as_str()),

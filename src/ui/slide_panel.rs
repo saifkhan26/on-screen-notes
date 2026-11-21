@@ -104,14 +104,7 @@ pub fn show(ctx: &egui::Context, state: &mut SlidePanel, cfg: &mut AppConfig, to
     let area = egui::Area::new(egui::Id::new("osn_slide_panel"))
         .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(left, -bottom))
         .show(ctx, |ui| {
-            egui::Frame {
-                inner_margin: egui::Margin::symmetric(4.0, 4.0),
-                outer_margin: egui::Margin::ZERO,
-                rounding: Rounding::same(10.0),
-                shadow: theme::card_shadow(),
-                fill: theme::GLASS_FILL,
-                stroke: egui::Stroke::NONE,
-            }
+            theme::panel_frame()
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
                 if !*open {
@@ -359,7 +352,7 @@ fn folded_tab(ui: &mut egui::Ui, active: usize, count: usize) -> egui::Response 
         .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Small);
     let w = 6.0 + ICON + 4.0 + label.size().x + 2.0 + ICON + 2.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::new(w, ROW_H), egui::Sense::click());
-    let bg = if response.hovered() { Color32::from_white_alpha(18) } else { Color32::TRANSPARENT };
+    let bg = if response.hovered() { theme::HOVER } else { Color32::TRANSPARENT };
     ui.painter().rect_filled(rect, Rounding::same(6.0), bg);
     let mut x = rect.min.x + 6.0;
     let icon_rect = |x: f32| egui::Rect::from_min_size(egui::pos2(x, rect.center().y - ICON * 0.5), Vec2::splat(ICON)).shrink(2.0);
@@ -383,7 +376,7 @@ fn icon_btn_response(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str, ena
     if selected {
         ui.painter().rect_filled(rect, Rounding::same(5.0), theme::ACCENT);
     } else if enabled && response.hovered() {
-        ui.painter().rect_filled(rect, Rounding::same(5.0), Color32::from_white_alpha(18));
+        ui.painter().rect_filled(rect, Rounding::same(5.0), theme::HOVER);
     }
     let tint = if enabled { theme::TEXT_PRIMARY } else { Color32::from_white_alpha(60) };
     paint_svg(ui, rect.shrink(4.0), img, tint);

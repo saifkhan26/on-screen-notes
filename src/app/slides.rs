@@ -92,8 +92,8 @@ impl OnScreenNotesApp {
                 ui.label(egui::RichText::new(after).small().color(ui::theme::TEXT_MUTED));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let label = egui::RichText::new(if only { "Empty slide" } else { "Delete slide" }).color(egui::Color32::WHITE);
-                    if ui.add(egui::Button::new(label).fill(egui::Color32::from_rgb(190, 52, 52))).clicked() {
+                    let label = egui::RichText::new(if only { "Empty slide" } else { "Delete slide" }).color(ui::theme::SELECTED_INK);
+                    if ui.add(egui::Button::new(label).fill(ui::theme::SELECTED_FILL)).clicked() {
                         decision = Some(true);
                     }
                     if ui.button("Keep it").clicked() {
@@ -266,7 +266,7 @@ impl OnScreenNotesApp {
                             let p = ui.painter();
                             p.rect_filled(bar, 2.0, egui::Color32::from_white_alpha(28));
                             let filled = egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * done.clamp(0.0, 1.0), bar.height()));
-                            p.rect_filled(filled, 2.0, egui::Color32::from_rgb(86, 160, 255));
+                            p.rect_filled(filled, 2.0, ui::theme::TEXT_PRIMARY);
                         });
                     }
                 });

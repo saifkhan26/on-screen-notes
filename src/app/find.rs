@@ -192,8 +192,9 @@ impl OnScreenNotesApp {
             self.ws.find_flash = None;
             return;
         };
-        let glow = FOUND.gamma_multiply(0.25 * alpha);
-        painter.add(egui::Shape::closed_line(ring.clone(), egui::Stroke::new(7.0, glow)));
+        // A light ring over a dark halo: it shows on a white page too.
+        let glow = egui::Color32::BLACK.gamma_multiply(0.45 * alpha);
+        painter.add(egui::Shape::closed_line(ring.clone(), egui::Stroke::new(6.0, glow)));
         painter.add(egui::Shape::closed_line(ring, egui::Stroke::new(2.5, FOUND.gamma_multiply(alpha))));
         ctx.request_repaint();
     }

@@ -111,6 +111,11 @@ impl OnScreenNotesApp {
                 self.config.bg_opacity = (self.config.bg_opacity + 0.1 * f32::from(n)).clamp(0.0, 1.0);
             }
             K::ResetBackground => self.config.bg_color = [0, 0, 0],
+            K::UiScale(step) => {
+                let to = if step == 0 { 1.0 } else { crate::config::ui_scale_step(self.config.ui_scale, step) };
+                self.config.ui_scale = to;
+                say(self, format!("UI size {:.0} %", to * 100.0));
+            }
             K::NewSlide => {
                 self.canvases.push_canvas(crate::canvas::canvas::Canvas::default());
                 say(self, format!("Slide {} added at the end", self.canvases.count()));

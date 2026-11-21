@@ -15,7 +15,7 @@ use crate::tools::arrange::{Align, Arrange, Match, PackMode};
 use crate::ui::theme;
 use egui::{Color32, Rounding, Vec2};
 
-const BTN: f32 = 28.0;
+const BTN: f32 = 30.0;
 
 /// `tip`, followed by the keys that press the button when it has any.
 fn with_key(tip: &str, key: Option<Binding>) -> String {
@@ -343,7 +343,7 @@ pub fn show(
 fn tag_chips(ui: &mut egui::Ui, tags: &[(String, bool)]) -> bool {
     let shown: Vec<String> = tags.iter().map(|(t, some)| if *some { format!("{t}*") } else { t.clone() }).collect();
     let all = crate::ui::media_filter::tags_text(&shown, usize::MAX);
-    let text = egui::RichText::new(crate::ui::media_filter::tags_text(&shown, 32)).small().color(crate::ui::media_filter::TAG_COLOUR);
+    let text = egui::RichText::new(crate::ui::media_filter::tags_text(&shown, 32)).small().color(theme::TEXT_PRIMARY);
     let mut tip = format!("{all} — click to change");
     if tags.iter().any(|(_, some)| *some) {
         tip.push_str("\n* only some of the selection has it");
@@ -392,7 +392,7 @@ fn tag_row(ui: &mut egui::Ui, edit: &mut TagEdit) -> Option<Option<String>> {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(egui::RichText::new("Looks like").small().color(theme::TEXT_MUTED));
                 for (tag, close) in &likely {
-                    let text = egui::RichText::new(format!("#{tag} {:.0}%", close * 100.0)).small().color(crate::ui::media_filter::TAG_COLOUR);
+                    let text = egui::RichText::new(format!("#{tag} {:.0}%", close * 100.0)).small().color(theme::TEXT_PRIMARY);
                     let tip = format!("It looks like the pictures tagged #{tag}. Click to add it");
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
                         picked = Some(tag.clone());
@@ -406,7 +406,7 @@ fn tag_row(ui: &mut egui::Ui, edit: &mut TagEdit) -> Option<Option<String>> {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(egui::RichText::new("Used").small().color(theme::TEXT_MUTED));
                 for (k, tag) in offered.iter().enumerate() {
-                    let text = egui::RichText::new(format!("#{tag}")).small().color(crate::ui::media_filter::TAG_COLOUR);
+                    let text = egui::RichText::new(format!("#{tag}")).small().color(theme::TEXT_PRIMARY);
                     let tip = if k == 0 { "Click, or Tab, to add it" } else { "Click to add it" };
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
                         picked = Some(tag.clone());
@@ -530,11 +530,11 @@ fn move_btn(ui: &mut egui::Ui, slides: &CanvasManager, key: Option<Binding>, ope
     let bg = if open {
         theme::ACCENT
     } else if others && response.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, Rounding::same(7.0), bg);
+    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), bg);
     let tint = if others { theme::TEXT_PRIMARY } else { Color32::from_white_alpha(60) };
     let icon = rect.shrink(rect.width() * 0.22);
     egui::Image::new(egui::include_image!("../../assets/icons/move-to-slide.svg"))
@@ -590,7 +590,7 @@ fn pack_mode_menu(ui: &mut egui::Ui, mode: &mut PackMode) {
     let bg = if open {
         theme::ACCENT
     } else if response.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
@@ -694,13 +694,13 @@ fn divider(ui: &mut egui::Ui) {
 fn toggle_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, on: bool, tooltip: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if on {
-        Color32::from_rgba_unmultiplied(86, 160, 255, 70)
+        theme::ACCENT
     } else if resp.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, Rounding::same(7.0), bg);
+    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), bg);
     let icon = rect.shrink(rect.width() * 0.24);
     egui::Image::new(img).tint(theme::TEXT_PRIMARY).fit_to_exact_size(icon.size()).paint_at(ui, icon);
     resp.on_hover_text(tooltip).clicked()
@@ -709,8 +709,8 @@ fn toggle_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, on: bool, tool
 fn icon_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, enabled: bool, tooltip: &str) -> bool {
     let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BTN), sense);
-    let bg = if enabled && resp.hovered() { Color32::from_white_alpha(22) } else { Color32::TRANSPARENT };
-    ui.painter().rect_filled(rect, Rounding::same(7.0), bg);
+    let bg = if enabled && resp.hovered() { theme::HOVER } else { Color32::TRANSPARENT };
+    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), bg);
     let tint = if enabled { theme::TEXT_PRIMARY } else { Color32::from_white_alpha(70) };
     let icon = rect.shrink(rect.width() * 0.24);
     egui::Image::new(img).tint(tint).fit_to_exact_size(icon.size()).paint_at(ui, icon);

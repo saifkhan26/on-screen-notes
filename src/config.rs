@@ -216,6 +216,66 @@ pub struct AppConfig {
     /// RGBA (alpha is its opacity). White to start.
     #[serde(default = "default_pad_paper")]
     pub pad_paper: [u8; 4],
+
+    /// How big the UI is drawn — toolbar, panels, bars, popups — as a
+    /// multiple of the system's own scaling (1.0 = 100 %). The slides
+    /// keep their size on screen: the views are rescaled with it. One of
+    /// `UI_SCALES`; picked in the settings or with `canvas.ui_scale_*`.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+}
+
+fn default_ui_scale() -> f32 { 1.0 }
+
+/// The UI sizes on offer, smallest first.
+pub const UI_SCALES: [f32; 9] = [0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+
+/// The UI size `steps` places from `now` in `UI_SCALES`, stopping at
+/// either end. A size between two steps (a hand-edited config) goes to
+/// the next one that way.
+pub fn ui_scale_step(now: f32, steps: i8) -> f32 {
+    let mut at = now;
+    for _ in 0..steps.unsigned_abs() {
+        at = if steps > 0 {
+            UI_SCALES.iter().copied().find(|&s| s > at + 1e-3).unwrap_or(UI_SCALES[UI_SCALES.len() - 1])
+        } else {
+            UI_SCALES.iter().rev().copied().find(|&s| s < at - 1e-3).unwrap_or(UI_SCALES[0])
+        };
+    }
+    at
+}
+
+/// A UI size from the config, kept to what the settings offer.
+pub fn clamp_ui_scale(s: f32) -> f32 {
+    if s.is_finite() { s.clamp(UI_SCALES[0], UI_SCALES[UI_SCALES.len() - 1]) } else { 1.0 }
+}
+
+#[cfg(test)]
+mod ui_scale_tests {
+    use super::*;
+
+    #[test]
+    fn ui_scale_steps_through_the_sizes_and_stops_at_the_ends() {
+        assert_eq!(ui_scale_step(1.0, 1), 1.1);
+        assert_eq!(ui_scale_step(1.0, -1), 0.9);
+        assert_eq!(ui_scale_step(1.0, 2), 1.25);
+        assert_eq!(ui_scale_step(2.0, 1), 2.0);
+        assert_eq!(ui_scale_step(0.75, -1), 0.75);
+        // Between two sizes (a hand-edited config): to the next one that way.
+        assert_eq!(ui_scale_step(1.05, 1), 1.1);
+        assert_eq!(ui_scale_step(1.05, -1), 1.0);
+        assert_eq!(clamp_ui_scale(9.0), 2.0);
+        assert_eq!(clamp_ui_scale(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn a_config_without_a_ui_scale_loads_at_100_percent() {
+        let cfg = AppConfig { ui_scale: 1.5, ..AppConfig::default() };
+        let text = ron::to_string(&cfg).unwrap();
+        assert!(text.contains(",ui_scale:1.5"), "{text}");
+        let old: AppConfig = ron::from_str(&text.replace(",ui_scale:1.5", "")).unwrap();
+        assert_eq!(old.ui_scale, 1.0);
+    }
 }
 
 fn default_pad_paper() -> [u8; 4] { [255, 255, 255, 255] }
@@ -284,6 +344,7 @@ impl Default for AppConfig {
             arrange_apart: true,
             shape_snap: true,
             smart_guides: true,
+            ui_scale: 1.0,
             dim_unselected: false,
             slide_window_ui: SlideWindowUi::default(),
             picture_search: false,

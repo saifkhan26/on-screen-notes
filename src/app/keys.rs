@@ -133,6 +133,13 @@ impl OnScreenNotesApp {
         // An edit key on a slide that takes no edits, to say why
         // nothing happened.
         let mut refused = false;
+        // The wheel over the UI — a dropdown's or popup's list, the
+        // toolbar, a panel, the help — is the UI's: it scrolls that and
+        // never zooms the slide under it. egui's scroll areas read the
+        // wheel too, but its raw events stay in the input for the canvas
+        // below, so the two must be told apart here. The canvas itself is
+        // a background panel, which does not count.
+        let over_ui = ui::theme::pointer_over_ui(ctx);
 
         ctx.input(|i| {
             let mods = i.modifiers;
@@ -384,8 +391,8 @@ impl OnScreenNotesApp {
                 // unit mapping used inside `handle_scroll`.
                 raw_delta_y += zoom_delta_extra.ln() / 1.10_f32.ln();
             }
-            // Over the slide panel the wheel scrolls its list instead.
-            if (notches != 0 || raw_delta_y.abs() > 1e-4) && !slides.hovered {
+            // Over the slide panel (or any UI) the wheel scrolls it instead.
+            if (notches != 0 || raw_delta_y.abs() > 1e-4) && !slides.hovered && !over_ui {
                 if let Some(l) = self.loupe.as_mut() {
                     if notches != 0 {
                         l.zoom = (l.zoom + notches as f32 * 0.25).clamp(1.5, 12.0);

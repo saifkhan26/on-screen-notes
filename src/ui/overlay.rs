@@ -488,8 +488,8 @@ pub fn show(
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    // Words, not ←/→: this font has no arrows.
-                    "Start drawing — Left / Right to switch canvas · hover ? for every shortcut",
+                    // Words, not ←/→: the default font has no arrows.
+                    "Start drawing — Left / Right to switch slides · hover the keyboard button for every shortcut",
                     egui::FontId::proportional(14.0),
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
                 );
@@ -844,8 +844,9 @@ pub fn show(
 /// screen point `q` shows at `origin + q`.
 pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos2, pinned: &[crate::canvas::pins::Pinned], marks: PinMarks) {
     let at = |q: [f32; 2]| origin + egui::vec2(q[0], q[1]);
-    let line = egui::Color32::from_rgb(86, 160, 255);
-    let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+    let line = crate::ui::theme::CHROME_LINE;
+    let under = crate::ui::theme::CHROME_UNDER;
+    let ink = egui::Color32::from_gray(30);
     for p in pinned {
         let frame = p.frame();
         let corners: Vec<egui::Pos2> = frame.corners().iter().map(|c| at(*c)).collect();
@@ -861,28 +862,28 @@ pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos
                     crate::canvas::pins::PinHandle::Rotate => {
                         painter.circle_filled(h, 6.5, under);
                         painter.circle_filled(h, 5.0, egui::Color32::WHITE);
-                        painter.circle_stroke(h, 5.0, egui::Stroke::new(1.4, line));
+                        painter.circle_stroke(h, 5.0, egui::Stroke::new(1.4, ink));
                     }
                     crate::canvas::pins::PinHandle::Corner { .. } => {
                         let outer = egui::Rect::from_center_size(h, egui::vec2(11.0, 11.0));
                         let inner = egui::Rect::from_center_size(h, egui::vec2(8.0, 8.0));
                         painter.rect_filled(outer, egui::Rounding::same(2.0), under);
                         painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
-                        painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
+                        painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, ink));
                     }
                 }
             }
         } else if marks.outlines {
             let mut ring = corners.clone();
             ring.push(corners[0]);
-            let faint = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 150));
+            let faint = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(150));
             painter.extend(egui::Shape::dashed_line(&ring, faint, 6.0, 4.0));
         }
         if marks.outlines {
             // Badge on the top-right corner, turned with the pin but kept
             // upright.
             let c = at(frame.corners()[1]);
-            painter.circle_filled(c, 9.0, egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220));
+            painter.circle_filled(c, 9.0, crate::ui::theme::GLASS_FILL);
             let icon = egui::Rect::from_center_size(c, egui::vec2(11.0, 11.0));
             egui::Image::new(egui::include_image!("../../assets/icons/pin.svg"))
                 .tint(line)
@@ -898,23 +899,29 @@ pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos
 /// grab at any zoom. The canvas sits on arbitrary desktop content, so
 /// every line is a light stroke over a dark one: it reads on both bright
 /// and dark backgrounds.
-/// Smart guides' colour: apart from the selection's blue.
-const GUIDE: egui::Color32 = egui::Color32::from_rgb(255, 72, 150);
+/// Smart guides: dashed, so they read apart from the selection's frame.
+const GUIDE: egui::Color32 = crate::ui::theme::CHROME_LINE;
 
 pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f32, chrome: &crate::tools::select_tool::Chrome) {
     let to_screen = |p: [f32; 2]| egui::pos2(origin.x + p[0] * zoom, origin.y + p[1] * zoom);
-    let line = egui::Color32::from_rgb(86, 160, 255);
-    let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+    let line = crate::ui::theme::CHROME_LINE;
+    let under = crate::ui::theme::CHROME_UNDER;
+    let knob = egui::Color32::from_gray(30);
 
     if let Some(m) = chrome.marquee {
         let r = egui::Rect::from_two_pos(to_screen([m[0], m[1]]), to_screen([m[2], m[3]]));
-        painter.rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 28));
+        painter.rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_white_alpha(20));
+        painter.rect_stroke(r, egui::Rounding::ZERO, egui::Stroke::new(2.5, egui::Color32::from_black_alpha(90)));
         painter.rect_stroke(r, egui::Rounding::ZERO, egui::Stroke::new(1.0, line));
     }
-    // Smart guides the moving selection lined up on.
+    // Smart guides the moving selection lined up on: dashed over a dark
+    // halo, so they read apart from the selection's solid frame.
     for g in &chrome.guides {
-        painter.line_segment([to_screen(g[0]), to_screen(g[1])], egui::Stroke::new(1.0, GUIDE));
+        let seg = [to_screen(g[0]), to_screen(g[1])];
+        painter.line_segment(seg, egui::Stroke::new(2.5, egui::Color32::from_black_alpha(110)));
+        painter.extend(egui::Shape::dashed_line(&seg, egui::Stroke::new(1.0, GUIDE), 5.0, 3.0));
         for p in g {
+            painter.circle_filled(to_screen(*p), 3.0, under);
             painter.circle_filled(to_screen(*p), 2.0, GUIDE);
         }
     }
@@ -933,7 +940,7 @@ pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f3
         }
         let mut pts: Vec<egui::Pos2> = g.iter().map(|p| to_screen(*p)).collect();
         pts.push(pts[0]);
-        let dash = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(160, 205, 255, 200));
+        let dash = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(190));
         painter.extend(egui::Shape::dashed_line(&pts, dash, 4.0, 3.0));
     }
     if let Some(frame) = chrome.frame {
@@ -951,14 +958,14 @@ pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f3
                 crate::tools::select_tool::Handle::Rotate => {
                     painter.circle_filled(p, 6.5, under);
                     painter.circle_filled(p, 5.0, egui::Color32::WHITE);
-                    painter.circle_stroke(p, 5.0, egui::Stroke::new(1.4, line));
+                    painter.circle_stroke(p, 5.0, egui::Stroke::new(1.4, knob));
                 }
                 crate::tools::select_tool::Handle::Scale { .. } => {
                     let outer = egui::Rect::from_center_size(p, egui::vec2(11.0, 11.0));
                     let inner = egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0));
                     painter.rect_filled(outer, egui::Rounding::same(2.0), under);
                     painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
-                    painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
+                    painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, knob));
                 }
             }
         }

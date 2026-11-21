@@ -3,6 +3,31 @@
 use super::*;
 
 impl OnScreenNotesApp {
+    /// Put the UI at the size the config asks for (`config.ui_scale`),
+    /// as egui's zoom factor: every point is that many times the
+    /// system's pixels. The slides keep their size and place on screen —
+    /// every view, the windows' too, is scaled the other way — so only
+    /// the toolbar, panels and bars change size. Run at the start of a
+    /// frame, outside the windows' passes.
+    pub(super) fn apply_ui_scale(&mut self, ctx: &egui::Context) {
+        let want = crate::config::clamp_ui_scale(self.config.ui_scale);
+        self.config.ui_scale = want;
+        let now = ctx.zoom_factor();
+        if (want - now).abs() < 1e-4 {
+            return;
+        }
+        let f = now / want;
+        self.canvases.scale_views(f);
+        for w in [self.slide_window.as_mut(), self.pins_window.as_mut()].into_iter().flatten() {
+            w.scale_view(f);
+        }
+        // A glide or a peek in flight was aimed at the old scale.
+        self.ws.view_glide = None;
+        self.ws.peek = None;
+        ctx.set_zoom_factor(want);
+        ctx.request_repaint();
+    }
+
     /// Canvas box around everything on the active slide's shown layers.
     pub(super) fn slide_bounds(&self) -> Option<[f32; 4]> {
         let c = self.canvases.active();

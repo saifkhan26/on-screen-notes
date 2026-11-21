@@ -368,9 +368,9 @@ impl OnScreenNotesApp {
                 .interactable(false)
                 .show(ctx, |ui| {
                     egui::Frame::none()
-                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140))
-                        .rounding(6.0)
-                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                        .fill(ui::theme::GLASS_FILL)
+                        .rounding(10.0)
+                        .inner_margin(egui::Margin::symmetric(10.0, 5.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 // Pulsing red dot — alpha modulated by
@@ -406,10 +406,17 @@ impl OnScreenNotesApp {
                     .interactable(false)
                     .show(ctx, |ui| {
                         egui::Frame::none()
-                            .fill(egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220))
-                            .rounding(8.0)
-                            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                            .fill(ui::theme::GLASS_FILL)
+                            .rounding(12.0)
+                            .shadow(ui::theme::card_shadow())
+                            .inner_margin(egui::Margin::symmetric(16.0, 10.0))
                             .show(ui, |ui| {
+                                // One line when it fits, wrapped past 520
+                                // points: the area's width from an older,
+                                // shorter toast must not wrap this one.
+                                let font = egui::TextStyle::Body.resolve(ui.style());
+                                let w = ui.fonts(|f| f.layout_no_wrap(msg.clone(), font, egui::Color32::WHITE).size().x);
+                                ui.set_width(w.min(520.0).ceil());
                                 ui.label(msg);
                             });
                     });

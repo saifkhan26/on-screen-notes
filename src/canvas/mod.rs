@@ -675,6 +675,28 @@ impl CanvasManager {
         (&mut c.pan, &mut c.zoom)
     }
 
+    /// Scale every slide's view by `f`, pan and zoom alike, read or not
+    /// yet: the UI size changed by `1 / f`, and the slides keep their
+    /// size and place on screen (a point is `1 / f` times as many pixels
+    /// now). Not an edit; the views are written again.
+    pub fn scale_views(&mut self, f: f32) {
+        use crate::interaction::zoom_pan::{MAX_ZOOM, MIN_ZOOM};
+        let scale = |pan: &mut [f32; 2], zoom: &mut f32| {
+            *pan = [pan[0] * f, pan[1] * f];
+            *zoom = (*zoom * f).clamp(MIN_ZOOM, MAX_ZOOM);
+        };
+        for c in self.canvases.iter_mut().flatten() {
+            scale(&mut c.pan, &mut c.zoom);
+        }
+        scale(&mut self.opening.pan, &mut self.opening.zoom);
+        for v in &mut self.file_views {
+            scale(&mut v.pan, &mut v.zoom);
+        }
+        if let Some(swap) = self.view_swap.as_mut() {
+            scale(&mut swap.own.0, &mut swap.own.1);
+        }
+    }
+
     /// Put slide `idx`'s view at `pan` / `zoom`, as `active_view_mut`
     /// does for the shown one: not an edit. Nothing for a slide not read.
     pub fn set_view(&mut self, idx: usize, pan: [f32; 2], zoom: f32) {
@@ -1925,6 +1947,24 @@ mod view_tests {
 
     fn clean() -> Canvas {
         Canvas { dirty: false, ..Canvas::default() }
+    }
+
+    #[test]
+    fn scaling_the_views_keeps_each_slide_where_it_is_on_screen() {
+        let mut a = clean();
+        a.pan = [10.0, -20.0];
+        a.zoom = 2.0;
+        let mut m = CanvasManager::for_tests(vec![a, clean()]);
+        // The UI goes from 100 % to 125 %: a point is 1.25 × the pixels,
+        // so every view shrinks by 1 / 1.25 to stay put.
+        m.scale_views(1.0 / 1.25);
+        let (pan, zoom) = m.active_view_mut();
+        assert!((pan[0] - 8.0).abs() < 1e-4 && (pan[1] + 16.0).abs() < 1e-4, "{pan:?}");
+        assert!((*zoom - 1.6).abs() < 1e-4, "{zoom}");
+        m.go_to(1);
+        let (_, zoom) = m.active_view_mut();
+        assert!((*zoom - 0.8).abs() < 1e-4, "{zoom}");
+        assert!(!m.active().dirty, "a view change is not an edit");
     }
 
     #[test]

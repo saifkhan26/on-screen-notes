@@ -100,6 +100,8 @@ pub enum KeyAction {
     StepIn,
     /// Inside a group: select the whole group again.
     StepOut,
+    /// The UI one step bigger (+1), smaller (−1), or back to 100 % (0).
+    UiScale(i8),
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -184,6 +186,9 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.move_layer_down, KeyAction::MoveLayer(-1)),
         (c.pin_go_to_slide, KeyAction::PinGoToSlide),
         (c.pin_this_slide_only, KeyAction::PinThisSlideOnly),
+        (c.ui_scale_up, KeyAction::UiScale(1)),
+        (c.ui_scale_down, KeyAction::UiScale(-1)),
+        (c.ui_scale_reset, KeyAction::UiScale(0)),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));
     for (bindings, step) in [(&c.nudge_1px, 1.0), (&c.nudge_10px, 10.0)] {

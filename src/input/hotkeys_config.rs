@@ -510,6 +510,13 @@ pub struct CanvasSection {
     #[serde(default)] pub pin_go_to_slide: String,
     /// With a pin selected: show it on that slide only, or on every slide.
     #[serde(default)] pub pin_this_slide_only: String,
+    /// The UI (toolbar, panels, bars) one step bigger / smaller, or back
+    /// to 100 %; the slides keep their size on screen. Unbound until set
+    /// (egui's own Ctrl+= / Ctrl+- / Ctrl+0 zoom is off, so those keys
+    /// stay free for the actions bound to them).
+    #[serde(default)] pub ui_scale_up: String,
+    #[serde(default)] pub ui_scale_down: String,
+    #[serde(default)] pub ui_scale_reset: String,
 }
 
 /// The toolbar's buttons that are not tools. Unbound until set.
@@ -667,6 +674,9 @@ impl Default for CanvasSection {
             move_layer_down: String::new(),
             pin_go_to_slide: String::new(),
             pin_this_slide_only: String::new(),
+            ui_scale_up: String::new(),
+            ui_scale_down: String::new(),
+            ui_scale_reset: String::new(),
         }
     }
 }
@@ -922,6 +932,9 @@ pub struct CanvasBindings {
     pub move_layer_down: Option<Binding>,
     pub pin_go_to_slide: Option<Binding>,
     pub pin_this_slide_only: Option<Binding>,
+    pub ui_scale_up: Option<Binding>,
+    pub ui_scale_down: Option<Binding>,
+    pub ui_scale_reset: Option<Binding>,
 }
 
 /// The `[global]` bindings, for showing them in the help panel. The OS
@@ -1138,6 +1151,9 @@ impl HotkeysConfig {
                 move_layer_down:    p("canvas.move_layer_down",    &cv.move_layer_down),
                 pin_go_to_slide:    p("canvas.pin_go_to_slide",    &cv.pin_go_to_slide),
                 pin_this_slide_only: p("canvas.pin_this_slide_only", &cv.pin_this_slide_only),
+                ui_scale_up:        p("canvas.ui_scale_up",        &cv.ui_scale_up),
+                ui_scale_down:      p("canvas.ui_scale_down",      &cv.ui_scale_down),
+                ui_scale_reset:     p("canvas.ui_scale_reset",     &cv.ui_scale_reset),
             },
         }
     }
@@ -1513,6 +1529,9 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "move_layer_down")      => "Active layer one place down (clears the undo history)",
         ("canvas", "pin_go_to_slide")      => "Selected pin: go to the slide its objects are on",
         ("canvas", "pin_this_slide_only")  => "Selected pin: show it on its slide only, or on every slide",
+        ("canvas", "ui_scale_up")          => "UI bigger (toolbar, panels, bars; the slides keep their size)",
+        ("canvas", "ui_scale_down")        => "UI smaller",
+        ("canvas", "ui_scale_reset")       => "UI back to 100 %",
         _ => return None,
     };
     Some(text.to_owned())

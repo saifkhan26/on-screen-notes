@@ -432,7 +432,9 @@ impl OnScreenNotesApp {
     /// from `cc` so octotablet can attach to the same window.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Apply our project-wide theme once. Every subsequent widget
-        // inherits these colours, rounding, and spacing.
+        // inherits these colours, rounding, spacing and fonts — the UI's
+        // and the "handwritten" family the Text tool's labels are drawn
+        // in (see `theme::install_fonts`).
         ui::theme::apply(&cc.egui_ctx);
 
         // Install egui_extras image loaders (SVG, plus the default raster
@@ -441,36 +443,6 @@ impl OnScreenNotesApp {
         // widget renders.
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
-        // Register a "handwritten" font family used by the Text tool's
-        // `Shape::Text` renderer. It defaults to the same fallback
-        // chain as `Proportional` so text renders even when no
-        // dedicated handwriting TTF is bundled. If we later drop a
-        // file at `assets/handwritten.ttf`, swap the binding here:
-        //
-        //   const HANDWRITTEN: &[u8] = include_bytes!("../assets/handwritten.ttf");
-        //   fonts.font_data.insert("handwritten".into(), FontData::from_static(HANDWRITTEN));
-        //   fonts.families.insert(
-        //       FontFamily::Name("handwritten".into()),
-        //       vec!["handwritten".into()],
-        //   );
-        //   cc.egui_ctx.set_fonts(fonts);
-        //
-        // For now we just alias the family to the default
-        // proportional fallbacks so `FontFamily::Name("handwritten")`
-        // does not silently drop text.
-        {
-            use egui::FontFamily;
-            let mut fonts = egui::FontDefinitions::default();
-            let prop_chain = fonts
-                .families
-                .get(&FontFamily::Proportional)
-                .cloned()
-                .unwrap_or_default();
-            fonts
-                .families
-                .insert(FontFamily::Name("handwritten".into()), prop_chain);
-            cc.egui_ctx.set_fonts(fonts);
-        }
 
         // Committed ink is drawn from GPU memory when the device allows
         // it; see `canvas::ink_gpu`.
@@ -480,7 +452,13 @@ impl OnScreenNotesApp {
             crate::canvas::pad_gpu::init(rs);
         }
 
-        let config = crate::persistence::load_config();
+        let mut config = crate::persistence::load_config();
+        // The UI at the size it was left at. The slides' views were kept
+        // at this size too, so nothing is rescaled here (see
+        // `apply_ui_scale`). egui's own Ctrl+= / Ctrl+- / Ctrl+0 zoom is
+        // off (`theme::apply`): those keys are the user's to bind.
+        config.ui_scale = crate::config::clamp_ui_scale(config.ui_scale);
+        cc.egui_ctx.set_zoom_factor(config.ui_scale);
         // Before any slide is read: stroke caches built while loading
         // read the curve from this global.
         crate::canvas::stroke::set_pressure_curve(config.pressure_curve);
@@ -630,6 +608,7 @@ impl eframe::App for OnScreenNotesApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.hold_to_refresh_rate(ctx);
+        self.apply_ui_scale(ctx);
         // Frame timing for `OSN_PERF_LOG`; does nothing when it is unset.
         let _perf = crate::perf::frame(|| {
             let c = self.canvases.active();

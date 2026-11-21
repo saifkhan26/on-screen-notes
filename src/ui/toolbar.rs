@@ -1,9 +1,16 @@
 //! Floating toolbar: tool buttons + colour palette + size slider with
-//! live preview. Anchored top-centre of the overlay.
+//! live preview, then the utilities and the settings. Anchored
+//! top-centre of the overlay.
 //!
 //! Icons are bundled SVGs (Lucide set) loaded through `egui_extras` and
 //! tinted at render time. SVGs scale crisply at any DPI, are easy to swap,
 //! and ship inside the binary via `include_image!`.
+//!
+//! Buttons are grouped by what they do — drawing, marking, selecting,
+//! shapes, colour, size, media, settings — with a thin rule between
+//! groups. The tool in use is the one solid light chip; switches that
+//! are on are a quieter grey. Every tooltip names the key that presses
+//! the button, as bound in `hotkeys.toml`.
 
 use crate::canvas::shape::{BorderStyle, MediaType};
 use crate::canvas::smoothing::{SmoothingOptions, SmoothingType};
@@ -13,8 +20,11 @@ use crate::input::hotkeys_config::{Binding, ParsedHotkeys};
 use crate::tools::beside::{BesideFit, BesideSide};
 use crate::tools::{ActiveTool, ToolKind};
 use crate::ui::media_filter::{self, MediaFilter};
-use crate::ui::theme;
+use crate::ui::theme::{self, Look};
 use egui::{Color32, Rounding, Stroke, Vec2};
+
+/// The settings popup's id: global, so a test can open it.
+pub const SETTINGS_POPUP: &str = "osn_settings_popup";
 
 /// Render the toolbar. Returns `true` if the user interacted with any
 /// element this frame.
@@ -28,6 +38,8 @@ pub fn show(
     smoothing: &mut SmoothingLevel,
     smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
+    // How big the UI is drawn (`config.ui_scale`), in the settings popup.
+    ui_scale: &mut f32,
     // Shape snap and smart guides on / off, in the settings popup.
     snaps: (&mut bool, &mut bool),
     // New media beside the selected picture: what it matches and which
@@ -49,7 +61,7 @@ pub fn show(
     pins_hidden: Option<&mut bool>,
     // Text labels are selected: the text-box switch shows for them.
     text_selected: bool,
-    // The hotkeys as bound, for the help panel.
+    // The hotkeys as bound, for the tooltips and the help panel.
     keys: &ParsedHotkeys,
 ) -> bool {
     let mut interacted = false;
@@ -58,74 +70,91 @@ pub fn show(
         .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 10.0))
         .show(ctx, |ui| {
             theme::card_frame().show(ui, |ui| {
-                // One row on the overlay; in a narrower window (the slide
-                // window) the buttons wrap onto more rows.
+                // One row on the overlay; in a narrower window the
+                // buttons wrap onto more rows.
                 ui.set_max_width((ctx.screen_rect().width() - 40.0).max(200.0));
                 ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 3.0;
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 4.0);
+                    let t = &keys.tool;
 
-                    // Group 1: freehand tools — Pen + Pencil share the
-                    // same `ToolKind::Pen`, distinguished by `tool.style`.
-                    //
-                    // The standalone Eraser button intentionally is not in
-                    // this group: erasing is now a Ctrl-held modifier (see
-                    // `app::eraser_override`), which feels lighter than
-                    // round-tripping through a tool change.
-                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Default, "Pen — P");
-                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Pencil,  "Pencil — B");
-                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Marker,  "Marker — M  (translucent highlighter; overlaps darken)");
-                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Airbrush, "Airbrush — G  (soft spray; hold still to build density)");
-                    interacted |= tool_btn(ui, tool, ToolKind::Fill,          "Fill — F");
-                    interacted |= tool_btn(ui, tool, ToolKind::Laser,         "Laser pointer — L  (fades after pen-up)");
-                    interacted |= tool_btn(ui, tool, ToolKind::Text,          "Text — T  (click to place, Enter to commit, Shift+Enter newline)");
-                    // Contextual, like the dashed-border switch: with the
-                    // Text tool, or with labels selected.
+                    // Drawing. Pen, pencil, marker and airbrush are one
+                    // `ToolKind::Pen`, told apart by `tool.style`. The
+                    // eraser has no button: hold Ctrl while drawing.
+                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Default, t.pen, "Smooth ink that follows the pen's pressure. Hold Ctrl to erase");
+                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Pencil, t.pencil, "Grainy, see-through pencil");
+                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Marker, t.marker, "See-through highlighter: where strokes overlap, they darken");
+                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Airbrush, t.airbrush, "Soft spray: hold still to build it up");
+                    interacted |= tool_btn(ui, tool, ToolKind::Fill, t.fill, "Fill a closed area with the colour");
+                    theme::divider(ui, BTN_SIZE);
+
+                    // Marking up: text, and the pointers that leave nothing.
+                    interacted |= tool_btn(ui, tool, ToolKind::Text, t.text, "Click to place a label. Enter keeps it, Shift+Enter starts a new line");
+                    // Contextual: with the Text tool, or with labels selected.
                     if tool.kind == ToolKind::Text || text_selected {
                         interacted |= text_box_btn(ui, tool, keys.toolbar.text_box);
                     }
-                    interacted |= tool_btn(ui, tool, ToolKind::Spotlight,     "Spotlight — S  (dim everything except a square around the cursor; wheel resizes)");
-                    interacted |= tool_btn(ui, tool, ToolKind::LassoErase,    "Lasso erase — X  (draw a closed loop, or click corner by corner for a polygon and close it on the first corner, with a double click or Enter; ink whose centroid lands inside is removed)");
-                    interacted |= tool_btn(ui, tool, ToolKind::LassoSelect,   "Lasso capture — Shift+X  (draw a closed loop, or click corner by corner for a polygon and close it on the first corner, with a double click or Enter; the screen pixels inside become an image on the active layer)");
-                    interacted |= tool_btn(ui, tool, ToolKind::Select,        "Select — V  (click an object, Shift+click for more, drag empty space to box-select; handles move / resize / rotate; Delete removes)");
-                    spacer(ui);
+                    interacted |= tool_btn(ui, tool, ToolKind::Laser, t.laser, "A pointer trail that fades once the pen lifts");
+                    interacted |= tool_btn(ui, tool, ToolKind::Spotlight, t.spotlight, "Dims all but a square round the pointer; the wheel resizes it. Its key again goes back to the pen");
+                    theme::divider(ui, BTN_SIZE);
 
-                    // Group 2: shape tools
-                    interacted |= tool_btn(ui, tool, ToolKind::Rect,          "Rectangle — R");
-                    interacted |= tool_btn(ui, tool, ToolKind::Ellipse,       "Ellipse — O");
-                    let line_tip = keys.tool.line.map_or_else(|| "Line — straight line".to_string(), |b| format!("Line — {}", b.label()));
-                    interacted |= tool_btn(ui, tool, ToolKind::Line,          &line_tip);
-                    interacted |= tool_btn(ui, tool, ToolKind::Arrow,         "Arrow — A");
-                    interacted |= tool_btn(ui, tool, ToolKind::FreehandArrow, "Freehand arrow — Shift+A");
-                    // Contextual dashed-border toggle — visible only
-                    // while the Rect / Ellipse / Line tool is active,
-                    // since the dashed variant is only wired into
-                    // those shapes. Sits inside the same group so it
-                    // reads as a modifier on the adjacent buttons.
+                    // Selecting.
+                    interacted |= tool_btn(ui, tool, ToolKind::Select, t.select, "Click an object, Shift+click for more, drag on empty space for a box. The handles move, resize and turn it; Delete removes it");
+                    interacted |= tool_btn(ui, tool, ToolKind::LassoErase, t.lasso, "Draw a loop — or click corner by corner, closing it with a double click or Enter — and the ink inside goes");
+                    interacted |= tool_btn(ui, tool, ToolKind::LassoSelect, t.lasso_select, "Draw a loop round part of the screen: what is inside becomes a picture on the active layer");
+                    theme::divider(ui, BTN_SIZE);
+
+                    // Shapes.
+                    interacted |= tool_btn(ui, tool, ToolKind::Rect, t.rect, "Drag out a rectangle");
+                    interacted |= tool_btn(ui, tool, ToolKind::Ellipse, t.ellipse, "Drag out an ellipse");
+                    interacted |= tool_btn(ui, tool, ToolKind::Line, t.line, "A straight line");
+                    interacted |= tool_btn(ui, tool, ToolKind::Arrow, t.arrow, "A straight arrow");
+                    interacted |= tool_btn(ui, tool, ToolKind::FreehandArrow, t.freehand_arrow, "Draw a path; an arrowhead goes on its end");
+                    // Contextual: the shapes that can have a dashed border.
                     if matches!(tool.kind, ToolKind::Rect | ToolKind::Ellipse | ToolKind::Line | ToolKind::Arrow) {
-                        interacted |= dash_toggle_btn(ui, tool);
+                        interacted |= dash_toggle_btn(ui, tool, t.dashed_border);
                     }
-                    spacer(ui);
+                    theme::divider(ui, BTN_SIZE);
 
-                    // Group 3: colours
+                    // Colours.
+                    ui.spacing_mut().item_spacing.x = 0.0;
                     for (i, slot) in palette.iter_mut().enumerate() {
-                        let (new_slot, hit) = colour_swatch(ui, &mut tool.color, *slot, i);
+                        let (new_slot, hit) = colour_swatch(ui, &mut tool.color, *slot, i, keys.toolbar.colour.get(i).copied().flatten());
                         *slot = new_slot;
                         interacted |= hit;
                     }
-                    spacer(ui);
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    theme::divider(ui, BTN_SIZE);
 
-                    // Group 4: size
-                    interacted |= size_widget(ui, tool);
-                    spacer(ui);
+                    // Size.
+                    interacted |= size_widget(ui, tool, keys);
+                    theme::divider(ui, BTN_SIZE);
 
-                    // Group 5: utilities (insert media + pin + settings + help)
-                    interacted |= insert_media_btn(ui, insert_media);
+                    // Media, pins, the window pin.
+                    interacted |= insert_media_btn(ui, insert_media, keys.toolbar.insert_media);
                     interacted |= filter_btn(ui, media_filter, media_counts, select_filtered);
                     if let Some(hidden) = pins_hidden {
                         interacted |= pins_btn(ui, hidden);
                     }
-                    interacted |= pin_btn(ui, pinned_hwnd, pin_picking);
-                    interacted |= settings_btn(ui, bg_opacity, bg_color, smoothing, smoothing_options, pressure_curve, (&mut *snaps.0, &mut *snaps.1), (&mut *beside.0, &mut *beside.1), (&mut *picture_search.0, picture_search.1));
+                    interacted |= pin_btn(ui, pinned_hwnd, pin_picking, keys.toolbar.pin_to_window);
+                    theme::divider(ui, BTN_SIZE);
+
+                    // Settings and the keys.
+                    let settings = Settings {
+                        bg_opacity,
+                        bg_color,
+                        smoothing,
+                        smoothing_options,
+                        pressure_curve,
+                        ui_scale,
+                        shape_snap: snaps.0,
+                        smart_guides: snaps.1,
+                        beside_fit: beside.0,
+                        beside_side: beside.1,
+                        picture_search: picture_search.0,
+                        picture_status: picture_search.1,
+                        keys,
+                    };
+                    interacted |= settings_btn(ui, settings);
                     interacted |= help_btn(ui, keys);
                 });
             });
@@ -134,271 +163,198 @@ pub fn show(
     interacted
 }
 
-const BTN_SIZE: f32 = 28.0;
-const SWATCH_SIZE: f32 = 16.0;
-const BTN_ROUND: f32 = 7.0;
+/// A bar button's side, points.
+pub(crate) const BTN_SIZE: f32 = 30.0;
+/// A colour swatch's cell: narrower than a button, as tall.
+const SWATCH_W: f32 = 22.0;
 
-/// Pen / Pencil button. Both select `ToolKind::Pen`; they differ only in
-/// `tool.style`, which the renderer uses to switch between the smooth
-/// opaque ribbon and the translucent grainy pencil look. Active when the
-/// pen tool is selected *and* its style matches `style`.
-fn pen_style_btn(
-    ui: &mut egui::Ui,
-    tool: &mut ActiveTool,
-    style: StrokeStyle,
-    tooltip: &str,
-) -> bool {
-    let selected = tool.kind == ToolKind::Pen && tool.style == style;
-    let size = Vec2::splat(BTN_SIZE);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+/// A tooltip naming `name` and its `key`, then what it does.
+fn tip(response: egui::Response, name: &str, key: Option<Binding>, about: &str) -> egui::Response {
+    theme::tip(response, name, key, (!about.is_empty()).then_some(about))
+}
 
-    let painter = ui.painter();
-    let bg = if selected {
-        theme::ACCENT
-    } else if response.hovered() {
-        Color32::from_white_alpha(22)
-    } else {
-        Color32::TRANSPARENT
-    };
-    painter.rect_filled(rect, Rounding::same(BTN_ROUND), bg);
-
-    let icon_color = theme::TEXT_PRIMARY;
-    let icon_rect = rect.shrink(rect.width() * 0.22);
-    let img = match style {
-        StrokeStyle::Default => egui::Image::new(egui::include_image!("../../assets/icons/pen.svg")),
-        StrokeStyle::Pencil  => egui::Image::new(egui::include_image!("../../assets/icons/pencil.svg")),
-        StrokeStyle::Marker  => egui::Image::new(egui::include_image!("../../assets/icons/marker.svg")),
-        StrokeStyle::Airbrush => egui::Image::new(egui::include_image!("../../assets/icons/spray-can.svg")),
-    };
-    img.tint(icon_color)
-        .fit_to_exact_size(icon_rect.size())
-        .paint_at(ui, icon_rect);
-
-    let response = response.on_hover_text(tooltip);
-    if response.clicked() {
-        tool.kind  = ToolKind::Pen;
-        tool.style = style;
-        return true;
-    }
+/// `response` as a bar button's: clicked, or just under the pointer (a
+/// press there is the UI's, not ink).
+fn touched(response: &egui::Response) -> bool {
     response.hovered() || response.is_pointer_button_down_on()
 }
 
-fn tool_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, kind: ToolKind, tooltip: &str) -> bool {
-    let selected = tool.kind == kind;
-    let size = Vec2::splat(BTN_SIZE);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+/// The icon a pen style shows.
+fn pen_icon(style: StrokeStyle) -> egui::Image<'static> {
+    match style {
+        StrokeStyle::Default => egui::Image::new(egui::include_image!("../../assets/icons/pen.svg")),
+        StrokeStyle::Pencil => egui::Image::new(egui::include_image!("../../assets/icons/pencil.svg")),
+        StrokeStyle::Marker => egui::Image::new(egui::include_image!("../../assets/icons/marker.svg")),
+        StrokeStyle::Airbrush => egui::Image::new(egui::include_image!("../../assets/icons/spray-can.svg")),
+    }
+}
 
-    let painter = ui.painter();
-    let bg = if selected {
-        theme::ACCENT
-    } else if response.hovered() {
-        Color32::from_white_alpha(22)
-    } else {
-        Color32::TRANSPARENT
-    };
-    painter.rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+/// Pen / Pencil / Marker / Airbrush button. All select `ToolKind::Pen`;
+/// they differ only in `tool.style`, which the renderer uses to switch
+/// between the smooth opaque ribbon, the grainy pencil, the highlighter
+/// and the spray. Current when the pen tool is selected *and* its style
+/// matches `style`.
+fn pen_style_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, style: StrokeStyle, key: Option<Binding>, about: &str) -> bool {
+    let current = tool.kind == ToolKind::Pen && tool.style == style;
+    let look = if current { Look::Current } else { Look::Plain };
+    let response = theme::icon_button(ui, pen_icon(style), BTN_SIZE, look);
+    let name = tool_name(ToolKind::Pen, style);
+    let response = tip(response, name, key, about);
+    if response.clicked() {
+        tool.kind = ToolKind::Pen;
+        tool.style = style;
+        return true;
+    }
+    touched(&response)
+}
 
-    // Icon stays white regardless of state — selection is signalled by
-    // the translucent white fill behind, not by a colour change.
-    let icon_color = theme::TEXT_PRIMARY;
-
-    // Centre the icon, leaving ~22 % padding on every side.
-    let icon_rect = rect.shrink(rect.width() * 0.22);
-    paint_icon(ui, icon_rect, kind, icon_color);
-
-    let response = response.on_hover_text(tooltip);
+fn tool_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, kind: ToolKind, key: Option<Binding>, about: &str) -> bool {
+    let look = if tool.kind == kind { Look::Current } else { Look::Plain };
+    let response = theme::icon_button(ui, tool_icon(kind), BTN_SIZE, look);
+    let name = tool_name(kind, tool.style);
+    let response = tip(response, name, key, about);
     if response.clicked() {
         tool.kind = kind;
         return true;
     }
-    response.hovered() || response.is_pointer_button_down_on()
+    touched(&response)
 }
 
 /// "Insert picture / video / GIF" — opens the Open dialog (the app runs it).
-fn insert_media_btn(ui: &mut egui::Ui, clicked: &mut bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
-    let bg = if response.hovered() { Color32::from_white_alpha(22) } else { Color32::TRANSPARENT };
-    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
-    let icon_rect = rect.shrink(rect.width() * 0.22);
-    egui::Image::new(egui::include_image!("../../assets/icons/film.svg"))
-        .tint(theme::TEXT_PRIMARY)
-        .fit_to_exact_size(icon_rect.size())
-        .paint_at(ui, icon_rect);
-    let response = response.on_hover_text("Insert picture / video / GIF  (or drop a file onto the canvas)");
+fn insert_media_btn(ui: &mut egui::Ui, clicked: &mut bool, key: Option<Binding>) -> bool {
+    let response = theme::icon_button(ui, egui::Image::new(egui::include_image!("../../assets/icons/film.svg")), BTN_SIZE, Look::Plain);
+    let response = tip(response, "Insert", key, "A picture, video, GIF or PureRef board — or drop a file onto the canvas");
     if response.clicked() {
         *clicked = true;
         return true;
     }
-    response.hovered() || response.is_pointer_button_down_on()
+    touched(&response)
 }
 
 /// Show / hide every pin (objects kept on screen). Lit while they
 /// are hidden, so a hidden state is never forgotten.
 fn pins_btn(ui: &mut egui::Ui, hidden: &mut bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
-    let bg = if *hidden {
-        theme::ACCENT
-    } else if response.hovered() {
-        Color32::from_white_alpha(22)
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
     let icon = if *hidden {
-        egui::include_image!("../../assets/icons/eye-off.svg")
+        egui::Image::new(egui::include_image!("../../assets/icons/eye-off.svg"))
     } else {
-        egui::include_image!("../../assets/icons/eye.svg")
+        egui::Image::new(egui::include_image!("../../assets/icons/eye.svg"))
     };
-    let icon_rect = rect.shrink(rect.width() * 0.22);
-    egui::Image::new(icon).tint(theme::TEXT_PRIMARY).fit_to_exact_size(icon_rect.size()).paint_at(ui, icon_rect);
-    let tooltip = if *hidden {
-        "Pins are hidden — click to show them again"
+    let response = theme::icon_button(ui, icon, BTN_SIZE, Look::on(*hidden));
+    let response = if *hidden {
+        tip(response, "Pins hidden", None, "Click to show them again")
     } else {
-        "Hide all pins. Their originals stay on their own slides"
+        tip(response, "Hide pins", None, "Their originals stay on their own slides")
     };
-    let response = response.on_hover_text(tooltip);
     if response.clicked() {
         *hidden = !*hidden;
         return true;
     }
-    response.hovered() || response.is_pointer_button_down_on()
+    touched(&response)
 }
 
 /// Media filter: highlights pictures, GIFs and / or videos on the slide,
 /// its groups, and what is tagged. Lit while any is on; the popup picks.
 fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: &media_filter::Counts, select: &mut bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
-    let bg = if filter.any() {
-        theme::ACCENT
-    } else if response.hovered() {
-        Color32::from_white_alpha(22)
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
-    let icon_rect = rect.shrink(rect.width() * 0.24);
-    egui::Image::new(egui::include_image!("../../assets/icons/filter.svg"))
-        .tint(theme::TEXT_PRIMARY)
-        .fit_to_exact_size(icon_rect.size())
-        .paint_at(ui, icon_rect);
-    let response = response.on_hover_text("Highlight pictures, GIFs, videos, groups or tags");
-    let popup_id = ui.make_persistent_id("osn_media_filter_popup");
-    let mut interacted = response.hovered() || response.is_pointer_button_down_on();
+    let response = theme::icon_button(ui, egui::Image::new(egui::include_image!("../../assets/icons/filter.svg")), BTN_SIZE, Look::on(filter.any()));
+    let response = tip(response, "Highlight", None, "Pictures, GIFs, videos, groups or tags on this slide");
+    let popup_id = egui::Id::new("osn_media_filter_popup");
+    let mut interacted = touched(&response);
     if response.clicked() {
         ui.memory_mut(|m| m.toggle_popup(popup_id));
         interacted = true;
     }
-    egui::popup::popup_below_widget(
-        ui,
-        popup_id,
-        &response,
-        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-        |ui: &mut egui::Ui| {
-            ui.set_min_width(200.0);
-            ui.label(egui::RichText::new("Highlight media").small().color(theme::TEXT_MUTED));
-            ui.add_space(2.0);
-            let dot_row = |ui: &mut egui::Ui, colour: Color32, on: &mut bool, text: String| {
-                ui.horizontal(|ui| {
-                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 4.5, colour);
-                    ui.toggle_value(on, text);
-                });
-            };
-            for (t, n) in MediaType::ALL.into_iter().zip(counts.media) {
-                dot_row(ui, media_filter::color(t), filter.flag(t), format!("{}  ({n})", media_filter::label(t)));
-            }
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("Groups and tags").small().color(theme::TEXT_MUTED));
-            ui.add_space(2.0);
-            dot_row(ui, media_filter::GROUP_COLOUR, &mut filter.groups, format!("Groups  ({})", counts.groups));
-            dot_row(ui, media_filter::TAG_COLOUR, &mut filter.tagged, format!("All tagged  ({})", counts.tagged));
-            // Each tag on this slide, and any picked that is not on it, so
-            // it can be put back.
-            let mut tags = counts.tags.clone();
-            for t in &filter.tags {
-                if !tags.iter().any(|(have, _)| crate::canvas::units::same_tag(have, t)) {
-                    tags.push((t.clone(), 0));
-                }
-            }
-            if tags.is_empty() {
-                ui.label(egui::RichText::new("Nothing here is tagged — select something, then the arrange bar's tag button").small().color(theme::TEXT_MUTED));
-            } else {
-                egui::ScrollArea::vertical().max_height(180.0).auto_shrink([true, true]).show(ui, |ui| {
-                    for (tag, n) in &tags {
-                        ui.horizontal(|ui| {
-                            ui.add_space(14.0);
-                            let mut on = filter.has_tag(tag);
-                            if ui.toggle_value(&mut on, format!("#{tag}  ({n})")).clicked() {
-                                filter.toggle_tag(tag);
-                            }
-                        });
-                    }
-                });
-            }
-            // A slide opened from a PureRef board: what the board has
-            // dropped since (a resync keeps it on the slide).
-            if let Some(gone) = counts.gone {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("PureRef board").small().color(theme::TEXT_MUTED));
-                ui.add_space(2.0);
-                dot_row(ui, media_filter::GONE_COLOUR, &mut filter.gone, format!("Gone from the board  ({gone})"));
-            }
-            ui.add_space(4.0);
+    theme::popup_below(ui, popup_id, &response, true, |ui| {
+        ui.set_width(260.0);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        // A row: the highlight's colour, what it is, how many, a switch.
+        let row = |ui: &mut egui::Ui, colour: Color32, on: &mut bool, label: &str, n: usize| -> bool {
             ui.horizontal(|ui| {
-                let media: usize = MediaType::ALL.into_iter().zip(counts.media).filter(|(t, _)| filter.shows(*t)).map(|(_, n)| n).sum();
-                let picked: usize = tags.iter().filter(|(t, _)| filter.has_tag(t)).map(|(_, n)| n).sum();
-                let matching = media
-                    + if filter.groups { counts.groups } else { 0 }
-                    + if filter.tagged { counts.tagged } else { picked }
-                    + if filter.gone { counts.gone.unwrap_or(0) } else { 0 };
-                if ui
-                    .add_enabled(matching > 0, egui::Button::new("Select these"))
-                    .on_hover_text("Select the highlighted objects, ready to arrange")
-                    .clicked()
-                {
-                    *select = true;
-                    ui.memory_mut(|m| m.close_popup());
-                }
-                if ui.add_enabled(filter.any(), egui::Button::new("Clear")).clicked() {
-                    *filter = MediaFilter::default();
+                let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, colour);
+                ui.label(label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let changed = theme::switch(ui, on).changed();
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(n.to_string()).color(theme::TEXT_MUTED));
+                    changed
+                })
+                .inner
+            })
+            .inner
+        };
+        theme::section(ui, "Media");
+        for (t, n) in MediaType::ALL.into_iter().zip(counts.media) {
+            row(ui, media_filter::color(t), filter.flag(t), media_filter::label(t), n);
+        }
+        theme::section(ui, "Groups and tags");
+        row(ui, media_filter::GROUP_COLOUR, &mut filter.groups, "Groups", counts.groups);
+        row(ui, media_filter::TAG_COLOUR, &mut filter.tagged, "All tagged", counts.tagged);
+        // Each tag on this slide, and any picked that is not on it, so
+        // it can be put back.
+        let mut tags = counts.tags.clone();
+        for t in &filter.tags {
+            if !tags.iter().any(|(have, _)| crate::canvas::units::same_tag(have, t)) {
+                tags.push((t.clone(), 0));
+            }
+        }
+        if tags.is_empty() {
+            ui.label(egui::RichText::new("Nothing here is tagged — select something, then the arrange bar's tag button").small().color(theme::TEXT_MUTED));
+        } else {
+            egui::ScrollArea::vertical().max_height(180.0).auto_shrink([false, true]).show(ui, |ui| {
+                for (tag, n) in &tags {
+                    let mut on = filter.has_tag(tag);
+                    if row(ui, media_filter::TAG_COLOUR, &mut on, &format!("#{tag}"), *n) {
+                        filter.toggle_tag(tag);
+                    }
                 }
             });
-        },
-    );
+        }
+        // A slide opened from a PureRef board: what the board has
+        // dropped since (a resync keeps it on the slide).
+        if let Some(gone) = counts.gone {
+            theme::section(ui, "PureRef board");
+            row(ui, media_filter::GONE_COLOUR, &mut filter.gone, "Gone from the board", gone);
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let media: usize = MediaType::ALL.into_iter().zip(counts.media).filter(|(t, _)| filter.shows(*t)).map(|(_, n)| n).sum();
+            let picked: usize = tags.iter().filter(|(t, _)| filter.has_tag(t)).map(|(_, n)| n).sum();
+            let matching = media
+                + if filter.groups { counts.groups } else { 0 }
+                + if filter.tagged { counts.tagged } else { picked }
+                + if filter.gone { counts.gone.unwrap_or(0) } else { 0 };
+            if ui
+                .add_enabled(matching > 0, egui::Button::new(format!("Select {matching}")))
+                .on_hover_text("Select the highlighted objects, ready to arrange")
+                .clicked()
+            {
+                *select = true;
+                ui.memory_mut(|m| m.close_popup());
+            }
+            if ui.add_enabled(filter.any(), egui::Button::new("Clear")).clicked() {
+                *filter = MediaFilter::default();
+            }
+        });
+    });
     interacted
 }
 
-/// Render the SVG icon for a tool inside `rect`, tinted to `color`.
-///
-/// SVGs are baked into the binary by `egui::include_image!`. The Lucide
-/// icons use `stroke="currentColor"`, which `egui_extras`'s SVG loader
-/// honours via `Image::tint(...)` — so the same SVG renders white when the
-/// button is selected, near-white otherwise.
 /// The tool in use, lit like a picked toolbar button, for a bar that
 /// shows only it (the slide window's): the pen's style shows as its own
 /// icon. Shows only; the tool keys pick tools.
 pub(crate) fn active_tool(ui: &mut egui::Ui, tool: &ActiveTool) {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::hover());
-    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), theme::ACCENT);
-    let icon = rect.shrink(rect.width() * 0.22);
-    if tool.kind == ToolKind::Pen {
-        let img = match tool.style {
-            StrokeStyle::Default => egui::Image::new(egui::include_image!("../../assets/icons/pen.svg")),
-            StrokeStyle::Pencil => egui::Image::new(egui::include_image!("../../assets/icons/pencil.svg")),
-            StrokeStyle::Marker => egui::Image::new(egui::include_image!("../../assets/icons/marker.svg")),
-            StrokeStyle::Airbrush => egui::Image::new(egui::include_image!("../../assets/icons/spray-can.svg")),
-        };
-        img.tint(theme::TEXT_PRIMARY).fit_to_exact_size(icon.size()).paint_at(ui, icon);
-    } else {
-        paint_icon(ui, icon, tool.kind, theme::TEXT_PRIMARY);
-    }
-    response.on_hover_text(format!("{} — the tool keys pick another", tool_name(tool)));
+    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), theme::SELECTED_FILL);
+    let icon = egui::Rect::from_center_size(rect.center(), Vec2::splat((BTN_SIZE * 0.56).round()));
+    let img = if tool.kind == ToolKind::Pen { pen_icon(tool.style) } else { tool_icon(tool.kind) };
+    img.tint(theme::SELECTED_INK).fit_to_exact_size(icon.size()).paint_at(ui, icon);
+    response.on_hover_text(format!("{} — the tool keys pick another", tool_name(tool.kind, tool.style)));
 }
 
-/// A tool's name, as its toolbar button calls it.
-fn tool_name(tool: &ActiveTool) -> &'static str {
-    match tool.kind {
-        ToolKind::Pen => match tool.style {
+/// A tool's name, as its toolbar button calls it (`style` names the pen).
+fn tool_name(kind: ToolKind, style: StrokeStyle) -> &'static str {
+    match kind {
+        ToolKind::Pen => match style {
             StrokeStyle::Default => "Pen",
             StrokeStyle::Pencil => "Pencil",
             StrokeStyle::Marker => "Marker",
@@ -415,33 +371,33 @@ fn tool_name(tool: &ActiveTool) -> &'static str {
         ToolKind::Text => "Text",
         ToolKind::Spotlight => "Spotlight",
         ToolKind::LassoErase => "Lasso erase",
-        ToolKind::LassoSelect => "Lasso select",
+        ToolKind::LassoSelect => "Lasso capture",
         ToolKind::Select => "Select",
     }
 }
 
-fn paint_icon(ui: &mut egui::Ui, rect: egui::Rect, kind: ToolKind, color: Color32) {
-    let img = match kind {
-        ToolKind::Pen           => egui::Image::new(egui::include_image!("../../assets/icons/pen.svg")),
-        ToolKind::Eraser        => egui::Image::new(egui::include_image!("../../assets/icons/eraser.svg")),
-        ToolKind::Rect          => egui::Image::new(egui::include_image!("../../assets/icons/rect.svg")),
-        ToolKind::Ellipse       => egui::Image::new(egui::include_image!("../../assets/icons/ellipse.svg")),
-        ToolKind::Line          => egui::Image::new(egui::include_image!("../../assets/icons/line.svg")),
-        ToolKind::Arrow         => egui::Image::new(egui::include_image!("../../assets/icons/arrow.svg")),
+/// A tool's icon. The SVGs are baked into the binary by
+/// `egui::include_image!`; their strokes are white, and `Image::tint`
+/// darkens them on the light chip of the tool in use.
+fn tool_icon(kind: ToolKind) -> egui::Image<'static> {
+    match kind {
+        ToolKind::Pen => egui::Image::new(egui::include_image!("../../assets/icons/pen.svg")),
+        ToolKind::Eraser => egui::Image::new(egui::include_image!("../../assets/icons/eraser.svg")),
+        ToolKind::Rect => egui::Image::new(egui::include_image!("../../assets/icons/rect.svg")),
+        ToolKind::Ellipse => egui::Image::new(egui::include_image!("../../assets/icons/ellipse.svg")),
+        ToolKind::Line => egui::Image::new(egui::include_image!("../../assets/icons/line.svg")),
+        ToolKind::Arrow => egui::Image::new(egui::include_image!("../../assets/icons/arrow.svg")),
         ToolKind::FreehandArrow => egui::Image::new(egui::include_image!("../../assets/icons/freehand_arrow.svg")),
-        ToolKind::Fill          => egui::Image::new(egui::include_image!("../../assets/icons/fill.svg")),
-        ToolKind::Laser         => egui::Image::new(egui::include_image!("../../assets/icons/laser.svg")),
-        ToolKind::Text          => egui::Image::new(egui::include_image!("../../assets/icons/text.svg")),
-        ToolKind::Spotlight     => egui::Image::new(egui::include_image!("../../assets/icons/spotlight.svg")),
-        ToolKind::LassoErase    => egui::Image::new(egui::include_image!("../../assets/icons/lasso.svg")),
+        ToolKind::Fill => egui::Image::new(egui::include_image!("../../assets/icons/fill.svg")),
+        ToolKind::Laser => egui::Image::new(egui::include_image!("../../assets/icons/laser.svg")),
+        ToolKind::Text => egui::Image::new(egui::include_image!("../../assets/icons/text.svg")),
+        ToolKind::Spotlight => egui::Image::new(egui::include_image!("../../assets/icons/spotlight.svg")),
+        ToolKind::LassoErase => egui::Image::new(egui::include_image!("../../assets/icons/lasso.svg")),
         // Reuses the lasso glyph for now; a dedicated lasso-select icon
         // can be dropped into assets/icons/ later.
-        ToolKind::LassoSelect   => egui::Image::new(egui::include_image!("../../assets/icons/lasso.svg")),
-        ToolKind::Select        => egui::Image::new(egui::include_image!("../../assets/icons/select.svg")),
-    };
-    img.tint(color)
-        .fit_to_exact_size(rect.size())
-        .paint_at(ui, rect);
+        ToolKind::LassoSelect => egui::Image::new(egui::include_image!("../../assets/icons/lasso.svg")),
+        ToolKind::Select => egui::Image::new(egui::include_image!("../../assets/icons/select.svg")),
+    }
 }
 
 /// Palette swatch widget. Returns the (possibly edited) colour + whether
@@ -461,44 +417,32 @@ pub(crate) fn colour_swatch(
     active: &mut [u8; 4],
     color: [u8; 4],
     index: usize,
+    key: Option<Binding>,
 ) -> ([u8; 4], bool) {
-    let size = Vec2::splat(SWATCH_SIZE);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(SWATCH_W, BTN_SIZE), egui::Sense::click_and_drag());
     let mut current = color;
     let c = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
     let selected = *active == color;
 
+    // A round dot at the colour; the picked one gets a white ring with
+    // a gap, a hovered one a faint ring.
     let painter = ui.painter();
-    // Swatch body — flat rounded square at the chosen colour. No
-    // outline (user-requested minimal aesthetic). Selected state is
-    // signalled by a slight inset gap + translucent ring, not by a
-    // saturated halo.
-    let body = if selected {
-        rect.shrink(3.5)
-    } else {
-        rect.shrink(2.5)
-    };
-    painter.rect_filled(body, Rounding::same(5.0), c);
+    let centre = rect.center();
+    painter.circle_filled(centre, 7.0, c);
+    // A dark dot on the dark card: a hairline keeps it visible.
+    if c.r().max(c.g()).max(c.b()) < 60 {
+        painter.circle_stroke(centre, 7.0, Stroke::new(1.0, theme::HAIRLINE));
+    }
     if selected {
-        // Translucent white ring around the selected swatch.
-        painter.rect_stroke(
-            rect.shrink(1.0),
-            Rounding::same(6.0),
-            Stroke::new(1.4, Color32::from_white_alpha(200)),
-        );
+        painter.circle_stroke(centre, 9.75, Stroke::new(1.5, theme::TEXT_PRIMARY));
     } else if response.hovered() {
-        painter.rect_stroke(
-            rect.shrink(1.5),
-            Rounding::same(5.5),
-            Stroke::new(1.0, Color32::from_white_alpha(90)),
-        );
+        painter.circle_stroke(centre, 9.75, Stroke::new(1.0, Color32::from_white_alpha(90)));
     }
 
-    let popup_id = ui.make_persistent_id(("osn_palette_popup", index));
-    let response = response.on_hover_text(format!(
-        "Colour #{:02X}{:02X}{:02X}  •  L-click: select  •  R-click: edit",
-        color[0], color[1], color[2]
-    ));
+    let popup_id = egui::Id::new(("osn_palette_popup", index));
+    let response = response.on_hover_ui(|ui| {
+        theme::tip_body(ui, &format!("Colour {}", index + 1), key, Some(&format!("#{:02X}{:02X}{:02X} · right-click to change it", color[0], color[1], color[2])));
+    });
 
     let mut interacted = false;
     if response.clicked() {
@@ -512,19 +456,11 @@ pub(crate) fn colour_swatch(
 
     // Popup with the egui colour picker, anchored under the swatch. The
     // user mutates `c32`; we mirror the change back into the [u8;4] slot.
-    egui::popup::popup_below_widget(
-        ui,
-        popup_id,
-        &response,
-        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-        |ui: &mut egui::Ui| {
+    egui::popup::popup_below_widget(ui, popup_id, &response, egui::popup::PopupCloseBehavior::CloseOnClickOutside, |ui: &mut egui::Ui| {
         ui.set_min_width(220.0);
+        theme::section(ui, &format!("Colour {}", index + 1));
         let mut c32 = c;
-        let changed = egui::color_picker::color_picker_color32(
-            ui,
-            &mut c32,
-            egui::color_picker::Alpha::Opaque,
-        );
+        let changed = egui::color_picker::color_picker_color32(ui, &mut c32, egui::color_picker::Alpha::Opaque);
         if changed {
             current = c32.to_array();
             // Live-update the active pen colour too if this slot is the
@@ -547,78 +483,48 @@ pub(crate) fn colour_swatch(
                     interacted = true;
                 }
             }
-            if ui.button("Close").clicked() {
+            if ui.button("Done").clicked() {
                 ui.memory_mut(|m| m.close_popup());
             }
         });
-    },
-    );
-
-    let hovering = response.hovered() || response.is_pointer_button_down_on();
-    (current, interacted || hovering)
-}
-
-fn size_widget(ui: &mut egui::Ui, tool: &mut ActiveTool) -> bool {
-    let mut interacted = false;
-    ui.scope(|ui| {
-        // Live preview dot — scales with `tool.size`, capped to fit the row.
-        let dot_size = Vec2::splat(SWATCH_SIZE);
-        let (rect, _) = ui.allocate_exact_size(dot_size, egui::Sense::hover());
-        let preview_radius = (tool.size * 0.5).clamp(1.5, 7.0);
-        ui.painter().circle_filled(
-            rect.center(),
-            preview_radius,
-            Color32::from_rgba_unmultiplied(
-                tool.color[0], tool.color[1], tool.color[2], tool.color[3],
-            ),
-        );
-
-        let slider = ui.add_sized(
-            Vec2::new(100.0, 16.0),
-            egui::Slider::new(&mut tool.size, 1.0..=80.0)
-                .integer()
-                .show_value(false),
-        );
-        if slider.changed() || slider.dragged() {
-            interacted = true;
-        }
     });
-    interacted
+
+    (current, interacted || touched(&response))
 }
 
-/// Help "?" button — purely hover-driven. On hover, egui pops a tooltip
-/// listing every hotkey as bound in `hotkeys.toml`, plus the mouse,
-/// wheel and held-modifier gestures. Lives in the toolbar so it is
-/// always discoverable but never in the way.
-fn help_btn(ui: &mut egui::Ui, keys: &ParsedHotkeys) -> bool {
-    let size = Vec2::splat(BTN_SIZE);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
-
-    let painter = ui.painter();
-    let bg = if response.hovered() {
-        Color32::from_white_alpha(32)
-    } else {
-        Color32::TRANSPARENT
+/// The size: a dot as big as the line (in the drawing colour), a
+/// slider, and the size in points.
+fn size_widget(ui: &mut egui::Ui, tool: &mut ActiveTool, keys: &ParsedHotkeys) -> bool {
+    let (rect, dot) = ui.allocate_exact_size(Vec2::new(24.0, BTN_SIZE), egui::Sense::hover());
+    let c = Color32::from_rgba_unmultiplied(tool.color[0], tool.color[1], tool.color[2], tool.color[3]);
+    ui.painter().circle_filled(rect.center(), (tool.size * 0.5).clamp(1.5, 10.0), c);
+    if c.r().max(c.g()).max(c.b()) < 60 {
+        ui.painter().circle_stroke(rect.center(), (tool.size * 0.5).clamp(1.5, 10.0), Stroke::new(1.0, theme::HAIRLINE));
+    }
+    let about = match (keys.toolbar.size_down, keys.toolbar.size_up) {
+        (Some(d), Some(u)) => format!("Pen size; also the wheel over the canvas, or {} / {}", d.label(), u.label()),
+        _ => "Pen size; also the wheel over the canvas".to_string(),
     };
-    painter.rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+    dot.on_hover_ui(|ui| theme::tip_body(ui, "Size", None, Some(&about)));
+    let slider = theme::slider(ui, &mut tool.size, 1.0..=80.0, 1.0, 92.0);
+    theme::value_label(ui, format!("{:.0}", tool.size), 22.0);
+    ui.add_space(4.0);
+    slider.changed() || slider.dragged() || slider.hovered()
+}
 
-    // Outline circle + "?" glyph drawn via the painter, so we don't depend
-    // on a font containing a stylised help glyph.
-    let r = rect.width() * 0.30;
-    let stroke = Stroke::new(1.6, theme::TEXT_PRIMARY);
-    painter.circle_stroke(rect.center(), r, stroke);
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "?",
-        egui::FontId::proportional(BTN_SIZE * 0.50),
-        theme::TEXT_PRIMARY,
-    );
-
-    // Rich tooltip on hover. Using `on_hover_ui` (not `on_hover_text`)
-    // gives us proper layout control.
+/// Help button — hover-driven. On hover, a panel lists every hotkey as
+/// bound in `hotkeys.toml`, plus the mouse, wheel and held-modifier
+/// gestures. Lives in the toolbar so it is always discoverable but
+/// never in the way.
+fn help_btn(ui: &mut egui::Ui, keys: &ParsedHotkeys) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::hover());
+    theme::paint_button(ui, rect, Look::Plain, &response);
+    let icon = egui::Rect::from_center_size(rect.center(), Vec2::splat((BTN_SIZE * 0.56).round()));
+    egui::Image::new(egui::include_image!("../../assets/icons/keyboard.svg"))
+        .tint(theme::TEXT_PRIMARY)
+        .fit_to_exact_size(icon.size())
+        .paint_at(ui, icon);
     response.on_hover_ui(|ui| help_panel(ui, keys));
-
     // Hover is *not* a click — never report it as a user interaction so
     // pen events still flow to the canvas.
     false
@@ -632,12 +538,12 @@ type HelpSection = (&'static str, Vec<(&'static str, String)>);
 /// the bottom of it.
 fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
     // Room a column takes, with the gap after it.
-    const COL_W: f32 = 400.0;
+    const COL_W: f32 = 430.0;
     let sections = help_sections(keys);
     let screen_w = ui.ctx().screen_rect().width() - 40.0;
     let cols = (screen_w / COL_W).floor().clamp(1.0, 3.0) as usize;
-    // A tooltip stops at `spacing.tooltip_width` (500), which would
-    // wrap every column past the first.
+    // A tooltip stops at `spacing.tooltip_width`, which would wrap every
+    // column past the first.
     ui.set_max_width(screen_w);
 
     // Fill columns in order, a heading counting as a row. A section
@@ -657,44 +563,34 @@ fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
         filled += n;
     }
 
-    ui.label(
-        egui::RichText::new("Keyboard & input shortcuts")
-            .strong()
-            .size(13.0),
-    );
-    ui.add_space(4.0);
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("Shortcuts").font(theme::semibold(15.0)));
+    ui.add_space(2.0);
     // Taller than the screen allows, the columns scroll: a scroll bar
     // makes the tooltip one the pointer can move onto, so it stays open
     // to be scrolled.
     let room = (ui.ctx().screen_rect().height() - 150.0).max(200.0);
     egui::ScrollArea::vertical().max_height(room).auto_shrink([true, true]).show(ui, |ui| {
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 24.0;
-        for (ci, column) in columns.iter().enumerate() {
-            ui.vertical(|ui| {
-                for (si, (title, rows)) in column.iter().enumerate() {
-                    if si > 0 {
-                        ui.add_space(6.0);
-                    }
-                    ui.label(egui::RichText::new(*title).strong().color(theme::TEXT_MUTED));
-                    egui::Grid::new(("osn_help_grid", ci, si))
-                        .num_columns(2)
-                        .spacing([18.0, 2.0])
-                        .show(ui, |ui| {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 28.0;
+            for (ci, column) in columns.iter().enumerate() {
+                ui.vertical(|ui| {
+                    for (si, (title, rows)) in column.iter().enumerate() {
+                        if si > 0 {
+                            ui.add_space(6.0);
+                        }
+                        theme::section(ui, title);
+                        egui::Grid::new(("osn_help_grid", ci, si)).num_columns(2).spacing([16.0, 3.0]).min_row_height(20.0).show(ui, |ui| {
                             for (action, how) in rows {
                                 ui.label(*action);
-                                ui.label(
-                                    egui::RichText::new(how)
-                                        .monospace()
-                                        .color(Color32::from_rgb(232, 200, 200)),
-                                );
+                                ui.horizontal(|ui| theme::shortcut_text(ui, how));
                                 ui.end_row();
                             }
                         });
-                }
-            });
-        }
-    });
+                    }
+                });
+            }
+        });
     });
     ui.add_space(6.0);
     ui.label(
@@ -706,8 +602,8 @@ fn help_panel(ui: &mut egui::Ui, keys: &ParsedHotkeys) {
             ),
             None => "Keys can be changed in hotkeys.toml, where every button can be given one too.".to_string(),
         })
-            .small()
-            .color(theme::TEXT_MUTED),
+        .small()
+        .color(theme::TEXT_MUTED),
     );
 }
 
@@ -781,6 +677,9 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Pin: this slide only / every slide", c.pin_this_slide_only),
             ("Loop video / GIF",         c.media_loop),
             ("Onion skin on / off",      c.media_onion),
+            ("UI bigger",                c.ui_scale_up),
+            ("UI smaller",               c.ui_scale_down),
+            ("UI size 100 %",            c.ui_scale_reset),
         ])),
     ];
     // Both layer moves on one row, when either is bound.
@@ -913,106 +812,54 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
     ]
 }
 
-/// Smoothing-level picker: Low / Medium / High as inline
-/// `selectable_value` pills. Matches the Krita mode row visually so
-/// both selectors in the settings popup read as the same widget family.
-fn smoothing_widget(ui: &mut egui::Ui, level: &mut SmoothingLevel) -> bool {
-    let mut interacted = false;
-    ui.horizontal_wrapped(|ui| {
-        for opt in [SmoothingLevel::Low, SmoothingLevel::Medium, SmoothingLevel::High] {
-            let resp = ui.selectable_value(level, opt, opt.label());
-            let tip = match opt {
-                SmoothingLevel::Low    => "Low — least lag, raw feel",
-                SmoothingLevel::Medium => "Medium — balanced default",
-                SmoothingLevel::High   => "High — cleanest lines, slight lag",
-            };
-            let resp = resp.on_hover_text(tip);
-            if resp.clicked() || resp.hovered() {
-                interacted = true;
-            }
-        }
-    });
-    interacted
-}
-
-/// Invisible group divider — small gap so groups read as separate
-/// without a visible rule. Minimal aesthetic — no painted line.
-fn spacer(ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-}
-
 /// Contextual "dashed border" toggle. Drawn as a small rectangle with
 /// either a solid or dashed outline, painted directly via the egui
 /// painter so we don't need an extra SVG. Clicking flips
 /// `tool.border_style` between `Solid` and `DashedAnimated`; the
-/// renderer reads this flag when committing the next Rect or Ellipse.
-fn dash_toggle_btn(ui: &mut egui::Ui, tool: &mut ActiveTool) -> bool {
-    let active = matches!(tool.border_style, BorderStyle::DashedAnimated);
-    let size = Vec2::splat(BTN_SIZE);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+/// renderer reads this flag when committing the next shape.
+fn dash_toggle_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, key: Option<Binding>) -> bool {
+    let on = matches!(tool.border_style, BorderStyle::DashedAnimated);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
+    theme::paint_button(ui, rect, Look::on(on), &response);
 
+    // Icon: a small box, dashed when on so the user sees what they will
+    // get. The four sides are emitted as short segments — no glyph needed.
     let painter = ui.painter();
-    let bg = if active {
-        theme::ACCENT
-    } else if response.hovered() {
-        Color32::from_white_alpha(22)
-    } else {
-        Color32::TRANSPARENT
-    };
-    painter.rect_filled(rect, Rounding::same(BTN_ROUND), bg);
-
-    // Icon: a small box, dashed when `active` so the user sees what
-    // they will get. The four sides are emitted as short dashed
-    // segments — no font glyph needed.
-    let icon = rect.shrink(rect.width() * 0.26);
+    let icon = egui::Rect::from_center_size(rect.center(), Vec2::splat((BTN_SIZE * 0.48).round()));
     let stroke = Stroke::new(1.6, theme::TEXT_PRIMARY);
-    if active {
-        // Eight dashes per side feels lively without overcrowding the
-        // 28-px button. Emit by hand so we don't pull a polyline
-        // helper just for the icon.
-        let segs = 6;
-        let on  = 1.0_f32;
-        let off = 1.0_f32;
-        let span = on + off;
-        let _ = span;
+    if on {
+        let segs = 4;
         let edges = [
-            (icon.left_top(),    icon.right_top()),
-            (icon.right_top(),   icon.right_bottom()),
-            (icon.right_bottom(),icon.left_bottom()),
+            (icon.left_top(), icon.right_top()),
+            (icon.right_top(), icon.right_bottom()),
+            (icon.right_bottom(), icon.left_bottom()),
             (icon.left_bottom(), icon.left_top()),
         ];
         for (a, b) in edges {
-            let dx = b.x - a.x;
-            let dy = b.y - a.y;
+            let d = b - a;
             for i in 0..segs {
                 let t0 = i as f32 / segs as f32;
                 let t1 = (i as f32 + 0.55) / segs as f32;
-                painter.line_segment(
-                    [egui::pos2(a.x + dx * t0, a.y + dy * t0),
-                     egui::pos2(a.x + dx * t1, a.y + dy * t1)],
-                    stroke,
-                );
+                painter.line_segment([a + d * t0, a + d * t1], stroke);
             }
         }
     } else {
         painter.rect_stroke(icon, Rounding::same(2.0), stroke);
     }
 
-    let response = response.on_hover_text(
-        if active {
-            "Dashed border ON — next shape will use animated dashes (click to switch back)"
-        } else {
-            "Dashed border OFF — click to switch the next shape to animated dashes"
-        }
-    );
+    let response = if on {
+        tip(response, "Dashed border", key, "New shapes get moving dashes. Click for a solid line")
+    } else {
+        tip(response, "Solid border", key, "Click to give new shapes moving dashes")
+    };
     if response.clicked() {
         tool.border_style = match tool.border_style {
-            BorderStyle::Solid          => BorderStyle::DashedAnimated,
+            BorderStyle::Solid => BorderStyle::DashedAnimated,
             BorderStyle::DashedAnimated => BorderStyle::Solid,
         };
         return true;
     }
-    response.hovered() || response.is_pointer_button_down_on()
+    touched(&response)
 }
 
 /// Text-in-a-box switch: flips `tool.text_box`, which the Text tool
@@ -1020,78 +867,36 @@ fn dash_toggle_btn(ui: &mut egui::Ui, tool: &mut ActiveTool) -> bool {
 /// labels).
 fn text_box_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, key: Option<Binding>) -> bool {
     let on = tool.text_box;
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
-    let bg = if on {
-        theme::ACCENT
-    } else if response.hovered() {
-        Color32::from_white_alpha(22)
+    let response = theme::icon_button(ui, egui::Image::new(egui::include_image!("../../assets/icons/text-box.svg")), BTN_SIZE, Look::on(on));
+    let response = if on {
+        tip(response, "Text in a box", key, "On: labels sit in a box that keeps them readable. Applies to the selected labels too")
     } else {
-        Color32::TRANSPARENT
+        tip(response, "Text in a box", key, "Off: plain labels. Click to put them in a box that keeps them readable (the selected ones too)")
     };
-    ui.painter().rect_filled(rect, Rounding::same(BTN_ROUND), bg);
-    let icon = rect.shrink(rect.width() * 0.22);
-    egui::Image::new(egui::include_image!("../../assets/icons/text-box.svg"))
-        .tint(theme::TEXT_PRIMARY)
-        .fit_to_exact_size(icon.size())
-        .paint_at(ui, icon);
-    let tip = if on {
-        "Text in a box ON — labels get a box that keeps them readable (click for plain text; applies to selected labels too)"
-    } else {
-        "Text in a box OFF — click to put labels in a box that keeps them readable (applies to selected labels too)"
-    };
-    let tip = match key {
-        Some(b) => format!("{tip} — {}", b.label()),
-        None => tip.to_string(),
-    };
-    let response = response.on_hover_text(tip);
     if response.clicked() {
         tool.text_box = !tool.text_box;
         return true;
     }
-    response.hovered() || response.is_pointer_button_down_on()
+    touched(&response)
 }
 
-/// Pin-to-window toolbar button. Three visual states:
-///   * No pin set, no picking → idle outline.
-///   * Pin picking armed → accent fill + crosshair tooltip.
-///   * Pinned to a window → accent fill + "unpin" tooltip.
+/// Pin-to-window toolbar button. Three states:
+///   * No pin set, no picking → plain.
+///   * Pin picking armed → on.
+///   * Pinned to a window → on.
 ///
 /// Click semantics: idle → arm picking; picking → cancel; pinned →
 /// unpin. The actual pick-and-follow logic lives in `app.rs`.
-fn pin_btn(
-    ui: &mut egui::Ui,
-    pinned_hwnd: &mut Option<isize>,
-    pin_picking: &mut bool,
-) -> bool {
-    let size = Vec2::splat(BTN_SIZE);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let active = pinned_hwnd.is_some() || *pin_picking;
-
-    let painter = ui.painter();
-    let bg = if active {
-        theme::ACCENT
-    } else if response.hovered() {
-        Color32::from_white_alpha(22)
-    } else {
-        Color32::TRANSPARENT
-    };
-    painter.rect_filled(rect, Rounding::same(BTN_ROUND), bg);
-
-    let icon_color = theme::TEXT_PRIMARY;
-    let icon_rect = rect.shrink(rect.width() * 0.22);
-    egui::Image::new(egui::include_image!("../../assets/icons/pin.svg"))
-        .tint(icon_color)
-        .fit_to_exact_size(icon_rect.size())
-        .paint_at(ui, icon_rect);
-
-    let tooltip = if *pin_picking {
-        "Click any window to pin — Esc cancels"
+fn pin_btn(ui: &mut egui::Ui, pinned_hwnd: &mut Option<isize>, pin_picking: &mut bool, key: Option<Binding>) -> bool {
+    let on = pinned_hwnd.is_some() || *pin_picking;
+    let response = theme::icon_button(ui, egui::Image::new(egui::include_image!("../../assets/icons/pin.svg")), BTN_SIZE, Look::on(on));
+    let response = if *pin_picking {
+        tip(response, "Pick a window", key, "Click any window to follow it — Esc cancels")
     } else if pinned_hwnd.is_some() {
-        "Pinned. Click to unpin (OSN stops following the target window)"
+        tip(response, "Pinned to a window", key, "The overlay follows that window. Click to unpin")
     } else {
-        "Pin to a window — click, then click any window to follow it"
+        tip(response, "Pin to a window", key, "Click, then click any window: the overlay follows it")
     };
-    let response = response.on_hover_text(tooltip);
     if response.clicked() {
         if pinned_hwnd.is_some() {
             *pinned_hwnd = None;
@@ -1100,286 +905,261 @@ fn pin_btn(
         }
         return true;
     }
-    response.hovered() || response.is_pointer_button_down_on()
+    touched(&response)
 }
 
-/// Combined settings button — opens a popup with background-opacity and
-/// smoothing-level controls. Folding these secondary controls behind a
-/// single button keeps the always-visible toolbar tight.
-#[allow(clippy::too_many_arguments)]
-fn settings_btn(
-    ui: &mut egui::Ui,
-    bg_opacity: &mut f32,
-    bg_color: &mut [u8; 3],
-    smoothing: &mut SmoothingLevel,
-    smoothing_options: &mut SmoothingOptions,
-    pressure_curve: &mut f32,
-    (shape_snap, smart_guides): (&mut bool, &mut bool),
-    (beside_fit, beside_side): (&mut BesideFit, &mut BesideSide),
-    (picture_search, picture_status): (&mut bool, &str),
-) -> bool {
-    let size = Vec2::splat(BTN_SIZE);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+/// What the settings popup changes.
+struct Settings<'a> {
+    bg_opacity: &'a mut f32,
+    bg_color: &'a mut [u8; 3],
+    smoothing: &'a mut SmoothingLevel,
+    smoothing_options: &'a mut SmoothingOptions,
+    pressure_curve: &'a mut f32,
+    ui_scale: &'a mut f32,
+    shape_snap: &'a mut bool,
+    smart_guides: &'a mut bool,
+    beside_fit: &'a mut BesideFit,
+    beside_side: &'a mut BesideSide,
+    picture_search: &'a mut bool,
+    picture_status: &'a str,
+    keys: &'a ParsedHotkeys,
+}
 
-    let painter = ui.painter();
-    let bg = if response.hovered() {
-        Color32::from_white_alpha(32)
-    } else {
-        Color32::TRANSPARENT
-    };
-    painter.rect_filled(rect, Rounding::same(BTN_ROUND), bg);
+/// The settings popup's pages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum SettingsTab {
+    #[default]
+    General,
+    Pen,
+    Editing,
+}
 
-    // Sliders glyph — three short horizontal lines with a knob.
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let line_color = theme::TEXT_PRIMARY;
-    let line_w = 1.6;
-    let half_w = rect.width() * 0.30;
-    for (i, ratio) in [-1.0_f32, 0.0, 1.0].into_iter().enumerate() {
-        let y = cy + ratio * 5.0;
-        painter.line_segment(
-            [egui::pos2(cx - half_w, y), egui::pos2(cx + half_w, y)],
-            Stroke::new(line_w, line_color),
-        );
-        // Per-row "slider knob" position — staggered so the icon reads as
-        // a multi-slider settings panel rather than a stack of identical
-        // lines.
-        let knob_x = match i {
-            0 => cx + half_w * 0.35,
-            1 => cx - half_w * 0.45,
-            _ => cx + half_w * 0.10,
-        };
-        painter.circle_filled(egui::pos2(knob_x, y), 1.6, line_color);
-    }
+/// Where the settings popup keeps its page: global, so a test can pick one.
+pub(crate) const SETTINGS_TAB: &str = "osn_settings_tab";
 
-    let response = response.on_hover_text("Settings");
-    let popup_id = ui.make_persistent_id("osn_settings_popup");
-    let mut interacted = false;
+/// The settings button and its popup: the UI size and the background,
+/// the pen, and editing, each a page. Everything in the popup is drawn
+/// inline — a combo box or a colour button would open a popup of its
+/// own, which egui counts as a click outside this one, closing it.
+fn settings_btn(ui: &mut egui::Ui, s: Settings) -> bool {
+    let popup_id = egui::Id::new(SETTINGS_POPUP);
+    let open = ui.memory(|m| m.is_popup_open(popup_id));
+    let response = theme::icon_button(ui, egui::Image::new(egui::include_image!("../../assets/icons/settings.svg")), BTN_SIZE, Look::on(open));
+    let response = tip(response, "Settings", None, "UI size, background, pen, selection and pictures");
+    let mut interacted = touched(&response);
     if response.clicked() {
         ui.memory_mut(|m| m.toggle_popup(popup_id));
         interacted = true;
     }
+    theme::popup_below(ui, popup_id, &response, true, |ui| {
+        ui.set_width(320.0);
+        settings_panel(ui, s);
+    });
+    interacted
+}
 
-    egui::popup::popup_below_widget(
-        ui,
-        popup_id,
-        &response,
-        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-        |ui: &mut egui::Ui| {
-            ui.set_min_width(240.0);
-            // Background opacity row.
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("Background opacity")
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
-                ui.add(
-                    egui::Slider::new(bg_opacity, 0.0..=1.0)
-                        .show_value(false),
-                );
-            });
-            ui.add_space(6.0);
-            // Background colour row — paired with the opacity slider so
-            // the user can tint the dim layer (paper-cream, navy, etc.).
-            //
-            // We render the full HSV picker *inline* inside this popup
-            // rather than using `color_edit_button_srgba`, because that
-            // helper opens its own child popup. Egui treats the click on
-            // the child popup as "outside" the parent popup, so the
-            // parent (this settings popup) closes the instant the user
-            // tries to interact with the picker. Inline rendering keeps
-            // everything in one popup — same model the palette swatch
-            // editor already uses.
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("Background colour")
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
-                let mut c32 = Color32::from_rgb(bg_color[0], bg_color[1], bg_color[2]);
-                let changed = egui::color_picker::color_picker_color32(
-                    ui,
-                    &mut c32,
-                    egui::color_picker::Alpha::Opaque,
-                );
-                if changed {
-                    *bg_color = [c32.r(), c32.g(), c32.b()];
-                }
-                ui.add_space(4.0);
-                if ui
-                    .button("Reset background")
-                    .on_hover_text("Restore black background")
-                    .clicked()
-                {
-                    *bg_color = [0, 0, 0];
-                }
-            });
-            ui.add_space(6.0);
-            // Smoothing level row.
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("Stroke smoothing")
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
-                ui.horizontal(|ui| {
-                    let _ = smoothing_widget(ui, smoothing);
-                });
-            });
-            ui.add_space(6.0);
-            // Krita-style smoothing mode selector + per-mode knobs.
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("Smoothing mode (Krita)")
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
-                // Inline pill row — NOT a ComboBox. ComboBox opens a
-                // child popup, and egui treats that child popup as
-                // "outside" the settings popup → settings closes the
-                // instant the user clicks the dropdown. Same gotcha
-                // already documented above for the bg colour picker.
-                ui.horizontal_wrapped(|ui| {
-                    for opt in [
-                        SmoothingType::Adaptive,
-                        SmoothingType::None,
-                        SmoothingType::Simple,
-                        SmoothingType::Weighted,
-                        SmoothingType::Stabilizer,
-                    ] {
-                        let resp = ui.selectable_value(
-                            &mut smoothing_options.kind,
-                            opt,
-                            opt.label(),
-                        );
-                        resp.on_hover_text(opt.tooltip());
-                    }
-                });
-                // Per-mode controls. Only the relevant rows render so
-                // the popup stays compact.
-                match smoothing_options.kind {
-                    SmoothingType::Adaptive | SmoothingType::None | SmoothingType::Simple => {
-                        // Nothing to tune — Adaptive is driven by the
-                        // SmoothingLevel chips above; None/Simple have
-                        // no parameters in Krita either.
-                    }
-                    SmoothingType::Weighted => {
-                        ui.add(
-                            egui::Slider::new(&mut smoothing_options.smoothness_distance, 3.0..=80.0)
-                                .text("Distance px"),
-                        ).on_hover_text("Gaussian sigma · 3 — bigger = smoother + laggier");
-                        ui.add(
-                            egui::Slider::new(&mut smoothing_options.tail_aggressiveness, 0.0..=1.0)
-                                .text("Tail aggr."),
-                        ).on_hover_text("Penalises rising pressure to tighten lift-off");
-                        ui.checkbox(&mut smoothing_options.smooth_pressure, "Smooth pressure");
-                    }
-                    SmoothingType::Stabilizer => {
-                        ui.add(
-                            egui::Slider::new(&mut smoothing_options.smoothness_distance, 3.0..=80.0)
-                                .text("Sample size"),
-                        ).on_hover_text("Queue depth — bigger = more rope-pull lag");
-                        ui.checkbox(&mut smoothing_options.use_delay_distance, "Use delay distance");
-                        if smoothing_options.use_delay_distance {
-                            ui.add(
-                                egui::Slider::new(&mut smoothing_options.delay_distance, 1.0..=80.0)
-                                    .text("Delay px"),
-                            ).on_hover_text("Cursor must move farther than this before ink commits");
-                        }
-                        ui.checkbox(&mut smoothing_options.finish_stabilized_curve,
-                                    "Finish stabilized curve");
-                        ui.checkbox(&mut smoothing_options.stabilize_sensors,
-                                    "Stabilize sensors (pressure, tilt)");
-                    }
-                }
-                ui.add_space(4.0);
-                ui.checkbox(&mut smoothing_options.fan_corners, "Fan corners (render)");
-                if smoothing_options.fan_corners {
-                    ui.add(
-                        egui::Slider::new(&mut smoothing_options.fan_corners_step, 0.05..=0.80)
-                            .text("Corner step (rad)"),
-                    );
-                }
-            });
-            ui.add_space(6.0);
-            // Pressure curve row.
-            //
-            // Slider maps raw pressure → effective width via
-            // `raw.powf(curve)`. 0.5 = lighter touch (heavy users
-            // squash less); 2.0 = heavier touch (light users get a
-            // sharper taper). 1.0 leaves pressure linear (default).
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("Pressure curve")
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
-                let slider = egui::Slider::new(pressure_curve, 0.5..=2.0)
-                    .step_by(0.05)
-                    .show_value(true)
-                    .text("");
-                let resp = ui.add(slider);
-                if resp.hovered() {
-                    resp.on_hover_text(
-                        "0.5 = lighter touch (low pressure thicker)\n\
-                         1.0 = linear\n\
-                         2.0 = heavier touch (low pressure thinner)",
-                    );
-                }
-            });
-            ui.add_space(6.0);
-            ui.checkbox(shape_snap, "Shape snap").on_hover_text(
-                "Hold the pen still at the end of a stroke and it snaps to the line, \
-                 triangle, rectangle, polygon, circle or ellipse it was meant to be",
-            );
-            ui.checkbox(smart_guides, "Smart guides").on_hover_text(
-                "While a selection is moved, its edges and middle line up with those of the \
-                 objects around it, and a line shows each. Hold Alt to move it freely",
-            );
-            ui.checkbox(picture_search, "Picture search").on_hover_text(
-                "Find's pictures like this one lists pictures of the same subject — the same \
-                 character, pose or kind of study — besides its copies, and typed words also \
-                 find the pictures that show them. A vision model (SigLIP 2) reads every \
-                 picture once, in the background, on the GPU or else the CPU. The first time \
-                 it downloads about 215 MB, and 570 MB more the first time words are looked for",
-            );
-            if *picture_search {
-                ui.label(egui::RichText::new(picture_status).small().color(theme::TEXT_MUTED));
+fn settings_panel(ui: &mut egui::Ui, s: Settings) {
+    let tab_id = egui::Id::new(SETTINGS_TAB);
+    let mut tab = ui.data(|d| d.get_temp::<SettingsTab>(tab_id)).unwrap_or_default();
+    ui.spacing_mut().item_spacing.y = 8.0;
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("Settings").font(theme::semibold(15.0)));
+    theme::segmented(ui, &mut tab, &[(SettingsTab::General, "General"), (SettingsTab::Pen, "Pen"), (SettingsTab::Editing, "Editing")], true);
+    ui.data_mut(|d| d.insert_temp(tab_id, tab));
+    ui.add_space(2.0);
+    match tab {
+        SettingsTab::General => general_page(ui, s),
+        SettingsTab::Pen => pen_page(ui, s),
+        SettingsTab::Editing => editing_page(ui, s),
+    }
+    ui.add_space(2.0);
+}
+
+/// The background tints on offer, before "custom".
+const BACKGROUNDS: [(&str, [u8; 3]); 5] = [
+    ("Black", [0, 0, 0]),
+    ("Graphite", [36, 36, 38]),
+    ("Grey", [128, 128, 128]),
+    ("Paper", [244, 242, 236]),
+    ("White", [255, 255, 255]),
+];
+
+fn general_page(ui: &mut egui::Ui, s: Settings) {
+    theme::section(ui, "Interface");
+    let c = &s.keys.canvas;
+    let hint = match (c.ui_scale_down, c.ui_scale_up) {
+        (Some(d), Some(u)) => format!("Bars and panels; slides keep their size. {} / {}", d.label(), u.label()),
+        _ => "Bars and panels; slides keep their size".to_string(),
+    };
+    theme::setting_row(ui, "UI size", Some(&hint), |ui| ui_scale_stepper(ui, s.ui_scale, c));
+
+    theme::section(ui, "Background");
+    theme::setting_row(ui, "Opacity", Some("How much the canvas covers what is behind it"), |ui| {
+        theme::value_label(ui, format!("{:.0} %", *s.bg_opacity * 100.0), 40.0);
+        theme::slider(ui, s.bg_opacity, 0.0..=1.0, 0.01, 120.0);
+    });
+    let custom_id = egui::Id::new("osn_settings_custom_bg");
+    let mut custom = ui.data(|d| d.get_temp::<bool>(custom_id)).unwrap_or(false);
+    theme::setting_row(ui, "Colour", None, |ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let preset = BACKGROUNDS.iter().any(|(_, c)| c == s.bg_color);
+        // Custom: the colour itself when it is none of the presets.
+        let shown = if preset { None } else { Some(*s.bg_color) };
+        if bg_swatch(ui, shown, custom || !preset, "Custom colour…").clicked() {
+            custom = !custom;
+        }
+        for (name, colour) in BACKGROUNDS.iter().rev() {
+            if bg_swatch(ui, Some(*colour), !custom && s.bg_color == colour, name).clicked() {
+                *s.bg_color = *colour;
+                custom = false;
             }
-            ui.add_space(6.0);
-            // Pills, not a ComboBox: see the smoothing mode row.
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("New picture beside the selected one")
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
-                let about = "With a picture, GIF or video selected, one you drop, paste or insert \
-                             comes in at its height (or width) and lands right beside it, past any \
-                             already there. With nothing like that selected, or Off, new ones come \
-                             in at their own size where they fall";
-                ui.horizontal(|ui| {
-                    for f in BesideFit::ALL {
-                        ui.selectable_value(beside_fit, f, f.label()).on_hover_text(about);
-                    }
-                });
-                if *beside_fit != BesideFit::Off {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("on the").small().color(theme::TEXT_MUTED));
-                        for s in BesideSide::ALL {
-                            ui.selectable_value(beside_side, s, s.label());
-                        }
-                    });
-                }
-            });
+        }
+    });
+    if custom {
+        // The picker inline (see `settings_btn`).
+        let mut c32 = Color32::from_rgb(s.bg_color[0], s.bg_color[1], s.bg_color[2]);
+        if egui::color_picker::color_picker_color32(ui, &mut c32, egui::color_picker::Alpha::Opaque) {
+            *s.bg_color = [c32.r(), c32.g(), c32.b()];
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(custom_id, custom));
+}
+
+/// A round background swatch: `colour`, or a "+" for a custom one not
+/// picked yet. Ringed when `picked`.
+fn bg_swatch(ui: &mut egui::Ui, colour: Option<[u8; 3]>, picked: bool, name: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
+    let p = ui.painter();
+    let c = rect.center();
+    match colour {
+        Some([r, g, b]) => {
+            p.circle_filled(c, 8.0, Color32::from_rgb(r, g, b));
+            p.circle_stroke(c, 8.0, Stroke::new(1.0, theme::HAIRLINE));
+        }
+        None => {
+            p.circle_stroke(c, 7.5, Stroke::new(1.0, Color32::from_white_alpha(70)));
+            let s = Stroke::new(1.4, theme::TEXT_PRIMARY);
+            p.line_segment([c - egui::vec2(3.5, 0.0), c + egui::vec2(3.5, 0.0)], s);
+            p.line_segment([c - egui::vec2(0.0, 3.5), c + egui::vec2(0.0, 3.5)], s);
+        }
+    }
+    if picked {
+        p.circle_stroke(c, 11.0, Stroke::new(1.5, theme::TEXT_PRIMARY));
+    } else if response.hovered() {
+        p.circle_stroke(c, 11.0, Stroke::new(1.0, Color32::from_white_alpha(90)));
+    }
+    response.on_hover_text(name)
+}
+
+/// The UI size: − / the size / +, the size a button back to 100 %.
+/// Drawn right to left (a `setting_row` control).
+fn ui_scale_stepper(ui: &mut egui::Ui, scale: &mut f32, s_keys: &crate::input::hotkeys_config::CanvasBindings) {
+    let reset_key = s_keys.ui_scale_reset;
+    use crate::config::{ui_scale_step, UI_SCALES};
+    ui.spacing_mut().item_spacing.x = 2.0;
+    let top = *scale >= UI_SCALES[UI_SCALES.len() - 1] - 1e-3;
+    let bottom = *scale <= UI_SCALES[0] + 1e-3;
+    let plus = ui.add_enabled_ui(!top, |ui| theme::icon_button(ui, egui::Image::new(egui::include_image!("../../assets/icons/plus.svg")), 26.0, Look::Plain)).inner;
+    let unbound = "Keys can be bound in hotkeys.toml: canvas.ui_scale_up, _down and _reset";
+    if theme::tip(plus, "Bigger", s_keys.ui_scale_up, s_keys.ui_scale_up.is_none().then_some(unbound)).clicked() {
+        *scale = ui_scale_step(*scale, 1);
+    }
+    let (rect, value) = ui.allocate_exact_size(egui::vec2(52.0, 26.0), egui::Sense::click());
+    theme::paint_button(ui, rect, Look::Plain, &value);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, format!("{:.0} %", *scale * 100.0), egui::FontId::proportional(13.0), theme::TEXT_PRIMARY);
+    if theme::tip(value, "100 %", reset_key, Some("Click to go back to the system's size")).clicked() {
+        *scale = 1.0;
+    }
+    let minus = ui.add_enabled_ui(!bottom, |ui| theme::icon_button(ui, egui::Image::new(egui::include_image!("../../assets/icons/minus.svg")), 26.0, Look::Plain)).inner;
+    if theme::tip(minus, "Smaller", s_keys.ui_scale_down, s_keys.ui_scale_down.is_none().then_some(unbound)).clicked() {
+        *scale = ui_scale_step(*scale, -1);
+    }
+}
+
+fn pen_page(ui: &mut egui::Ui, s: Settings) {
+    let o = s.smoothing_options;
+    theme::section(ui, "Smoothing");
+    theme::setting_row(ui, "Strength", Some("More is cleaner, with a little lag"), |ui| {
+        let levels = [SmoothingLevel::Low, SmoothingLevel::Medium, SmoothingLevel::High];
+        let options: Vec<_> = levels.iter().map(|l| (*l, l.label())).collect();
+        theme::segmented(ui, s.smoothing, &options, false);
+    });
+    theme::setting_block(ui, "Method", Some(o.kind.tooltip()), |ui| {
+        let kinds = [SmoothingType::Adaptive, SmoothingType::None, SmoothingType::Simple, SmoothingType::Weighted, SmoothingType::Stabilizer];
+        let options: Vec<_> = kinds.iter().map(|k| (*k, k.label())).collect();
+        theme::segmented(ui, &mut o.kind, &options, true);
+    });
+    // The method's own knobs; Adaptive is tuned by the strength above,
+    // None and Simple have none.
+    let slider_row = |ui: &mut egui::Ui, title: &str, hint: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, step: f32, fmt: &dyn Fn(f32) -> String| {
+        theme::setting_row(ui, title, Some(hint), |ui| {
+            theme::value_label(ui, fmt(*v), 36.0);
+            theme::slider(ui, v, range, step, 110.0);
+        });
+    };
+    let px = |v: f32| format!("{v:.0}");
+    match o.kind {
+        SmoothingType::Adaptive | SmoothingType::None | SmoothingType::Simple => {}
+        SmoothingType::Weighted => {
+            slider_row(ui, "Distance", "Bigger is smoother and lags more", &mut o.smoothness_distance, 3.0..=80.0, 1.0, &px);
+            slider_row(ui, "Tail", "Tightens the line as the pen lifts", &mut o.tail_aggressiveness, 0.0..=1.0, 0.05, &|v| format!("{v:.2}"));
+            theme::setting_row(ui, "Smooth pressure", None, |ui| theme::switch(ui, &mut o.smooth_pressure));
+        }
+        SmoothingType::Stabilizer => {
+            slider_row(ui, "Sample size", "Bigger pulls the line along like a rope", &mut o.smoothness_distance, 3.0..=80.0, 1.0, &px);
+            theme::setting_row(ui, "Delay distance", Some("Ink waits until the pen is this far ahead"), |ui| theme::switch(ui, &mut o.use_delay_distance));
+            if o.use_delay_distance {
+                slider_row(ui, "Delay", "Points", &mut o.delay_distance, 1.0..=80.0, 1.0, &px);
+            }
+            theme::setting_row(ui, "Finish the curve", Some("The line catches up with the pen when it lifts"), |ui| theme::switch(ui, &mut o.finish_stabilized_curve));
+            theme::setting_row(ui, "Steady pressure and tilt", None, |ui| theme::switch(ui, &mut o.stabilize_sensors));
+        }
+    }
+    theme::setting_row(ui, "Round the corners", Some("Sharp turns are drawn as fans"), |ui| theme::switch(ui, &mut o.fan_corners));
+    if o.fan_corners {
+        slider_row(ui, "Corner step", "Radians a fan blade turns", &mut o.fan_corners_step, 0.05..=0.80, 0.01, &|v| format!("{v:.2}"));
+    }
+
+    theme::section(ui, "Pressure");
+    // Raw pressure → width as `raw.powf(curve)`: 0.5 a lighter touch,
+    // 2.0 a heavier one, 1.0 linear (the default).
+    slider_row(ui, "Curve", "Below 1 a light touch draws thicker, above 1 thinner", s.pressure_curve, 0.5..=2.0, 0.05, &|v| format!("{v:.2}"));
+
+    theme::section(ui, "Shapes");
+    theme::setting_row(ui, "Shape snap", Some("Hold the pen still at the end of a stroke and it becomes the line, rectangle or circle it was meant to be"), |ui| theme::switch(ui, s.shape_snap));
+}
+
+fn editing_page(ui: &mut egui::Ui, s: Settings) {
+    theme::section(ui, "Selection");
+    theme::setting_row(ui, "Smart guides", Some("A selection being moved lines up with the objects round it. Hold Alt to move it freely"), |ui| theme::switch(ui, s.smart_guides));
+
+    theme::section(ui, "New pictures");
+    theme::setting_block(
+        ui,
+        "Beside the selected one",
+        Some("With a picture, GIF or video selected, one dropped, pasted or inserted takes its height or width and lands beside it"),
+        |ui| {
+            let options: Vec<_> = BesideFit::ALL.iter().map(|f| (*f, f.label())).collect();
+            theme::segmented(ui, s.beside_fit, &options, true);
         },
     );
-
-    if response.hovered() {
-        interacted = true;
+    if *s.beside_fit != BesideFit::Off {
+        theme::setting_row(ui, "On the", None, |ui| {
+            let options: Vec<_> = BesideSide::ALL.iter().map(|f| (*f, f.label())).collect();
+            theme::segmented(ui, s.beside_side, &options, false);
+        });
     }
-    interacted
+
+    theme::section(ui, "Picture search");
+    theme::setting_row(
+        ui,
+        "Find by subject",
+        Some("Pictures like this one find the same character, pose or kind of study, and words find what pictures show. A vision model reads each picture once, on this computer: about 215 MB to download, 570 MB more for words"),
+        |ui| theme::switch(ui, s.picture_search),
+    );
+    if *s.picture_search && !s.picture_status.is_empty() {
+        ui.label(egui::RichText::new(s.picture_status).small().color(theme::TEXT_MUTED));
+    }
 }
 
 #[cfg(test)]
@@ -1418,6 +1198,65 @@ mod tests {
             let size = help_panel_size(w, h);
             assert!(size.x < w && size.y < h - 60.0, "{size:?} on {w}x{h}");
         }
+    }
+
+    /// The toolbar as the app shows it, with everything at its default.
+    fn show_default(ctx: &egui::Context, cfg: &mut crate::config::AppConfig, tool: &mut ActiveTool) {
+        let keys = HotkeysConfig::default().parsed();
+        let mut palette = cfg.palette.clone();
+        let (mut pin, mut picking, mut insert, mut select) = (None, false, false, false);
+        let mut filter = MediaFilter::default();
+        let counts = media_filter::Counts::default();
+        show(
+            ctx,
+            tool,
+            &mut cfg.bg_opacity,
+            &mut cfg.bg_color,
+            &mut palette,
+            &mut cfg.smoothing_level,
+            &mut cfg.smoothing,
+            &mut cfg.pressure_curve,
+            &mut cfg.ui_scale,
+            (&mut cfg.shape_snap, &mut cfg.smart_guides),
+            (&mut cfg.beside_fit, &mut cfg.beside_side),
+            (&mut cfg.picture_search, "Reading pictures: 12 of 340"),
+            &mut pin,
+            &mut picking,
+            &mut insert,
+            &mut filter,
+            &counts,
+            &mut select,
+            None,
+            false,
+            &keys,
+        );
+    }
+
+    #[test]
+    #[ignore = "writes PNGs to OSN_SNAP_DIR"]
+    fn snapshot_toolbar() {
+        use crate::ui::snapshot::{shoot, Step};
+        let mut cfg = crate::config::AppConfig::default();
+        let mut tool = ActiveTool::from_config(&cfg);
+        let size = [1500.0, 860.0];
+        let Some(ctx) = shoot("toolbar", size, 1.0, &[Step::Idle], |ctx| show_default(ctx, &mut cfg, &mut tool)) else { return };
+        // The help is the toolbar's last button.
+        let bar = ctx.memory(|m| m.area_rect(egui::Id::new("osn_toolbar"))).expect("toolbar drawn");
+        let y = bar.center().y;
+        let help = egui::pos2(bar.right() - 6.0 - BTN_SIZE * 0.5, y);
+        let first = egui::pos2(bar.left() + 6.0 + BTN_SIZE * 1.5 + 2.0, y);
+        let rest = |p| [Step::Move(p), Step::Move(p), Step::Move(p), Step::Move(p)];
+        for (tab, name) in [(SettingsTab::General, "general"), (SettingsTab::Pen, "pen"), (SettingsTab::Editing, "editing")] {
+            shoot(&format!("settings-{name}"), size, 1.0, &[Step::Idle], |ctx| {
+                ctx.memory_mut(|m| m.open_popup(egui::Id::new(SETTINGS_POPUP)));
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new(SETTINGS_TAB), tab));
+                show_default(ctx, &mut cfg, &mut tool);
+            });
+        }
+        shoot("toolbar-hover", size, 1.0, &rest(first), |ctx| show_default(ctx, &mut cfg, &mut tool));
+        shoot("toolbar-help", size, 1.0, &rest(help), |ctx| show_default(ctx, &mut cfg, &mut tool));
+        cfg.ui_scale = 1.5;
+        shoot("toolbar-150", size, 1.5, &[Step::Idle], |ctx| show_default(ctx, &mut cfg, &mut tool));
     }
 
     #[test]

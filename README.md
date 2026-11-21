@@ -507,6 +507,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Active layer opacity — step | `-` −10 %, `=` +10 % |
 | Layer preview popup (active layer) | `Q` (toggle) |
 | Toggle floating UI | `Tab` |
+| UI bigger / smaller / back to 100 % — toolbar, panels and popups; the slides keep their size on screen (also Settings → General → UI size) | unbound; set `ui_scale_up` / `ui_scale_down` / `ui_scale_reset` (`Ctrl+=` / `Ctrl+-` / `Ctrl+0` are free to bind: egui's own zoom keys are off) |
 | Cancel pending (eyedropper / lasso / text / selection) | `Esc` |
 | Selection: delete / duplicate | `Delete` / `Ctrl+D` |
 | Selection: copy to a new slide | `Ctrl+Shift+D` |

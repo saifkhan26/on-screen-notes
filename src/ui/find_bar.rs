@@ -38,7 +38,6 @@ use crate::canvas::canvas::{Canvas, Layer};
 use crate::canvas::units::{bounds_of, same_tag, tagged_by};
 use crate::canvas::shape::{parse_tags, MediaType, RasterKind, Shape};
 use crate::canvas::TagCount;
-use crate::ui::media_filter::TAG_COLOUR;
 use crate::tools::similar::{self, Kind, Likeness, Origin, Query, Signature};
 use crate::ui::theme;
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
@@ -47,7 +46,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 /// The colour a match is marked in, here and on the canvas.
-pub const FOUND: Color32 = Color32::from_rgb(255, 196, 64);
+pub const FOUND: Color32 = Color32::WHITE;
 
 /// What matched.
 #[derive(Debug, Clone, PartialEq)]
@@ -618,8 +617,8 @@ const PICTURE_THUMB: f32 = 32.0;
 fn kind_colour(k: Kind) -> Color32 {
     match k {
         Kind::Duplicate => FOUND,
-        Kind::Edited => Color32::from_rgb(255, 226, 160),
-        Kind::Alike => theme::TEXT_PRIMARY,
+        Kind::Edited => theme::TEXT_PRIMARY,
+        Kind::Alike => theme::TEXT_MUTED,
     }
 }
 const WIDTH: f32 = 520.0;
@@ -1012,7 +1011,15 @@ impl FindBar {
                     } else {
                         (&mut self.query, "Find labels and tags — or paste or drop a picture")
                     };
-                    let out = egui::TextEdit::singleline(field).hint_text(hint).desired_width(f32::INFINITY).show(ui);
+                    let out = egui::TextEdit::singleline(field)
+                        .hint_text(hint)
+                        .font(FontId::proportional(15.0))
+                        .margin(egui::vec2(10.0, 8.0))
+                        .frame(false)
+                        .desired_width(f32::INFINITY)
+                        .show(ui);
+                    let rule = ui.available_rect_before_wrap();
+                    ui.painter().hline(rule.x_range(), rule.top(), egui::Stroke::new(1.0, theme::HAIRLINE));
                     if std::mem::take(&mut self.focus_pending) {
                         out.response.request_focus();
                         let mut state = out.state.clone();
@@ -1069,7 +1076,7 @@ impl FindBar {
                             None => s,
                         }
                     } else if self.query.trim().is_empty() {
-                        "Type a label's words or a tag — or paste or drop a picture to find ones like it".to_string()
+                        "Words or a #tag — or paste or drop a picture".to_string()
                     } else {
                         let total = hits.len() + self.word_rows().len();
                         let s = if total == 0 {
@@ -1333,7 +1340,7 @@ fn tag_list(ui: &mut egui::Ui, renaming: &mut Option<(String, String)>, focus: &
                     }
                     return;
                 }
-                let label = egui::RichText::new(format!("#{}", t.tag)).color(TAG_COLOUR);
+                let label = egui::RichText::new(format!("#{}", t.tag)).color(theme::TEXT_PRIMARY);
                 if ui.add(egui::Button::new(label).frame(false)).on_hover_text("Find everything with this tag").clicked() {
                     out = Some(TagPick::Find(t.tag.clone()));
                 }

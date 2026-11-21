@@ -491,7 +491,7 @@ impl OnScreenNotesApp {
         // toolbar and panels.
         let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(canvas_rect);
         painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(3.0, egui::Color32::from_black_alpha(140))));
-        painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 176, 32))));
+        painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(1.5, ui::theme::CHROME_LINE)));
 
         let Some(paper) = e.paper else { return };
         // Just above the pad's top-left corner, or inside it when the
@@ -522,7 +522,7 @@ impl OnScreenNotesApp {
                             let on = rgb == [paper[0], paper[1], paper[2]];
                             let p = ui.painter();
                             p.circle_filled(rect.center(), 7.5, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
-                            let ring = if on { egui::Color32::from_rgb(255, 176, 32) } else { egui::Color32::from_white_alpha(70) };
+                            let ring = if on { ui::theme::TEXT_PRIMARY } else { egui::Color32::from_white_alpha(70) };
                             p.circle_stroke(rect.center(), 8.5, egui::Stroke::new(if on { 2.0 } else { 1.0 }, ring));
                             if resp.on_hover_text(name).clicked() {
                                 picked = Some([rgb[0], rgb[1], rgb[2], paper[3]]);
