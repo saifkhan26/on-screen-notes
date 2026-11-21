@@ -38,8 +38,10 @@ pub fn show(
     smoothing: &mut SmoothingLevel,
     smoothing_options: &mut SmoothingOptions,
     pressure_curve: &mut f32,
-    // How big the UI is drawn (`config.ui_scale`), in the settings popup.
+    // How big the UI is drawn (`config.ui_scale`), and its accent
+    // colour (`config.accent`), in the settings popup.
     ui_scale: &mut f32,
+    accent: &mut [u8; 3],
     // Shape snap and smart guides on / off, in the settings popup.
     snaps: (&mut bool, &mut bool),
     // New media beside the selected picture: what it matches and which
@@ -146,6 +148,7 @@ pub fn show(
                         smoothing_options,
                         pressure_curve,
                         ui_scale,
+                        accent,
                         shape_snap: snaps.0,
                         smart_guides: snaps.1,
                         beside_fit: beside.0,
@@ -344,10 +347,10 @@ fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: &media_filter
 /// icon. Shows only; the tool keys pick tools.
 pub(crate) fn active_tool(ui: &mut egui::Ui, tool: &ActiveTool) {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::hover());
-    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), theme::SELECTED_FILL);
+    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), theme::accent());
     let icon = egui::Rect::from_center_size(rect.center(), Vec2::splat((BTN_SIZE * 0.56).round()));
     let img = if tool.kind == ToolKind::Pen { pen_icon(tool.style) } else { tool_icon(tool.kind) };
-    img.tint(theme::SELECTED_INK).fit_to_exact_size(icon.size()).paint_at(ui, icon);
+    img.tint(theme::accent_ink()).fit_to_exact_size(icon.size()).paint_at(ui, icon);
     response.on_hover_text(format!("{} — the tool keys pick another", tool_name(tool.kind, tool.style)));
 }
 
@@ -916,6 +919,7 @@ struct Settings<'a> {
     smoothing_options: &'a mut SmoothingOptions,
     pressure_curve: &'a mut f32,
     ui_scale: &'a mut f32,
+    accent: &'a mut [u8; 3],
     shape_snap: &'a mut bool,
     smart_guides: &'a mut bool,
     beside_fit: &'a mut BesideFit,
@@ -992,34 +996,52 @@ fn general_page(ui: &mut egui::Ui, s: Settings) {
         _ => "Bars and panels; slides keep their size".to_string(),
     };
     theme::setting_row(ui, "UI size", Some(&hint), |ui| ui_scale_stepper(ui, s.ui_scale, c));
+    colour_row(ui, "Accent", Some("The tool in use, switches, picks and the selection"), "osn_settings_custom_accent", &ACCENTS, s.accent);
 
     theme::section(ui, "Background");
     theme::setting_row(ui, "Opacity", Some("How much the canvas covers what is behind it"), |ui| {
         theme::value_label(ui, format!("{:.0} %", *s.bg_opacity * 100.0), 40.0);
         theme::slider(ui, s.bg_opacity, 0.0..=1.0, 0.01, 120.0);
     });
-    let custom_id = egui::Id::new("osn_settings_custom_bg");
+    colour_row(ui, "Colour", None, "osn_settings_custom_bg", &BACKGROUNDS, s.bg_color);
+}
+
+/// The accents on offer, before "custom". The first is the monochrome
+/// default.
+const ACCENTS: [(&str, [u8; 3]); 6] = [
+    ("Mono", theme::MONO),
+    ("Blue", [64, 156, 255]),
+    ("Violet", [150, 122, 255]),
+    ("Pink", [255, 92, 160]),
+    ("Orange", [255, 153, 51]),
+    ("Green", [60, 200, 112]),
+];
+
+/// A settings row of colour swatches — `presets`, then a custom one —
+/// for `colour`. The custom one opens a picker under the row, inline
+/// (see `settings_btn`); `custom_key` keeps whether it is open.
+fn colour_row(ui: &mut egui::Ui, title: &str, hint: Option<&str>, custom_key: &str, presets: &[(&str, [u8; 3])], colour: &mut [u8; 3]) {
+    let custom_id = egui::Id::new(custom_key);
     let mut custom = ui.data(|d| d.get_temp::<bool>(custom_id)).unwrap_or(false);
-    theme::setting_row(ui, "Colour", None, |ui| {
+    theme::setting_row(ui, title, hint, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        let preset = BACKGROUNDS.iter().any(|(_, c)| c == s.bg_color);
+        let preset = presets.iter().any(|(_, c)| c == colour);
         // Custom: the colour itself when it is none of the presets.
-        let shown = if preset { None } else { Some(*s.bg_color) };
+        let shown = if preset { None } else { Some(*colour) };
         if bg_swatch(ui, shown, custom || !preset, "Custom colour…").clicked() {
             custom = !custom;
         }
-        for (name, colour) in BACKGROUNDS.iter().rev() {
-            if bg_swatch(ui, Some(*colour), !custom && s.bg_color == colour, name).clicked() {
-                *s.bg_color = *colour;
+        for (name, c) in presets.iter().rev() {
+            if bg_swatch(ui, Some(*c), !custom && colour == c, name).clicked() {
+                *colour = *c;
                 custom = false;
             }
         }
     });
     if custom {
-        // The picker inline (see `settings_btn`).
-        let mut c32 = Color32::from_rgb(s.bg_color[0], s.bg_color[1], s.bg_color[2]);
+        let mut c32 = Color32::from_rgb(colour[0], colour[1], colour[2]);
         if egui::color_picker::color_picker_color32(ui, &mut c32, egui::color_picker::Alpha::Opaque) {
-            *s.bg_color = [c32.r(), c32.g(), c32.b()];
+            *colour = [c32.r(), c32.g(), c32.b()];
         }
     }
     ui.data_mut(|d| d.insert_temp(custom_id, custom));
@@ -1207,6 +1229,8 @@ mod tests {
 
     /// The toolbar as the app shows it, with everything at its default.
     fn show_default(ctx: &egui::Context, cfg: &mut crate::config::AppConfig, tool: &mut ActiveTool) {
+        // As the app does each frame.
+        crate::ui::theme::set_accent(ctx, cfg.accent);
         let keys = HotkeysConfig::default().parsed();
         let mut palette = cfg.palette.clone();
         let (mut pin, mut picking, mut insert, mut select) = (None, false, false, false);
@@ -1222,6 +1246,7 @@ mod tests {
             &mut cfg.smoothing,
             &mut cfg.pressure_curve,
             &mut cfg.ui_scale,
+            &mut cfg.accent,
             (&mut cfg.shape_snap, &mut cfg.smart_guides),
             (&mut cfg.beside_fit, &mut cfg.beside_side),
             (&mut cfg.picture_search, "Reading pictures: 12 of 340"),
@@ -1264,6 +1289,19 @@ mod tests {
         shoot("toolbar-help", size, 1.0, &rest(help), |ctx| show_default(ctx, &mut cfg, &mut tool));
         cfg.ui_scale = 1.5;
         shoot("toolbar-150", size, 1.5, &[Step::Idle], |ctx| show_default(ctx, &mut cfg, &mut tool));
+        // A colour accent: the tool in use, switches, picks. Run the
+        // snapshots one at a time (`--test-threads=1`): the accent is the
+        // whole app's.
+        cfg.ui_scale = 1.0;
+        cfg.accent = [64, 156, 255];
+        for (tab, name) in [(SettingsTab::General, "accent-general"), (SettingsTab::Editing, "accent-editing")] {
+            shoot(name, size, 1.0, &[Step::Idle], |ctx| {
+                ctx.memory_mut(|m| m.open_popup(egui::Id::new(SETTINGS_POPUP)));
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new(SETTINGS_TAB), tab));
+                show_default(ctx, &mut cfg, &mut tool);
+            });
+        }
+        crate::ui::theme::set_accent(&egui::Context::default(), crate::ui::theme::MONO);
     }
 
     #[test]

@@ -491,7 +491,7 @@ impl OnScreenNotesApp {
         // toolbar and panels.
         let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(canvas_rect);
         painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(3.0, egui::Color32::from_black_alpha(140))));
-        painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(1.5, ui::theme::CHROME_LINE)));
+        painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(1.5, ui::theme::chrome_line())));
 
         let Some(paper) = e.paper else { return };
         // Just above the pad's top-left corner, or inside it when the

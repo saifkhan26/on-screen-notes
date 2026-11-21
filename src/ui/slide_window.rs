@@ -482,7 +482,7 @@ const NUM_W: f32 = 26.0;
 pub(crate) fn slide_row(ui: &mut egui::Ui, manager: &CanvasManager, i: usize, current: bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(PICKER_W, ROW_H), egui::Sense::click());
     let bg = if current {
-        theme::ACCENT
+        theme::on_fill()
     } else if response.hovered() {
         Color32::from_white_alpha(14)
     } else {
@@ -523,7 +523,7 @@ fn slide_picker(ui: &mut egui::Ui, current: usize, manager: &CanvasManager) -> O
     let popup = ui.make_persistent_id("osn_slide_window_picker");
     let open = ui.memory(|m| m.is_popup_open(popup));
     let bg = if open {
-        theme::ACCENT
+        theme::on_fill()
     } else if response.hovered() {
         theme::HOVER
     } else {
@@ -669,7 +669,7 @@ fn view_menu(ui: &mut egui::Ui, parts: &mut crate::config::SlideWindowUi) {
     let eye = egui::Image::new(egui::include_image!("../../assets/icons/eye.svg"));
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if open {
-        theme::ACCENT
+        theme::on_fill()
     } else if response.hovered() {
         theme::HOVER
     } else {
@@ -732,7 +732,7 @@ fn icon_btn(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str, enabled: boo
 fn toggle_btn(ui: &mut egui::Ui, img: egui::Image<'_>, on: bool, tooltip: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if on {
-        theme::ACCENT
+        theme::on_fill()
     } else if response.hovered() {
         theme::HOVER
     } else {
@@ -751,7 +751,7 @@ fn text_btn(ui: &mut egui::Ui, text: &str, tooltip: &str, selected: bool) -> boo
         .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(galley.size().x + 16.0, BTN), egui::Sense::click());
     let bg = if selected {
-        theme::ACCENT
+        theme::on_fill()
     } else if response.hovered() {
         theme::HOVER
     } else {

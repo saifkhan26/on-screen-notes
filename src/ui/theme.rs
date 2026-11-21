@@ -33,16 +33,87 @@ const fn grey(g: u8, a: u8) -> Color32 {
     Color32::from_rgba_premultiplied(c, c, c, a)
 }
 
-/// Toggled-on fill — a quiet translucent white. Used for switches that
-/// are on in a bar (dashed border, text box, hidden pins, a filter in
-/// use) and the active row of a list. The tool in use is
-/// `SELECTED_FILL`, stronger.
-pub const ACCENT: Color32 = white(40);
+// ---------------------------------------------------------------------------
+// The accent
+// ---------------------------------------------------------------------------
+//
+// One colour the user picks (`AppConfig::accent`, Settings → General)
+// marks what is picked: the tool in use, a switch that is on, the chosen
+// option, a slider's fill, the selection on the canvas. The default is
+// `MONO`, the near-white the UI was designed in, which keeps it all
+// black, white and grey.
 
-/// The tool in use: a solid light chip…
-pub const SELECTED_FILL: Color32 = Color32::from_gray(236);
-/// …with its icon or text dark on it.
-pub const SELECTED_INK: Color32 = Color32::from_gray(18);
+/// The default accent: the UI's own near-white.
+pub const MONO: [u8; 3] = [236, 236, 236];
+
+/// The accent in use, packed `0x00RRGGBB` (`set_accent`).
+static ACCENT_RGB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(pack(MONO));
+
+const fn pack([r, g, b]: [u8; 3]) -> u32 {
+    (r as u32) << 16 | (g as u32) << 8 | b as u32
+}
+
+fn accent_rgb() -> [u8; 3] {
+    let v = ACCENT_RGB.load(std::sync::atomic::Ordering::Relaxed);
+    [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
+
+/// A grey accent (`MONO`, or any r = g = b): the UI stays monochrome.
+pub fn is_grey([r, g, b]: [u8; 3]) -> bool {
+    r == g && g == b
+}
+
+/// What reads on top of `rgb`: dark on a light colour, white on a dark one.
+pub fn ink_on([r, g, b]: [u8; 3]) -> Color32 {
+    let luma = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+    if luma > 150.0 { Color32::from_gray(18) } else { Color32::from_gray(250) }
+}
+
+/// The accent: the tool in use, a switch that is on, the picked option.
+pub fn accent() -> Color32 {
+    let [r, g, b] = accent_rgb();
+    Color32::from_rgb(r, g, b)
+}
+
+/// Icon or text on the accent.
+pub fn accent_ink() -> Color32 {
+    ink_on(accent_rgb())
+}
+
+/// A quiet "on" fill — toggled bar buttons (dashed border, text box,
+/// hidden pins, a filter in use) and the active row of a list. The tool
+/// in use is `accent()`, stronger: translucent white with a grey accent,
+/// a see-through tint of it otherwise.
+pub fn on_fill() -> Color32 {
+    let rgb = accent_rgb();
+    if is_grey(rgb) { white(40) } else { accent().linear_multiply(0.32) }
+}
+
+/// Selected text and egui's own selected labels: the text on it stays
+/// white, so this stays see-through.
+fn selection_fill() -> Color32 {
+    let rgb = accent_rgb();
+    if is_grey(rgb) { white(64) } else { accent().linear_multiply(0.5) }
+}
+
+/// Lines drawn on the canvas for the UI — the selection's frame, guides,
+/// pins' outlines — over a dark halo (`CHROME_UNDER`), so they read over a
+/// white page and a dark one alike: near-white with a grey accent, the
+/// accent otherwise.
+pub fn chrome_line() -> Color32 {
+    let rgb = accent_rgb();
+    if is_grey(rgb) { Color32::from_gray(245) } else { accent() }
+}
+
+/// Use `rgb` as the accent from now on. Cheap when it is the one in use
+/// (the app calls it every frame); otherwise egui's own selection colour
+/// follows it.
+pub fn set_accent(ctx: &egui::Context, rgb: [u8; 3]) {
+    if ACCENT_RGB.swap(pack(rgb), std::sync::atomic::Ordering::Relaxed) != pack(rgb) {
+        ctx.style_mut(|s| s.visuals.selection.bg_fill = selection_fill());
+        ctx.request_repaint();
+    }
+}
 
 /// Under the pointer.
 pub const HOVER: Color32 = white(18);
@@ -72,11 +143,7 @@ pub const TEXT_MUTED: Color32 = Color32::from_gray(156);
 /// Least: section titles, disabled hints.
 pub const TEXT_FAINT: Color32 = Color32::from_gray(112);
 
-/// Lines drawn on the canvas for the UI — the selection's frame and
-/// handles, pins' outlines — light over a dark halo (`CHROME_UNDER`), so
-/// they read over a white page and a dark one alike.
-pub const CHROME_LINE: Color32 = Color32::from_gray(245);
-/// The halo under `CHROME_LINE`.
+/// The halo under `chrome_line()`.
 pub const CHROME_UNDER: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 150);
 
 /// A card's corner radius.
@@ -184,7 +251,7 @@ pub fn apply(ctx: &egui::Context) {
 
     // Selection / active states: greys only — no hue. Text stays white
     // on the grey, so selected text in a field stays readable.
-    v.selection.bg_fill = white(64);
+    v.selection.bg_fill = selection_fill();
     v.selection.stroke = Stroke::new(1.0, TEXT_PRIMARY);
     v.hyperlink_color = TEXT_PRIMARY;
 
@@ -331,9 +398,9 @@ impl Look {
 /// A bar button's background for `look`, hovered or pressed.
 pub fn button_fill(look: Look, response: &egui::Response) -> Color32 {
     match look {
-        Look::Current => SELECTED_FILL,
-        Look::On if response.is_pointer_button_down_on() => white(52),
-        Look::On => ACCENT,
+        Look::Current => accent(),
+        Look::On if response.is_pointer_button_down_on() => on_fill().linear_multiply(1.3),
+        Look::On => on_fill(),
         Look::Plain if response.is_pointer_button_down_on() => PRESSED,
         Look::Plain if response.hovered() => HOVER,
         Look::Plain => Color32::TRANSPARENT,
@@ -342,7 +409,7 @@ pub fn button_fill(look: Look, response: &egui::Response) -> Color32 {
 
 /// The ink an icon on a `look` button takes.
 pub fn icon_ink(look: Look) -> Color32 {
-    if look == Look::Current { SELECTED_INK } else { TEXT_PRIMARY }
+    if look == Look::Current { accent_ink() } else { TEXT_PRIMARY }
 }
 
 /// Paint a bar button's background over `rect`.
@@ -370,8 +437,8 @@ pub fn divider(ui: &mut egui::Ui, height: f32) {
 // Controls
 // ---------------------------------------------------------------------------
 
-/// An on / off switch: a pill whose knob slides across. On is a light
-/// track with a dark knob, off a grey track with a light one.
+/// An on / off switch: a pill whose knob slides across. On is an accent
+/// track with a knob that reads on it, off a grey track with a light one.
 pub fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let size = egui::vec2(32.0, 18.0);
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -382,8 +449,8 @@ pub fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, ""));
     let t = ui.ctx().animate_bool_with_time(response.id, *on, 0.12);
     let off_track = if response.hovered() { white(56) } else { white(40) };
-    let track = lerp_colour(off_track, SELECTED_FILL, t);
-    let knob = lerp_colour(Color32::from_gray(230), SELECTED_INK, t);
+    let track = lerp_colour(off_track, accent(), t);
+    let knob = lerp_colour(Color32::from_gray(230), accent_ink(), t);
     let r = rect.height() * 0.5;
     ui.painter().rect_filled(rect, Rounding::same(r), track);
     let x = egui::lerp((rect.left() + r)..=(rect.right() - r), t);
@@ -421,7 +488,8 @@ pub fn slider(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusiv
     let x = egui::lerp(rail.left()..=rail.right(), f);
     let p = ui.painter();
     p.rect_filled(rail, Rounding::same(1.5), white(40));
-    p.rect_filled(egui::Rect::from_min_max(rail.min, egui::pos2(x, rail.max.y)), Rounding::same(1.5), Color32::from_gray(200));
+    let fill = if is_grey(accent_rgb()) { Color32::from_gray(200) } else { accent() };
+    p.rect_filled(egui::Rect::from_min_max(rail.min, egui::pos2(x, rail.max.y)), Rounding::same(1.5), fill);
     let hot = response.hovered() || response.dragged();
     p.circle_filled(egui::pos2(x, rail.center().y), if hot { knob_r + 1.0 } else { knob_r }, Color32::from_gray(245));
     response
@@ -449,14 +517,14 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options:
         let response = ui.interact(seg, track.id.with(i), egui::Sense::click());
         let picked = *value == *opt;
         let fill = if picked {
-            SELECTED_FILL
+            accent()
         } else if response.hovered() {
             HOVER
         } else {
             Color32::TRANSPARENT
         };
         ui.painter().rect_filled(seg, Rounding::same(CONTROL_ROUNDING), fill);
-        let ink = if picked { SELECTED_INK } else if response.hovered() { TEXT_PRIMARY } else { TEXT_MUTED };
+        let ink = if picked { accent_ink() } else if response.hovered() { TEXT_PRIMARY } else { TEXT_MUTED };
         ui.painter().galley_with_override_text_color(seg.center() - galley.size() * 0.5, galley, ink);
         if response.clicked() && !picked {
             *value = *opt;
@@ -680,6 +748,20 @@ mod tests {
             assert!(seen, "{key:?} reached the app");
             assert_eq!(ctx.zoom_factor(), 1.0, "{key:?} left the UI size alone");
         }
+    }
+
+    /// Icons and text on the accent stay readable: dark on a light one,
+    /// white on a dark one. A grey accent keeps the UI monochrome.
+    #[test]
+    fn ink_reads_on_any_accent() {
+        let dark = Color32::from_gray(18);
+        let light = Color32::from_gray(250);
+        assert_eq!(ink_on(MONO), dark);
+        assert_eq!(ink_on([255, 220, 60]), dark, "yellow");
+        assert_eq!(ink_on([64, 156, 255]), light, "blue");
+        assert_eq!(ink_on([150, 122, 255]), light, "violet");
+        assert_eq!(ink_on([20, 20, 20]), light);
+        assert!(is_grey(MONO) && is_grey([90, 90, 90]) && !is_grey([64, 156, 255]));
     }
 
     /// A disabled UI (the layer panel on a locked slide, the UI size's

@@ -609,6 +609,7 @@ impl eframe::App for OnScreenNotesApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.hold_to_refresh_rate(ctx);
         self.apply_ui_scale(ctx);
+        ui::theme::set_accent(ctx, self.config.accent);
         // Frame timing for `OSN_PERF_LOG`; does nothing when it is unset.
         let _perf = crate::perf::frame(|| {
             let c = self.canvases.active();

@@ -1185,7 +1185,7 @@ impl FindBar {
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::click());
                         let lit = k == self.cursor;
                         if lit || resp.hovered() {
-                            let fill = if lit { theme::ACCENT } else { Color32::from_white_alpha(16) };
+                            let fill = if lit { theme::on_fill() } else { Color32::from_white_alpha(16) };
                             ui.painter().rect_filled(rect, egui::Rounding::same(5.0), fill);
                         }
                         let y = rect.center().y;
@@ -1480,7 +1480,7 @@ fn picture_header(ui: &mut egui::Ui, p: &mut PictureQuery) -> bool {
 fn picture_row(ui: &mut egui::Ui, h: &PictureHit, lit: bool, texture: Option<&TextureHandle>, name: &impl Fn(usize) -> String, copy: Option<&str>) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), PICTURE_ROW), egui::Sense::click());
     if lit || resp.hovered() {
-        let fill = if lit { theme::ACCENT } else { Color32::from_white_alpha(16) };
+        let fill = if lit { theme::on_fill() } else { Color32::from_white_alpha(16) };
         ui.painter().rect_filled(rect, egui::Rounding::same(5.0), fill);
     }
     let pad = (PICTURE_ROW - PICTURE_THUMB) * 0.5;

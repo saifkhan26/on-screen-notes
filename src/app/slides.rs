@@ -92,8 +92,8 @@ impl OnScreenNotesApp {
                 ui.label(egui::RichText::new(after).small().color(ui::theme::TEXT_MUTED));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let label = egui::RichText::new(if only { "Empty slide" } else { "Delete slide" }).color(ui::theme::SELECTED_INK);
-                    if ui.add(egui::Button::new(label).fill(ui::theme::SELECTED_FILL)).clicked() {
+                    let label = egui::RichText::new(if only { "Empty slide" } else { "Delete slide" }).color(ui::theme::accent_ink());
+                    if ui.add(egui::Button::new(label).fill(ui::theme::accent())).clicked() {
                         decision = Some(true);
                     }
                     if ui.button("Keep it").clicked() {

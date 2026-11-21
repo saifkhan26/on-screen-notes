@@ -844,7 +844,7 @@ pub fn show(
 /// screen point `q` shows at `origin + q`.
 pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos2, pinned: &[crate::canvas::pins::Pinned], marks: PinMarks) {
     let at = |q: [f32; 2]| origin + egui::vec2(q[0], q[1]);
-    let line = crate::ui::theme::CHROME_LINE;
+    let line = crate::ui::theme::chrome_line();
     let under = crate::ui::theme::CHROME_UNDER;
     let ink = egui::Color32::from_gray(30);
     for p in pinned {
@@ -899,14 +899,13 @@ pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos
 /// grab at any zoom. The canvas sits on arbitrary desktop content, so
 /// every line is a light stroke over a dark one: it reads on both bright
 /// and dark backgrounds.
-/// Smart guides: dashed, so they read apart from the selection's frame.
-const GUIDE: egui::Color32 = crate::ui::theme::CHROME_LINE;
-
 pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f32, chrome: &crate::tools::select_tool::Chrome) {
     let to_screen = |p: [f32; 2]| egui::pos2(origin.x + p[0] * zoom, origin.y + p[1] * zoom);
-    let line = crate::ui::theme::CHROME_LINE;
+    let line = crate::ui::theme::chrome_line();
     let under = crate::ui::theme::CHROME_UNDER;
     let knob = egui::Color32::from_gray(30);
+    // Smart guides: dashed, so they read apart from the selection's frame.
+    let guide = line;
 
     if let Some(m) = chrome.marquee {
         let r = egui::Rect::from_two_pos(to_screen([m[0], m[1]]), to_screen([m[2], m[3]]));
@@ -919,10 +918,10 @@ pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f3
     for g in &chrome.guides {
         let seg = [to_screen(g[0]), to_screen(g[1])];
         painter.line_segment(seg, egui::Stroke::new(2.5, egui::Color32::from_black_alpha(110)));
-        painter.extend(egui::Shape::dashed_line(&seg, egui::Stroke::new(1.0, GUIDE), 5.0, 3.0));
+        painter.extend(egui::Shape::dashed_line(&seg, egui::Stroke::new(1.0, guide), 5.0, 3.0));
         for p in g {
             painter.circle_filled(to_screen(*p), 3.0, under);
-            painter.circle_filled(to_screen(*p), 2.0, GUIDE);
+            painter.circle_filled(to_screen(*p), 2.0, guide);
         }
     }
     // Each selected object, when there are two or more: a thin line round

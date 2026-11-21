@@ -198,8 +198,8 @@ fn drag_rows(ui: &mut egui::Ui, state: &mut SlidePanel, rows: &[egui::Rect]) -> 
             g => (rows[g - 1].bottom() + rows[g].top()) * 0.5,
         };
         let x = rows[0].x_range();
-        ui.painter().line_segment([egui::pos2(x.min + 4.0, y), egui::pos2(x.max - 4.0, y)], egui::Stroke::new(2.0, theme::ACCENT));
-        ui.painter().circle_filled(egui::pos2(x.min + 4.0, y), 3.0, theme::ACCENT);
+        ui.painter().line_segment([egui::pos2(x.min + 4.0, y), egui::pos2(x.max - 4.0, y)], egui::Stroke::new(2.0, theme::on_fill()));
+        ui.painter().circle_filled(egui::pos2(x.min + 4.0, y), 3.0, theme::on_fill());
     }
     let clip = ui.clip_rect();
     let step = if pointer.y < clip.top() + 18.0 { 6.0 } else if pointer.y > clip.bottom() - 18.0 { -6.0 } else { 0.0 };
@@ -231,7 +231,7 @@ fn slide_row(
     let bg = if state.dragging == Some(i) {
         Color32::from_white_alpha(34)
     } else if is_active {
-        theme::ACCENT
+        theme::on_fill()
     } else if response.hovered() {
         Color32::from_white_alpha(14)
     } else {
@@ -374,7 +374,7 @@ fn icon_btn(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str, enabled: boo
 fn icon_btn_response(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str, enabled: bool, selected: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON + 4.0), egui::Sense::click());
     if selected {
-        ui.painter().rect_filled(rect, Rounding::same(5.0), theme::ACCENT);
+        ui.painter().rect_filled(rect, Rounding::same(5.0), theme::on_fill());
     } else if enabled && response.hovered() {
         ui.painter().rect_filled(rect, Rounding::same(5.0), theme::HOVER);
     }

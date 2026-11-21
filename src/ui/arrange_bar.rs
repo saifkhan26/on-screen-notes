@@ -528,7 +528,7 @@ fn move_btn(ui: &mut egui::Ui, slides: &CanvasManager, key: Option<Binding>, ope
     let open = ui.memory(|m| m.is_popup_open(popup));
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if open {
-        theme::ACCENT
+        theme::on_fill()
     } else if others && response.hovered() {
         theme::HOVER
     } else {
@@ -588,7 +588,7 @@ fn pack_mode_menu(ui: &mut egui::Ui, mode: &mut PackMode) {
     let open = ui.memory(|m| m.is_popup_open(popup));
     let (rect, response) = ui.allocate_exact_size(Vec2::new(14.0, BTN), egui::Sense::click());
     let bg = if open {
-        theme::ACCENT
+        theme::on_fill()
     } else if response.hovered() {
         theme::HOVER
     } else {
@@ -694,7 +694,7 @@ fn divider(ui: &mut egui::Ui) {
 fn toggle_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, on: bool, tooltip: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if on {
-        theme::ACCENT
+        theme::on_fill()
     } else if resp.hovered() {
         theme::HOVER
     } else {

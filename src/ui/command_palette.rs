@@ -418,7 +418,7 @@ impl Palette {
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::click());
                         let lit = k == self.cursor || resp.hovered();
                         if lit {
-                            ui.painter().rect_filled(rect, egui::Rounding::same(theme::CONTROL_ROUNDING), if k == self.cursor { theme::ACCENT } else { theme::HOVER });
+                            ui.painter().rect_filled(rect, egui::Rounding::same(theme::CONTROL_ROUNDING), if k == self.cursor { theme::on_fill() } else { theme::HOVER });
                         }
                         let y = rect.center().y;
                         ui.painter().text(egui::pos2(rect.left() + 8.0, y), egui::Align2::LEFT_CENTER, &e.label, egui::FontId::proportional(13.5), theme::TEXT_PRIMARY);

@@ -102,7 +102,7 @@ fn layer_row(
 
     let painter = ui.painter();
     let bg = if active {
-        theme::ACCENT
+        theme::on_fill()
     } else if response.hovered() {
         Color32::from_white_alpha(14)
     } else {

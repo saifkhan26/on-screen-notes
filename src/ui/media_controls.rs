@@ -397,7 +397,7 @@ enum Icon {
 fn icon_btn(ui: &mut egui::Ui, icon: Icon, active: bool, tooltip: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if active {
-        theme::ACCENT
+        theme::on_fill()
     } else if resp.hovered() {
         theme::HOVER
     } else {

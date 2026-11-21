@@ -223,7 +223,15 @@ pub struct AppConfig {
     /// `UI_SCALES`; picked in the settings or with `canvas.ui_scale_*`.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+
+    /// The UI's accent: what marks the tool in use, a switch that is on,
+    /// the picked option, the selection on the canvas (`ui::theme`). Its
+    /// near-white default keeps the UI black, white and grey.
+    #[serde(default = "default_accent")]
+    pub accent: [u8; 3],
 }
+
+fn default_accent() -> [u8; 3] { crate::ui::theme::MONO }
 
 fn default_ui_scale() -> f32 { 1.0 }
 
@@ -266,6 +274,15 @@ mod ui_scale_tests {
         assert_eq!(ui_scale_step(1.05, -1), 1.0);
         assert_eq!(clamp_ui_scale(9.0), 2.0);
         assert_eq!(clamp_ui_scale(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn a_config_without_an_accent_loads_monochrome() {
+        let cfg = AppConfig { accent: [64, 156, 255], ..AppConfig::default() };
+        let text = ron::to_string(&cfg).unwrap();
+        assert!(text.contains(",accent:(64,156,255)"), "{text}");
+        let old: AppConfig = ron::from_str(&text.replace(",accent:(64,156,255)", "")).unwrap();
+        assert_eq!(old.accent, crate::ui::theme::MONO);
     }
 
     #[test]
@@ -345,6 +362,7 @@ impl Default for AppConfig {
             shape_snap: true,
             smart_guides: true,
             ui_scale: 1.0,
+            accent: default_accent(),
             dim_unselected: false,
             slide_window_ui: SlideWindowUi::default(),
             picture_search: false,
