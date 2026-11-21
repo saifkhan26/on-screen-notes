@@ -2,7 +2,8 @@
 //! pasted or inserted while one is selected comes in at that one's
 //! height (or width) and lands right next to it, instead of at its own
 //! size wherever it fell — so a row of references grows one even piece
-//! at a time. What it matches and which side it goes are settings
+//! at a time. Or it stacks: the same height (or width), centred on top
+//! of it. What it matches and where it goes are settings
 //! (`AppConfig::beside_fit`, `beside_side`), saved with the config.
 //!
 //! Pure geometry: `place` says how to scale and move the new objects;
@@ -24,12 +25,14 @@ pub enum BesideFit {
     SameWidth,
 }
 
-/// Which side of the selected object a new one lands on.
+/// Which side of the selected object a new one lands on — or on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum BesideSide {
     Left,
     #[default]
     Right,
+    /// On top of it, centred: the same height (or width), neither side.
+    Stack,
 }
 
 impl BesideFit {
@@ -45,23 +48,27 @@ impl BesideFit {
 }
 
 impl BesideSide {
-    pub const ALL: [BesideSide; 2] = [BesideSide::Left, BesideSide::Right];
+    /// In the order the settings show them: left, on it, right.
+    pub const ALL: [BesideSide; 3] = [BesideSide::Left, BesideSide::Stack, BesideSide::Right];
 
     pub fn label(self) -> &'static str {
         match self {
             BesideSide::Left => "Left",
             BesideSide::Right => "Right",
+            BesideSide::Stack => "Stack",
         }
     }
 }
 
 /// Of the selected media boxes, the one new objects go beside: the
-/// furthest out on `side`.
+/// furthest out on `side`. A stack goes on the last one, which the app
+/// makes the topmost (`selected` in paint order).
 pub fn anchor(selected: impl Iterator<Item = Bounds>, side: BesideSide) -> Option<Bounds> {
     selected.reduce(|a, b| {
         let further = match side {
             BesideSide::Right => b[2] > a[2],
             BesideSide::Left => b[0] < a[0],
+            BesideSide::Stack => true,
         };
         if further { b } else { a }
     })
@@ -72,7 +79,8 @@ pub fn anchor(selected: impl Iterator<Item = Bounds>, side: BesideSide) -> Optio
 /// `incoming` the way `fit` says to match `anchor`, and sets them on
 /// `side` of it, tops level. Where that spot is taken by one of
 /// `obstacles` (the layer's other media), they slide further out until
-/// clear. `px` is one screen pixel in canvas units: boxes only a hair
+/// clear. A stack is centred on `anchor` instead, over whatever is
+/// there: lying on it is the point. `px` is one screen pixel in canvas units: boxes only a hair
 /// into each other are not in each other's way (see `in_way`). `None`
 /// when `fit` is off or either box has no size.
 pub fn place(incoming: Bounds, anchor: Bounds, fit: BesideFit, side: BesideSide, obstacles: &[Bounds], px: f32) -> Option<(f32, [f32; 2])> {
@@ -87,10 +95,14 @@ pub fn place(incoming: Bounds, anchor: Bounds, fit: BesideFit, side: BesideSide,
         return None;
     }
     let (w, h) = (len(incoming, 0) * s, len(incoming, 1) * s);
+    if side == BesideSide::Stack {
+        let (cx, cy) = ((anchor[0] + anchor[2]) * 0.5, (anchor[1] + anchor[3]) * 0.5);
+        return Some((s, [cx - w * 0.5 - s * incoming[0], cy - h * 0.5 - s * incoming[1]]));
+    }
     let y = anchor[1];
     let mut x = match side {
         BesideSide::Right => anchor[2],
-        BesideSide::Left => anchor[0] - w,
+        BesideSide::Left | BesideSide::Stack => anchor[0] - w,
     };
     // Each pass jumps past every box in the way, never back, so a box
     // passed once is never met again.
@@ -99,7 +111,7 @@ pub fn place(incoming: Bounds, anchor: Bounds, fit: BesideFit, side: BesideSide,
         let hit = obstacles.iter().filter(|o| in_way(**o, at, 0, px) && in_way(**o, at, 1, px));
         let next = match side {
             BesideSide::Right => hit.map(|o| o[2]).reduce(f32::max),
-            BesideSide::Left => hit.map(|o| o[0] - w).reduce(f32::min),
+            BesideSide::Left | BesideSide::Stack => hit.map(|o| o[0] - w).reduce(f32::min),
         };
         match next {
             Some(n) => x = n,
@@ -156,6 +168,33 @@ mod tests {
         // A row above or below, not in the way, is passed by.
         let p = place(BIG, PIC, BesideFit::SameHeight, BesideSide::Right, &[PIC, [300.0, 200.0, 600.0, 400.0]], 1.0).unwrap();
         assert_near(apply(p, BIG), [300.0, 50.0, 600.0, 200.0]);
+    }
+
+    #[test]
+    fn a_stack_lies_centred_on_the_picture_at_its_height_or_width() {
+        // Same height: as tall as it, centred across it.
+        let p = place(BIG, PIC, BesideFit::SameHeight, BesideSide::Stack, &[PIC], 1.0).unwrap();
+        assert_near(apply(p, BIG), [50.0, 50.0, 350.0, 200.0]);
+        // Same width: as wide as it, centred down it.
+        let p = place(BIG, PIC, BesideFit::SameWidth, BesideSide::Stack, &[PIC], 1.0).unwrap();
+        assert_near(apply(p, BIG), [100.0, 75.0, 300.0, 175.0]);
+        // Whatever else is there does not push it off.
+        let p = place(BIG, PIC, BesideFit::SameHeight, BesideSide::Stack, &[PIC, [0.0, 0.0, 400.0, 300.0]], 1.0).unwrap();
+        assert_near(apply(p, BIG), [50.0, 50.0, 350.0, 200.0]);
+        assert_eq!(place(BIG, PIC, BesideFit::Off, BesideSide::Stack, &[], 1.0), None);
+    }
+
+    #[test]
+    fn a_stack_goes_on_the_last_one() {
+        let boxes = [[0.0, 0.0, 10.0, 10.0], [50.0, 0.0, 60.0, 10.0], [-20.0, 30.0, 5.0, 40.0]];
+        assert_eq!(anchor(boxes.into_iter(), BesideSide::Stack), Some(boxes[2]));
+    }
+
+    #[test]
+    fn an_old_config_side_still_reads() {
+        for (text, side) in [("Left", BesideSide::Left), ("Right", BesideSide::Right), ("Stack", BesideSide::Stack)] {
+            assert_eq!(ron::from_str::<BesideSide>(text).unwrap(), side);
+        }
     }
 
     #[test]

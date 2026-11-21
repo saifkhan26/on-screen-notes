@@ -1137,14 +1137,19 @@ fn editing_page(ui: &mut egui::Ui, s: Settings) {
     theme::setting_block(
         ui,
         "Beside the selected one",
-        Some("With a picture, GIF or video selected, one dropped, pasted or inserted takes its height or width and lands beside it"),
+        Some("With a picture, GIF or video selected, one dropped, pasted or inserted takes its height or width and lands beside it — or, stacked, on top of it"),
         |ui| {
             let options: Vec<_> = BesideFit::ALL.iter().map(|f| (*f, f.label())).collect();
             theme::segmented(ui, s.beside_fit, &options, true);
         },
     );
     if *s.beside_fit != BesideFit::Off {
-        theme::setting_row(ui, "On the", None, |ui| {
+        let hint = match *s.beside_side {
+            BesideSide::Stack => "Centred on top of it",
+            BesideSide::Left => "Left of it, past any already there",
+            BesideSide::Right => "Right of it, past any already there",
+        };
+        theme::setting_row(ui, "Where", Some(hint), |ui| {
             let options: Vec<_> = BesideSide::ALL.iter().map(|f| (*f, f.label())).collect();
             theme::segmented(ui, s.beside_side, &options, false);
         });
@@ -1246,6 +1251,8 @@ mod tests {
         let help = egui::pos2(bar.right() - 6.0 - BTN_SIZE * 0.5, y);
         let first = egui::pos2(bar.left() + 6.0 + BTN_SIZE * 1.5 + 2.0, y);
         let rest = |p| [Step::Move(p), Step::Move(p), Step::Move(p), Step::Move(p)];
+        // A stack picked, to see the three-way picker.
+        cfg.beside_side = BesideSide::Stack;
         for (tab, name) in [(SettingsTab::General, "general"), (SettingsTab::Pen, "pen"), (SettingsTab::Editing, "editing")] {
             shoot(&format!("settings-{name}"), size, 1.0, &[Step::Idle], |ctx| {
                 ctx.memory_mut(|m| m.open_popup(egui::Id::new(SETTINGS_POPUP)));

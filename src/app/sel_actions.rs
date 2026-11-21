@@ -137,7 +137,10 @@ impl OnScreenNotesApp {
         let layer = c.layers.get(c.active_layer)?;
         let media = |i: usize| layer.shapes.get(i).filter(|s| s.media_type().is_some()).map(crate::canvas::canvas::shape_bounds);
         let side = self.config.beside_side;
-        let anchor = beside::anchor(self.ws.tool.select.sel.shapes.iter().filter_map(|&i| media(i)), side)?;
+        // In paint order, so a stack goes on the topmost selected one.
+        let mut picked = self.ws.tool.select.sel.shapes.clone();
+        picked.sort_unstable();
+        let anchor = beside::anchor(picked.into_iter().filter_map(media), side)?;
         let others: Vec<[f32; 4]> = (0..layer.shapes.len()).filter_map(media).collect();
         beside::place(incoming, anchor, self.config.beside_fit, side, &others, 1.0 / c.zoom.max(1e-3))
     }
