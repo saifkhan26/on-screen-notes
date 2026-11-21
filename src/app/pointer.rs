@@ -43,7 +43,8 @@ impl OnScreenNotesApp {
                         // A tap on the toolbar, or on another app's
                         // window over ours, is not a pan.
                         let elsewhere = {
-                            let w = crate::platform::top_level_window_at(client_origin[0] + s.pos[0] as i32, client_origin[1] + s.pos[1] as i32);
+                            let [sx, sy] = pen_screen(client_origin, s.pos, ctx.pixels_per_point());
+                            let w = crate::platform::top_level_window_at(sx, sy);
                             w != 0 && w != self.ws.hwnd
                         };
                         if over_ui(here) || elsewhere {
@@ -273,8 +274,7 @@ impl OnScreenNotesApp {
                         // drawing/clicking *there*, so swallow the
                         // whole gesture (Move + Up too, via
                         // `pen_blocked`) and don't reclaim.
-                        let sx = client_origin[0] + s.pos[0] as i32;
-                        let sy = client_origin[1] + s.pos[1] as i32;
+                        let [sx, sy] = pen_screen(client_origin, s.pos, ctx.pixels_per_point());
                         let win_under = crate::platform::top_level_window_at(sx, sy);
                         if win_under != 0 && win_under != self.ws.hwnd {
                             self.ws.pen_blocked = true;
@@ -294,8 +294,7 @@ impl OnScreenNotesApp {
                         // the gesture out of dispatch.
                         if (shift_held && !select_active) || self.ws.tool.eyedropper_pending {
                             self.ws.pen_picking = true;
-                            let sx = client_origin[0] + s.pos[0] as i32;
-                            let sy = client_origin[1] + s.pos[1] as i32;
+                            let [sx, sy] = pen_screen(client_origin, s.pos, ctx.pixels_per_point());
                             if let Some(c) = crate::input::picker::pick_screen_color(sx, sy) {
                                 self.take_picked_color(c);
                             }
@@ -335,8 +334,9 @@ impl OnScreenNotesApp {
                 }
                 // A selection let go over the slide window moves there.
                 if matches!(ev, PenEvent::Up(_)) && !self.ws.pen_using_eraser {
-                    let screen = [client_origin[0] as f32 + s.pos[0], client_origin[1] as f32 + s.pos[1]];
-                    if self.drop_on_slide_window(screen, ctx.pixels_per_point()) {
+                    let ppp = ctx.pixels_per_point();
+                    let screen = [client_origin[0] as f32 + s.pos[0] * ppp, client_origin[1] as f32 + s.pos[1] * ppp];
+                    if self.drop_on_slide_window(screen, ppp) {
                         continue;
                     }
                 }
@@ -568,4 +568,10 @@ impl OnScreenNotesApp {
             self.queue_lasso_capture(poly, ctx.pixels_per_point());
         }
     }
+}
+
+/// The screen pixel under a pen sample at window-client points `pos`, the
+/// client area's top-left being `client_origin` (screen pixels).
+fn pen_screen(client_origin: [i32; 2], pos: [f32; 2], ppp: f32) -> [i32; 2] {
+    [client_origin[0] + (pos[0] * ppp).round() as i32, client_origin[1] + (pos[1] * ppp).round() as i32]
 }

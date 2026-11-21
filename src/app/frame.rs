@@ -144,16 +144,23 @@ impl OnScreenNotesApp {
         //    * `client_origin` = screen-pixel coordinate of our window's
         //      client area's top-left. The Wintab backend reports packets
         //      in screen pixels; subtracting `client_origin` converts to
-        //      window-client coordinates.
-        //    * After polling, we transform each sample from window-client
-        //      to canvas-local (subtract canvas rect, pan, divide zoom),
-        //      then dispatch to tools.
-        let client_origin = ctx.input(|i| {
-            i.viewport()
-                .inner_rect
-                .map(|r| [r.min.x as i32, r.min.y as i32])
-                .unwrap_or([0, 0])
-        });
+        //      window-client pixels. They are smoothed, and the slide
+        //      windows claim theirs, in pixels.
+        //    * Then each sample goes to window-client *points* (÷ ppp), the
+        //      space egui, `canvas_rect` and `canvas.pan` are in. A point is
+        //      a pixel only at 100 % — the system's scaling and the UI size
+        //      (`config.ui_scale`, egui's zoom) both change that.
+        let ppp = ctx.pixels_per_point().max(1e-3);
+        let client_origin = crate::platform::client_rect(self.osn_hwnd)
+            .map(|(l, t, _, _)| [l, t])
+            .unwrap_or_else(|| {
+                ctx.input(|i| {
+                    i.viewport()
+                        .inner_rect
+                        .map(|r| [(r.min.x * ppp).round() as i32, (r.min.y * ppp).round() as i32])
+                        .unwrap_or([0, 0])
+                })
+            });
         let mut raw_pen_events = self.pen.poll(client_origin);
         // The packets still show the pen touching, none has come for a
         // while, and the mouse moves or clicks here: the pen's lift was
@@ -235,6 +242,7 @@ impl OnScreenNotesApp {
         if let Some(win) = self.pins_window.as_mut() {
             win.claim_pen(&mut pen_events, client_origin);
         }
+        let pen_events = pen_events.into_iter().map(|ev| pen_in_points(ev, ppp)).collect();
         (pen_events, client_origin)
     }
 
@@ -717,6 +725,40 @@ impl OnScreenNotesApp {
                         );
                     });
                 });
+        }
+    }
+}
+
+/// A pen event at window-client pixels `pos`, moved to window-client
+/// points: what the overlay's frame works in.
+fn pen_in_points(ev: crate::input::pen::PenEvent, ppp: f32) -> crate::input::pen::PenEvent {
+    use crate::input::pen::PenEvent;
+    let to = |s: crate::canvas::stroke::PenSample| crate::canvas::stroke::PenSample { pos: [s.pos[0] / ppp, s.pos[1] / ppp], ..s };
+    match ev {
+        PenEvent::Down(s) => PenEvent::Down(to(s)),
+        PenEvent::Move(s) => PenEvent::Move(to(s)),
+        PenEvent::Up(s) => PenEvent::Up(to(s)),
+    }
+}
+
+#[cfg(test)]
+mod pen_point_tests {
+    use super::*;
+    use crate::canvas::stroke::PenSample;
+    use crate::input::pen::PenEvent;
+
+    #[test]
+    fn pen_pixels_become_points_at_any_ui_size() {
+        let s = PenSample { pos: [300.0, 150.0], pressure: 0.5, tilt: [0.0, 0.0] };
+        // 100 %: a point is a pixel, nothing moves.
+        assert!(matches!(pen_in_points(PenEvent::Down(s), 1.0), PenEvent::Down(p) if p.pos == [300.0, 150.0]));
+        // 150 % (system scaling or UI size): the same pixel is fewer points.
+        match pen_in_points(PenEvent::Move(s), 1.5) {
+            PenEvent::Move(p) => {
+                assert_eq!(p.pos, [200.0, 100.0]);
+                assert_eq!(p.pressure, 0.5);
+            }
+            other => panic!("{other:?}"),
         }
     }
 }
