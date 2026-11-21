@@ -526,7 +526,7 @@ fn decode_source(source: &Source, side: u32) -> (Option<ColorImage>, u32) {
         },
         Source::Inline(png) => match image::load_from_memory(png) {
             Ok(img) => {
-                let img = img.to_rgba8();
+                let img = premultiplied(img);
                 let full = img.width().max(img.height());
                 (Some(color_image(fit(img, side))), full)
             }
@@ -539,7 +539,25 @@ fn decode_source(source: &Source, side: u32) -> (Option<ColorImage>, u32) {
 }
 
 fn decode_png(png: &[u8], side: u32) -> Option<ColorImage> {
-    Some(color_image(fit(image::load_from_memory(png).ok()?.to_rgba8(), side)))
+    Some(color_image(fit(premultiplied(image::load_from_memory(png).ok()?), side)))
+}
+
+/// Decoded pixels premultiplied in their stored (sRGB) values: as egui
+/// blends, as a drawing pad shows while it is drawn on (`pad_gpu`) and as
+/// exports draw. Before any scaling down, so a see-through pixel's colour
+/// adds nothing to its neighbours' average.
+///
+/// Not `ColorImage::from_rgba_unmultiplied`: egui 0.29 premultiplies there
+/// in linear light, which leaves a faint edge pixel far too bright for its
+/// alpha (grey 140 at 20 % gets 64, not 28), so soft edges went light,
+/// near white over paper, instead of fading out.
+fn premultiplied(img: image::DynamicImage) -> image::RgbaImage {
+    let alpha = img.color().has_alpha();
+    let mut rgba = img.into_rgba8();
+    if alpha {
+        crate::canvas::pad::premultiply(&mut rgba);
+    }
+    rgba
 }
 
 /// `img` scaled so its long side is at most `side` (never up).
@@ -554,11 +572,17 @@ fn fit(img: image::RgbaImage, side: u32) -> image::RgbaImage {
     image::imageops::thumbnail(&img, tw, th)
 }
 
+/// `img` already premultiplied (`premultiplied`).
 fn color_image(img: image::RgbaImage) -> ColorImage {
-    ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
+    let pixels = img
+        .as_raw()
+        .chunks_exact(4)
+        .map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
+        .collect();
+    ColorImage { size: [img.width() as usize, img.height() as usize], pixels }
 }
 
-/// Decode a stored picture's file.
+/// Decode a stored picture's file, premultiplied.
 fn load_file(picture: &PictureRef) -> Option<image::RgbaImage> {
     let path = crate::persistence::paths::media_dir().ok()?.join(&picture.file);
     let decoded = image::ImageReader::open(&path)
@@ -566,7 +590,7 @@ fn load_file(picture: &PictureRef) -> Option<image::RgbaImage> {
         .map_err(|e| e.to_string())
         .and_then(|r| r.decode().map_err(|e| e.to_string()));
     match decoded {
-        Ok(img) => Some(img.to_rgba8()),
+        Ok(img) => Some(premultiplied(img)),
         Err(e) => {
             log::warn!("could not load picture {}: {e}", path.display());
             None
@@ -716,6 +740,26 @@ mod tests {
         let same = Source::Inline(Arc::clone(&a));
         assert_eq!(Source::Inline(a), same);
         assert_ne!(Source::Inline(png(2, 2)), same, "equal bytes, another picture");
+    }
+
+    /// A pad's soft pencil edge (grey ink, fading alpha) shows as that ink
+    /// fading out, not lighter: premultiplied in the stored values. And
+    /// scaled down, a see-through neighbour only thins it, never darkens it.
+    #[test]
+    fn soft_edges_fade_out_in_their_own_colour() {
+        let mut img = image::RgbaImage::new(2, 1);
+        img.put_pixel(0, 0, image::Rgba([140, 140, 140, 51]));
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+        let full = decode_png(&out, u32::MAX).unwrap();
+        assert_eq!(full.pixels[0].to_array(), [28, 28, 28, 51]);
+        assert_eq!(full.pixels[1].to_array(), [0, 0, 0, 0]);
+
+        img.put_pixel(0, 0, image::Rgba([140, 140, 140, 255]));
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+        let [r, _, _, a] = decode_png(&out, 1).unwrap().pixels[0].to_array();
+        assert!(a.abs_diff(128) <= 1 && r.abs_diff(70) <= 1, "{r} {a}");
     }
 
     #[test]
