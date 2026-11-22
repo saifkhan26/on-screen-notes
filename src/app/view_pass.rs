@@ -152,7 +152,7 @@ impl OnScreenNotesApp {
                 let pin_local = if pinned { self.selection_pin_local() } else { None };
                 let grouped = self.selection_grouped();
                 let open_move = std::mem::take(&mut self.ws.move_picker_pending);
-                self.fill_likely_tags();
+                self.fill_likely_tags(ctx);
                 let keys = &self.hotkeys_cfg;
                 let row = picture.map(|_| ui::arrange_bar::ColourRow {
                     shown: self.ws.picture_colours.as_ref().map(|p| p.colours.as_slice()),

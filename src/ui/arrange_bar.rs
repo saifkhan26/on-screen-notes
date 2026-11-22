@@ -97,7 +97,7 @@ pub struct TagEdit {
     /// first: what the row suggests. The app fills it in.
     pub known: Vec<(String, usize)>,
     /// Tags the selected picture probably has, and how closely it fits
-    /// each (`tools::tag_suggest::fits`), most likely first. The app fills
+    /// each (`tools::tag_suggest::fits_bars`), most likely first. The app fills
     /// it in while picture search is on.
     pub likely: Vec<(String, f32)>,
 }

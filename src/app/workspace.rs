@@ -104,9 +104,9 @@ pub(super) struct Workspace {
     pub(super) word_search: Option<similar::WordSearch>,
     /// The slides' pictures being gathered into sets of copies for find.
     pub(super) copies_job: Option<similar::CopiesJob>,
-    /// The picture (and vectors generation) the tag row's likely tags are
-    /// for.
-    pub(super) likely_for: Option<((usize, usize, usize), u64)>,
+    /// The picture (and the vectors' and tags' bars' generations) the tag
+    /// row's likely tags are for.
+    pub(super) likely_for: Option<((usize, usize, usize), u64, u64)>,
     /// The selection's tags being typed on the arrange bar. Keys go to
     /// it alone while it is open.
     pub(super) tag_edit: Option<ui::arrange_bar::TagEdit>,

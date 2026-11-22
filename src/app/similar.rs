@@ -21,14 +21,126 @@ pub(super) struct WordSearch {
     failed: bool,
 }
 
-/// A tag as first spelled, and its pictures' vectors.
-type TagPictures = (String, Vec<Arc<[f32]>>);
+/// A tag as first spelled, its pictures' vectors, and what they are
+/// (`TagBars::print`, being worked out).
+type TagPictures = (String, Vec<Arc<[f32]>>, std::hash::DefaultHasher);
 
 /// Most tags the tag row offers as likely for a picture.
 const LIKELY_TAGS: usize = 3;
 /// One picture in this many goes into the sample a tag's typical
 /// closeness is taken from, for the tag row.
 const SAMPLE_EVERY: usize = 16;
+
+/// Each tag's bars, for the likely tags the tag row offers
+/// (`tag_suggest::tag_bars`): the slow part, and the same for every
+/// picture, so kept from one picture to the next and worked out off the UI
+/// thread. Bars out of date still serve until new ones come.
+#[derive(Default)]
+pub(super) struct TagBars {
+    /// By tag (`units::tag_key`).
+    known: HashMap<String, BarsFor>,
+    /// Tags' bars being worked out.
+    job: Option<mpsc::Receiver<Vec<(String, BarsFor)>>>,
+    /// Counts the jobs done: the likely tags are worked out again after
+    /// each.
+    generation: u64,
+}
+
+/// A tag's bars (`None`: too few pictures to learn from), and what they
+/// were worked out from: the tag's pictures (`TagBars::print`) and how
+/// big the sample was.
+#[derive(Debug, Clone, PartialEq)]
+struct BarsFor {
+    print: u64,
+    sample: usize,
+    bars: Option<crate::tools::tag_suggest::Bars>,
+}
+
+/// A tag whose bars are to be worked out: its key, what its pictures are
+/// (`TagBars::print`) and their vectors.
+type BarsTodo = (String, u64, Vec<Arc<[f32]>>);
+
+impl TagBars {
+    /// Add one of a tag's pictures, known by `key` (`PictureVectors::key`),
+    /// to what its pictures are: bars are worked out again once it changes.
+    fn print(h: &mut std::hash::DefaultHasher, key: &str) {
+        use std::hash::Hash;
+        key.hash(h);
+    }
+
+    /// The tag's bars, if any are known, and whether they are up to date
+    /// for its pictures (`print`) and a sample of `sample`: they go out of
+    /// date when the sample has grown or shrunk by more than a quarter.
+    fn get(&self, tag: &str, print: u64, sample: usize) -> (Option<&crate::tools::tag_suggest::Bars>, bool) {
+        match self.known.get(tag) {
+            Some(b) => (b.bars.as_ref(), b.print == print && b.sample.abs_diff(sample) * 4 <= b.sample),
+            None => (None, false),
+        }
+    }
+
+    /// Keep the bars a finished job worked out. True when there were some.
+    fn take_done(&mut self) -> bool {
+        let Some(rx) = &self.job else { return false };
+        match rx.try_recv() {
+            Ok(done) => {
+                self.known.extend(done);
+                self.job = None;
+                self.generation += 1;
+                true
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.job = None;
+                false
+            }
+            Err(TryRecvError::Empty) => false,
+        }
+    }
+
+    /// Work out the bars of the tags in `todo` against `sample`, off the UI
+    /// thread, unless a job is under way. Repaints once it is done.
+    fn start(&mut self, mut todo: Vec<BarsTodo>, sample: Vec<Arc<[f32]>>, ctx: &egui::Context) {
+        if self.job.is_some() || todo.is_empty() {
+            return;
+        }
+        // Biggest first, dealt out in turn, so each thread gets as much.
+        todo.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1)).clamp(1, 8);
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new().name("osn-tag-bars".into()).spawn(move || {
+            let t = Instant::now();
+            let sample: Vec<&[f32]> = sample.iter().map(|x| &x[..]).collect();
+            let work = |first: usize| -> Vec<(String, BarsFor)> {
+                todo.iter()
+                    .skip(first)
+                    .step_by(threads)
+                    .map(|(tag, print, vs)| {
+                        let refs: Vec<&[f32]> = vs.iter().map(|x| &x[..]).collect();
+                        let bars = crate::tools::tag_suggest::tag_bars(&refs, &sample);
+                        (tag.clone(), BarsFor { print: *print, sample: sample.len(), bars })
+                    })
+                    .collect()
+            };
+            let done: Vec<(String, BarsFor)> = std::thread::scope(|s| {
+                let work = &work;
+                let parts: Vec<_> = (1..threads).map(|i| s.spawn(move || work(i))).collect();
+                let mut done = work(0);
+                for p in parts {
+                    done.extend(p.join().unwrap_or_default());
+                }
+                done
+            });
+            log::info!("bars of {} tags against {} pictures in {} ms", done.len(), sample.len(), t.elapsed().as_millis());
+            let _ = tx.send(done);
+            // The main window: the slide window is drawn in its frame.
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        });
+        match spawned {
+            Ok(_) => self.job = Some(rx),
+            Err(e) => log::warn!("could not start working out the tags' bars: {e}"),
+        }
+    }
+}
 
 /// Typing must pause this long before the words are read.
 const WORD_PAUSE: std::time::Duration = std::time::Duration::from_millis(350);
@@ -284,9 +396,11 @@ impl OnScreenNotesApp {
     }
 
     /// While the tag row is open on one picture and picture search is on:
-    /// offer the tags it probably has (`tools::tag_suggest::fits`), worked
-    /// out once for that picture.
-    pub(super) fn fill_likely_tags(&mut self) {
+    /// offer the tags it probably has (`tools::tag_suggest::fits_bars`),
+    /// worked out once for that picture, and again as the tags' bars come
+    /// (`TagBars`).
+    pub(super) fn fill_likely_tags(&mut self, ctx: &egui::Context) {
+        self.tag_bars.take_done();
         let Some(at) = self.selected_picture().filter(|_| self.ws.tag_edit.is_some() && self.picture_vectors.is_on()) else {
             self.ws.likely_for = None;
             return;
@@ -297,7 +411,7 @@ impl OnScreenNotesApp {
         };
         let vectors = &self.picture_vectors;
         let Some(v) = vectors.vector(&png) else { return };
-        let key = (at, vectors.generation());
+        let key = (at, vectors.generation(), self.tag_bars.generation);
         if self.ws.likely_for == Some(key) {
             return;
         }
@@ -322,20 +436,35 @@ impl OnScreenNotesApp {
                 if s.tags().is_empty() {
                     continue;
                 }
+                let picture = vectors.key(p);
                 for t in s.tags() {
-                    by_tag.entry(crate::canvas::units::tag_key(t)).or_insert_with(|| (t.clone(), Vec::new())).1.push(Arc::clone(&pv));
+                    let e = by_tag.entry(crate::canvas::units::tag_key(t)).or_insert_with(|| (t.clone(), Vec::new(), Default::default()));
+                    e.1.push(Arc::clone(&pv));
+                    TagBars::print(&mut e.2, picture.as_deref().unwrap_or_default());
                 }
             }
         }
-        let sample: Vec<&[f32]> = sample.iter().map(|x| &x[..]).collect();
-        let mut likely: Vec<(String, f32)> = by_tag
-            .into_values()
-            .filter(|(t, _)| !own.iter().any(|o| crate::canvas::units::same_tag(o, t)))
-            .filter_map(|(t, vs)| {
+        // Each tag with bars known is checked now; those with none, or
+        // out of date, are worked out (off the UI thread) to check again.
+        let mut likely: Vec<(String, f32)> = Vec::new();
+        let mut todo: Vec<BarsTodo> = Vec::new();
+        for (k, (t, vs, print)) in by_tag {
+            if own.iter().any(|o| crate::canvas::units::same_tag(o, &t)) {
+                continue;
+            }
+            let print = std::hash::Hasher::finish(&print);
+            let (bars, fresh) = self.tag_bars.get(&k, print, sample.len());
+            if let Some(b) = bars {
                 let refs: Vec<&[f32]> = vs.iter().map(|x| &x[..]).collect();
-                crate::tools::tag_suggest::fits(&refs, &v, &sample).map(|s| (t, s.close))
-            })
-            .collect();
+                if let Some(s) = crate::tools::tag_suggest::fits_bars(b, &refs, &v) {
+                    likely.push((t, s.close));
+                }
+            }
+            if !fresh {
+                todo.push((k, print, vs));
+            }
+        }
+        self.tag_bars.start(todo, sample, ctx);
         likely.sort_by(|a, b| b.1.total_cmp(&a.1));
         likely.truncate(LIKELY_TAGS);
         if let Some(e) = self.ws.tag_edit.as_mut() {
@@ -511,5 +640,69 @@ impl OnScreenNotesApp {
         let what = if n == 1 { "1 extra copy" } else { "extra copies" };
         let msg = if n == 1 { format!("{what} selected — Delete removes it") } else { format!("{n} {what} selected — Delete removes them") };
         self.toast = Some((msg, Instant::now()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(axis: usize) -> Arc<[f32]> {
+        let mut v = vec![0.0f32; 8];
+        v[axis] = 1.0;
+        v.into()
+    }
+
+    /// Wait for the job under way to finish.
+    fn finish(b: &mut TagBars) {
+        let t = Instant::now();
+        while !b.take_done() {
+            assert!(b.job.is_some(), "the job went without an answer");
+            assert!(t.elapsed().as_secs() < 10, "the job never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn tag_bars_are_worked_out_once_and_kept_until_out_of_date() {
+        let ctx = egui::Context::default();
+        let mut b = TagBars::default();
+        let pictures: Vec<Arc<[f32]>> = (0..3).map(unit).collect();
+        let sample: Vec<Arc<[f32]>> = (3..8).map(unit).collect();
+        let few: Vec<Arc<[f32]>> = vec![unit(0)];
+        assert_eq!(b.get("cat", 1, 5), (None, false));
+        b.start(vec![("cat".into(), 1, pictures.clone()), ("dog".into(), 2, few)], sample.clone(), &ctx);
+        assert!(b.job.is_some());
+        // One job at a time: more waits for it.
+        b.start(vec![("owl".into(), 3, pictures.clone())], sample.clone(), &ctx);
+        finish(&mut b);
+        assert_eq!(b.generation, 1);
+        assert!(!b.known.contains_key("owl"));
+        let refs: Vec<&[f32]> = pictures.iter().map(|x| &x[..]).collect();
+        let s: Vec<&[f32]> = sample.iter().map(|x| &x[..]).collect();
+        let want = crate::tools::tag_suggest::tag_bars(&refs, &s).expect("three pictures to learn from");
+        assert_eq!(b.get("cat", 1, 5), (Some(&want), true));
+        // Too few pictures: known to have none.
+        assert_eq!(b.get("dog", 2, 5), (None, true));
+        // Other pictures, or a sample grown by more than a quarter: out of
+        // date, but still there until new ones come.
+        assert_eq!(b.get("cat", 9, 5), (Some(&want), false));
+        assert_eq!(b.get("cat", 1, 6), (Some(&want), true));
+        assert_eq!(b.get("cat", 1, 7), (Some(&want), false));
+        assert_eq!(b.get("cat", 1, 3), (Some(&want), false));
+        assert!(!b.take_done(), "nothing more under way");
+    }
+
+    #[test]
+    fn a_tags_pictures_print_follows_which_pictures_they_are() {
+        let print = |keys: &[&str]| {
+            let mut h = std::hash::DefaultHasher::default();
+            keys.iter().for_each(|k| TagBars::print(&mut h, k));
+            std::hash::Hasher::finish(&h)
+        };
+        assert_eq!(print(&["a", "b"]), print(&["a", "b"]));
+        assert_ne!(print(&["a", "b"]), print(&["a"]));
+        assert_ne!(print(&["a", "b"]), print(&["a", "c"]));
+        assert_ne!(print(&["ab"]), print(&["a", "b"]));
     }
 }

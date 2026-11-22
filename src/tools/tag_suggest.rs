@@ -86,11 +86,28 @@ fn learned_bar(tagged: &[&[f32]]) -> Option<f32> {
 /// How `v` stands with the tag its `tagged` pictures carry, if it reaches
 /// "maybe": what the tag row offers for a picture. `sample` is a fair
 /// sample of the pictures, to tell how close a typical one is. `None`
-/// with too few tagged pictures to learn from.
+/// with too few tagged pictures to learn from. The app does it in two
+/// halves (`tag_bars`, `fits_bars`), the slow one kept from one picture to
+/// the next.
+#[cfg(test)]
 pub fn fits(tagged: &[&[f32]], v: &[f32], sample: &[&[f32]]) -> Option<Suggestion> {
-    learned_bar(tagged)?;
+    fits_bars(&tag_bars(tagged, sample)?, tagged, v)
+}
+
+/// The bars a picture must reach for the tag row to offer it the tag its
+/// `tagged` pictures carry (`fits_bars`), from those pictures and `sample`,
+/// a fair sample of all of them. The same for every picture, and the slow
+/// part: each sample picture is scored against the tag's pictures. `None`
+/// with too few tagged pictures to learn from.
+pub fn tag_bars(tagged: &[&[f32]], sample: &[&[f32]]) -> Option<Bars> {
+    let learned = learned_bar(tagged)?;
     let scored: Vec<f32> = sample.iter().map(|s| closeness(s, tagged, None)).collect();
-    let b = bars(tagged, &scored);
+    Some(bars_from(Some(learned), &scored))
+}
+
+/// How `v` stands with the tag its `tagged` pictures carry, given the tag's
+/// bars (`tag_bars`), if it reaches "maybe".
+pub fn fits_bars(b: &Bars, tagged: &[&[f32]], v: &[f32]) -> Option<Suggestion> {
     let close = closeness(v, tagged, None);
     (close >= b.maybe && close > b.median).then_some(Suggestion { id: 0, close: close.clamp(0.0, 1.0), likely: close >= b.likely })
 }
@@ -99,20 +116,26 @@ pub fn fits(tagged: &[&[f32]], v: &[f32], sample: &[&[f32]]) -> Option<Suggestio
 /// tag's pictures and the candidates' closeness to them (`scored`,
 /// closest first, or any fair sample of the pictures).
 fn bars(tagged: &[&[f32]], scored: &[f32]) -> Bars {
+    bars_from(learned_bar(tagged), scored)
+}
+
+/// `bars`, with the tag's learned bar (`learned_bar`) already worked out.
+fn bars_from(learned: Option<f32>, scored: &[f32]) -> Bars {
     let mut sorted = scored.to_vec();
     sorted.sort_by(|a, b| b.total_cmp(a));
     let top = sorted.first().copied().unwrap_or(0.0);
     let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
     let spread = |cut: f32| median + cut * (top - median);
-    match learned_bar(tagged) {
+    match learned {
         Some(learned) => Bars { likely: learned, maybe: (median + MAYBE * (learned - median)).max(spread(SPREAD_MAYBE)).min(learned), median },
         None => Bars { likely: spread(SPREAD_CUT), maybe: spread(SPREAD_MAYBE), median },
     }
 }
 
-/// See `bars`.
-#[derive(Debug, Clone, Copy)]
-struct Bars {
+/// How close a picture must be to a tag's pictures to be "likely" and
+/// "maybe", and how close the typical picture is (`bars`, `tag_bars`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bars {
     likely: f32,
     maybe: f32,
     median: f32,
@@ -239,6 +262,28 @@ mod tests {
         assert!(!near.likely, "{near:?}");
         assert!(fits(&t, &mix(&[(6, 1.0)]), &sample).is_none());
         assert!(fits(&t[..2], &tagged[0], &sample).is_none(), "two are too few to learn from");
+    }
+
+    #[test]
+    fn a_tags_bars_serve_every_picture() {
+        let tagged = [mix(&[(0, 1.0), (1, 0.3)]), mix(&[(0, 1.0), (2, 0.3)]), mix(&[(0, 1.0), (3, 0.3)]), mix(&[(0, 1.0), (4, 0.2)])];
+        let t: Vec<&[f32]> = tagged.iter().map(|v| v.as_slice()).collect();
+        let others = [mix(&[(6, 1.0)]), mix(&[(7, 1.0)]), mix(&[(8, 1.0)]), mix(&[(9, 1.0), (0, 0.2)]), mix(&[(0, 0.5), (5, 1.0)])];
+        let sample: Vec<&[f32]> = others.iter().map(|v| v.as_slice()).collect();
+        // Worked out once, they are the bars of the tag and sample.
+        let b = tag_bars(&t, &sample).expect("enough to learn from");
+        let scored: Vec<f32> = sample.iter().map(|s| closeness(s, &t, None)).collect();
+        assert_eq!(b, bars(&t, &scored));
+        // And they tell each picture what working them out for it would.
+        let pictures = [mix(&[(0, 1.0), (1, 0.2), (2, 0.2)]), mix(&[(0, 1.0), (5, 0.45)]), mix(&[(6, 1.0)])];
+        let close: Vec<f32> = pictures.iter().map(|p| closeness(p, &t, None)).collect();
+        for (p, c) in pictures.iter().zip(close) {
+            let want = (c >= b.maybe && c > b.median).then_some(Suggestion { id: 0, close: c.clamp(0.0, 1.0), likely: c >= b.likely });
+            assert_eq!(fits_bars(&b, &t, p), want);
+        }
+        assert!(fits_bars(&b, &t, &pictures[0]).is_some_and(|s| s.likely));
+        assert!(fits_bars(&b, &t, &pictures[2]).is_none());
+        assert!(tag_bars(&t[..2], &sample).is_none(), "two are too few to learn from");
     }
 
     #[test]

@@ -164,6 +164,9 @@ pub struct OnScreenNotesApp {
     picture_vectors: crate::canvas::picture_vectors::PictureVectors,
     /// Pictures turned down for a tag; read once picture search needs them.
     tag_rejections: Option<crate::persistence::tag_rejections::Rejections>,
+    /// Each tag's bars for the tag row's likely tags, kept from one
+    /// picture to the next.
+    tag_bars: similar::TagBars,
     /// Last rect applied via `ViewportCommand` so we can skip the
     /// re-emit when the target window hasn't moved.
     pinned_last_rect: Option<(i32, i32, i32, i32)>,
@@ -564,6 +567,7 @@ impl OnScreenNotesApp {
             picture_index: Default::default(),
             picture_vectors: Default::default(),
             tag_rejections: None,
+            tag_bars: Default::default(),
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),
             obj_clipboard: (Vec::new(), Vec::new()),
