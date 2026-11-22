@@ -199,6 +199,10 @@ impl OnScreenNotesApp {
                     Some(BarAction::KeepColours) => self.keep_picture_colours(),
                     Some(BarAction::RestorePalette) => self.restore_palette(),
                     Some(BarAction::SetTags { was, now }) => self.tag_selection(was, now),
+                    Some(BarAction::FindTag(tag)) => {
+                        self.ws.commands.close();
+                        self.ws.find.find_words(format!("#{tag}"));
+                    }
                     None => {}
                 }
             } else {

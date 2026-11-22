@@ -62,6 +62,8 @@ pub enum BarAction {
     /// The tag row was saved: it showed tags `was` and now holds `now`
     /// (see `parse_row`). Each object's tags change by the difference.
     SetTags { was: Vec<String>, now: Vec<(String, bool)> },
+    /// Find everything tagged so (a click on one of the selection's tags).
+    FindTag(String),
 }
 
 /// What the tag row holds (as `shape::parse_tags` reads it): each tag
@@ -307,7 +309,11 @@ pub fn show(
                     let tip = with_key("Tags — words find (Ctrl+F) knows the selection by", k.tag);
                     let mut open = toggle_btn(ui, egui::include_image!("../../assets/icons/tag.svg"), tag_edit.is_some(), &tip);
                     if !tags.is_empty() && tag_edit.is_none() {
-                        open |= tag_chips(ui, tags);
+                        match tag_chips(ui, tags) {
+                            Some(ChipPick::Find(tag)) => picked = Some(BarAction::FindTag(tag)),
+                            Some(ChipPick::Edit) => open = true,
+                            None => {}
+                        }
                     }
                     if open {
                         *tag_edit = match tag_edit {
@@ -337,18 +343,64 @@ pub fn show(
     picked
 }
 
-/// The selection's tags beside the tag button, cut short if long, one
-/// only some of it carries marked `*`; a click opens them for typing,
-/// as the button does.
-fn tag_chips(ui: &mut egui::Ui, tags: &[(String, bool)]) -> bool {
-    let shown: Vec<String> = tags.iter().map(|(t, some)| if *some { format!("{t}*") } else { t.clone() }).collect();
-    let all = crate::ui::media_filter::tags_text(&shown, usize::MAX);
-    let text = egui::RichText::new(crate::ui::media_filter::tags_text(&shown, 32)).small().color(theme::TEXT_PRIMARY);
-    let mut tip = format!("{all} — click to change");
-    if tags.iter().any(|(_, some)| *some) {
-        tip.push_str("\n* only some of the selection has it");
-    }
-    ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked()
+/// Room for the tags beside the tag button, in characters.
+const CHIP_ROOM: usize = 32;
+
+/// What a click on the tags beside the tag button asks for.
+enum ChipPick {
+    /// Find everything tagged so.
+    Find(String),
+    /// Open the tags for typing, as the button does.
+    Edit,
+}
+
+/// How many of `tags` (`#tag` each, a space between) fit in `room`
+/// characters; the first always does, cut short if long.
+fn chips_that_fit(tags: &[String], room: usize) -> usize {
+    let mut used = 0;
+    tags.iter()
+        .take_while(|t| {
+            let len = t.chars().count() + 1;
+            let fits = used == 0 || used + 1 + len <= room;
+            used += if used == 0 { len } else { 1 + len };
+            fits
+        })
+        .count()
+}
+
+/// The selection's tags beside the tag button, one only some of it
+/// carries marked `*`, as many as fit: a click on one finds everything
+/// tagged so (as `#tag` typed in find would); on the count of the rest,
+/// opens them for typing, as the button does.
+fn tag_chips(ui: &mut egui::Ui, tags: &[(String, bool)]) -> Option<ChipPick> {
+    use crate::ui::media_filter::tags_text;
+    let names: Vec<String> = tags.iter().map(|(t, some)| if *some { format!("{t}*") } else { t.clone() }).collect();
+    let fit = chips_that_fit(&names, CHIP_ROOM);
+    let mut out = None;
+    ui.add_space(2.0);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+        for ((tag, some), name) in tags.iter().zip(&names).take(fit) {
+            let text = egui::RichText::new(tags_text(std::slice::from_ref(name), CHIP_ROOM)).small().color(theme::TEXT_PRIMARY);
+            let mut tip = format!("Find everything tagged #{tag} — the tag button changes the tags");
+            if *some {
+                tip.push_str("\n* only some of the selection has it");
+            }
+            let r = ui.add(egui::Button::new(text).rounding(Rounding::same(9.0))).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
+            if r.clicked() {
+                out = Some(ChipPick::Find(tag.clone()));
+            }
+        }
+        if fit < tags.len() {
+            let text = egui::RichText::new(format!("+{}", tags.len() - fit)).small().color(theme::TEXT_MUTED);
+            let tip = format!("{} — click to change", tags_text(&names[fit..], usize::MAX));
+            if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
+                out = Some(ChipPick::Edit);
+            }
+        }
+    });
+    out
 }
 
 /// The row for typing the selection's tags, with the tags already used
@@ -720,6 +772,17 @@ fn icon_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, enabled: bool, t
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn as_many_tag_chips_as_fit_the_first_always() {
+        let tags = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // "#pose #ref" is 10 characters.
+        assert_eq!(chips_that_fit(&tags(&["pose", "ref"]), 10), 2);
+        assert_eq!(chips_that_fit(&tags(&["pose", "ref"]), 9), 1);
+        assert_eq!(chips_that_fit(&tags(&["a-very-long-tag-indeed"]), 5), 1, "one alone is cut, not left out");
+        assert_eq!(chips_that_fit(&tags(&["a", "bb", "c"]), 7), 2, "#a #bb");
+        assert_eq!(chips_that_fit(&[], 10), 0);
+    }
 
     fn edit(text: &str) -> TagEdit {
         let known = [("pose", 9), ("ref", 4), ("portrait", 6), ("prop", 1), ("hands", 2)];

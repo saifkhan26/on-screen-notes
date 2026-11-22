@@ -9,6 +9,7 @@
 //!     and fall back to defaults.
 
 mod blobs;
+pub mod copy_ignores;
 pub mod paths;
 pub mod tag_rejections;
 pub mod vectors;

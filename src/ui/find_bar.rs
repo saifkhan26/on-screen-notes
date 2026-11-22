@@ -17,6 +17,10 @@
 //! each set with a button that selects all of its copies on one slide
 //! but one, for deleting, and each copy with a button that deletes it
 //! where it is, whatever slide that is; the last copy of a set is kept.
+//! A set that is not copies can be ignored ("ignore set"), or one picture
+//! taken out of its set ("not a copy"); what was ignored is kept
+//! (`persistence::copy_ignores`) and listed under "Ignored", each with a
+//! button that lists it as copies again.
 //! Typing goes back to finding words.
 //!
 //! With picture search on, typed words also find the pictures that show
@@ -38,6 +42,7 @@ use crate::canvas::canvas::{Canvas, Layer};
 use crate::canvas::units::{bounds_of, same_tag, tagged_by};
 use crate::canvas::shape::{parse_tags, MediaType, RasterKind, Shape};
 use crate::canvas::TagCount;
+use crate::persistence::copy_ignores::Ignore;
 use crate::tools::similar::{self, Kind, Likeness, Origin, Query, Signature};
 use crate::ui::theme;
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
@@ -484,14 +489,111 @@ struct WordPictures {
     note: Option<String>,
 }
 
-/// Every set of copies on the slides, as the bar lists them.
+/// Every set of copies on the slides, as the bar lists them, and what of
+/// them was ignored.
 #[derive(Default)]
 pub struct Copies {
     /// Every copy, set after set; `sets` cuts the list into its sets.
     results: Vec<PictureHit>,
+    /// Each copy's picture key (`app::similar::picture_id`), for ignoring.
+    ids: Vec<Arc<str>>,
     sets: Vec<std::ops::Range<usize>>,
     /// What they were found from, once found (`set_copies`).
     results_for: Option<(u64, usize)>,
+    /// What was ignored, newest first, with its pictures on the slides
+    /// (none there: not listed).
+    ignored: Vec<IgnoredCopies>,
+    /// Their pictures one after another, as the rows list them.
+    ignored_rows: Vec<PictureHit>,
+    /// The list shows what was ignored instead of the sets.
+    showing_ignored: bool,
+}
+
+/// Something ignored in the duplicates list, with its pictures on the
+/// slides.
+pub struct IgnoredCopies {
+    pub ignore: Ignore,
+    /// Its pictures: for one ignored as not a copy, its own places first
+    /// (`lead` of them), then the rest of the set it was in.
+    pub rows: Vec<PictureHit>,
+    pub lead: usize,
+}
+
+impl Copies {
+    /// Keep the rows `keep` says yes to (given its place in the list, it
+    /// may change the row), each set left with two or more, and the
+    /// ignored rows `keep_ignored` says yes to. Where each row kept was
+    /// before, and whether `keep` said no to the one at `cursor`.
+    fn retain(&mut self, cursor: usize, mut keep: impl FnMut(usize, &mut PictureHit) -> bool, keep_ignored: impl FnMut(&mut PictureHit) -> bool) -> (Vec<usize>, bool) {
+        let mut said_no = false;
+        // Each copy kept, its key, its set, and where it was.
+        let mut kept: Vec<(PictureHit, Arc<str>, usize, usize)> = Vec::new();
+        for (set_no, range) in self.sets.iter().enumerate() {
+            for was in range.clone() {
+                let mut h = self.results[was].clone();
+                if keep(was, &mut h) {
+                    kept.push((h, Arc::clone(&self.ids[was]), set_no, was));
+                } else {
+                    said_no |= was == cursor;
+                }
+            }
+        }
+        self.results.clear();
+        self.ids.clear();
+        self.sets.clear();
+        let mut was_at: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < kept.len() {
+            let set_no = kept[i].2;
+            let end = kept[i..].iter().position(|k| k.2 != set_no).map_or(kept.len(), |p| i + p);
+            if end - i > 1 {
+                let start = self.results.len();
+                for (h, id, _, was) in &kept[i..end] {
+                    self.results.push(h.clone());
+                    self.ids.push(Arc::clone(id));
+                    was_at.push(*was);
+                }
+                self.sets.push(start..self.results.len());
+            }
+            i = end;
+        }
+        let mut keep_ignored = keep_ignored;
+        for g in &mut self.ignored {
+            let (mut rows, mut lead) = (Vec::new(), 0);
+            for (k, mut h) in std::mem::take(&mut g.rows).into_iter().enumerate() {
+                if keep_ignored(&mut h) {
+                    lead += usize::from(k < g.lead);
+                    rows.push(h);
+                }
+            }
+            (g.rows, g.lead) = (rows, lead);
+        }
+        self.ignored.retain(|g| !g.rows.is_empty());
+        self.flatten_ignored();
+        (was_at, said_no)
+    }
+
+    /// The ignored pictures again, one after another.
+    fn flatten_ignored(&mut self) {
+        self.ignored_rows = self.ignored.iter().flat_map(|g| g.rows.iter().cloned()).collect();
+    }
+
+    /// Where each ignored thing's rows are in `ignored_rows`.
+    fn ignored_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        let mut at = 0;
+        self.ignored
+            .iter()
+            .map(|g| {
+                at += g.rows.len();
+                at - g.rows.len()..at
+            })
+            .collect()
+    }
+
+    /// The rows shown: the sets, or what was ignored.
+    fn rows(&self) -> &[PictureHit] {
+        if self.showing_ignored { &self.ignored_rows } else { &self.results }
+    }
 }
 
 /// What a click on the bar asks of the app.
@@ -509,6 +611,10 @@ pub enum Request {
     /// Delete this copy where it is: `png` is its bytes, to make sure it
     /// is still the picture listed.
     DeleteCopy { slide: usize, layer: usize, shape: usize, png: Arc<Vec<u8>> },
+    /// List these as copies no more (a set, or one picture of one).
+    IgnoreCopies(Ignore),
+    /// List what was ignored as copies again.
+    ShowCopiesAgain(Ignore),
 }
 
 /// A tag changed everywhere from the tag list.
@@ -606,9 +712,20 @@ const PICTURE_ROWS: usize = 7;
 const WORD_ROWS_WITH_PICTURES: usize = 4;
 const WORD_PICTURE_ROWS: usize = 4;
 /// Room beside a suggested picture's row for its two buttons, and
-/// beside a copy's row for its delete button.
+/// beside a copy's row for its "not a copy" and delete buttons.
 const SUGGESTION_BUTTONS: f32 = 112.0;
-const DELETE_BUTTON: f32 = 60.0;
+const COPY_BUTTONS: f32 = 156.0;
+
+/// A click in the list of copies that changes the list.
+#[derive(Clone, Copy)]
+enum CopyAct {
+    /// "Ignore set" on this set.
+    IgnoreSet(usize),
+    /// "Not a copy" on this row.
+    NotACopy(usize),
+    /// "Show again" on this ignored thing.
+    ShowAgain(usize),
+}
 /// Height of a picture's row, and of its thumbnail.
 const PICTURE_ROW: f32 = 40.0;
 const PICTURE_THUMB: f32 = 32.0;
@@ -668,6 +785,14 @@ impl FindBar {
         self.open();
     }
 
+    /// Open it finding `query`, as if typed (`#tag`: what is tagged so).
+    pub fn find_words(&mut self, query: String) {
+        self.retire_picture();
+        self.query = query;
+        self.typed.clear();
+        self.open();
+    }
+
     /// Open it listing every set of copies on the slides.
     pub fn find_copies(&mut self) {
         self.retire_picture();
@@ -686,21 +811,28 @@ impl FindBar {
         self.copies.as_ref().and_then(|c| c.results_for)
     }
 
-    /// The sets of copies found from `key` (see `update_pictures`). The
-    /// highlighted copy stays highlighted.
-    pub fn set_copies(&mut self, sets: Vec<Vec<PictureHit>>, key: (u64, usize)) {
+    /// The sets of copies found from `key` (see `update_pictures`), each
+    /// copy with its picture key, and what was ignored, newest first. The
+    /// highlighted row stays highlighted.
+    pub fn set_copies(&mut self, sets: Vec<Vec<(PictureHit, Arc<str>)>>, ignored: Vec<IgnoredCopies>, key: (u64, usize)) {
         let Some(c) = self.copies.as_mut() else { return };
-        let current = c.results.get(self.cursor).map(|h| (h.hit.slide, h.hit.layer, h.hit.found.clone()));
+        let current = c.rows().get(self.cursor).map(|h| (h.hit.slide, h.hit.layer, h.hit.found.clone()));
         c.results.clear();
+        c.ids.clear();
         c.sets.clear();
         for set in sets {
             let start = c.results.len();
-            c.results.extend(set);
+            for (h, id) in set {
+                c.results.push(h);
+                c.ids.push(id);
+            }
             c.sets.push(start..c.results.len());
         }
+        c.ignored = ignored.into_iter().filter(|g| !g.rows.is_empty()).collect();
+        c.flatten_ignored();
         c.results_for = Some(key);
         if let Some(cur) = current {
-            if let Some(i) = c.results.iter().position(|h| (h.hit.slide, h.hit.layer, &h.hit.found) == (cur.0, cur.1, &cur.2)) {
+            if let Some(i) = c.rows().iter().position(|h| (h.hit.slide, h.hit.layer, &h.hit.found) == (cur.0, cur.1, &cur.2)) {
                 self.cursor = i;
             }
         }
@@ -708,53 +840,91 @@ impl FindBar {
 
     /// A copy listed was deleted (`Request::DeleteCopy`): take it out of
     /// its set, and move the copies after it on that layer down one, as
-    /// the layer's shapes did. A set left with one copy goes. The
-    /// highlight stays on the copy it was on; if that was the one deleted,
-    /// it moves to the copy that took its place, and the bar goes there.
+    /// the layer's shapes did (in what was ignored too). A set left with
+    /// one copy goes. The highlight stays on the copy it was on; if that
+    /// was the one deleted, it moves to the copy that took its place, and
+    /// the bar goes there.
     pub fn forget_copy(&mut self, slide: usize, layer: usize, shape: usize) {
-        let Some(c) = self.copies.as_mut() else { return };
-        let cursor = self.cursor;
-        let mut deleted_lit = false;
-        // Each copy kept, its set, and where it was.
-        let mut kept: Vec<(PictureHit, usize, usize)> = Vec::new();
-        for (set_no, range) in c.sets.iter().enumerate() {
-            for (k, h) in c.results[range.clone()].iter().enumerate() {
-                let was = range.start + k;
-                let mut h = h.clone();
-                if let Found::Tagged { shapes, .. } = &mut h.hit.found {
-                    if h.hit.slide == slide && h.hit.layer == layer {
-                        if shapes.first() == Some(&shape) {
-                            deleted_lit |= was == cursor;
-                            continue;
-                        }
-                        shapes.iter_mut().filter(|s| **s > shape).for_each(|s| *s -= 1);
+        let gone = |h: &mut PictureHit| {
+            if let Found::Tagged { shapes, .. } = &mut h.hit.found {
+                if h.hit.slide == slide && h.hit.layer == layer {
+                    if shapes.first() == Some(&shape) {
+                        return true;
                     }
+                    shapes.iter_mut().filter(|s| **s > shape).for_each(|s| *s -= 1);
                 }
-                kept.push((h, set_no, was));
             }
+            false
+        };
+        self.retain_copies(|_, h| !gone(h), |h| !gone(h), true);
+    }
+
+    /// Keep the copies listed as `Copies::retain` does, the highlight on
+    /// the row it was on, else the first after it, else the last; if
+    /// `keep` dropped the highlighted row and `go` is set, the bar goes to
+    /// the row that took its place.
+    fn retain_copies(&mut self, keep: impl FnMut(usize, &mut PictureHit) -> bool, keep_ignored: impl FnMut(&mut PictureHit) -> bool, go: bool) {
+        let Some(c) = self.copies.as_mut() else { return };
+        let (was_at, lit_dropped) = c.retain(self.cursor, keep, keep_ignored);
+        if c.showing_ignored {
+            self.cursor = self.cursor.min(c.ignored_rows.len().saturating_sub(1));
+            return;
         }
-        c.results.clear();
-        c.sets.clear();
-        // Where each listed copy was, in the new list's order.
-        let mut was_at: Vec<usize> = Vec::new();
-        let mut i = 0;
-        while i < kept.len() {
-            let set_no = kept[i].1;
-            let end = kept[i..].iter().position(|k| k.1 != set_no).map_or(kept.len(), |p| i + p);
-            if end - i > 1 {
-                let start = c.results.len();
-                c.results.extend(kept[i..end].iter().map(|k| k.0.clone()));
-                was_at.extend(kept[i..end].iter().map(|k| k.2));
-                c.sets.push(start..c.results.len());
-            }
-            i = end;
-        }
-        // The copy the highlight was on, else the first after it, else
-        // the last.
+        let cursor = self.cursor;
         self.cursor = was_at.iter().position(|&w| w >= cursor).unwrap_or(was_at.len().saturating_sub(1));
-        if deleted_lit && !was_at.is_empty() {
+        if go && lit_dropped && !was_at.is_empty() {
             self.go_to_cursor = true;
         }
+    }
+
+    /// "Ignore set" on the set `set_no`: it goes from the list, to the top
+    /// of what was ignored, and the app keeps that.
+    fn ignore_set(&mut self, set_no: usize) {
+        let Some(c) = self.copies.as_mut() else { return };
+        let Some(range) = c.sets.get(set_no).cloned() else { return };
+        let ignore = Ignore::Set(c.ids[range.clone()].iter().map(|id| id.to_string()).collect());
+        let rows = c.results[range.clone()].to_vec();
+        c.ignored.insert(0, IgnoredCopies { ignore: ignore.clone(), rows, lead: 0 });
+        self.retain_copies(|k, _| !range.contains(&k), |_| true, false);
+        self.request = Some(Request::IgnoreCopies(ignore));
+    }
+
+    /// "Not a copy" on the copy at `row`: it (and its other places in the
+    /// set, being the same picture) goes from its set, to the top of what
+    /// was ignored, and the app keeps that.
+    fn ignore_one(&mut self, row: usize) {
+        let Some(c) = self.copies.as_mut() else { return };
+        let Some(range) = c.sets.iter().find(|r| r.contains(&row)).cloned() else { return };
+        let id = Arc::clone(&c.ids[row]);
+        let of: Vec<String> = range.clone().filter(|&k| k != row).map(|k| c.ids[k].to_string()).collect();
+        let ignore = Ignore::Picture { picture: id.to_string(), of };
+        let own: Vec<usize> = range.clone().filter(|&k| c.ids[k] == id).collect();
+        let rows: Vec<PictureHit> = own.iter().chain(range.clone().filter(|k| !own.contains(k)).collect::<Vec<_>>().iter()).map(|&k| c.results[k].clone()).collect();
+        c.ignored.insert(0, IgnoredCopies { ignore: ignore.clone(), rows, lead: own.len() });
+        self.retain_copies(|k, _| !own.contains(&k), |_| true, false);
+        self.request = Some(Request::IgnoreCopies(ignore));
+    }
+
+    /// "Show again" on what was ignored, the `n`th: it goes from the
+    /// ignored list; its pictures are listed as copies again once the app
+    /// has gathered them anew.
+    fn show_again(&mut self, n: usize) {
+        let Some(c) = self.copies.as_mut() else { return };
+        if n >= c.ignored.len() {
+            return;
+        }
+        let g = c.ignored.remove(n);
+        c.flatten_ignored();
+        self.cursor = self.cursor.min(c.rows().len().saturating_sub(1));
+        self.request = Some(Request::ShowCopiesAgain(g.ignore));
+    }
+
+    /// Show what was ignored, or the sets again.
+    fn toggle_ignored(&mut self) {
+        let Some(c) = self.copies.as_mut() else { return };
+        c.showing_ignored = !c.showing_ignored;
+        self.cursor = 0;
+        self.shown = false;
     }
 
     /// What a click on the bar asked for, once.
@@ -764,7 +934,7 @@ impl FindBar {
 
     /// The pictures listed, when listing pictures rather than words.
     fn rows(&self) -> Option<&[PictureHit]> {
-        self.picture.as_ref().map(|p| p.results.as_slice()).or_else(|| self.copies.as_ref().map(|c| c.results.as_slice()))
+        self.picture.as_ref().map(|p| p.results.as_slice()).or_else(|| self.copies.as_ref().map(Copies::rows))
     }
 
     /// Open it looking for pictures like `q`.
@@ -994,7 +1164,15 @@ impl FindBar {
                     ui.set_width(WIDTH - 16.0);
                     let back = match (self.picture.as_mut(), &self.copies) {
                         (Some(p), _) => picture_header(ui, p),
-                        (None, Some(_)) => copies_header(ui),
+                        (None, Some(c)) => match copies_header(ui, c.showing_ignored, c.ignored.len()) {
+                            Some(CopiesPick::Back) => true,
+                            Some(CopiesPick::Toggle) => {
+                                self.toggle_ignored();
+                                picked = None;
+                                false
+                            }
+                            None => false,
+                        },
                         _ => false,
                     };
                     if back {
@@ -1045,7 +1223,16 @@ impl FindBar {
                     ui.add_space(4.0);
                     let status = if let Some(c) = &self.copies {
                         let m = c.results.len();
-                        if c.results_for.is_none() {
+                        if c.showing_ignored {
+                            let n = c.ignored.len();
+                            if n == 0 {
+                                "Nothing ignored on the slides".to_string()
+                            } else if self.shown {
+                                format!("{} of {}", self.cursor + 1, c.ignored_rows.len())
+                            } else {
+                                format!("{n} ignored — Show again puts one back in the duplicates")
+                            }
+                        } else if c.results_for.is_none() {
                             match reading.filter(|(r, t)| r < t) {
                                 Some((r, t)) => format!("Reading pictures, {r} of {t}"),
                                 None if unread > 0 => "Waiting for every slide to open".to_string(),
@@ -1125,38 +1312,82 @@ impl FindBar {
                     if let Some(c) = &self.copies {
                         let first = self.cursor.saturating_sub(PICTURE_ROWS - 1);
                         let mut budget = THUMBS_PER_FRAME;
-                        for (k, h) in c.results.iter().enumerate().skip(first).take(PICTURE_ROWS) {
-                            let set = c.sets.iter().find(|r| r.contains(&k)).cloned().unwrap_or(k..k + 1);
-                            if k == set.start || k == first {
-                                if let Some(r) = set_header(ui, &c.results[set.clone()], active) {
-                                    self.request = Some(r);
+                        // A click that changes the list, done once it is drawn.
+                        let mut act: Option<CopyAct> = None;
+                        let rows = c.rows();
+                        if c.showing_ignored {
+                            let ranges = c.ignored_ranges();
+                            for (k, h) in rows.iter().enumerate().skip(first).take(PICTURE_ROWS) {
+                                let Some(n) = ranges.iter().position(|r| r.contains(&k)) else { continue };
+                                let (g, range) = (&c.ignored[n], ranges[n].clone());
+                                if (k == range.start || k == first) && ignored_header(ui, g) {
+                                    act = Some(CopyAct::ShowAgain(n));
+                                }
+                                let texture = thumb(ui.ctx(), &mut self.thumbs, &h.png, &mut budget);
+                                let at = k - range.start;
+                                let label = match &g.ignore {
+                                    Ignore::Set(_) => format!("Picture {} of {}", at + 1, range.len()),
+                                    Ignore::Picture { .. } if at < g.lead => "Not a copy of the rest".to_string(),
+                                    Ignore::Picture { .. } => "Of the set it was in".to_string(),
+                                };
+                                if picture_row(ui, h, k == self.cursor, texture.as_ref(), &name, Some(&label)) {
+                                    self.cursor = k;
+                                    self.shown = true;
+                                    picked = Some(k);
                                 }
                             }
-                            let texture = thumb(ui.ctx(), &mut self.thumbs, &h.png, &mut budget);
-                            let label = format!("Copy {} of {}", k - set.start + 1, set.len());
-                            let mut go = false;
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                let w = (ui.available_width() - DELETE_BUTTON).max(120.0);
-                                ui.allocate_ui(Vec2::new(w, PICTURE_ROW), |ui| go = picture_row(ui, h, k == self.cursor, texture.as_ref(), &name, Some(&label)));
-                                let tip = format!("Delete this copy from slide {} — the other copies stay; Ctrl+Z there brings it back", h.hit.slide + 1);
-                                if ui.button("Delete").on_hover_text(tip).clicked() {
-                                    if let Found::Tagged { shapes, .. } = &h.hit.found {
-                                        if let [shape] = shapes[..] {
-                                            self.request = Some(Request::DeleteCopy { slide: h.hit.slide, layer: h.hit.layer, shape, png: Arc::clone(&h.png) });
-                                        }
+                        } else {
+                            for (k, h) in rows.iter().enumerate().skip(first).take(PICTURE_ROWS) {
+                                let Some(set_no) = c.sets.iter().position(|r| r.contains(&k)) else { continue };
+                                let set = c.sets[set_no].clone();
+                                if k == set.start || k == first {
+                                    match set_header(ui, &c.results[set.clone()], active) {
+                                        Some(SetPick::Extras(r)) => self.request = Some(r),
+                                        Some(SetPick::Ignore) => act = Some(CopyAct::IgnoreSet(set_no)),
+                                        None => {}
                                     }
                                 }
-                            });
-                            if go {
-                                self.cursor = k;
-                                self.shown = true;
-                                picked = Some(k);
+                                let texture = thumb(ui.ctx(), &mut self.thumbs, &h.png, &mut budget);
+                                let label = format!("Copy {} of {}", k - set.start + 1, set.len());
+                                let mut go = false;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    let w = (ui.available_width() - COPY_BUTTONS).max(120.0);
+                                    ui.allocate_ui(Vec2::new(w, PICTURE_ROW), |ui| go = picture_row(ui, h, k == self.cursor, texture.as_ref(), &name, Some(&label)));
+                                    let tip = "Not a copy of the others: take it out of this set. Ignored, at the top, brings it back";
+                                    if ui.button("Not a copy").on_hover_text(tip).clicked() {
+                                        act = Some(CopyAct::NotACopy(k));
+                                    }
+                                    let tip = format!("Delete this copy from slide {} — the other copies stay; Ctrl+Z there brings it back", h.hit.slide + 1);
+                                    if ui.button("Delete").on_hover_text(tip).clicked() {
+                                        if let Found::Tagged { shapes, .. } = &h.hit.found {
+                                            if let [shape] = shapes[..] {
+                                                self.request = Some(Request::DeleteCopy { slide: h.hit.slide, layer: h.hit.layer, shape, png: Arc::clone(&h.png) });
+                                            }
+                                        }
+                                    }
+                                });
+                                if go {
+                                    self.cursor = k;
+                                    self.shown = true;
+                                    picked = Some(k);
+                                }
                             }
                         }
-                        if c.results.len() > first + PICTURE_ROWS {
-                            let more = c.results.len() - first - PICTURE_ROWS;
+                        if rows.len() > first + PICTURE_ROWS {
+                            let more = rows.len() - first - PICTURE_ROWS;
                             ui.label(egui::RichText::new(format!("{more} more below")).small().color(theme::TEXT_MUTED));
+                        }
+                        match act {
+                            Some(CopyAct::IgnoreSet(n)) => self.ignore_set(n),
+                            Some(CopyAct::NotACopy(k)) => self.ignore_one(k),
+                            Some(CopyAct::ShowAgain(n)) => self.show_again(n),
+                            None => {}
+                        }
+                        if act.is_some() {
+                            // The rows changed under it: nothing to go to.
+                            picked = None;
+                            self.shown = false;
                         }
                         return;
                     }
@@ -1378,46 +1609,106 @@ fn icon_btn(ui: &mut egui::Ui, img: egui::Image<'_>, tooltip: &str) -> bool {
     response.on_hover_text(tooltip).clicked()
 }
 
-/// Above the field while listing copies: what the list is, and a button
-/// back to finding words. Returns whether that was clicked.
-fn copies_header(ui: &mut egui::Ui) -> bool {
-    let mut back = false;
+/// What a click on the header over the copies asks for.
+enum CopiesPick {
+    /// Back to finding words.
+    Back,
+    /// Show what was ignored, or the sets again.
+    Toggle,
+}
+
+/// Above the field while listing copies: what the list is, a link
+/// between the sets and what was ignored (`ignored` things), and a
+/// button back to finding words.
+fn copies_header(ui: &mut egui::Ui, showing_ignored: bool, ignored: usize) -> Option<CopiesPick> {
+    let mut out = None;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(egui::RichText::new("Duplicate pictures on every slide").color(theme::TEXT_PRIMARY));
-            ui.label(egui::RichText::new("Resized, recompressed, mirrored or turned copies count too").small().color(theme::TEXT_MUTED));
+            if showing_ignored {
+                ui.label(egui::RichText::new("Ignored duplicates").color(theme::TEXT_PRIMARY));
+                ui.label(egui::RichText::new("Not listed as copies — Show again puts one back").small().color(theme::TEXT_MUTED));
+            } else {
+                ui.label(egui::RichText::new("Duplicate pictures on every slide").color(theme::TEXT_PRIMARY));
+                ui.label(egui::RichText::new("Resized, recompressed, mirrored or turned copies count too").small().color(theme::TEXT_MUTED));
+            }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            back = ui.button(egui::RichText::new("×").size(16.0)).on_hover_text("Back to finding words").clicked();
+            if ui.button(egui::RichText::new("×").size(16.0)).on_hover_text("Back to finding words").clicked() {
+                out = Some(CopiesPick::Back);
+            }
+            let (text, tip) = if showing_ignored {
+                ("Duplicates".to_string(), "Back to the sets of copies")
+            } else {
+                (format!("Ignored · {ignored}"), "The sets and pictures you ignored, to bring any back")
+            };
+            if (showing_ignored || ignored > 0) && ui.link(egui::RichText::new(text).small()).on_hover_text(tip).clicked() {
+                out = Some(CopiesPick::Toggle);
+            }
         });
     });
     ui.add_space(4.0);
-    back
+    out
 }
 
-/// The line over a set of copies: how many and on which slides, and,
-/// where two or more sit on one layer of one slide (the shown slide's
-/// first), a button that selects all of those but one.
-fn set_header(ui: &mut egui::Ui, set: &[PictureHit], active: usize) -> Option<Request> {
-    let mut slides: Vec<usize> = set.iter().map(|h| h.hit.slide).collect();
-    slides.dedup();
-    let on = slides.iter().map(|s| (s + 1).to_string()).collect::<Vec<_>>().join(", ");
-    let text = format!("{} copies · {} {on}", set.len(), if slides.len() == 1 { "slide" } else { "slides" });
+/// What a click on the line over a set of copies asks for.
+enum SetPick {
+    /// Select its extra copies on one slide (`Request::SelectExtras`).
+    Extras(Request),
+    /// List it as copies no more.
+    Ignore,
+}
+
+/// The line over a set of copies: how many and on which slides, a button
+/// that ignores the set, and, where two or more sit on one layer of one
+/// slide (the shown slide's first), one that selects all of those but one.
+fn set_header(ui: &mut egui::Ui, set: &[PictureHit], active: usize) -> Option<SetPick> {
+    let text = format!("{} copies · {}", set.len(), slides_text(set));
     let mut out = None;
     ui.horizontal(|ui| {
         ui.add_space(4.0);
         ui.label(egui::RichText::new(text).small().color(FOUND));
-        if let Some(Request::SelectExtras { slide, shapes, .. }) = extras(set, active) {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let tip = "These are not copies: list them no more. Ignored, at the top, brings them back";
+            if ui.small_button("Ignore set").on_hover_text(tip).clicked() {
+                out = Some(SetPick::Ignore);
+            }
+            if let Some(Request::SelectExtras { slide, shapes, .. }) = extras(set, active) {
                 let n = shapes.len();
                 let tip = format!("Go to slide {} and select {n} of the {} copies there, keeping the one at the back — Delete then removes them", slide + 1, n + 1);
                 if ui.small_button(format!("Select {n} extra")).on_hover_text(tip).clicked() {
-                    out = extras(set, active);
+                    out = extras(set, active).map(SetPick::Extras);
                 }
-            });
-        }
+            }
+        });
     });
     out
+}
+
+/// The line over something ignored: what and on which slides, and a
+/// button that lists it as copies again. Whether that was clicked.
+fn ignored_header(ui: &mut egui::Ui, g: &IgnoredCopies) -> bool {
+    let text = match &g.ignore {
+        Ignore::Set(_) => format!("Ignored set of {} · {}", g.rows.len(), slides_text(&g.rows)),
+        Ignore::Picture { .. } => format!("Not a copy · {}", slides_text(&g.rows[..g.lead.max(1).min(g.rows.len())])),
+    };
+    let mut again = false;
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(text).small().color(FOUND));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            again = ui.small_button("Show again").on_hover_text("List these as copies again").clicked();
+        });
+    });
+    again
+}
+
+/// The slides these pictures are on: "slide 3", "slides 1, 4".
+fn slides_text(rows: &[PictureHit]) -> String {
+    let mut slides: Vec<usize> = rows.iter().map(|h| h.hit.slide).collect();
+    slides.sort_unstable();
+    slides.dedup();
+    let on = slides.iter().map(|s| (s + 1).to_string()).collect::<Vec<_>>().join(", ");
+    format!("{} {on}", if slides.len() == 1 { "slide" } else { "slides" })
 }
 
 /// A set's copies to select for deleting: where two or more sit on one
@@ -1634,7 +1925,8 @@ mod tests {
         };
         let mut bar = FindBar::default();
         bar.find_copies();
-        bar.set_copies(vec![vec![hit(1, 1), hit(1, 4), hit(2, 0)], vec![hit(1, 2), hit(3, 5)]], (1, 1));
+        let id = |h: PictureHit| (h, Arc::<str>::from("a"));
+        bar.set_copies(vec![vec![id(hit(1, 1)), id(hit(1, 4)), id(hit(2, 0))], vec![id(hit(1, 2)), id(hit(3, 5))]], Vec::new(), (1, 1));
         // The highlight is on slide 2's copy (row 2).
         bar.cursor = 2;
         // Slide 1's shape 2 goes: its set is down to one and goes too;
@@ -1655,6 +1947,98 @@ mod tests {
         bar.forget_copy(2, 0, 0);
         assert!(places(&bar).is_empty(), "the last copy is not a set of copies");
         assert!(!bar.go_to_cursor, "nothing left to go to");
+    }
+
+    /// The duplicates list, a click on a set's "Ignore set", and the
+    /// ignored list it went to. `OSN_SNAP_CLICK=x,y` clicks there in the
+    /// second shot (find the button in the first).
+    #[test]
+    #[ignore = "writes PNGs to OSN_SNAP_DIR"]
+    fn snapshot_copies_and_ignored() {
+        use crate::ui::snapshot::{shoot, Step};
+        let copy = Likeness { kind: Kind::Duplicate, score: 1.0, way: Default::default(), other_crop: false };
+        let mut c = Canvas::default();
+        c.layers[0].shapes.extend((0..8).map(|i| label([0.0, i as f32 * 10.0], "x")));
+        let png = |rgb: [u8; 3]| {
+            let img = image::RgbaImage::from_fn(48, 32, |x, _| image::Rgba([rgb[0], rgb[1].saturating_add(x as u8 * 2), rgb[2], 255]));
+            let mut out = Vec::new();
+            image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+            Arc::new(out)
+        };
+        let hit = |slide: usize, shape: usize, id: &str, rgb: [u8; 3]| (picture_hit(&c, slide, 0, shape, copy, png(rgb)).unwrap(), Arc::<str>::from(id));
+        let mut bar = FindBar::default();
+        bar.find_copies();
+        let sets = vec![
+            vec![hit(0, 0, "a", [200, 80, 60]), hit(2, 1, "a2", [205, 85, 60]), hit(4, 2, "a3", [200, 80, 70])],
+            vec![hit(1, 3, "b", [60, 120, 200]), hit(3, 4, "b2", [60, 125, 205])],
+        ];
+        let ignored = vec![IgnoredCopies { ignore: Ignore::Picture { picture: "c".into(), of: vec!["d".into()] }, rows: vec![hit(5, 5, "c", [90, 170, 90]).0, hit(6, 6, "d", [95, 175, 95]).0], lead: 1 }];
+        bar.set_copies(sets, ignored, (1, 1));
+        let draw = |bar: &mut FindBar, ctx: &egui::Context| {
+            bar.free_retired();
+            bar.show(ctx, |_| Vec::new(), 0, 0, |_| String::new(), None, Vec::new);
+        };
+        shoot("copies", [900.0, 640.0], 1.0, &[Step::Idle], |ctx| draw(&mut bar, ctx));
+        let click = std::env::var("OSN_SNAP_CLICK").ok().and_then(|s| {
+            let (x, y) = s.split_once(',')?;
+            Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))
+        });
+        if let Some(at) = click {
+            bar.thumbs.clear();
+            shoot("copies-clicked", [900.0, 640.0], 1.0, &[Step::Click(at)], |ctx| draw(&mut bar, ctx));
+            println!("asked for: {}", match bar.take_request() {
+                Some(Request::IgnoreCopies(i)) => format!("ignore {i:?}"),
+                Some(Request::ShowCopiesAgain(i)) => format!("show again {i:?}"),
+                Some(_) => "something else".into(),
+                None => "nothing".into(),
+            });
+        }
+        bar.thumbs.clear();
+        bar.toggle_ignored();
+        shoot("copies-ignored", [900.0, 640.0], 1.0, &[Step::Idle], |ctx| draw(&mut bar, ctx));
+    }
+
+    #[test]
+    fn ignoring_moves_rows_to_the_ignored_list_and_back() {
+        let copy = Likeness { kind: Kind::Duplicate, score: 1.0, way: Default::default(), other_crop: false };
+        let mut c = Canvas::default();
+        c.layers[0].shapes.extend((0..8).map(|i| label([0.0, i as f32 * 10.0], "x")));
+        let hit = |shape: usize, id: &str| (picture_hit(&c, 0, 0, shape, copy, Arc::new(Vec::new())).unwrap(), Arc::<str>::from(id));
+        let mut bar = FindBar::default();
+        bar.find_copies();
+        // Set 0: a, b, a again; set 1: c, d, e.
+        bar.set_copies(vec![vec![hit(0, "a"), hit(1, "b"), hit(2, "a")], vec![hit(3, "c"), hit(4, "d"), hit(5, "e")]], Vec::new(), (1, 1));
+        let shapes = |rows: &[PictureHit]| -> Vec<usize> { rows.iter().map(|h| match &h.hit.found { Found::Tagged { shapes, .. } => shapes[0], _ => unreachable!() }).collect() };
+        // "Not a copy" on the second "a": both places of it go; the set
+        // left with one goes too.
+        bar.cursor = 4;
+        bar.ignore_one(2);
+        let ignore = match bar.take_request() {
+            Some(Request::IgnoreCopies(i)) => i,
+            _ => panic!("no ignore asked for"),
+        };
+        assert_eq!(ignore, Ignore::Picture { picture: "a".into(), of: vec!["a".into(), "b".into()] });
+        let cp = bar.copies.as_ref().unwrap();
+        assert_eq!(shapes(&cp.results), [3, 4, 5]);
+        assert_eq!(bar.cursor, 1, "the highlight stays on shape 4");
+        assert_eq!((cp.ignored.len(), cp.ignored[0].lead), (1, 2));
+        assert_eq!(shapes(&cp.ignored_rows), [0, 2, 1], "its own places first");
+        // Ignore the whole other set: it goes to the top of the ignored.
+        bar.ignore_set(0);
+        assert!(matches!(bar.take_request(), Some(Request::IgnoreCopies(Ignore::Set(ids))) if ids == ["c", "d", "e"]));
+        let cp = bar.copies.as_ref().unwrap();
+        assert!(cp.results.is_empty());
+        assert_eq!(shapes(&cp.ignored_rows), [3, 4, 5, 0, 2, 1]);
+        // In the ignored list, a picture deleted goes from it, and the
+        // shapes after it move down.
+        bar.toggle_ignored();
+        assert_eq!(bar.rows().map(<[PictureHit]>::len), Some(6));
+        bar.forget_copy(0, 0, 4);
+        assert_eq!(shapes(&bar.copies.as_ref().unwrap().ignored_rows), [3, 4, 0, 2, 1]);
+        // Show again: it leaves the ignored list, for the app to list anew.
+        bar.show_again(1);
+        assert!(matches!(bar.take_request(), Some(Request::ShowCopiesAgain(Ignore::Picture { .. }))));
+        assert_eq!(shapes(&bar.copies.as_ref().unwrap().ignored_rows), [3, 4]);
     }
 
     fn label(at: [f32; 2], text: &str) -> Shape {

@@ -3,7 +3,8 @@
 //! find has one.
 
 use super::*;
-use crate::canvas::shape::{RasterKind, Shape};
+use crate::canvas::shape::{PictureRef, RasterKind, Shape};
+use crate::persistence::copy_ignores::{CopyIgnores, Ignore};
 use crate::tools::similar::{self, Origin};
 use std::sync::mpsc::{self, TryRecvError};
 use std::collections::HashMap;
@@ -142,6 +143,20 @@ impl TagBars {
     }
 }
 
+/// What a stored picture is known by in the duplicates list, here and in
+/// what was ignored of it (`persistence::copy_ignores`): its file and how
+/// it is shown. A video or GIF is known by its file (`media:…`), any
+/// other picture by its bytes (`bytes_id`).
+fn picture_id(p: &PictureRef) -> String {
+    format!("file:{}|{:?}|{}", p.file, p.crop, p.mirror)
+}
+
+/// What a picture kept in its slide is known by: its bytes' hash, which
+/// stays the same from run to run.
+fn bytes_id(png: &[u8]) -> String {
+    format!("bytes:{:016x}:{}", crate::canvas::board_link::Fnv::of(png), png.len())
+}
+
 /// Typing must pause this long before the words are read.
 const WORD_PAUSE: std::time::Duration = std::time::Duration::from_millis(350);
 
@@ -151,10 +166,14 @@ pub(super) struct FindReading {
     rx: mpsc::Receiver<Option<image::RgbaImage>>,
 }
 
+/// What gathering copies comes back with: the sets, and each picture's
+/// key (`picture_id`).
+type CopiesFound = (Vec<Vec<usize>>, Vec<Arc<str>>);
+
 /// Every picture on the slides being gathered into sets of copies, off
-/// the UI thread (`similar::copies`).
+/// the UI thread (`similar::copies_apart`).
 pub(super) struct CopiesJob {
-    rx: mpsc::Receiver<Vec<Vec<usize>>>,
+    rx: mpsc::Receiver<CopiesFound>,
     /// `(slide, layer, shape, bytes)` of each picture the job was given.
     places: Vec<(usize, usize, usize, Arc<Vec<u8>>)>,
     /// What the job was started from (see `FindBar::update_pictures`).
@@ -492,6 +511,23 @@ impl OnScreenNotesApp {
         self.toast = Some((format!("Deleted from slide {} — Ctrl+Z there brings it back", slide + 1), Instant::now()));
     }
 
+    /// Something in the duplicates list ignored: list it no more, from
+    /// now on. The list is gathered again (`update_copies`).
+    pub(super) fn ignore_copies(&mut self, ignore: Ignore) {
+        let what = match &ignore {
+            Ignore::Set(_) => "Set ignored",
+            Ignore::Picture { .. } => "Taken out of its set",
+        };
+        self.copy_ignores.get_or_insert_with(CopyIgnores::load).add(ignore);
+        self.toast = Some((format!("{what} — Ignored, at the top of the list, brings it back"), Instant::now()));
+    }
+
+    /// Something ignored in the duplicates list, listed again.
+    pub(super) fn show_copies_again(&mut self, ignore: Ignore) {
+        self.copy_ignores.get_or_insert_with(CopyIgnores::load).remove(&ignore);
+        self.toast = Some(("Listed as copies again".to_string(), Instant::now()));
+    }
+
     /// A suggestion taken: tag the picture.
     pub(super) fn tag_suggested(&mut self, slide: usize, layer: usize, shape: usize, tag: &str) {
         let msg = if self.canvases.add_tag(slide, layer, shape, tag) {
@@ -550,28 +586,58 @@ impl OnScreenNotesApp {
         let unread = canvases.count() - slides.len();
         let first_look = self.ws.find.copies_found_for().is_none() && self.ws.copies_job.is_none();
         self.picture_index.tick(slides.iter().copied(), first_look);
+        let ignores: &CopyIgnores = self.copy_ignores.get_or_insert_with(CopyIgnores::load);
         let index = &self.picture_index;
-        let key = (index.generation(), slides.len());
+        // Gathered again when pictures are read, or something is ignored
+        // or shown again.
+        let key = (index.generation() ^ ignores.generation().rotate_left(40), slides.len());
         let (read, total) = index.progress();
 
         let done = self.ws.copies_job.as_ref().map(|j| j.rx.try_recv());
         match done {
-            Some(Ok(sets)) => {
+            Some(Ok((sets, ids))) => {
                 let job = self.ws.copies_job.take().expect("a job is running");
                 let copy = similar::Likeness { kind: similar::Kind::Duplicate, score: 1.0, way: Default::default(), other_crop: false };
-                let sets: Vec<Vec<ui::find_bar::PictureHit>> = sets
+                let hit = |i: usize| {
+                    let (s, l, sh, png) = &job.places[i];
+                    ui::find_bar::picture_hit(canvases.slide(*s)?, *s, *l, *sh, copy, Arc::clone(png))
+                };
+                let sets: Vec<Vec<(ui::find_bar::PictureHit, Arc<str>)>> = sets
                     .into_iter()
-                    .map(|set| {
-                        set.into_iter()
-                            .filter_map(|i| {
-                                let (s, l, sh, png) = &job.places[i];
-                                ui::find_bar::picture_hit(canvases.slide(*s)?, *s, *l, *sh, copy, Arc::clone(png))
-                            })
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|set| set.into_iter().filter_map(|i| Some((hit(i)?, Arc::clone(&ids[i])))).collect::<Vec<_>>())
                     .filter(|set| set.len() > 1)
                     .collect();
-                self.ws.find.set_copies(sets, job.key);
+                // What was ignored, newest first, with its pictures here.
+                let mut at: HashMap<&str, Vec<usize>> = HashMap::new();
+                for (i, id) in ids.iter().enumerate() {
+                    at.entry(&**id).or_default().push(i);
+                }
+                let places_of = |keys: &[String]| -> Vec<usize> {
+                    let mut v: Vec<usize> = keys.iter().flat_map(|k| at.get(k.as_str()).into_iter().flatten().copied()).collect();
+                    v.sort_unstable();
+                    v.dedup();
+                    v
+                };
+                let ignored: Vec<ui::find_bar::IgnoredCopies> = ignores
+                    .list()
+                    .iter()
+                    .rev()
+                    .map(|ignore| {
+                        let (own, of) = match ignore {
+                            Ignore::Set(keys) => (Vec::new(), places_of(keys)),
+                            Ignore::Picture { picture, of } => {
+                                let own = places_of(std::slice::from_ref(picture));
+                                let of = places_of(of).into_iter().filter(|i| !own.contains(i)).collect();
+                                (own, of)
+                            }
+                        };
+                        let mut rows: Vec<ui::find_bar::PictureHit> = own.into_iter().filter_map(hit).collect();
+                        let lead = rows.len();
+                        rows.extend(of.into_iter().filter_map(hit));
+                        ui::find_bar::IgnoredCopies { ignore: ignore.clone(), rows, lead }
+                    })
+                    .collect();
+                self.ws.find.set_copies(sets, ignored, job.key);
             }
             Some(Err(TryRecvError::Disconnected)) => self.ws.copies_job = None,
             Some(Err(TryRecvError::Empty)) | None => {}
@@ -582,6 +648,8 @@ impl OnScreenNotesApp {
             // In slide order, so each set lists its copies that way.
             let mut items = Vec::new();
             let mut places = Vec::new();
+            // Each picture's key where it is known without its bytes.
+            let mut known: Vec<Option<String>> = Vec::new();
             for si in 0..canvases.count() {
                 let Some(c) = canvases.slide(si) else { continue };
                 for (li, l) in c.layers.iter().enumerate() {
@@ -589,22 +657,49 @@ impl OnScreenNotesApp {
                         let Shape::Raster { png, kind: RasterKind::Image, picture, media, .. } = s else { continue };
                         let mut keys = vec![format!("bytes:{}", Arc::as_ptr(png) as usize)];
                         if let Some(p) = picture {
-                            keys.push(format!("file:{}|{:?}|{}", p.file, p.crop, p.mirror));
+                            keys.push(picture_id(p));
                         }
                         if let Some(m) = media {
                             keys.push(format!("media:{}", m.file));
                         }
+                        known.push(match (picture, media) {
+                            (Some(p), _) => Some(picture_id(p)),
+                            (None, Some(m)) => Some(format!("media:{}", m.file)),
+                            (None, None) => None,
+                        });
                         items.push(similar::Item { print: index.print(png), keys });
                         places.push((si, li, shi, Arc::clone(png)));
                     }
                 }
             }
+            let pngs: Vec<Arc<Vec<u8>>> = places.iter().map(|p| Arc::clone(&p.3)).collect();
+            let apart = ignores.pairs().clone();
             let (tx, rx) = mpsc::channel();
             let spawned = std::thread::Builder::new().name("osn-copies".into()).spawn(move || {
                 let t = Instant::now();
-                let sets = similar::copies(&items);
+                let ids: Vec<Arc<str>> = known.into_iter().zip(&pngs).map(|(k, png)| k.unwrap_or_else(|| bytes_id(png)).into()).collect();
+                let sets = {
+                    // Each key as a number, and the pairs kept apart among
+                    // the pictures here.
+                    let mut no: HashMap<&str, u32> = HashMap::new();
+                    let nos: Vec<u32> = ids
+                        .iter()
+                        .map(|id| {
+                            let n = no.len() as u32;
+                            *no.entry(&**id).or_insert(n)
+                        })
+                        .collect();
+                    let pairs: std::collections::HashSet<(u32, u32)> = apart
+                        .iter()
+                        .filter_map(|(a, b)| {
+                            let (a, b) = (*no.get(a.as_str())?, *no.get(b.as_str())?);
+                            Some((a.min(b), a.max(b)))
+                        })
+                        .collect();
+                    similar::copies_apart(&items, |i, j| !pairs.is_empty() && pairs.contains(&(nos[i].min(nos[j]), nos[i].max(nos[j]))))
+                };
                 log::info!("{} pictures gathered into {} sets of copies in {} ms", items.len(), sets.len(), t.elapsed().as_millis());
-                let _ = tx.send(sets);
+                let _ = tx.send((sets, ids));
             });
             match spawned {
                 Ok(_) => self.ws.copies_job = Some(CopiesJob { rx, places, key }),

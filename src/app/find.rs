@@ -77,6 +77,8 @@ impl OnScreenNotesApp {
             Some(ui::find_bar::Request::TagPicture { slide, layer, shape, tag }) => self.tag_suggested(slide, layer, shape, &tag),
             Some(ui::find_bar::Request::NotThis { slide, layer, shape, tag }) => self.reject_suggested(slide, layer, shape, &tag),
             Some(ui::find_bar::Request::DeleteCopy { slide, layer, shape, png }) => self.delete_copy(slide, layer, shape, &png),
+            Some(ui::find_bar::Request::IgnoreCopies(i)) => self.ignore_copies(i),
+            Some(ui::find_bar::Request::ShowCopiesAgain(i)) => self.show_copies_again(i),
             None => {}
         }
     }

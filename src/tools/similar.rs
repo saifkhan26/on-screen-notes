@@ -232,7 +232,15 @@ const _: () = assert!(CHUNKS > DUPLICATE_BITS, "a copy must share a chunk");
 
 /// The sets of copies among `items`: each set's items in the order given,
 /// the sets in the order of their first item. Items in no set are left out.
+#[cfg(test)]
 pub fn copies(items: &[Item]) -> Vec<Vec<usize>> {
+    copies_apart(items, |_, _| false)
+}
+
+/// As `copies`, but two items `apart` says are not copies (ignored in
+/// the duplicates list) are never joined directly; they still share a
+/// set when other copies link them.
+pub fn copies_apart(items: &[Item], apart: impl Fn(usize, usize) -> bool) -> Vec<Vec<usize>> {
     let mut parent: Vec<usize> = (0..items.len()).collect();
     fn root(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
@@ -247,15 +255,18 @@ pub fn copies(items: &[Item]) -> Vec<Vec<usize>> {
             parent[ra.max(rb)] = ra.min(rb);
         }
     };
-    let mut first: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    // Every earlier item with each key, so one kept apart from the first
+    // can still join another.
+    let mut with: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for (i, item) in items.iter().enumerate() {
         for k in &item.keys {
-            match first.get(k.as_str()) {
-                Some(&j) => join(&mut parent, i, j),
-                None => {
-                    first.insert(k, i);
+            let earlier = with.entry(k.as_str()).or_default();
+            for &j in earlier.iter() {
+                if root(&mut parent, i) != root(&mut parent, j) && !apart(i, j) {
+                    join(&mut parent, i, j);
                 }
             }
+            earlier.push(i);
         }
     }
     let chunk = |h: u64, k: u32| ((h >> (1 + k * CHUNK)) & ((1 << CHUNK) - 1)) as u16;
@@ -272,7 +283,7 @@ pub fn copies(items: &[Item]) -> Vec<Vec<usize>> {
         for h in p.hashes {
             for k in 0..CHUNKS {
                 for &j in buckets.get(&(k, chunk(h, k))).map_or(&[][..], Vec::as_slice) {
-                    if j != i && root(&mut parent, i) != root(&mut parent, j) && items[j].print.is_some_and(|q| p.is_copy_of(&q)) {
+                    if j != i && root(&mut parent, i) != root(&mut parent, j) && items[j].print.is_some_and(|q| p.is_copy_of(&q)) && !apart(i, j) {
                         join(&mut parent, i, j);
                     }
                 }
@@ -927,6 +938,12 @@ mod tests {
         ];
         assert_eq!(copies(&items), vec![vec![0, 2, 4], vec![1, 5], vec![8, 9]]);
         assert!(copies(&[]).is_empty());
+        // Kept apart: 0 from 2 and 4 (it is not a copy of them), and the
+        // same file 8 from 9 (that set ignored).
+        let apart = |i: usize, j: usize| matches!((i.min(j), i.max(j)), (0, 2) | (0, 4) | (8, 9));
+        assert_eq!(copies_apart(&items, apart), vec![vec![1, 5], vec![2, 4]]);
+        // Kept apart from one, a copy still joins through another.
+        assert_eq!(copies_apart(&items, |i, j| (i.min(j), i.max(j)) == (0, 2)), vec![vec![0, 2, 4], vec![1, 5], vec![8, 9]]);
     }
 
     /// Every picture on a folder of slides (a copy: `OSN_TEST_SLIDES_DIR`)

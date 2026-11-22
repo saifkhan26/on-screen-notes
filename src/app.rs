@@ -164,6 +164,8 @@ pub struct OnScreenNotesApp {
     picture_vectors: crate::canvas::picture_vectors::PictureVectors,
     /// Pictures turned down for a tag; read once picture search needs them.
     tag_rejections: Option<crate::persistence::tag_rejections::Rejections>,
+    /// What was ignored in the duplicates list; read once it is listed.
+    copy_ignores: Option<crate::persistence::copy_ignores::CopyIgnores>,
     /// Each tag's bars for the tag row's likely tags, kept from one
     /// picture to the next.
     tag_bars: similar::TagBars,
@@ -567,6 +569,7 @@ impl OnScreenNotesApp {
             picture_index: Default::default(),
             picture_vectors: Default::default(),
             tag_rejections: None,
+            copy_ignores: None,
             tag_bars: Default::default(),
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),

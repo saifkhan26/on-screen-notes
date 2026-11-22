@@ -262,4 +262,36 @@ mod tests {
             find.show(ctx, |_| Vec::new(), 0, 0, |_| String::new(), None, tags);
         });
     }
+
+    /// The arrange bar over one tagged picture: each tag a chip that
+    /// finds it, the rest as a count. `OSN_SNAP_CLICK=x,y` clicks there in
+    /// a second shot and prints what the bar asked for.
+    #[test]
+    #[ignore = "writes PNGs to OSN_SNAP_DIR"]
+    fn snapshot_tag_chips() {
+        let m = CanvasManager::for_tests(vec![Canvas::default()]);
+        let keys = HotkeysConfig::default().parsed();
+        let (mut apart, mut dim, mut pack) = (true, false, crate::tools::arrange::PackMode::default());
+        let tags: Vec<(String, bool)> = [("pose", false), ("character", false), ("ref", true), ("hands", false), ("study", false)].iter().map(|(t, s)| (t.to_string(), *s)).collect();
+        let mut asked = None;
+        let mut draw = |ctx: &egui::Context| {
+            if let Some(a) = crate::ui::arrange_bar::show(ctx, 1, false, None, &m, &mut apart, &mut dim, &mut pack, &keys, false, None, false, &tags, &mut None) {
+                asked = Some(a);
+            }
+        };
+        shoot("tag-chips", [1100.0, 300.0], 1.0, &[Step::Idle], &mut draw);
+        let click = std::env::var("OSN_SNAP_CLICK").ok().and_then(|s| {
+            let (x, y) = s.split_once(',')?;
+            Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))
+        });
+        if let Some(at) = click {
+            shoot("tag-chips-hover", [1100.0, 300.0], 1.0, &[Step::Move(at), Step::Idle, Step::Idle], &mut draw);
+            shoot("tag-chips-clicked", [1100.0, 300.0], 1.0, &[Step::Click(at)], &mut draw);
+            println!("asked for: {}", match asked {
+                Some(crate::ui::arrange_bar::BarAction::FindTag(t)) => format!("find #{t}"),
+                Some(_) => "something else".into(),
+                None => "nothing".into(),
+            });
+        }
+    }
 }
