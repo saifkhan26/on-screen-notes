@@ -1527,14 +1527,14 @@ impl CanvasManager {
         // Pins are found by slide index, and every later slide just moved.
         self.pins.forget_scans();
         // Removing a canvas shifts every later one down a file slot, so
-        // their existing files now hold the wrong content — everything
-        // has to be rewritten, not just the deleted index.
-        for c in self.canvases.iter_mut().flatten() {
+        // their existing files now hold the wrong content and are
+        // rewritten. The ones before it keep their slot and their file:
+        // deleting the last slide rewrites nothing.
+        for c in self.canvases[i..].iter_mut().flatten() {
             c.dirty = true;
         }
-        // Best-effort: also remove the on-disk file for the removed slot,
-        // and shift down everything past it. Simplest is to re-save all,
-        // which `save_all` does on the next debounced tick.
+        // The files past the new count go at the next save, after the
+        // rewrites (`save_all`).
         self.prune_orphans = true;
     }
 
@@ -1632,10 +1632,11 @@ impl CanvasManager {
             }
         }
         let count = self.canvases.len();
-        if dirty.is_empty() {
+        if dirty.is_empty() && !self.prune_orphans {
             // Nothing changed — skip the worker entirely. Most ticks
             // hit this path; the heavy work only fires after a real
-            // edit.
+            // edit. (Deleting the last slide leaves nothing to rewrite,
+            // only files to remove.)
             return;
         }
         let prune = std::mem::take(&mut self.prune_orphans);
@@ -1833,14 +1834,7 @@ fn delete_media_files_in(dir: &std::path::Path, names: &[String]) {
 /// right after the user deleted a canvas, when those slots are known to
 /// hold content that has just been rewritten one index lower.
 fn remove_stale_canvas_files(count: usize) {
-    if let Ok(dir) = crate::persistence::paths::canvases_dir() {
-        for extra in count..(count + 10) {
-            let p = dir.join(format!("canvas_{extra}.ron"));
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
+    crate::persistence::remove_canvas_files_from(count);
 }
 
 #[cfg(test)]
@@ -2275,6 +2269,7 @@ mod loader_tests {
 
         slides_still_loading_are_never_written(&dir);
         moved_slides_are_renamed_not_rewritten(&dir);
+        deleted_last_slides_stay_deleted(&dir);
 
         std::env::remove_var("OSN_DATA_DIR");
         let _ = std::fs::remove_dir_all(&root);
@@ -2322,6 +2317,46 @@ mod loader_tests {
         let m = CanvasManager::load_or_default(&AppConfig::default());
         assert_eq!((m.name(0), m.name(2)), ("", "First"));
         assert_eq!(m.slide(2).unwrap().pan, [0.0, 0.0]);
+    }
+
+    /// Empty slides deleted off the end, several before one save, are
+    /// gone at the next start: every file past the last slide goes, however
+    /// far past, and the slides before them are not rewritten. Runs inside
+    /// the test above, which owns `OSN_DATA_DIR`.
+    fn deleted_last_slides_stay_deleted(dir: &std::path::Path) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            std::fs::remove_file(e.unwrap().path()).unwrap();
+        }
+        let modified = |i: usize| std::fs::metadata(dir.join(format!("canvas_{i}.ron"))).unwrap().modified().unwrap();
+        for i in 0..3 {
+            let c = Canvas { pan: [i as f32, 0.0], ..Canvas::default() };
+            std::fs::write(dir.join(format!("canvas_{i}.ron")), crate::persistence::serialize_canvas(&c).unwrap()).unwrap();
+        }
+        // Empty slides left far past the others, 3..=19 missing between.
+        let empty = crate::persistence::serialize_canvas(&Canvas::default()).unwrap();
+        for i in 20..26 {
+            std::fs::write(dir.join(format!("canvas_{i}.ron")), &empty).unwrap();
+        }
+        let before: Vec<_> = (0..3).map(modified).collect();
+
+        let mut m = CanvasManager::load_or_default(&AppConfig::default());
+        assert_eq!(m.count(), 26);
+        while m.count() > 3 {
+            m.go_to(m.count() - 1);
+            m.delete_active();
+        }
+        m.save_all(Some(&HashSet::new()));
+        while m.saving.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut left: Vec<usize> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.strip_prefix("canvas_")?.strip_suffix(".ron")?.parse().ok())
+            .collect();
+        left.sort_unstable();
+        assert_eq!(left, [0, 1, 2], "no file past the last slide is left");
+        assert_eq!((0..3).map(modified).collect::<Vec<_>>(), before, "the slides kept are not rewritten");
+        assert_eq!(CanvasManager::load_or_default(&AppConfig::default()).count(), 3);
     }
 
     /// A slide the background loader has not read yet is never written,
