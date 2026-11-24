@@ -225,6 +225,9 @@ pub struct OnScreenNotesApp {
     pureref_jobs: Vec<crate::media::pureref::OpenJob>,
     /// When the last frame started, for `hold_to_refresh_rate`.
     last_frame_at: Option<Instant>,
+    /// Pen events `hold_to_refresh_rate` read while it waited, handed on
+    /// with the frame's own (`smoothed_pen_events`).
+    early_pen: Vec<crate::input::pen::PenEvent>,
     /// The picture the last in-app copy put on the OS clipboard, so a
     /// paste that finds it there pastes the objects instead. Set by the
     /// thread that builds it.
@@ -245,6 +248,10 @@ const PEN_OWNS_POINTER: Duration = Duration::from_millis(250);
 /// range, keeping frames coming at full speed. A hovering pen sends
 /// packets as it moves; this bridges the pauses of a hand held still.
 const PEN_NEARBY: Duration = Duration::from_secs(1);
+
+/// How often a frame held to the refresh rate looks for the pen touching
+/// down while it waits (`hold_to_refresh_rate`).
+const PEN_WATCH_STEP: Duration = Duration::from_millis(1);
 
 /// Frame interval when nothing on screen moves by itself. Frames keep
 /// coming this often because Wintab packets and global hotkeys are
@@ -592,6 +599,7 @@ impl OnScreenNotesApp {
             resync_dialog: None,
             pureref_jobs: Vec::new(),
             last_frame_at: None,
+            early_pen: Vec::new(),
             clip_image: Default::default(),
             progress_since: None,
         }

@@ -136,6 +136,15 @@ impl OnScreenNotesApp {
         }
     }
 
+    /// Where the main window's client area starts on screen, in pixels:
+    /// what pen samples are taken relative to.
+    pub(super) fn client_origin(&self, ctx: &egui::Context) -> [i32; 2] {
+        let ppp = ctx.pixels_per_point().max(1e-3);
+        crate::platform::client_rect(self.osn_hwnd).map(|(l, t, _, _)| [l, t]).unwrap_or_else(|| {
+            ctx.input(|i| i.viewport().inner_rect.map(|r| [(r.min.x * ppp).round() as i32, (r.min.y * ppp).round() as i32]).unwrap_or([0, 0]))
+        })
+    }
+
     /// This frame's pen events, smoothed for the active smoothing mode (the
     /// ones a gesture over the slide window owns taken out), and where the window's
     /// client area is on screen.
@@ -151,17 +160,10 @@ impl OnScreenNotesApp {
         //      a pixel only at 100 % — the system's scaling and the UI size
         //      (`config.ui_scale`, egui's zoom) both change that.
         let ppp = ctx.pixels_per_point().max(1e-3);
-        let client_origin = crate::platform::client_rect(self.osn_hwnd)
-            .map(|(l, t, _, _)| [l, t])
-            .unwrap_or_else(|| {
-                ctx.input(|i| {
-                    i.viewport()
-                        .inner_rect
-                        .map(|r| [(r.min.x * ppp).round() as i32, (r.min.y * ppp).round() as i32])
-                        .unwrap_or([0, 0])
-                })
-            });
-        let mut raw_pen_events = self.pen.poll(client_origin);
+        let client_origin = self.client_origin(ctx);
+        // What the frame's hold read while it waited comes first.
+        let mut raw_pen_events = std::mem::take(&mut self.early_pen);
+        raw_pen_events.extend(self.pen.poll(client_origin));
         // The packets still show the pen touching, none has come for a
         // while, and the mouse moves or clicks here: the pen's lift was
         // lost, so lift it now. Until then the mouse would be ignored as

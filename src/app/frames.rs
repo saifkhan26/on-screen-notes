@@ -61,12 +61,33 @@ impl OnScreenNotesApp {
     /// frame that starts with a button or pen press is never held, and
     /// once ink is going down frames are not held either, so drawing
     /// latency is unchanged.
+    ///
+    /// Wintab wakes nothing, so a pen touching down mid-wait used to sit
+    /// unread for the rest of it, up to a whole refresh before its first
+    /// ink. With the pen in range the wait is taken in short steps, the
+    /// pen read between them (kept for this frame, `early_pen`), and a
+    /// touch-down ends it.
     pub(super) fn hold_to_refresh_rate(&mut self, ctx: &egui::Context) {
         let pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { pressed: true, .. })));
         if !pressed && !self.needs_live_frames() {
-            if let Some(since) = self.last_frame_at.map(|t| t.elapsed()) {
-                if since < self.idle_frame {
-                    std::thread::sleep(self.idle_frame - since);
+            if let Some(due) = self.last_frame_at.map(|t| t + self.idle_frame) {
+                if self.pen.seen_within(PEN_NEARBY) {
+                    let origin = self.client_origin(ctx);
+                    loop {
+                        let now = Instant::now();
+                        if now >= due {
+                            break;
+                        }
+                        std::thread::sleep((due - now).min(PEN_WATCH_STEP));
+                        let events = self.pen.poll(origin);
+                        let down = events.iter().any(|e| matches!(e, crate::input::pen::PenEvent::Down(_)));
+                        self.early_pen.extend(events);
+                        if down {
+                            break;
+                        }
+                    }
+                } else if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
                 }
             }
         }
