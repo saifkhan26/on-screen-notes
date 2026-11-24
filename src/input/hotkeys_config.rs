@@ -500,10 +500,11 @@ pub struct CanvasSection {
     /// Drag a box on the canvas: the slide window shows that part.
     #[serde(default)] pub slide_window_region: String,
     #[serde(default)] pub new_layer: String,
-    /// The active layer goes, as with the layer panel's bin: no undo.
+    /// The active layer goes, as with the layer panel's bin: asks first
+    /// when it holds anything, and undo brings it back.
     #[serde(default)] pub delete_layer: String,
-    /// The active layer one place up / down the stack. Like the panel's
-    /// arrows, this clears the slide's undo history.
+    /// The active layer one place up / down the stack, like the panel's
+    /// arrows. One undo step each.
     #[serde(default)] pub move_layer_up: String,
     #[serde(default)] pub move_layer_down: String,
     /// With a pin selected: go to the slide its objects are on.
@@ -1524,9 +1525,9 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "slide_window")         => "Show the slide in the slide window, or close it",
         ("canvas", "slide_window_region")  => "Drag a box on the canvas: the slide window shows that part (pops out over it if closed)",
         ("canvas", "new_layer")            => "New layer",
-        ("canvas", "delete_layer")         => "Delete the active layer (no undo)",
-        ("canvas", "move_layer_up")        => "Active layer one place up (clears the undo history)",
-        ("canvas", "move_layer_down")      => "Active layer one place down (clears the undo history)",
+        ("canvas", "delete_layer")         => "Delete the active layer (asks first; undo brings it back)",
+        ("canvas", "move_layer_up")        => "Active layer one place up",
+        ("canvas", "move_layer_down")      => "Active layer one place down",
         ("canvas", "pin_go_to_slide")      => "Selected pin: go to the slide its objects are on",
         ("canvas", "pin_this_slide_only")  => "Selected pin: show it on its slide only, or on every slide",
         ("canvas", "ui_scale_up")          => "UI bigger (toolbar, panels, bars; the slides keep their size)",
@@ -1793,7 +1794,7 @@ mod tests {
         assert!(added("marker").ends_with("  # Marker (highlighter)"));
         assert!(added("align_left").ends_with("  # Align the selection left"));
         assert!(added("colour_3").ends_with("  # Palette colour 3 (recolours a selection)"));
-        assert!(added("delete_layer").ends_with("# Delete the active layer (no undo)"));
+        assert!(added("delete_layer").ends_with("# Delete the active layer (asks first; undo brings it back)"));
         assert_eq!(added("pencil"), "pencil = \"b\"");
         let column = |key: &str| added(key).find("  # ").unwrap();
         assert_eq!(column("marker"), column("dashed_border"));

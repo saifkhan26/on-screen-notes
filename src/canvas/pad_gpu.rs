@@ -488,9 +488,8 @@ impl Session {
     }
 
     /// Start bringing the pad's pixels back from the GPU, as they are
-    /// now, without waiting for them (`Readback`). Ends a stroke in hand
-    /// first.
-    pub fn start_read(&mut self) -> Option<Readback> {
+    /// now (`Readback`). Ends a stroke in hand first.
+    fn start_read(&mut self) -> Option<Readback> {
         self.end();
         let g = GPU.get()?;
         let [w, h] = self.size;
@@ -514,8 +513,7 @@ impl Session {
         g.rs.queue.submit(Some(enc.finish()));
         let mapped = Arc::new(OnceLock::new());
         let done = Arc::clone(&mapped);
-        // No warning here: a readback let go of before it came (the pad
-        // put away mid-snapshot) also ends up here, as an error.
+        // No warning here: `read_pixels` says when one fails.
         buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             let _ = done.set(r.is_ok());
         });
@@ -523,10 +521,8 @@ impl Session {
     }
 }
 
-/// A pad's pixels on their way back from the GPU (`Session::start_read`),
-/// so a snapshot of them never holds up the pen: `ready` asks without
-/// waiting, and `into_pixels` may run on any thread.
-pub struct Readback {
+/// A pad's pixels on their way back from the GPU (`Session::start_read`).
+struct Readback {
     buffer: wgpu::Buffer,
     size: [u32; 2],
     /// Bytes a row takes in `buffer`: wgpu pads rows to its alignment.
@@ -536,17 +532,6 @@ pub struct Readback {
 }
 
 impl Readback {
-    /// `None` while the pixels are still on their way (the GPU is asked,
-    /// without waiting); then whether they could be read.
-    pub fn ready(&self) -> Option<bool> {
-        if self.mapped.get().is_none() {
-            if let Some(g) = GPU.get() {
-                let _ = g.rs.device.poll(wgpu::Maintain::Poll);
-            }
-        }
-        self.mapped.get().copied()
-    }
-
     /// Wait for the pixels; whether they could be read.
     fn wait(&self) -> bool {
         if self.mapped.get().is_none() {
@@ -557,9 +542,9 @@ impl Readback {
         self.mapped.get().copied().unwrap_or(false)
     }
 
-    /// The pixels, straight RGBA, once `ready` said they are back; `None`
+    /// The pixels, straight RGBA, once `wait` said they are back; `None`
     /// before, or if they could not be read.
-    pub fn into_pixels(self) -> Option<Vec<u8>> {
+    fn into_pixels(self) -> Option<Vec<u8>> {
         if self.mapped.get() != Some(&true) {
             return None;
         }
@@ -692,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn a_readback_holds_the_pixels_of_when_it_started_and_reads_on_any_thread() {
+    fn reading_back_a_pad_with_padded_rows_gives_its_pixels() {
         if gpu().is_none() {
             return;
         }
@@ -700,25 +685,10 @@ mod tests {
         let mut s = Session::new(vec![0u8; (w * h * 4) as usize], w, h, true).expect("opens");
         s.begin(Brush::Pen, [0, 0, 0, 255]);
         s.push(&[Stamp { c: [10.0, 10.0], r: 4.0, flow: 1.0 }]);
-        let back = s.start_read().expect("starts");
-        let want = s.read_pixels().unwrap();
-        // A stroke drawn after it started is not in it.
-        s.begin(Brush::Pen, [0, 0, 0, 255]);
-        s.push(&[Stamp { c: [50.0, 10.0], r: 4.0, flow: 1.0 }]);
-        s.end();
-        let start = std::time::Instant::now();
-        while back.ready().is_none() {
-            assert!(start.elapsed() < std::time::Duration::from_secs(5), "never came back");
-            std::thread::yield_now();
-        }
-        let got = std::thread::spawn(move || back.into_pixels()).join().unwrap().expect("reads");
-        assert_eq!(got, want);
+        let got = s.read_pixels().expect("reads");
+        assert_eq!(got.len(), (w * h * 4) as usize);
         assert_eq!(at(&got, w, 10, 10)[3], 255);
         assert_eq!(at(&got, w, 50, 10)[3], 0);
-        // One let go of before it came (the pad put away mid-snapshot)
-        // leaves the pad as it was.
-        drop(s.start_read());
-        assert_eq!(at(&s.read_pixels().unwrap(), w, 50, 10)[3], 255);
         free_texture(s.texture_id());
     }
 

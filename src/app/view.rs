@@ -158,6 +158,7 @@ impl OnScreenNotesApp {
         let typing = self.ws.tool.in_progress_text.is_some()
             || self.ws.slide_panel.is_renaming()
             || self.ws.confirm_delete.is_some()
+            || self.ws.confirm_edit.is_some()
             || ctx.wants_keyboard_input();
         let held = ctx.input(|i| {
             let ctrl = i.modifiers.ctrl || i.modifiers.command;

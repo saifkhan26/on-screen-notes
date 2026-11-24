@@ -149,17 +149,8 @@ impl OnScreenNotesApp {
                     self.canvases.active_mut().add_layer();
                 }
             }
-            K::DeleteLayer => {
-                if self.may_edit() {
-                    let c = self.canvases.active_mut();
-                    let (li, n) = (c.active_layer, c.layers.len());
-                    c.delete_layer(li);
-                    // Not undoable, as the layer panel's button is not:
-                    // say so, since an empty layer shows no change.
-                    let msg = if n > 1 { format!("Layer {} deleted", li + 1) } else { "The last layer stays".to_string() };
-                    say(self, msg);
-                }
-            }
+            // Asks first when the layer has something on it.
+            K::DeleteLayer => self.request_layer_delete(self.canvases.active().active_layer),
             K::MoveLayer(n) => {
                 if self.may_edit() {
                     let c = self.canvases.active_mut();
@@ -283,6 +274,9 @@ impl OnScreenNotesApp {
             C::Undo | C::Redo if self.ws.pad.is_open() => self.pad_undo(cmd == C::Redo),
             // While cropping they wait: Esc first.
             C::Undo | C::Redo if self.ws.crop.is_open() => {}
+            // Right after a slide was deleted, undo brings it back.
+            C::Undo if self.canvases.undo_restores_slide() => self.restore_deleted_slide(),
+            C::RestoreSlide => self.restore_deleted_slide(),
             C::Undo | C::Redo => {
                 if self.may_edit() {
                     let c = self.canvases.active_mut();
@@ -291,11 +285,7 @@ impl OnScreenNotesApp {
                     self.ws.nudge_run = None;
                 }
             }
-            C::ClearLayer => {
-                if self.may_edit() {
-                    self.canvases.active_mut().clear();
-                }
-            }
+            C::ClearLayer => self.request_layer_clear(),
             C::DeleteSlide => {
                 if self.may_edit() {
                     self.request_slide_delete();

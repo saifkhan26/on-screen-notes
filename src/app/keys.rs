@@ -12,6 +12,10 @@ pub(super) struct FrameKeys {
     rename_slide: bool,
     toggle_lock: bool,
     delete_slide: bool,
+    /// The clear-layer key: asks first (`request_layer_clear`).
+    clear_layer: bool,
+    /// The undo key right after a slide was deleted: it comes back.
+    restore_slide: bool,
     key_actions: Vec<interaction::action_keys::KeyAction>,
     refused: bool,
 }
@@ -111,6 +115,10 @@ impl OnScreenNotesApp {
         let mut toggle_lock = false;
         // Ctrl+Shift+Backspace (delete it, once confirmed), likewise.
         let mut delete_slide = false;
+        // The clear-layer key (asks first), and the undo key bringing a
+        // deleted slide back, likewise.
+        let mut clear_layer = false;
+        let mut restore_slide = false;
         // Keys bound to buttons (`interaction::action_keys`), likewise.
         let mut key_actions: Vec<interaction::action_keys::KeyAction> = Vec::new();
         // With objects selected a nudge key moves them and does
@@ -149,7 +157,13 @@ impl OnScreenNotesApp {
             let shift = mods.shift;
             // "Delete this slide?", the command palette, the find bar
             // and the tag row take the keys while they are up.
-            if text_consumed || self.ws.confirm_delete.is_some() || self.ws.commands.is_open() || self.ws.find.is_open() || self.ws.tag_edit.is_some() {
+            if text_consumed
+                || self.ws.confirm_delete.is_some()
+                || self.ws.confirm_edit.is_some()
+                || self.ws.commands.is_open()
+                || self.ws.find.is_open()
+                || self.ws.tag_edit.is_some()
+            {
                 // Still allow scroll-wheel events (handled below
                 // outside this for-loop) but drop key events.
                 // Falling through to the wheel block below means
@@ -274,6 +288,12 @@ impl OnScreenNotesApp {
                         .chain(kc.opacity)
                         .flatten()
                         .any(|b| b.matches(*key, mods));
+                    // Right after a slide was deleted, undo brings it back,
+                    // whatever the slide shown now takes.
+                    if keys.canvas.undo.is_some_and(|b| b.matches(*key, mods)) && self.canvases.undo_restores_slide() {
+                        restore_slide = true;
+                        continue;
+                    }
                     if !editable && edit_key {
                         refused = true;
                         continue;
@@ -295,8 +315,8 @@ impl OnScreenNotesApp {
                             self.ws.nudge_run = None;
                         }
                     }
-                    if let Some(b) = keys.canvas.clear_layer {
-                        if b.matches(*key, mods) { self.canvases.active_mut().clear(); }
+                    if keys.canvas.clear_layer.is_some_and(|b| b.matches(*key, mods)) {
+                        clear_layer = true;
                     }
                     if keys.canvas.delete_canvas.is_some_and(|b| b.matches(*key, mods)) {
                         delete_slide = true;
@@ -432,12 +452,24 @@ impl OnScreenNotesApp {
                 }
             }
         });
-        FrameKeys { text_consumed, sel_actions, media_keys, toggle_pins, rename_slide, toggle_lock, delete_slide, key_actions, refused }
+        FrameKeys { text_consumed, sel_actions, media_keys, toggle_pins, rename_slide, toggle_lock, delete_slide, clear_layer, restore_slide, key_actions, refused }
     }
 
     /// Run what `take_keys` collected, and the slide panel's pick, in that order.
     pub(super) fn run_keys(&mut self, ctx: &egui::Context, keys: FrameKeys, slides: ui::slide_panel::Shown, canvas_rect: egui::Rect, media_objs: &[ui::media_controls::OnScreen], media_selected: Option<u64>) {
-        let FrameKeys { text_consumed, mut sel_actions, media_keys, toggle_pins, rename_slide, toggle_lock, delete_slide, key_actions, refused } = keys;
+        let FrameKeys {
+            text_consumed,
+            mut sel_actions,
+            media_keys,
+            toggle_pins,
+            rename_slide,
+            toggle_lock,
+            delete_slide,
+            clear_layer,
+            restore_slide,
+            key_actions,
+            refused,
+        } = keys;
         // ---- Select-tool commands -----------------------------------
         // Ctrl+V with only an image on the clipboard produces no egui
         // event at all, so watch the physical chord for that case.
@@ -466,6 +498,12 @@ impl OnScreenNotesApp {
         }
         if delete_slide {
             self.request_slide_delete();
+        }
+        if clear_layer {
+            self.request_layer_clear();
+        }
+        if restore_slide {
+            self.restore_deleted_slide();
         }
         if toggle_lock {
             self.toggle_lock();

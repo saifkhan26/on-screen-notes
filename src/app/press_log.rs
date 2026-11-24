@@ -19,6 +19,7 @@ const AREAS: &[&str] = &[
     "osn_slide_panel",
     "osn_layer_panel",
     "osn_toast",
+    "osn_dup_bar",
     "osn_slide_status",
     "osn_arrange_bar",
     "osn_pin_bar",

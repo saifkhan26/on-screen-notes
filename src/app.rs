@@ -33,6 +33,10 @@ mod selection;
 mod sel_actions;
 mod view;
 mod slides;
+mod confirm;
+mod dup_check;
+#[cfg(test)]
+pub(crate) use dup_check::snapshot_bar as snapshot_dup_bar;
 mod pins;
 mod pointer;
 mod media;
@@ -166,6 +170,9 @@ pub struct OnScreenNotesApp {
     tag_rejections: Option<crate::persistence::tag_rejections::Rejections>,
     /// What was ignored in the duplicates list; read once it is listed.
     copy_ignores: Option<crate::persistence::copy_ignores::CopyIgnores>,
+    /// The pictures pasted or dropped last, checked for copies already on
+    /// the slides (`app::dup_check`).
+    dup_check: Option<dup_check::DupCheck>,
     /// Each tag's bars for the tag row's likely tags, kept from one
     /// picture to the next.
     tag_bars: similar::TagBars,
@@ -577,6 +584,7 @@ impl OnScreenNotesApp {
             picture_vectors: Default::default(),
             tag_rejections: None,
             copy_ignores: None,
+            dup_check: None,
             tag_bars: Default::default(),
             pinned_last_rect: None,
             ffmpeg_available: crate::recording::detect_ffmpeg(),

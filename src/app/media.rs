@@ -415,6 +415,8 @@ impl OnScreenNotesApp {
             shape.transform(a, b);
         }
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
+        // Already on a slide? Ringed if so (`app::dup_check`).
+        self.dup_watch_selection();
     }
 
     /// Carry out what the playback bars and the FFmpeg window asked for.

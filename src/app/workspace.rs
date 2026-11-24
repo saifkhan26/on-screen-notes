@@ -76,6 +76,10 @@ pub(super) struct Workspace {
     /// pressed on a slide with something on it. Keys go to the dialog
     /// alone while it is up.
     pub(super) confirm_delete: Option<usize>,
+    /// A big edit waiting on its "are you sure?" (`app::confirm`): a layer
+    /// with something on it to delete or clear, or a large selection to
+    /// delete. Keys go to the question alone while it is up.
+    pub(super) confirm_edit: Option<confirm::PendingEdit>,
     /// Zoom to fit / to selection in progress: the view glides there
     /// over a few frames instead of jumping.
     pub(super) view_glide: Option<interaction::zoom_pan::ViewGlide>,
@@ -160,6 +164,7 @@ impl Workspace {
             ui_visible: true,
             move_picker_pending: false,
             confirm_delete: None,
+            confirm_edit: None,
             view_glide: None,
             peek: None,
             picture_colours: None,

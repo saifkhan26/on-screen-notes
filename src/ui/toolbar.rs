@@ -260,8 +260,8 @@ fn pins_btn(ui: &mut egui::Ui, hidden: &mut bool) -> bool {
 /// Media filter: highlights pictures, GIFs and / or videos on the slide,
 /// its groups, and what is tagged. Lit while any is on; the popup picks.
 fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: &media_filter::Counts, select: &mut bool) -> bool {
-    let response = theme::icon_button(ui, egui::Image::new(egui::include_image!("../../assets/icons/filter.svg")), BTN_SIZE, Look::on(filter.any()));
-    let response = tip(response, "Highlight", None, "Pictures, GIFs, videos, groups or tags on this slide");
+    let response = theme::icon_button(ui, egui::Image::new(egui::include_image!("../../assets/icons/filter.svg")), BTN_SIZE, Look::on(filter.lit()));
+    let response = tip(response, "Highlight", None, "Pictures, GIFs, videos, groups or tags on this slide, and duplicates just added");
     let popup_id = egui::Id::new("osn_media_filter_popup");
     let mut interacted = touched(&response);
     if response.clicked() {
@@ -287,6 +287,12 @@ fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: &media_filter
             })
             .inner
         };
+        // Pictures just pasted or dropped that are copies: their rings
+        // stay until switched off here (or the bar's ×).
+        if let Some(n) = counts.duplicates {
+            theme::section(ui, "Just added");
+            row(ui, crate::ui::find_bar::FOUND, &mut filter.duplicates, "Duplicates", n);
+        }
         theme::section(ui, "Media");
         for (t, n) in MediaType::ALL.into_iter().zip(counts.media) {
             row(ui, media_filter::color(t), filter.flag(t), media_filter::label(t), n);
@@ -336,7 +342,11 @@ fn filter_btn(ui: &mut egui::Ui, filter: &mut MediaFilter, counts: &media_filter
                 *select = true;
                 ui.memory_mut(|m| m.close_popup());
             }
-            if ui.add_enabled(filter.any(), egui::Button::new("Clear")).clicked() {
+            if ui
+                .add_enabled(filter.lit(), egui::Button::new("Unhighlight all"))
+                .on_hover_text("Turn every highlight off, the duplicates' rings too")
+                .clicked()
+            {
                 *filter = MediaFilter::default();
             }
         });
@@ -677,7 +687,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Slide window open / close", c.slide_window),
             ("Slide window on a box",    c.slide_window_region),
             ("New layer",                c.new_layer),
-            ("Delete layer (no undo)",   c.delete_layer),
+            ("Delete layer",             c.delete_layer),
             ("Pin: go to its slide",     c.pin_go_to_slide),
             ("Pin: this slide only / every slide", c.pin_this_slide_only),
             ("Loop video / GIF",         c.media_loop),

@@ -15,6 +15,7 @@ impl OnScreenNotesApp {
         let stored = self.canvases.store_pictures();
         self.overlay_cache.carry_pictures(&stored);
         self.pad_follow_store(&stored);
+        self.dup_follow_store(&stored);
         self.canvases.refresh_pins();
         // Global pins show in the pins window only; local ones stay on
         // their slide on the canvas.
@@ -660,12 +661,16 @@ impl OnScreenNotesApp {
             // canvas borrow every frame just to paint would flag it
             // dirty ~60×/s and put the autosave back into a permanent
             // rewrite loop. The panel takes it only on a real click.
-            ui::layer_panel::show(
+            let delete = ui::layer_panel::show(
                 ctx,
                 &mut self.overlay_cache,
                 canvas_idx,
                 &mut self.canvases,
             );
+            // Its delete button asks first when the layer holds anything.
+            if let Some(li) = delete {
+                self.request_layer_delete(li);
+            }
         }
         // Layer preview popup — large centred thumbnail of the
         // active layer. Toggled by the `canvas.preview_layer`

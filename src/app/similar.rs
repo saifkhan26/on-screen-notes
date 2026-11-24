@@ -147,13 +147,13 @@ impl TagBars {
 /// what was ignored of it (`persistence::copy_ignores`): its file and how
 /// it is shown. A video or GIF is known by its file (`media:…`), any
 /// other picture by its bytes (`bytes_id`).
-fn picture_id(p: &PictureRef) -> String {
+pub(super) fn picture_id(p: &PictureRef) -> String {
     format!("file:{}|{:?}|{}", p.file, p.crop, p.mirror)
 }
 
 /// What a picture kept in its slide is known by: its bytes' hash, which
 /// stays the same from run to run.
-fn bytes_id(png: &[u8]) -> String {
+pub(super) fn bytes_id(png: &[u8]) -> String {
     format!("bytes:{:016x}:{}", crate::canvas::board_link::Fnv::of(png), png.len())
 }
 

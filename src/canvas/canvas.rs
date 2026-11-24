@@ -152,6 +152,20 @@ pub enum UndoEntry {
     /// the swapped-out state is the redo — the same step either way.
     /// Pictures share their bytes, so the lists are cheap to keep.
     Resynced(Vec<(usize, Vec<Shape>)>, Option<Box<BoardLink>>),
+    /// The layer at `.0` was taken out of the stack whole (layer delete):
+    /// the layer itself, and the active layer to go back to when it is
+    /// put back. Undo puts it back at the same place.
+    ///
+    /// Entries older than this one name layers by their place in the
+    /// stack *with* this layer in it, and they only replay after this one
+    /// has put it back, so none of them needs renumbering.
+    LayerRemoved(usize, Box<Layer>, usize),
+    /// A layer was put into the stack at `.0` (new layer, frozen frame),
+    /// and `.1` is the active layer from before it. Undo takes the layer
+    /// out again, whole, into a `LayerRemoved` for the redo.
+    LayerInserted(usize, usize),
+    /// The layer at `.0` was moved to place `.1` (layer up / down).
+    LayerReordered(usize, usize),
 }
 
 impl Default for Canvas {
@@ -289,15 +303,12 @@ impl Canvas {
     /// and redo history, since an undo can bring back an object that was
     /// deleted.
     pub fn media_files(&self, out: &mut std::collections::HashSet<String>) {
+        self.saved_media_files(out);
         let mut add = |s: &Shape| {
             if let Some(f) = s.media_file() {
                 out.insert(f.to_string());
             }
         };
-        for layer in &self.layers {
-            layer.shapes.iter().for_each(&mut add);
-        }
-        self.legacy_shapes.iter().for_each(&mut add);
         for entry in self.undo_log.iter().chain(&self.redo_log) {
             // No catch-all arm: a new entry kind that holds shapes must
             // be added here, or its videos could be deleted while an undo
@@ -321,6 +332,7 @@ impl Canvas {
                 UndoEntry::Resynced(layers, _) => {
                     layers.iter().flat_map(|(_, shapes)| shapes).for_each(&mut add);
                 }
+                UndoEntry::LayerRemoved(_, layer, _) => layer.shapes.iter().for_each(&mut add),
                 UndoEntry::StrokeAdded(_)
                 | UndoEntry::ShapeAdded(_)
                 | UndoEntry::StrokeErased(..)
@@ -328,7 +340,20 @@ impl Canvas {
                 | UndoEntry::LayerMoved(..)
                 | UndoEntry::LayerScaled(..)
                 | UndoEntry::ObjectsReordered(..)
-                | UndoEntry::PlatePromoted(..) => {}
+                | UndoEntry::PlatePromoted(..)
+                | UndoEntry::LayerInserted(..)
+                | UndoEntry::LayerReordered(..) => {}
+            }
+        }
+    }
+
+    /// Add to `out` the name of every media-folder file the slide's file
+    /// names: what is on its layers, without the undo history (which ends
+    /// with the app).
+    pub fn saved_media_files(&self, out: &mut std::collections::HashSet<String>) {
+        for s in self.layers.iter().flat_map(|l| &l.shapes).chain(&self.legacy_shapes) {
+            if let Some(f) = s.media_file() {
+                out.insert(f.to_string());
             }
         }
     }
@@ -728,5 +753,96 @@ mod object_edit_tests {
         c.undo();
         assert!(c.layers[0].image.is_some());
         assert!(c.layers[0].shapes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod layer_undo_tests {
+    use super::*;
+    use crate::canvas::stroke::{PenSample, StrokeStyle};
+
+    /// A short stroke told apart by its red channel.
+    fn stroke(tag: u8) -> Stroke {
+        let mut s = Stroke::with_style([tag, 0, 0, 255], 4.0, StrokeStyle::Default);
+        for i in 0..=4 {
+            s.samples.push(PenSample { pos: [i as f32 * 10.0, 0.0], pressure: 1.0, tilt: [0.0, 0.0] });
+        }
+        s
+    }
+
+    /// Each layer's name and its strokes' tags, bottom to top.
+    fn stack(c: &Canvas) -> Vec<(String, Vec<u8>)> {
+        c.layers.iter().map(|l| (l.name.clone(), l.strokes.iter().map(|s| s.color[0]).collect())).collect()
+    }
+
+    /// Layers 1, 2 and 3 holding strokes 1, 2 and 3, with no history.
+    fn three_layers() -> Canvas {
+        let mut c = Canvas::default();
+        c.add_layer();
+        c.add_layer();
+        for (i, l) in c.layers.iter_mut().enumerate() {
+            l.strokes.push(stroke(i as u8 + 1));
+        }
+        c.undo_log.clear();
+        c
+    }
+
+    #[test]
+    fn a_deleted_layer_comes_back_whole_in_its_place() {
+        let mut c = three_layers();
+        c.active_layer = 2;
+        let before = stack(&c);
+        c.delete_layer(0);
+        assert_eq!(stack(&c), before[1..].to_vec());
+        assert_eq!(c.active_layer, 1, "still on the same layer");
+        c.undo();
+        assert_eq!(stack(&c), before);
+        assert_eq!(c.active_layer, 2);
+        c.redo();
+        assert_eq!(stack(&c), before[1..].to_vec());
+        c.undo();
+        assert_eq!(stack(&c), before);
+    }
+
+    #[test]
+    fn older_history_still_lands_on_the_right_layer() {
+        // A stroke drawn on the top layer, then the bottom layer deleted:
+        // undoing both takes the stroke off the top layer, not another.
+        let mut c = three_layers();
+        c.active_layer = 2;
+        c.add_stroke(stroke(9));
+        c.delete_layer(0);
+        c.undo();
+        c.undo();
+        assert_eq!(stack(&c), stack(&three_layers()));
+    }
+
+    #[test]
+    fn adding_and_moving_layers_are_undo_steps_that_keep_the_history() {
+        let mut c = three_layers();
+        c.active_layer = 0;
+        c.add_stroke(stroke(9));
+        let drawn = stack(&c);
+        c.add_layer();
+        c.move_layer(0, 3);
+        assert_eq!(c.layers[3].strokes.iter().map(|s| s.color[0]).collect::<Vec<_>>(), vec![1, 9]);
+        c.undo();
+        c.undo();
+        assert_eq!(stack(&c), drawn);
+        c.undo();
+        assert_eq!(stack(&c), stack(&three_layers()));
+        c.redo();
+        c.redo();
+        c.redo();
+        assert_eq!(c.layers.len(), 4);
+        assert_eq!(c.layers[3].strokes.iter().map(|s| s.color[0]).collect::<Vec<_>>(), vec![1, 9]);
+    }
+
+    #[test]
+    fn the_last_layer_still_stays() {
+        let mut c = Canvas::default();
+        c.delete_layer(0);
+        assert_eq!(c.layers.len(), 1);
+        assert!(c.undo_log.is_empty(), "nothing done, nothing to undo");
     }
 }

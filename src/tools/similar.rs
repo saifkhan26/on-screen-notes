@@ -209,6 +209,12 @@ impl Print {
             colour_gap(&mine, &theirs) <= DUPLICATE_COLOUR && mine.aspect.max(theirs.aspect) / mine.aspect.min(theirs.aspect).max(1e-6) <= DUPLICATE_ASPECT
         })
     }
+
+    /// `is_copy_of`, but never for a picture of one flat colour, whose
+    /// hash says nothing (as `copies_apart` leaves those out).
+    pub fn duplicate_of(&self, other: &Print) -> bool {
+        !self.flat() && !other.flat() && self.is_copy_of(other)
+    }
 }
 
 /// A picture on the slides, for `copies`.

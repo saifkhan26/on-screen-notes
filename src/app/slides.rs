@@ -17,21 +17,61 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// Delete slide `idx` (the only slide is emptied instead).
+    /// Delete slide `idx` (the only slide is emptied instead). The undo
+    /// key, or "Bring back the deleted slide", puts it back until the app
+    /// closes.
     pub(super) fn delete_slide(&mut self, idx: usize) {
         if idx >= self.canvases.count() { return; }
         if self.canvases.active_index() != idx {
             self.canvases.go_to(idx);
         }
         let before = self.canvases.count();
+        let kept = self.canvases.deleted_count();
         self.canvases.delete_active();
         self.ws.view_glide = None;
         self.ws.peek = None;
+        self.ws.tool.select.sel.clear();
         // The slide window follows its slide to its new number, or
         // closes with it.
         if self.canvases.count() < before && self.slide_window.as_mut().is_some_and(|w| !w.slide_removed(idx)) {
             self.slide_window = None;
         }
+        if self.canvases.deleted_count() > kept {
+            let what = if self.canvases.count() < before { "Slide deleted" } else { "Slide emptied" };
+            self.toast = Some((format!("{what} — {} brings it back", self.undo_key()), Instant::now()));
+        }
+    }
+
+    /// Put back the slide deleted last (`CanvasManager::restore_deleted`),
+    /// and everything here that knows slides by number along with it.
+    pub(super) fn restore_deleted_slide(&mut self) {
+        let count = self.canvases.count();
+        let idx = match self.canvases.restore_deleted() {
+            Ok(i) => i,
+            Err(why) => {
+                self.toast = Some((why.to_string(), Instant::now()));
+                return;
+            }
+        };
+        // Put in at `idx`: every slide from there on moved up one.
+        if self.canvases.count() > count {
+            let map = |i: usize| if i >= idx { i + 1 } else { i };
+            if let Some(w) = self.slide_window.as_mut() {
+                w.renumber(map);
+            }
+            self.overlay_cache.slides_moved(map);
+            if let Some(p) = self.ws.picture_colours.as_mut() {
+                p.at.0 = map(p.at.0);
+            }
+        }
+        self.ws.view_glide = None;
+        self.ws.peek = None;
+        self.ws.restyle_run = None;
+        self.ws.nudge_run = None;
+        self.ws.tool.select.sel.clear();
+        let name = self.canvases.name(idx);
+        let which = if name.is_empty() { format!("Slide {}", idx + 1) } else { format!("Slide {} \u{201c}{name}\u{201d}", idx + 1) };
+        self.toast = Some((format!("{which} is back"), Instant::now()));
     }
 
     /// "Delete this slide?", while one is waiting on it. Enter (or the
@@ -64,45 +104,21 @@ impl OnScreenNotesApp {
             }
             None => "It is still opening.".to_string(),
         };
-        let mut decision: Option<bool> = None;
-        let delete_key = self.hotkeys_cfg.canvas.delete_canvas;
-        ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
-                decision = Some(false);
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                || delete_key.is_some_and(|b| i.consume_shortcut(&egui::KeyboardShortcut::new(b.to_modifiers(), b.key)))
-            {
-                decision = Some(true);
-            }
-        });
-        egui::Window::new(if only { "Empty this slide?" } else { "Delete this slide?" })
-            .id(egui::Id::new("osn_delete_slide"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                ui.set_max_width(340.0);
-                ui.label(format!("{which}. {holds}"));
-                let after = if only {
-                    "It is the only slide, so it is emptied instead. This can't be undone."
-                } else {
-                    "This can't be undone."
-                };
-                ui.label(egui::RichText::new(after).small().color(ui::theme::TEXT_MUTED));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let label = egui::RichText::new(if only { "Empty slide" } else { "Delete slide" }).color(ui::theme::accent_ink());
-                    if ui.add(egui::Button::new(label).fill(ui::theme::accent())).clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Keep it").clicked() {
-                        decision = Some(false);
-                    }
-                });
-                ui.add_space(2.0);
-                ui.label(egui::RichText::new("Enter deletes · Esc keeps it").small().color(ui::theme::TEXT_MUTED));
-            });
+        let undo = self.undo_key();
+        let note = if only {
+            format!("It is the only slide, so it is emptied instead. {undo} brings it back until you close the app.")
+        } else {
+            format!("{undo} brings it back until you close the app.")
+        };
+        let decision = confirm::ask(
+            ctx,
+            "osn_delete_slide",
+            if only { "Empty this slide?" } else { "Delete this slide?" },
+            &format!("{which}. {holds}"),
+            &note,
+            if only { "Empty slide" } else { "Delete slide" },
+            self.hotkeys_cfg.canvas.delete_canvas,
+        );
         match decision {
             Some(true) => {
                 self.ws.confirm_delete = None;

@@ -150,6 +150,31 @@ pub struct CanvasManager {
     /// The last try at those renames failed; until one goes through,
     /// no further reorder is taken (it would no longer match the files).
     move_stuck: bool,
+    /// Slides deleted this session, the newest last, so an undo can put
+    /// them back (`restore_deleted`). Never saved: closing the app lets
+    /// go of them, and then of the media only they used.
+    deleted: Vec<DeletedSlide>,
+    /// Some slide file could not be read this run. Its pictures are not
+    /// known, so the media folder is not swept at exit (`may_sweep_media`).
+    unreadable: bool,
+}
+
+/// A slide's `Canvas::edit_stamp`.
+type EditStamp = (usize, usize, usize, Vec<(usize, usize, u64)>);
+
+/// A slide deleted this session, kept whole so it can come back.
+struct DeletedSlide {
+    /// The place it had.
+    index: usize,
+    canvas: Canvas,
+    name: String,
+    locked: bool,
+    /// It was the only slide, so it was emptied in place, not removed.
+    emptied: bool,
+    /// The slide shown right after the delete, and its edit stamp then.
+    /// While both still hold nothing was done since, and the undo key
+    /// brings this slide back rather than undoing on the one shown.
+    after: Option<(usize, EditStamp)>,
 }
 
 /// Stand-in for a slot whose file is missing or unreadable. It keeps
@@ -309,6 +334,8 @@ impl CanvasManager {
             deleting_media: false,
             pending_move: None,
             move_stuck: false,
+            deleted: Vec::new(),
+            unreadable: false,
         };
         // Every slot up to the highest file on disk gets an entry. A gap
         // or an unreadable file becomes a blank placeholder instead of
@@ -392,6 +419,8 @@ impl CanvasManager {
             deleting_media: false,
             pending_move: None,
             move_stuck: false,
+            deleted: Vec::new(),
+            unreadable: false,
         }
     }
 
@@ -437,6 +466,7 @@ impl CanvasManager {
     fn install(&mut self, idx: usize, load: SlotLoad) {
         if let Some(e) = load.error {
             self.load_errors.push(e);
+            self.unreadable = true;
         }
         if load.protected {
             self.protected.push(idx);
@@ -1473,6 +1503,9 @@ impl CanvasManager {
     ///   the user always on at least one sheet).
     /// * Otherwise we remove it and shift the active index back by one
     ///   (or stay at 0 if we just removed canvas 0).
+    ///
+    /// Either way the slide is kept in memory until the app closes, so
+    /// `restore_deleted` can put it back.
     pub fn delete_active(&mut self) {
         if self.on_board() {
             log::warn!("delete slide ignored on the pins board");
@@ -1497,16 +1530,19 @@ impl CanvasManager {
         }
         self.media_cleanup_due = true;
         if self.canvases.len() == 1 {
-            self.canvases[0] = Some(Canvas::default());
-            self.names[0].clear();
-            self.locks[0] = false;
+            let old = self.canvases[0].replace(Canvas::default());
+            let name = std::mem::take(&mut self.names[0]);
+            let locked = std::mem::replace(&mut self.locks[0], false);
             self.active = 0;
+            if let Some(canvas) = old {
+                self.keep_deleted(0, canvas, name, locked, true);
+            }
             return;
         }
         let i = self.active;
-        self.canvases.remove(i);
-        self.names.remove(i);
-        self.locks.remove(i);
+        let gone = self.canvases.remove(i);
+        let name = self.names.remove(i);
+        let locked = self.locks.remove(i);
         // A second window deleted its slide: the main window's, if later,
         // moved down one; the gone slide's view needs no putting back.
         if let Some(v) = self.view_swap.as_mut() {
@@ -1536,6 +1572,86 @@ impl CanvasManager {
         // The files past the new count go at the next save, after the
         // rewrites (`save_all`).
         self.prune_orphans = true;
+        if let Some(canvas) = gone {
+            self.keep_deleted(i, canvas, name, locked, false);
+        }
+    }
+
+    /// Keep a slide just deleted from place `index` for `restore_deleted`.
+    fn keep_deleted(&mut self, index: usize, canvas: Canvas, name: String, locked: bool, emptied: bool) {
+        let after = self.canvases.get(self.active).and_then(Option::as_ref).map(|c| (self.active, c.edit_stamp()));
+        self.deleted.push(DeletedSlide { index, canvas, name, locked, emptied, after });
+    }
+
+    /// How many deleted slides `restore_deleted` can still bring back.
+    pub fn deleted_count(&self) -> usize {
+        self.deleted.len()
+    }
+
+    /// The undo key should bring back the slide deleted last: it was the
+    /// last thing done — the slide shown since is the one shown right
+    /// after the delete, with no edit made to it. Not in a second
+    /// window's frame (`restore_deleted` refuses there).
+    pub fn undo_restores_slide(&self) -> bool {
+        let Some(d) = self.deleted.last() else { return false };
+        let Some((at, stamp)) = &d.after else { return false };
+        self.view_swap.is_none()
+            && *at == self.active
+            && self.canvases.get(self.active).and_then(Option::as_ref).is_some_and(|c| c.edit_stamp() == *stamp)
+    }
+
+    /// Put back the slide deleted last, at the place it had (or last, if
+    /// there are fewer slides now), and go to it. Its name, lock, view,
+    /// undo history and pins come back with it. Returns its new index,
+    /// or why it can't come back yet.
+    pub fn restore_deleted(&mut self) -> Result<usize, &'static str> {
+        if self.deleted.is_empty() {
+            return Err("No deleted slide to bring back");
+        }
+        if self.on_board() || self.view_swap.is_some() {
+            return Err("Bring the slide back from the main window");
+        }
+        if self.loading.is_some() {
+            return Err("The slides are still opening — try again in a moment");
+        }
+        if !self.protected.is_empty() {
+            return Err("A slide that could not be read is kept in place, so slides can't be added back");
+        }
+        if self.pending_move.is_some() || self.move_stuck {
+            return Err("A slide move is still being written — try again in a moment");
+        }
+        let d = self.deleted.pop().expect("checked above");
+        let mut canvas = d.canvas;
+        canvas.dirty = true;
+        // The only slide was emptied in place: while it is still empty it
+        // takes the slide back, rather than staying as a blank one.
+        let blank = self.canvases.len() == 1
+            && self.canvases[0].as_ref().is_some_and(|c| c.layers.iter().all(|l| l.strokes.is_empty() && l.shapes.is_empty() && l.image.is_none()));
+        if d.emptied && blank {
+            self.canvases[0] = Some(canvas);
+            self.names[0] = d.name;
+            self.locks[0] = d.locked;
+            self.active = 0;
+            self.pins.forget_scans();
+            return Ok(0);
+        }
+        let i = d.index.min(self.canvases.len());
+        self.canvases.insert(i, Some(canvas));
+        self.names.insert(i, d.name);
+        self.locks.insert(i, d.locked);
+        // Every later slide moved up one place.
+        self.recent_walk = None;
+        for j in &mut self.recent {
+            if *j >= i { *j += 1; }
+        }
+        self.active = i;
+        self.pins.forget_scans();
+        // Each later slide's file now holds the slide before it: rewrite
+        // them all one slot up, the last into a new file.
+        for c in self.canvases[i..].iter_mut().flatten() {
+            c.dirty = true;
+        }
+        Ok(i)
     }
 
     /// Files a PureRef resync stored that it may not have used: the next
@@ -1690,7 +1806,13 @@ impl CanvasManager {
         // The pins board's pictures and videos are in use too.
         self.board.media_files(&mut used);
         self.media_to_check.retain(|f| !used.contains(f));
-        let unused: Vec<String> = self.media_to_check.iter().filter(|f| !keep.contains(*f)).cloned().collect();
+        // A deleted slide that can still come back holds its files like
+        // `keep` does: they stay listed, for the check at exit.
+        let mut held = HashSet::new();
+        for d in &self.deleted {
+            d.canvas.media_files(&mut held);
+        }
+        let unused: Vec<String> = self.media_to_check.iter().filter(|f| !keep.contains(*f) && !held.contains(*f)).cloned().collect();
         for f in &unused {
             self.media_to_check.remove(f);
         }
@@ -1749,14 +1871,113 @@ impl CanvasManager {
         if std::mem::take(&mut self.prune_orphans) {
             remove_stale_canvas_files(self.canvases.len());
         }
-        // The clipboard and any unfinished import end with the app, so
-        // only the slides still count.
-        if !self.media_to_check.is_empty() {
+        // The clipboard, any unfinished import, the undo history and the
+        // deleted slides kept for undo end with the app, so only what the
+        // slides' files name still counts.
+        self.deleted.clear();
+        if let Some(why) = self.sweep_blocker() {
+            log::info!("media folder not swept at exit: {why}");
+        }
+        if self.may_sweep_media() {
+            // Every file no slide uses goes: deleted pictures and layers,
+            // pictures a pad drew over, deleted slides' media alike.
+            self.media_to_check.clear();
+            self.media_cleanup_due = false;
+            if let Ok(dir) = crate::persistence::paths::media_dir() {
+                let (n, bytes) = sweep_media_in(&dir, &self.saved_media(), SWEEP_GRACE);
+                if n > 0 {
+                    log::info!("removed {n} media files no slide uses ({:.1} MB)", bytes as f64 / 1e6);
+                }
+            }
+        } else if !self.media_to_check.is_empty() {
+            // Not every slide is known as written: only the media deleted
+            // slides used, as during the run.
             self.media_cleanup_due = false;
             let unused = self.unused_media(&HashSet::new());
             delete_media_files(&unused);
         }
     }
+
+    /// The media folder may lose every file no slide names (at exit, after
+    /// `save_all_blocking` wrote them): every slide is read, none of them
+    /// failed to read or is kept from being written, every one is on disk
+    /// as it is in memory, and no picture is on its way into the folder.
+    fn may_sweep_media(&self) -> bool {
+        self.sweep_blocker().is_none()
+    }
+
+    /// Why `may_sweep_media` says no, if it does.
+    fn sweep_blocker(&self) -> Option<&'static str> {
+        if self.loading.is_some() || self.canvases.iter().any(Option::is_none) {
+            Some("slides still being read")
+        } else if self.canvases.iter().flatten().any(|c| c.dirty) {
+            Some("a slide could not be written")
+        } else if !self.protected.is_empty() || self.unreadable {
+            Some("a slide could not be read this run")
+        } else if self.board.dirty {
+            Some("the pins board could not be written")
+        } else if self.view_swap.is_some() {
+            Some("a second window's frame is running")
+        } else if self.pictures.busy() {
+            Some("pictures are still being stored")
+        } else {
+            None
+        }
+    }
+
+    /// Every media file the slides' files and the pins board name.
+    fn saved_media(&self) -> HashSet<String> {
+        let mut used = HashSet::new();
+        for c in self.canvases.iter().flatten() {
+            c.saved_media_files(&mut used);
+        }
+        self.board.saved_media_files(&mut used);
+        used
+    }
+}
+
+/// A file stored this recently is left for the next sweep: an import or a
+/// picture being stored as the app closes may not be in a slide yet.
+const SWEEP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether `name` is one of the app's own media files: 16 lowercase hex
+/// digits (a hash of the contents) and an extension. Nothing else in the
+/// folder is ever swept.
+fn is_app_media_name(name: &str) -> bool {
+    let Some((stem, ext)) = name.split_once('.') else { return false };
+    stem.len() == 16
+        && stem.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && (1..=5).contains(&ext.len())
+        && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Delete from `dir` the app's media files that `used` does not name and
+/// that were not written in the last `grace`. Returns how many went and
+/// their bytes. A file that cannot be deleted (open elsewhere) is logged
+/// and left for next time.
+fn sweep_media_in(dir: &std::path::Path, used: &HashSet<String>, grace: std::time::Duration) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0) };
+    let now = std::time::SystemTime::now();
+    let (mut n, mut bytes) = (0, 0);
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !is_app_media_name(&name) || used.contains(&name) {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        let recent = meta.modified().ok().and_then(|m| now.duration_since(m).ok()).is_none_or(|age| age < grace);
+        if !meta.is_file() || recent {
+            continue;
+        }
+        match std::fs::remove_file(e.path()) {
+            Ok(()) => {
+                n += 1;
+                bytes += meta.len();
+            }
+            Err(err) => log::warn!("could not delete unused media {}: {err}", e.path().display()),
+        }
+    }
+    (n, bytes)
 }
 
 /// Clears `CanvasManager::saving` when the save thread ends.
@@ -1902,6 +2123,10 @@ mod media_cleanup_tests {
 
         m.delete_active();
         assert!(m.media_cleanup_due);
+        // While undo can still bring the slide back, none of its files go.
+        assert!(m.unused_media(&names(&["copied.gif"])).is_empty());
+        // Closing the app lets go of it (`save_all_blocking`).
+        m.deleted.clear();
         let mut unused = m.unused_media(&names(&["copied.gif"]));
         unused.sort();
         assert_eq!(unused, vec!["in-undo.mp4".to_string(), "only-here.mp4".to_string()]);
@@ -1918,7 +2143,135 @@ mod media_cleanup_tests {
         only.layers[0].shapes.push(video("v.mp4"));
         let mut m = manager(vec![only]);
         m.delete_active();
+        assert!(m.unused_media(&HashSet::new()).is_empty(), "kept while it can come back");
+        m.deleted.clear();
         assert_eq!(m.unused_media(&HashSet::new()), vec!["v.mp4".to_string()]);
+    }
+
+    #[test]
+    fn the_exit_sweep_takes_only_the_apps_files_no_slide_uses() {
+        let dir = std::env::temp_dir().join(format!("osn-media-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = [
+            "0123456789abcdef.png", // used: stays
+            "fedcba9876543210.jpg", // unused: goes
+            "aaaaaaaaaaaaaaaa.mp4", // unused: goes
+            "ABCDEFABCDEFABCD.png", // not a name the app writes: stays
+            "notes.txt",            // likewise
+            ".store-12-3.tmp",      // likewise (startup clears these)
+        ];
+        for f in files {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let used = names(&["0123456789abcdef.png"]);
+        // Just written: left for the next sweep.
+        assert_eq!(sweep_media_in(&dir, &used, std::time::Duration::from_secs(3600)), (0, 0));
+        assert_eq!(sweep_media_in(&dir, &used, std::time::Duration::ZERO), (2, 2));
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec![".store-12-3.tmp", "0123456789abcdef.png", "ABCDEFABCDEFABCD.png", "notes.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_what_the_slides_files_name_counts_at_exit() {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(video("on-slide.mp4"));
+        c.undo_log.push(UndoEntry::ObjectsRemoved(0, Vec::new(), vec![(0, video("deleted.mp4"))]));
+        let m = manager(vec![c]);
+        assert_eq!(m.saved_media(), names(&["on-slide.mp4"]), "the undo history ends with the app");
+    }
+
+    #[test]
+    fn no_sweep_unless_every_slide_is_read_and_written() {
+        let mut m = manager(vec![Canvas::default(), Canvas::default()]);
+        for c in m.canvases.iter_mut().flatten() {
+            c.dirty = false;
+        }
+        assert!(m.may_sweep_media());
+        m.canvases[1].as_mut().unwrap().dirty = true;
+        assert!(!m.may_sweep_media(), "a slide not written as it is");
+        m.canvases[1].as_mut().unwrap().dirty = false;
+        m.unreadable = true;
+        assert!(!m.may_sweep_media(), "a slide that failed to read: its pictures are unknown");
+        m.unreadable = false;
+        m.canvases[1] = None;
+        assert!(!m.may_sweep_media(), "a slide still being read");
+    }
+
+    #[test]
+    fn a_deleted_layers_media_stays_in_use_while_undo_can_bring_it_back() {
+        let mut c = Canvas::default();
+        c.add_layer();
+        c.layers[0].shapes.push(video("layer.mp4"));
+        c.delete_layer(0);
+        let mut m = manager(vec![c]);
+        m.media_to_check.insert("layer.mp4".into());
+        assert!(m.unused_media(&HashSet::new()).is_empty());
+    }
+
+    fn files_of(m: &CanvasManager, i: usize) -> HashSet<String> {
+        let mut out = HashSet::new();
+        m.slide(i).unwrap().media_files(&mut out);
+        out
+    }
+
+    #[test]
+    fn a_deleted_slide_comes_back_in_its_place_with_its_name_and_media() {
+        let with = |f: &str| {
+            let mut c = Canvas::default();
+            c.layers[0].shapes.push(video(f));
+            c
+        };
+        let mut m = manager(vec![with("a.mp4"), with("b.mp4"), with("c.mp4")]);
+        m.rename(1, "Random Inspo 9");
+        m.go_to(1);
+        m.delete_active();
+        assert_eq!(m.count(), 2);
+        assert!(m.undo_restores_slide(), "nothing done since: undo brings it back");
+        for c in m.canvases.iter_mut().flatten() {
+            c.dirty = false;
+        }
+
+        assert_eq!(m.restore_deleted(), Ok(1));
+        assert_eq!((m.count(), m.active_index()), (3, 1));
+        assert_eq!(m.name(1), "Random Inspo 9");
+        assert_eq!([files_of(&m, 0), files_of(&m, 1), files_of(&m, 2)], [names(&["a.mp4"]), names(&["b.mp4"]), names(&["c.mp4"])]);
+        // From its slot on every file is rewritten, one slot up.
+        let dirty: Vec<bool> = (0..3).map(|i| m.slide(i).unwrap().dirty).collect();
+        assert_eq!(dirty, vec![false, true, true]);
+        // Its video is in use again: no longer a candidate for deletion.
+        assert!(m.unused_media(&HashSet::new()).is_empty());
+        assert!(m.media_to_check.is_empty());
+        assert!(m.restore_deleted().is_err(), "nothing left to bring back");
+        assert!(!m.undo_restores_slide());
+    }
+
+    #[test]
+    fn undo_brings_a_slide_back_only_until_the_next_edit() {
+        let mut m = manager(vec![Canvas::default(), Canvas::default()]);
+        m.delete_active();
+        assert!(m.undo_restores_slide());
+        m.edit_active(|c| c.add_layer());
+        assert!(!m.undo_restores_slide(), "undo is the new edit's now");
+        // Bringing it back on purpose still works.
+        assert_eq!(m.restore_deleted(), Ok(0));
+        assert_eq!(m.count(), 2);
+    }
+
+    #[test]
+    fn the_only_slide_emptied_comes_back_in_place() {
+        let mut only = Canvas::default();
+        only.layers[0].shapes.push(video("v.mp4"));
+        let mut m = manager(vec![only]);
+        m.rename(0, "Only");
+        m.delete_active();
+        assert_eq!((m.count(), m.name(0)), (1, ""));
+        assert_eq!(m.restore_deleted(), Ok(0));
+        assert_eq!(m.count(), 1, "the emptied slide takes it back, no blank one left over");
+        assert_eq!(m.name(0), "Only");
+        assert_eq!(files_of(&m, 0), names(&["v.mp4"]));
     }
 
     #[test]

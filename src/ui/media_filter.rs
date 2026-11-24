@@ -33,11 +33,22 @@ pub struct MediaFilter {
     pub tags: Vec<String>,
     /// What the slide's PureRef board no longer has (`LinkedItem::gone`).
     pub gone: bool,
+    /// Rings round pictures just pasted or dropped that are copies of
+    /// ones already there (`app::dup_check`, which draws them). Not part
+    /// of `any`: they do not fade the rest of the slide.
+    pub duplicates: bool,
 }
 
 impl MediaFilter {
+    /// Something here is highlighted, fading the rest (`paint`).
     pub fn any(&self) -> bool {
         self.pictures || self.gifs || self.videos || self.groups || self.tagged || !self.tags.is_empty() || self.gone
+    }
+
+    /// Anything at all is highlighted, the duplicates' rings included: the
+    /// toolbar button shows lit.
+    pub fn lit(&self) -> bool {
+        self.any() || self.duplicates
     }
 
     pub fn shows(&self, t: MediaType) -> bool {
@@ -130,6 +141,9 @@ pub struct Counts {
     /// Shapes gone from the slide's PureRef board; `None` when the slide
     /// is not linked to a board.
     pub gone: Option<usize>,
+    /// Pictures just pasted or dropped that have copies; `None` when none
+    /// do (the app fills it in, `app::dup_check`).
+    pub duplicates: Option<usize>,
 }
 
 fn shown(canvas: &Canvas) -> impl Iterator<Item = &Layer> {

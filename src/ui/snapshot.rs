@@ -222,6 +222,7 @@ mod tests {
             palette: &palette,
             slides: vec![String::new(); 4],
             active_slide: 0,
+            deleted_slides: 0,
         };
         let entries = crate::ui::command_palette::entries(&cx);
         let mut draw = |ctx: &egui::Context, with_palette: bool| {
@@ -261,6 +262,31 @@ mod tests {
             draw(ctx, false);
             find.show(ctx, |_| Vec::new(), 0, 0, |_| String::new(), None, tags);
         });
+    }
+
+    /// The highlight menu with duplicates just added: their row, and
+    /// "Unhighlight all".
+    #[test]
+    #[ignore = "writes PNGs to OSN_SNAP_DIR"]
+    fn snapshot_highlight_menu() {
+        let keys = HotkeysConfig::default().parsed();
+        let mut cfg = crate::config::AppConfig::default();
+        let mut tool = crate::tools::ActiveTool::from_config(&cfg);
+        let mut filter = crate::ui::media_filter::MediaFilter { duplicates: true, ..Default::default() };
+        let counts = crate::ui::media_filter::Counts { media: [12, 1, 0], groups: 2, duplicates: Some(2), ..Default::default() };
+        shoot("highlight-menu", [1500.0, 760.0], 1.0, &[Step::Idle], |ctx| {
+            ctx.memory_mut(|m| m.open_popup(egui::Id::new("osn_media_filter_popup")));
+            let (mut pin, mut picking, mut insert, mut select) = (None, false, false, false);
+            let mut pal = cfg.palette.clone();
+            crate::ui::toolbar::show(
+                ctx, &mut tool, &mut cfg.bg_opacity, &mut cfg.bg_color, &mut pal, &mut cfg.smoothing_level, &mut cfg.smoothing,
+                &mut cfg.pressure_curve, &mut cfg.ui_scale, &mut cfg.accent,
+                (&mut cfg.shape_snap, &mut cfg.smart_guides, &mut cfg.keep_proportions),
+                (&mut cfg.beside_fit, &mut cfg.beside_side), (&mut cfg.picture_search, ""),
+                &mut pin, &mut picking, &mut insert, &mut filter, &counts, &mut select, None, false, &keys,
+            );
+        });
+        shoot("duplicate-bar", [1100.0, 260.0], 1.0, &[Step::Idle], crate::app::snapshot_dup_bar);
     }
 
     /// The arrange bar over one tagged picture: each tag a chip that

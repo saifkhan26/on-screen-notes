@@ -66,7 +66,9 @@ impl OnScreenNotesApp {
             let text_selected = !self.selected_text().is_empty();
             let mut insert_media = false;
             let mut select_filtered = false;
-            let media_counts = ui::media_filter::counts(self.canvases.active());
+            self.update_dup_check(ctx);
+            let mut media_counts = ui::media_filter::counts(self.canvases.active());
+            media_counts.duplicates = self.dup_flagged_count();
             let mut pins_hidden = self.canvases.pins_hidden();
             let has_pins = self.canvases.has_pins();
             let picture_status = self.picture_vectors.status();
@@ -318,6 +320,7 @@ impl OnScreenNotesApp {
             }
             self.apply_media_out(media_out);
             self.show_delete_confirm(ctx);
+            self.show_edit_confirm(ctx);
             if self.ws.commands.is_open() {
                 let picked = {
                     let cx = ui::command_palette::Context {
@@ -337,6 +340,7 @@ impl OnScreenNotesApp {
                         palette: &self.config.palette,
                         slides: (0..self.canvases.count()).map(|i| self.canvases.name(i).to_string()).collect(),
                         active_slide: self.canvases.active_index(),
+                        deleted_slides: self.canvases.deleted_count(),
                     };
                     let all = ui::command_palette::entries(&cx);
                     self.ws.commands.show(ctx, &all)
@@ -350,6 +354,7 @@ impl OnScreenNotesApp {
             }
             self.show_find_bar(ctx);
             self.show_find_flash(ctx, canvas_rect);
+            self.show_dup_check(ctx, canvas_rect);
 
             // ---- Screenshot region selection --------------------------------
             // Draws the dimmed rubber-band over the canvas and, on release,

@@ -16,12 +16,8 @@ impl OnScreenNotesApp {
             SelAction::Delete if self.ws.pin_tool.selected.is_some() => self.unpin_selected_pin(),
             SelAction::TogglePin if has_selection => self.toggle_pin_selection(),
             SelAction::TogglePin if self.ws.pin_tool.selected.is_some() => self.unpin_selected_pin(),
-            SelAction::Delete if has_selection => {
-                let c = self.canvases.active_mut();
-                let li = c.active_layer;
-                c.delete_objects(li, &sel.strokes, &sel.shapes);
-                self.ws.tool.select.sel.clear();
-            }
+            // A large selection asks first (`app::confirm::BIG_DELETE`).
+            SelAction::Delete if has_selection => self.request_objects_delete(sel.strokes, sel.shapes),
             SelAction::Duplicate if has_selection => {
                 let (strokes, shapes) = self.selected_objects();
                 self.insert_and_select(strokes, shapes, [step, step]);
@@ -209,5 +205,7 @@ impl OnScreenNotesApp {
         }
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
+        // Already on a slide? Ringed if so (`app::dup_check`).
+        self.dup_watch_selection();
     }
 }

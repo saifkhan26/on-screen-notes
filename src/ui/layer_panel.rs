@@ -18,6 +18,9 @@ const ROW_PAD: f32 = 3.0;
 /// active canvas. `cache` provides per-layer thumbnail textures used by
 /// the hover preview popup; `canvas_idx` keys those entries.
 ///
+/// A click on a row's delete button is not done here: the layer comes
+/// back for the app to ask about first (`app::confirm`).
+///
 /// Takes the manager rather than a `&mut Canvas` so the mutable borrow
 /// can be deferred until the user actually clicks something. Drawing the
 /// panel is a read-only operation, and `CanvasManager::active_mut` is
@@ -29,7 +32,7 @@ pub fn show(
     cache: &mut crate::ui::overlay::OverlayCache,
     canvas_idx: usize,
     manager: &mut CanvasManager,
-) {
+) -> Option<usize> {
     let mut action: Option<LayerAction> = None;
     // A locked slide, or one still opening, takes no layer changes: the
     // panel shows dimmed and ignores clicks.
@@ -66,18 +69,22 @@ pub fn show(
     // Only now take the mutable borrow — on the rare frame where the
     // user actually clicked a row.
     if let Some(a) = action.filter(|_| editable) {
+        if let LayerAction::Delete(i) = a {
+            return Some(i);
+        }
         let canvas = manager.active_mut();
         match a {
             LayerAction::Add               => canvas.add_layer(),
             LayerAction::Select(i)         => canvas.active_layer = i,
             LayerAction::ToggleVisible(i)  => canvas.toggle_layer_visible(i),
-            LayerAction::Delete(i)         => canvas.delete_layer(i),
+            LayerAction::Delete(_)         => {}
             LayerAction::MoveUp(i)         => canvas.move_layer(i, i + 1),
             LayerAction::MoveDown(i) => {
                 if i > 0 { canvas.move_layer(i, i - 1); }
             }
         }
     }
+    None
 }
 
 /// One layer row — [eye] [↑] [↓] [✕]. Background highlights the

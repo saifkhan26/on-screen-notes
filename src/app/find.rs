@@ -86,7 +86,7 @@ impl OnScreenNotesApp {
     /// Go to `hit`'s slide and glide the view there, centred: at the zoom
     /// it had if the match fits and can be made out there, else at one
     /// where it can — a label read, an object seen. It flashes once there.
-    fn go_to_find_hit(&mut self, hit: &Hit, ctx: &egui::Context) {
+    pub(super) fn go_to_find_hit(&mut self, hit: &Hit, ctx: &egui::Context) {
         if let (Some(start), Some(c)) = (&mut self.ws.find_start, self.canvases.slide(hit.slide)) {
             if !start.views.iter().any(|v| v.0 == hit.slide) {
                 start.views.push((hit.slide, (c.pan, c.zoom)));

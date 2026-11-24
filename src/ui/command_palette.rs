@@ -30,6 +30,8 @@ pub enum Command {
     Redo,
     ClearLayer,
     DeleteSlide,
+    /// Put back the slide deleted last (kept until the app closes).
+    RestoreSlide,
     LockSlide,
     RenameSlide,
     ResetView,
@@ -78,6 +80,8 @@ pub struct Context<'a> {
     /// Every slide's name, in order.
     pub slides: Vec<String>,
     pub active_slide: usize,
+    /// Deleted slides that can still come back this run.
+    pub deleted_slides: usize,
 }
 
 /// The entries `cx` allows, in the order they show with no query.
@@ -228,6 +232,9 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Lock / unlock the slide", sl, c.lock_slide, C::LockSlide);
     add("Resync from PureRef", sl, c.resync_pureref, C::Key(K::ResyncPureRef));
     add("Delete the slide", sl, c.delete_canvas, C::DeleteSlide);
+    if cx.deleted_slides > 0 {
+        add("Bring back the deleted slide", sl, None, C::RestoreSlide);
+    }
     add("Move the slide up", sl, c.move_slide_up, C::Key(K::MoveSlide(-1)));
     add("Move the slide down", sl, c.move_slide_down, C::Key(K::MoveSlide(1)));
     add("Freeze the screen into a new layer", sl, c.freeze_frame, C::FreezeFrame);
@@ -473,7 +480,7 @@ mod tests {
     }
 
     fn context<'a>(keys: &'a ParsedHotkeys, selected: usize, palette: &'a [[u8; 4]]) -> Context<'a> {
-        Context { keys, selected, picture: false, grouped: false, inside_group: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0 }
+        Context { keys, selected, picture: false, grouped: false, inside_group: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0, deleted_slides: 0 }
     }
 
     #[test]

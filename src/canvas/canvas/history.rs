@@ -117,6 +117,13 @@ impl Canvas {
                 let swapped = self.swap_resynced(layers, link);
                 self.redo_log.push(swapped);
             }
+            entry @ (UndoEntry::LayerRemoved(..)
+            | UndoEntry::LayerInserted(..)
+            | UndoEntry::LayerReordered(..)) => {
+                if let Some(inverse) = self.invert_layer_entry(entry) {
+                    self.redo_log.push(inverse);
+                }
+            }
         }
     }
 
@@ -245,6 +252,15 @@ impl Canvas {
                 let swapped = self.swap_resynced(layers, link);
                 self.undo_log.push(swapped);
             }
+            // Like the object entries: each records what was done, so
+            // redoing is undoing the undo.
+            entry @ (UndoEntry::LayerRemoved(..)
+            | UndoEntry::LayerInserted(..)
+            | UndoEntry::LayerReordered(..)) => {
+                if let Some(inverse) = self.invert_layer_entry(entry) {
+                    self.undo_log.push(inverse);
+                }
+            }
         }
     }
 }
@@ -263,26 +279,6 @@ pub(super) fn apply_layer_xform(layers: &mut [Layer], li: usize, a: f32, b: [f32
     layer.scaled_by *= a;
     layer.moved_by[0] = a * layer.moved_by[0] + b[0];
     layer.moved_by[1] = a * layer.moved_by[1] + b[1];
-}
-
-pub(super) fn layer_idx_of(e: &UndoEntry) -> usize {
-    match e {
-        UndoEntry::StrokeAdded(li)
-        | UndoEntry::ShapeAdded(li)
-        | UndoEntry::StrokeErased(li, _, _)
-        | UndoEntry::ShapeErased(li, _, _)
-        | UndoEntry::Cleared(li, _, _)
-        | UndoEntry::StrokePartiallyErased(li, _, _, _)
-        | UndoEntry::ShapeReplaced(li, _, _, _)
-        | UndoEntry::LayerMoved(li, _)
-        | UndoEntry::LayerScaled(li, _, _)
-        | UndoEntry::ObjectsReplaced(li, _, _)
-        | UndoEntry::ObjectsRemoved(li, _, _)
-        | UndoEntry::ObjectsInserted(li, _, _)
-        | UndoEntry::ObjectsReordered(li, _, _)
-        | UndoEntry::PlatePromoted(li, _) => *li,
-        UndoEntry::Resynced(layers, _) => layers.first().map_or(0, |(li, _)| *li),
-    }
 }
 
 /// Turn layer `li`'s background plate into an image object at the front
