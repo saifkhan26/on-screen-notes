@@ -470,13 +470,16 @@ impl OnScreenNotesApp {
         let zoom = self.canvases.active().zoom.max(1e-3);
         let on_screen = if brush == Brush::Eraser { self.ws.tool.size.max(2.0) } else { self.ws.tool.size * 0.5 };
         let color = self.ws.tool.color;
+        // The settings' pressure curve, as ink off a pad takes it.
         let curve = crate::canvas::stroke::pressure_curve();
         let Some(e) = self.ws.pad.edit.as_mut() else { return false };
-        let r_max = on_screen / zoom * e.frame.px_per_unit();
+        // Pad pixels one screen point takes, for ink's thinnest line.
+        let px = e.frame.px_per_unit() / zoom;
+        let r_max = on_screen * px;
         let mut stamps = Vec::new();
         match ev {
             PenEvent::Down(s) => {
-                let mut walk = Walk::new(brush, r_max);
+                let mut walk = Walk::new(brush, r_max, px);
                 e.session.begin(brush, color);
                 walk.step(e.frame.to_px(s.pos), crate::canvas::stroke::apply_curve(s.pressure, curve), &mut stamps);
                 e.walk = Some(walk);

@@ -2,8 +2,11 @@
 //!
 //! Three textures the picture's size:
 //!   * the pad as it was before the stroke in hand;
-//!   * the stroke: each stamp max-blended in, so a stroke never darkens
-//!     where it crosses itself, however many stamps overlap;
+//!   * the stroke: the pen's and the eraser's stamps max-blended in, so
+//!     a stroke never darkens where it crosses itself, however many
+//!     stamps overlap; the pencil's piled up, each over the last, so it
+//!     builds up as graphite does. Half floats, so its light layers add
+//!     up without banding;
 //!   * what shows: the pad with the stroke on it, rebuilt only where new
 //!     stamps fell. egui draws it in the picture's place
 //!     (`OverlayCache::set_pad`), so pan, zoom, turn, mirror and the slide
@@ -24,6 +27,8 @@ use std::sync::{Arc, OnceLock};
 const FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// How egui reads the shown one.
 const SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// The stroke in hand: the same values, finer.
+const STROKE_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// GPU memory the undo steps of one pad may hold.
 const UNDO_BUDGET: u64 = 256 << 20;
 
@@ -92,7 +97,10 @@ struct Gpu {
     rs: egui_wgpu::RenderState,
     stamp_layout: wgpu::BindGroupLayout,
     compose_layout: wgpu::BindGroupLayout,
+    /// Stamps into the stroke, the strongest winning.
     stamp: wgpu::RenderPipeline,
+    /// Stamps into the stroke, each over the last (`Brush::builds_up`).
+    stamp_pile: wgpu::RenderPipeline,
     /// The stroke over what shows.
     over: wgpu::RenderPipeline,
     /// What shows, cleared where the stroke covers it.
@@ -145,7 +153,7 @@ pub fn init(rs: &egui_wgpu::RenderState) {
         source: wgpu::ShaderSource::Wgsl(COMPOSE_WGSL.into()),
     });
     let blend = |src, dst, op| wgpu::BlendComponent { src_factor: src, dst_factor: dst, operation: op };
-    let pipeline = |label: &str, module: &wgpu::ShaderModule, layout: &wgpu::BindGroupLayout, buffers: &[wgpu::VertexBufferLayout], b: wgpu::BlendComponent| {
+    let pipeline = |label: &str, module: &wgpu::ShaderModule, layout: &wgpu::BindGroupLayout, buffers: &[wgpu::VertexBufferLayout], format: wgpu::TextureFormat, b: wgpu::BlendComponent| {
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(label),
             bind_group_layouts: &[layout],
@@ -163,7 +171,7 @@ pub fn init(rs: &egui_wgpu::RenderState) {
                 entry_point: "fs",
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: FMT,
+                    format,
                     blend: Some(wgpu::BlendState { color: b, alpha: b }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -178,11 +186,13 @@ pub fn init(rs: &egui_wgpu::RenderState) {
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32],
     }];
-    let stamp = pipeline("pad stamp", &stamp_mod, &stamp_layout, &instances, blend(F::One, F::One, Op::Max));
-    let over = pipeline("pad over", &compose_mod, &compose_layout, &[], blend(F::One, F::OneMinusSrcAlpha, Op::Add));
-    let clear = pipeline("pad clear", &compose_mod, &compose_layout, &[], blend(F::Zero, F::OneMinusSrcAlpha, Op::Add));
+    let over_blend = blend(F::One, F::OneMinusSrcAlpha, Op::Add);
+    let stamp = pipeline("pad stamp", &stamp_mod, &stamp_layout, &instances, STROKE_FMT, blend(F::One, F::One, Op::Max));
+    let stamp_pile = pipeline("pad stamp pile", &stamp_mod, &stamp_layout, &instances, STROKE_FMT, over_blend);
+    let over = pipeline("pad over", &compose_mod, &compose_layout, &[], FMT, over_blend);
+    let clear = pipeline("pad clear", &compose_mod, &compose_layout, &[], FMT, blend(F::Zero, F::OneMinusSrcAlpha, Op::Add));
 
-    let _ = GPU.set(Gpu { rs: rs.clone(), stamp_layout, compose_layout, stamp, over, clear });
+    let _ = GPU.set(Gpu { rs: rs.clone(), stamp_layout, compose_layout, stamp, stamp_pile, over, clear });
 }
 
 /// Pads can be drawn on: the GPU is set up.
@@ -212,6 +222,10 @@ fn extent(r: [u32; 4]) -> wgpu::Extent3d {
 }
 
 fn texture(device: &wgpu::Device, label: &str, w: u32, h: u32, srgb_view: bool) -> wgpu::Texture {
+    texture_as(device, label, w, h, FMT, srgb_view)
+}
+
+fn texture_as(device: &wgpu::Device, label: &str, w: u32, h: u32, format: wgpu::TextureFormat, srgb_view: bool) -> wgpu::Texture {
     let view_formats: &[wgpu::TextureFormat] = if srgb_view { &[SRGB] } else { &[] };
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -219,7 +233,7 @@ fn texture(device: &wgpu::Device, label: &str, w: u32, h: u32, srgb_view: bool) 
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FMT,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC
@@ -260,6 +274,8 @@ pub struct Session {
     /// The stroke in hand clears to see-through (an eraser on a picture
     /// that has see-through parts).
     clearing: bool,
+    /// The stroke in hand's stamps pile up (`Brush::builds_up`).
+    pile: bool,
     /// The eraser paints white back: an opaque picture with no paper of
     /// its own. Otherwise it clears (a pad's paper shows through).
     pub erase_white: bool,
@@ -282,7 +298,7 @@ impl Session {
         let erase_white = !has_paper && pad::is_opaque(&rgba);
         pad::premultiply(&mut rgba);
         let pad_tex = texture(device, "pad", w, h, false);
-        let stroke = texture(device, "pad stroke", w, h, false);
+        let stroke = texture_as(device, "pad stroke", w, h, STROKE_FMT, false);
         let display = texture(device, "pad shown", w, h, true);
         let full = [0, 0, w, h];
         for t in [&pad_tex, &display] {
@@ -330,6 +346,7 @@ impl Session {
             pending: Vec::new(),
             stroke_rect: None,
             clearing: false,
+            pile: false,
             erase_white,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -363,6 +380,7 @@ impl Session {
             _ => [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0, color[3] as f32 / 255.0],
         };
         self.clearing = brush == Brush::Eraser && !self.erase_white;
+        self.pile = brush.builds_up();
         let u = Uniforms {
             size: [self.size[0] as f32, self.size[1] as f32],
             hard: look.hard,
@@ -396,7 +414,7 @@ impl Session {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pad stamps") });
         {
             let mut pass = render_pass(&mut enc, &self.stroke_view, wgpu::LoadOp::Load);
-            pass.set_pipeline(&g.stamp);
+            pass.set_pipeline(if self.pile { &g.stamp_pile } else { &g.stamp });
             pass.set_bind_group(0, &self.stamp_bg, &[]);
             pass.set_vertex_buffer(0, self.instances.slice(..));
             pass.draw(0..6, 0..self.pending.len() as u32);
@@ -635,7 +653,7 @@ mod tests {
         // A half-transparent pen stroke that crosses itself: an X.
         s.begin(Brush::Pen, [0, 0, 0, 128]);
         let mut stamps = Vec::new();
-        let mut walk = pad::Walk::new(Brush::Pen, 4.0);
+        let mut walk = pad::Walk::new(Brush::Pen, 4.0, 1.0);
         line(&mut walk, [8.0, 8.0], [56.0, 40.0], &mut stamps);
         line(&mut walk, [56.0, 40.0], [56.0, 8.0], &mut stamps);
         line(&mut walk, [56.0, 8.0], [8.0, 40.0], &mut stamps);
@@ -654,7 +672,7 @@ mod tests {
         // The eraser paints paper back.
         s.begin(Brush::Eraser, [0, 0, 0, 255]);
         let mut stamps = Vec::new();
-        let mut walk = pad::Walk::new(Brush::Eraser, 6.0);
+        let mut walk = pad::Walk::new(Brush::Eraser, 6.0, 1.0);
         line(&mut walk, [14.0, 12.0], [26.0, 20.0], &mut stamps);
         s.push(&stamps);
         s.end();
@@ -705,22 +723,44 @@ mod tests {
     }
 
     #[test]
-    fn the_pencil_lays_down_as_much_colour_as_the_pressure() {
+    fn the_pencil_builds_up_and_darkens_a_little_with_pressure() {
         if gpu().is_none() {
             return;
         }
-        let (w, h) = (48u32, 16u32);
+        let (w, h) = (96u32, 48u32);
         let mut s = Session::new(vec![0u8; (w * h * 4) as usize], w, h, true).expect("opens");
-        let (_, light) = Brush::Pencil.stamp_size(4.0, 0.3);
-        for (x, flow) in [(12.0, light), (36.0, 1.0)] {
+        // One pencil stroke along row `y`, each pass from one x to
+        // another, at pressure `p`.
+        fn draw(s: &mut Session, y: f32, passes: &[(f32, f32)], p: f32) {
             s.begin(Brush::Pencil, [0, 0, 0, 255]);
-            s.push(&[Stamp { c: [x, 8.0], r: 4.0, flow }]);
+            let mut walk = pad::Walk::new(Brush::Pencil, 4.0, 1.0);
+            let mut stamps = Vec::new();
+            for &(from, to) in passes {
+                for k in 0..=40 {
+                    walk.step([from + (to - from) * k as f32 / 40.0, y], p, &mut stamps);
+                }
+            }
+            s.push(&stamps);
             s.end();
         }
-        let px = s.read_pixels().unwrap();
-        let (faint, dark) = (at(&px, w, 12, 8)[3], at(&px, w, 36, 8)[3]);
-        assert_eq!(dark, 255);
-        assert!(faint.abs_diff(77) <= 2, "{faint}");
+        draw(&mut s, 8.5, &[(8.0, 88.0)], 1.0);
+        draw(&mut s, 20.5, &[(8.0, 88.0)], 0.1);
+        let once = s.read_pixels().unwrap();
+        let (firm, light) = (at(&once, w, 48, 8)[3], at(&once, w, 48, 20)[3]);
+        // One firm pass lays about `PENCIL_PASS` of the colour; a light
+        // one less, but never faint.
+        let want = |pass: f32| (pass * 255.0).round() as u8;
+        assert!(firm.abs_diff(want(pad::PENCIL_PASS)) <= 15, "{firm}");
+        assert!(light.abs_diff(want(Brush::pencil_pass(0.1))) <= 15, "{light}");
+        assert!(light < firm && light >= firm / 2, "{firm} vs {light}");
+        // Pressure set the width too: the light line is thin.
+        assert!(at(&once, w, 48, 11)[3] > 0);
+        assert_eq!(at(&once, w, 48, 23)[3], 0);
+        // Going over a line darkens it, in another stroke or the same one.
+        draw(&mut s, 8.5, &[(8.0, 88.0)], 1.0);
+        draw(&mut s, 32.5, &[(8.0, 88.0), (88.0, 8.0)], 1.0);
+        let twice = s.read_pixels().unwrap();        assert!(at(&twice, w, 48, 8)[3] > firm + 30, "{} vs {firm}", at(&twice, w, 48, 8)[3]);
+        assert!(at(&twice, w, 48, 32)[3] > firm + 30, "{} vs {firm}", at(&twice, w, 48, 32)[3]);
         free_texture(s.texture_id());
     }
 

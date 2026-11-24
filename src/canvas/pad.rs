@@ -13,9 +13,11 @@
 //!
 //! A stroke is a row of round stamps laid along the pen's path at a
 //! spacing set by their size, so it looks the same however fast the pen
-//! moved. Pressure sets each stamp's size and, for the pencil, how much
-//! colour it lays down: a light touch draws thin and faint, a firm one
-//! wide and dark.
+//! moved. Pressure sets each stamp's size exactly as it sets ink's width
+//! off a pad (the same curve, from the settings' slider, and the same
+//! floor). The pencil lays its colour in light layers that build up, a
+//! little darker the harder it is pressed; a light touch is thinner and
+//! lighter, never faint.
 
 use crate::canvas::shape::{Obb, Shape};
 
@@ -25,13 +27,23 @@ pub const MAX_SIDE: u32 = 4096;
 /// A new pad's size in pixels.
 pub const NEW_SIZE: [u32; 2] = [2048, 1536];
 
+/// Share of its colour one pass of the pencil lays down pressed firmly.
+/// Light enough that passes build up: two give 75 %, three 88 %.
+pub const PENCIL_PASS: f32 = 0.5;
+
+/// Share of a firm pass the lightest touch lays: pressing harder darkens
+/// the pencil a little, and a light touch still shows.
+pub const PENCIL_LIGHT: f32 = 0.6;
+
 /// What a stroke on a pad does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Brush {
     /// Solid ink with a crisp edge; pressure sets its width.
     Pen,
-    /// A softer edge, and pressure sets both its width (as the pen's)
-    /// and how much colour it lays down.
+    /// A soft edge, and colour laid in light layers: one pass lays up to
+    /// `PENCIL_PASS` of it, a little less the lighter the touch, and going
+    /// over it again, in the same stroke or another, darkens it, as
+    /// graphite does.
     Pencil,
     /// Takes paint away: to clear on a pad (its paper shows) or a picture
     /// with see-through parts; on an opaque picture with no paper, back
@@ -52,33 +64,74 @@ impl Brush {
     pub fn look(self) -> Look {
         match self {
             Brush::Pen => Look { hard: 0.8, spacing: 0.12 },
-            Brush::Pencil => Look { hard: 0.55, spacing: 0.1 },
+            Brush::Pencil => Look { hard: 0.3, spacing: 0.1 },
             Brush::Eraser => Look { hard: 0.6, spacing: 0.12 },
         }
     }
 
-    /// A stamp's radius and flow at pressure `p` (0..1, after the
-    /// pressure curve), for a brush whose full radius is `r_max` pixels.
-    pub fn stamp_size(self, r_max: f32, p: f32) -> (f32, f32) {
-        let p = p.clamp(0.0, 1.0);
-        let pen = (r_max * p.max(0.08)).max(0.5);
+    /// A stamp's radius in pixels at pressure `p` (0..1, after the
+    /// pressure curve), for a brush whose full radius is `r_max` pixels,
+    /// `px` pixels making a screen point. The pen and pencil follow
+    /// pressure as ink does off a pad (`stroke::width_at_pressure`), never
+    /// thinner than a pixel; the eraser reaches between half and all of
+    /// its size.
+    pub fn radius(self, r_max: f32, p: f32, px: f32) -> f32 {
         match self {
-            Brush::Pen => (pen, 1.0),
-            Brush::Pencil => (pen, p.max(0.04)),
-            Brush::Eraser => ((r_max * (0.5 + 0.5 * p)).max(0.5), 1.0),
+            Brush::Pen | Brush::Pencil => 0.5 * crate::canvas::stroke::width_at_pressure(2.0 * r_max, p, px),
+            Brush::Eraser => r_max * (0.5 + 0.5 * p.clamp(0.0, 1.0)),
+        }
+        .max(0.5)
+    }
+
+    /// Gap between stamps of radius `r`, in pixels.
+    pub fn spacing(self, r: f32) -> f32 {
+        (self.look().spacing * 2.0 * r).max(0.35)
+    }
+
+    /// Its stamps pile up, each adding a little colour (`flow`), rather
+    /// than the strongest over a pixel winning.
+    pub fn builds_up(self) -> bool {
+        self == Brush::Pencil
+    }
+
+    /// Share of its colour one pass of the pencil lays at pressure `p`
+    /// (after the curve): from `PENCIL_LIGHT` of `PENCIL_PASS` at the
+    /// lightest touch to all of it pressed firmly.
+    pub fn pencil_pass(p: f32) -> f32 {
+        PENCIL_PASS * (PENCIL_LIGHT + (1.0 - PENCIL_LIGHT) * p.clamp(0.0, 1.0))
+    }
+
+    /// How many stamps of radius `r` one pass lays over a point on its
+    /// line, each counted by how much of it covers the point: the stamp
+    /// shader's edge, full out to `hard` of the radius, then fading.
+    fn stamps_over(self, r: f32) -> f32 {
+        let ramp = (r + 0.5 - r * self.look().hard).max(1.0);
+        (2.0 * r + 1.0 - ramp) / self.spacing(r)
+    }
+
+    /// Share of the colour a stamp of radius `r` lays at pressure `p`.
+    /// The pencil's is set by how many of its stamps cover a point, so
+    /// one pass gives `pencil_pass(p)` whatever its size; the others lay
+    /// it all.
+    pub fn flow(self, r: f32, p: f32) -> f32 {
+        if self.builds_up() {
+            1.0 - (1.0 - Self::pencil_pass(p)).powf(1.0 / self.stamps_over(r))
+        } else {
+            1.0
         }
     }
 }
 
 /// One round stamp, in the picture's pixels. Laid out as the GPU reads it.
+/// Within a stroke of the pen or the eraser the strongest stamp over a
+/// pixel wins, so it never darkens where it crosses itself; the pencil's
+/// pile up (`Brush::builds_up`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Stamp {
     pub c: [f32; 2],
     pub r: f32,
-    /// Share of the colour it lays down (0..1): the pencil's pressure.
-    /// Within a stroke the strongest stamp over a pixel wins, so a
-    /// stroke never darkens where it crosses itself.
+    /// Share of the colour it lays down (`Brush::flow`).
     pub flow: f32,
 }
 
@@ -141,39 +194,48 @@ const MAX_STAMPS_PER_MOVE: usize = 20_000;
 pub struct Walk {
     brush: Brush,
     r_max: f32,
+    /// Pixels a screen point takes (`Brush::radius`).
+    px: f32,
     last: Option<([f32; 2], f32)>,
     /// Distance gone since the last stamp.
     carry: f32,
+    /// Where the last stamp went.
+    placed: Option<[f32; 2]>,
 }
 
 impl Walk {
-    pub fn new(brush: Brush, r_max: f32) -> Self {
-        Self { brush, r_max: r_max.max(0.5), last: None, carry: 0.0 }
+    /// A stroke of `brush`, `r_max` pixels its full radius, drawn where
+    /// `px` pixels make a screen point.
+    pub fn new(brush: Brush, r_max: f32, px: f32) -> Self {
+        let px = if px.is_finite() && px > 0.0 { px } else { 1.0 };
+        Self { brush, r_max: r_max.max(0.5), px, last: None, carry: 0.0, placed: None }
     }
 
-    fn stamp(&self, c: [f32; 2], p: f32) -> Stamp {
-        let (r, flow) = self.brush.stamp_size(self.r_max, p);
-        Stamp { c, r, flow }
+    fn radius(&self, p: f32) -> f32 {
+        self.brush.radius(self.r_max, p, self.px)
+    }
+
+    fn stamp(&self, c: [f32; 2], r: f32, p: f32) -> Stamp {
+        Stamp { c, r, flow: self.brush.flow(r, p) }
     }
 
     /// The pen reached `at` with pressure `p`: the stamps up to there go
     /// into `out`. The first point always gets one, so a tap leaves a dot.
     pub fn step(&mut self, at: [f32; 2], p: f32, out: &mut Vec<Stamp>) {
         let Some((from, p0)) = self.last else {
-            out.push(self.stamp(at, p));
+            out.push(self.stamp(at, self.radius(p), p));
             self.last = Some((at, p));
             self.carry = 0.0;
+            self.placed = Some(at);
             return;
         };
         let d = ((at[0] - from[0]).powi(2) + (at[1] - from[1]).powi(2)).sqrt();
         if d.is_finite() && d > 0.0 {
-            let spacing_k = self.brush.look().spacing;
             let mut t = 0.0_f32;
             let mut laid = 0;
             while laid < MAX_STAMPS_PER_MOVE {
                 let pp = p0 + (p - p0) * (t / d);
-                let (r, _) = self.brush.stamp_size(self.r_max, pp);
-                let spacing = (spacing_k * 2.0 * r).max(0.35);
+                let spacing = self.brush.spacing(self.radius(pp));
                 let need = (spacing - self.carry).max(0.0);
                 if t + need > d {
                     self.carry += d - t;
@@ -181,9 +243,20 @@ impl Walk {
                 }
                 t += need;
                 self.carry = 0.0;
-                let f = t / d;
-                out.push(self.stamp([from[0] + (at[0] - from[0]) * f, from[1] + (at[1] - from[1]) * f], p0 + (p - p0) * f));
                 laid += 1;
+                let f = t / d;
+                let c = [from[0] + (at[0] - from[0]) * f, from[1] + (at[1] - from[1]) * f];
+                let pf = p0 + (p - p0) * f;
+                let r = self.radius(pf);
+                // A slow pen wobbling within a pixel goes a long way along
+                // its path and hardly anywhere: no stamp there, or the
+                // pencil's would pile up into a blot. Going back over a
+                // line still lays them; it is farther than this.
+                if self.placed.is_some_and(|q| ((c[0] - q[0]).powi(2) + (c[1] - q[1]).powi(2)).sqrt() < 0.85 * spacing) {
+                    continue;
+                }
+                out.push(self.stamp(c, r, pf));
+                self.placed = Some(c);
             }
         }
         self.last = Some((at, p));
@@ -372,7 +445,7 @@ mod tests {
 
     #[test]
     fn stamps_are_evenly_spaced_whatever_the_samples() {
-        let mut w = Walk::new(Brush::Pen, 5.0);
+        let mut w = Walk::new(Brush::Pen, 5.0, 1.0);
         let mut out = Vec::new();
         // Full pressure: radius 5, spacing 0.12 · 10 = 1.2 px.
         w.step([0.0, 0.0], 1.0, &mut out);
@@ -392,22 +465,60 @@ mod tests {
     }
 
     #[test]
-    fn pressure_sets_size_and_the_pencils_colour() {
-        let (thin, _) = Brush::Pen.stamp_size(10.0, 0.1);
-        let (wide, _) = Brush::Pen.stamp_size(10.0, 1.0);
-        assert!(thin < wide && (wide - 10.0).abs() < 1e-4);
-        // The pencil: width as the pen's, and its colour follows pressure.
-        let (thin_p, light) = Brush::Pencil.stamp_size(10.0, 0.1);
-        let (wide_p, firm) = Brush::Pencil.stamp_size(10.0, 1.0);
-        assert_eq!((thin_p, wide_p), (thin, wide));
-        assert!(light < 0.2 && firm == 1.0);
-        // Never vanishing.
-        assert!(Brush::Pen.stamp_size(0.1, 0.0).0 >= 0.5);
+    fn pressure_sets_size_as_it_sets_inks_width_off_a_pad() {
+        use crate::canvas::stroke::width_at_pressure;
+        for p in [0.0, 0.03, 0.1, 0.5, 1.0] {
+            let ink = width_at_pressure(20.0, p, 1.0);
+            assert_eq!(Brush::Pen.radius(10.0, p, 1.0), 0.5 * ink, "{p}");
+            assert_eq!(Brush::Pencil.radius(10.0, p, 1.0), 0.5 * ink, "the pencil only softens the edge");
+        }
+        assert!(Brush::Pen.radius(10.0, 0.1, 1.0) < Brush::Pen.radius(10.0, 1.0, 1.0));
+        // Zoomed out the floor is a screen point's, as ink's.
+        assert_eq!(Brush::Pen.radius(10.0, 0.0, 4.0), 0.5 * (0.8 * 4.0));
+        // Never thinner than a pixel, however far zoomed in.
+        assert!(Brush::Pen.radius(0.1, 0.0, 0.01) >= 0.5);
+    }
+
+    #[test]
+    fn one_pencil_pass_lays_the_same_share_of_colour_at_any_size() {
+        for r in [0.5_f32, 1.0, 4.0, 40.0] {
+            for p in [0.0, 0.4, 1.0] {
+                let pass = 1.0 - (1.0 - Brush::Pencil.flow(r, p)).powf(Brush::Pencil.stamps_over(r));
+                assert!((pass - Brush::pencil_pass(p)).abs() < 1e-4, "{r} {p}: {pass}");
+            }
+        }
+        // Pressed harder, a little darker; the lightest touch still shows.
+        assert_eq!(Brush::pencil_pass(1.0), PENCIL_PASS);
+        assert_eq!(Brush::pencil_pass(0.0), PENCIL_PASS * PENCIL_LIGHT);
+        assert!(Brush::pencil_pass(0.3) < Brush::pencil_pass(0.6));
+        assert!(Brush::Pencil.flow(4.0, 1.0) < 0.2, "light layers");
+        assert_eq!((Brush::Pen.flow(4.0, 0.1), Brush::Eraser.flow(4.0, 0.1)), (1.0, 1.0));
+        assert!(Brush::Pencil.builds_up() && !Brush::Pen.builds_up() && !Brush::Eraser.builds_up());
+    }
+
+    #[test]
+    fn a_pen_wobbling_in_place_lays_no_pile_of_stamps() {
+        let mut w = Walk::new(Brush::Pencil, 4.0, 1.0);
+        let mut out = Vec::new();
+        w.step([0.0, 0.0], 1.0, &mut out);
+        // Back and forth within a fraction of the spacing (0.8 px): a long
+        // way along the path, nowhere on the pad.
+        for k in 0..200 {
+            w.step([if k % 2 == 0 { 0.3 } else { -0.3 }, 0.0], 1.0, &mut out);
+        }
+        assert!(out.len() <= 2, "{}", out.len());
+        // Going back over a line still lays stamps there.
+        let mut w = Walk::new(Brush::Pencil, 4.0, 1.0);
+        let mut out = Vec::new();
+        for x in [0.0, 20.0, 0.0] {
+            w.step([x, 0.0], 1.0, &mut out);
+        }
+        assert!(out.len() >= 45, "{}", out.len());
     }
 
     #[test]
     fn a_wild_jump_lays_a_bounded_number_of_stamps() {
-        let mut w = Walk::new(Brush::Pen, 0.5);
+        let mut w = Walk::new(Brush::Pen, 0.5, 1.0);
         let mut out = Vec::new();
         w.step([0.0, 0.0], 0.0, &mut out);
         w.step([1.0e9, 0.0], 0.0, &mut out);
