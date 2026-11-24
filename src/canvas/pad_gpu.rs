@@ -18,7 +18,7 @@
 
 use crate::canvas::pad::{self, Brush, Stamp};
 use eframe::{egui_wgpu, wgpu};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// What the textures hold: premultiplied RGBA, sRGB-encoded values.
 const FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -459,13 +459,24 @@ impl Session {
     }
 
     /// The pad's pixels, straight RGBA, `size()` big. Waits for the GPU
-    /// (a few milliseconds). Ends a stroke in hand first.
+    /// (tens of milliseconds on a big pad). Ends a stroke in hand first.
     pub fn read_pixels(&mut self) -> Option<Vec<u8>> {
+        let back = self.start_read()?;
+        if !back.wait() {
+            log::warn!("could not read a pad back from the GPU");
+            return None;
+        }
+        back.into_pixels()
+    }
+
+    /// Start bringing the pad's pixels back from the GPU, as they are
+    /// now, without waiting for them (`Readback`). Ends a stroke in hand
+    /// first.
+    pub fn start_read(&mut self) -> Option<Readback> {
         self.end();
         let g = GPU.get()?;
         let [w, h] = self.size;
-        let row = w * 4;
-        let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let device = &g.rs.device;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pad read back"),
@@ -483,25 +494,68 @@ impl Session {
             extent([0, 0, w, h]),
         );
         g.rs.queue.submit(Some(enc.finish()));
-        let slice = buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
+        let mapped = Arc::new(OnceLock::new());
+        let done = Arc::clone(&mapped);
+        // No warning here: a readback let go of before it came (the pad
+        // put away mid-snapshot) also ends up here, as an error.
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = done.set(r.is_ok());
         });
-        device.poll(wgpu::Maintain::Wait);
-        if let Err(e) = rx.recv().map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
-            log::warn!("could not read a pad back from the GPU: {e}");
-            return None;
-        }
-        let mut out = Vec::with_capacity((row * h) as usize);
-        {
-            let data = slice.get_mapped_range();
-            for y in 0..h as usize {
-                let start = y * padded as usize;
-                out.extend_from_slice(&data[start..start + row as usize]);
+        Some(Readback { buffer, size: self.size, padded, mapped })
+    }
+}
+
+/// A pad's pixels on their way back from the GPU (`Session::start_read`),
+/// so a snapshot of them never holds up the pen: `ready` asks without
+/// waiting, and `into_pixels` may run on any thread.
+pub struct Readback {
+    buffer: wgpu::Buffer,
+    size: [u32; 2],
+    /// Bytes a row takes in `buffer`: wgpu pads rows to its alignment.
+    padded: u32,
+    /// Set once the copy is mapped: whether it can be read.
+    mapped: Arc<OnceLock<bool>>,
+}
+
+impl Readback {
+    /// `None` while the pixels are still on their way (the GPU is asked,
+    /// without waiting); then whether they could be read.
+    pub fn ready(&self) -> Option<bool> {
+        if self.mapped.get().is_none() {
+            if let Some(g) = GPU.get() {
+                let _ = g.rs.device.poll(wgpu::Maintain::Poll);
             }
         }
-        buffer.unmap();
+        self.mapped.get().copied()
+    }
+
+    /// Wait for the pixels; whether they could be read.
+    fn wait(&self) -> bool {
+        if self.mapped.get().is_none() {
+            if let Some(g) = GPU.get() {
+                let _ = g.rs.device.poll(wgpu::Maintain::Wait);
+            }
+        }
+        self.mapped.get().copied().unwrap_or(false)
+    }
+
+    /// The pixels, straight RGBA, once `ready` said they are back; `None`
+    /// before, or if they could not be read.
+    pub fn into_pixels(self) -> Option<Vec<u8>> {
+        if self.mapped.get() != Some(&true) {
+            return None;
+        }
+        let [w, h] = self.size;
+        let row = (w * 4) as usize;
+        let mut out = Vec::with_capacity(row * h as usize);
+        {
+            let data = self.buffer.slice(..).get_mapped_range();
+            for y in 0..h as usize {
+                let start = y * self.padded as usize;
+                out.extend_from_slice(&data[start..start + row]);
+            }
+        }
+        self.buffer.unmap();
         pad::unpremultiply(&mut out);
         Some(out)
     }
@@ -616,6 +670,37 @@ mod tests {
         assert!(s.undo(true));
         assert_eq!(at(&s.read_pixels().unwrap(), w, 20, 16), on);
         assert_eq!(s.edits, 5);
+        free_texture(s.texture_id());
+    }
+
+    #[test]
+    fn a_readback_holds_the_pixels_of_when_it_started_and_reads_on_any_thread() {
+        if gpu().is_none() {
+            return;
+        }
+        let (w, h) = (70u32, 20u32); // A row that wgpu pads.
+        let mut s = Session::new(vec![0u8; (w * h * 4) as usize], w, h, true).expect("opens");
+        s.begin(Brush::Pen, [0, 0, 0, 255]);
+        s.push(&[Stamp { c: [10.0, 10.0], r: 4.0, flow: 1.0 }]);
+        let back = s.start_read().expect("starts");
+        let want = s.read_pixels().unwrap();
+        // A stroke drawn after it started is not in it.
+        s.begin(Brush::Pen, [0, 0, 0, 255]);
+        s.push(&[Stamp { c: [50.0, 10.0], r: 4.0, flow: 1.0 }]);
+        s.end();
+        let start = std::time::Instant::now();
+        while back.ready().is_none() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "never came back");
+            std::thread::yield_now();
+        }
+        let got = std::thread::spawn(move || back.into_pixels()).join().unwrap().expect("reads");
+        assert_eq!(got, want);
+        assert_eq!(at(&got, w, 10, 10)[3], 255);
+        assert_eq!(at(&got, w, 50, 10)[3], 0);
+        // One let go of before it came (the pad put away mid-snapshot)
+        // leaves the pad as it was.
+        drop(s.start_read());
+        assert_eq!(at(&s.read_pixels().unwrap(), w, 50, 10)[3], 255);
         free_texture(s.texture_id());
     }
 

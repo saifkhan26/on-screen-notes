@@ -8,18 +8,29 @@
 //! step through its strokes. Esc, a press outside it, another tool or
 //! another slide puts it away: its pixels go into the slide, one undo
 //! step there for the whole time it was open. Every 30 s of drawing they
-//! are also written into the slide quietly, so a crash loses little.
+//! are also written into the slide quietly, so a crash loses little:
+//! brought back from the GPU and made a PNG off the UI thread, since done
+//! at once (100 ms on a new pad) it held up the next pen-down.
 
 use super::*;
 use crate::canvas::pad::{self, Brush, PadFrame, Walk};
-use crate::canvas::pad_gpu::{self, Session};
+use crate::canvas::pad_gpu::{self, Readback, Session};
 use crate::canvas::stroke::StrokeStyle;
 use crate::input::pen::PenEvent;
 use crate::tools::ToolKind;
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
 
 /// How often an open pad's pixels go into its slide while it is drawn on.
 const SNAPSHOT_EVERY: Duration = Duration::from_secs(30);
+
+/// An open pad's pixels on their way into its slide (`SNAPSHOT_EVERY`).
+enum Snapshot {
+    /// Coming back from the GPU.
+    Gpu(Readback),
+    /// Being made a PNG on a thread of their own.
+    Encoding(mpsc::Receiver<Option<Vec<u8>>>),
+}
 
 /// The drawing pad open now, if any.
 #[derive(Default)]
@@ -50,6 +61,8 @@ struct PadEdit {
     /// `session.edits` when the slide last got the pixels, and when.
     saved_edits: u64,
     saved_at: Instant,
+    /// A snapshot under way, and `session.edits` when it was taken.
+    snapshot: Option<(u64, Snapshot)>,
     /// The pad's paper (straight RGBA, alpha its opacity); `None` for a
     /// picture that is not a pad. Changed with the paper bar.
     paper: Option<[u8; 4]>,
@@ -138,7 +151,55 @@ impl OnScreenNotesApp {
                 }
             }
         }
+        // Before the canvas is told what shows: a snapshot put in changes
+        // the picture's bytes, and so its key.
+        self.pad_snapshot_step();
         self.overlay_cache.set_pad(self.ws.pad.shown());
+    }
+
+    /// Move a snapshot under way on: its pixels back from the GPU go to
+    /// a thread to be made a PNG, and the PNG into the slide. Never waits.
+    fn pad_snapshot_step(&mut self) {
+        let Some(e) = self.ws.pad.edit.as_mut() else { return };
+        let Some((edits, stage)) = e.snapshot.take() else { return };
+        let next = match stage {
+            Snapshot::Gpu(back) => match back.ready() {
+                None => Some(Snapshot::Gpu(back)),
+                Some(false) => {
+                    log::warn!("could not read a pad back from the GPU for a snapshot");
+                    None
+                }
+                Some(true) => {
+                    let [w, h] = e.session.size();
+                    let (tx, rx) = mpsc::channel();
+                    let spawned = std::thread::Builder::new().name("pad snapshot".into()).spawn(move || {
+                        let png = back.into_pixels().and_then(|px| image::RgbaImage::from_raw(w, h, px)).and_then(|img| pad::encode_png(&img));
+                        let _ = tx.send(png);
+                    });
+                    spawned.is_ok().then_some(Snapshot::Encoding(rx))
+                }
+            },
+            Snapshot::Encoding(rx) => match rx.try_recv() {
+                Err(TryRecvError::Empty) => Some(Snapshot::Encoding(rx)),
+                Err(TryRecvError::Disconnected) | Ok(None) => None,
+                Ok(Some(png)) => {
+                    let mut taken = self.ws.pad.edit.take().expect("open");
+                    let started = Instant::now();
+                    match self.pad_put(&mut taken, png, edits) {
+                        Some(_) => log::info!("pad snapshot put into slide {} in {:?}", taken.slide + 1, started.elapsed()),
+                        None => taken.saved_at = Instant::now(),
+                    }
+                    self.ws.pad.edit = Some(taken);
+                    return;
+                }
+            },
+        };
+        let e = self.ws.pad.edit.as_mut().expect("open");
+        match next {
+            Some(stage) => e.snapshot = Some((edits, stage)),
+            // It failed: the next one is due in `SNAPSHOT_EVERY`.
+            None => e.saved_at = Instant::now(),
+        }
     }
 
     /// The picture store moved the open pad's bytes to the media folder:
@@ -284,6 +345,7 @@ impl OnScreenNotesApp {
             // nothing is drawn.
             saved_edits: if lifted { u64::MAX } else { 0 },
             saved_at: Instant::now(),
+            snapshot: None,
             paper,
             paper_changed: false,
         });
@@ -334,14 +396,29 @@ impl OnScreenNotesApp {
     /// `None` if it could not be done.
     fn pad_write(&mut self, e: &mut PadEdit) -> Option<usize> {
         e.session.end();
+        // This one has everything a snapshot under way would bring.
+        e.snapshot = None;
         let at = find(self.canvases.slide(e.slide)?.layers.get(e.layer)?, e.key, e.shape)?;
         if e.session.edits == e.saved_edits {
             return Some(at);
         }
         let started = Instant::now();
+        let edits = e.session.edits;
         let pixels = e.session.read_pixels()?;
         let [w, h] = e.session.size();
-        let png = Arc::new(pad::encode_png(&image::RgbaImage::from_raw(w, h, pixels)?)?);
+        let png = pad::encode_png(&image::RgbaImage::from_raw(w, h, pixels)?)?;
+        let at = self.pad_put(e, png, edits)?;
+        log::info!("pad {w}x{h} written into slide {} in {:?}", e.slide + 1, started.elapsed());
+        Some(at)
+    }
+
+    /// Put `png`, the pad's pixels when `session.edits` was `edits`, into
+    /// its picture in the slide, with no undo step. Where the picture is
+    /// then, `None` if it could not be done.
+    fn pad_put(&mut self, e: &mut PadEdit, png: Vec<u8>, edits: u64) -> Option<usize> {
+        let at = find(self.canvases.slide(e.slide)?.layers.get(e.layer)?, e.key, e.shape)?;
+        let [w, h] = e.session.size();
+        let png = Arc::new(png);
         let key = Arc::as_ptr(&png) as usize;
         let layer = e.layer;
         self.edit_pad_slide(e.slide, |c| {
@@ -357,9 +434,8 @@ impl OnScreenNotesApp {
         })??;
         e.key = key;
         e.shape = at;
-        e.saved_edits = e.session.edits;
+        e.saved_edits = edits;
         e.saved_at = Instant::now();
-        log::info!("pad {w}x{h} written into slide {} in {:?}", e.slide + 1, started.elapsed());
         Some(at)
     }
 
@@ -414,10 +490,13 @@ impl OnScreenNotesApp {
         e.session.push(&stamps);
         if matches!(ev, PenEvent::Up(_)) && e.walk.take().is_some() {
             e.session.end();
-            if e.saved_at.elapsed() >= SNAPSHOT_EVERY {
-                let mut taken = self.ws.pad.edit.take().expect("open");
-                let _ = self.pad_write(&mut taken);
-                self.ws.pad.edit = Some(taken);
+            // Started here, finished over the next frames
+            // (`pad_snapshot_step`): the pen is never kept waiting.
+            if e.snapshot.is_none() && e.session.edits != e.saved_edits && e.saved_at.elapsed() >= SNAPSHOT_EVERY {
+                match e.session.start_read() {
+                    Some(back) => e.snapshot = Some((e.session.edits, Snapshot::Gpu(back))),
+                    None => e.saved_at = Instant::now(),
+                }
             }
         }
         true
