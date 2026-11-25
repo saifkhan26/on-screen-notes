@@ -296,7 +296,9 @@ Every action is one undo step. Things worth knowing:
   underneath. Neither eraser removes images — delete them here.
 - With **two or more objects selected**, a bar under the toolbar arranges
   them: pack into a tight block, group by type (pictures, GIFs, videos,
-  everything else), align edges or centres, distribute evenly. Pictures,
+  everything else), group by tags (a cluster per tag, A to Z, untagged
+  last; an object with several tags joins the one most of the selection
+  shares), align edges or centres, distribute evenly. Pictures,
   GIFs and videos move one by one, taking the ink drawn on them along;
   other ink moves in touching clusters, so handwriting stays in one
   piece. Its last button copies the selection to a new slide.

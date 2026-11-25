@@ -162,6 +162,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
             let r = "Arrange";
             add("Pack", r, a.pack, C::Key(K::Arrange(Arrange::Pack)));
             add("Group by type", r, a.group_by_type, C::Key(K::Arrange(Arrange::GroupByType)));
+            add("Group by tags", r, a.group_by_tags, C::Key(K::Arrange(Arrange::GroupByTags)));
             add("Align left", r, a.align_left, C::Key(K::Align(Align::Left)));
             add("Align centres across", r, a.align_center_x, C::Key(K::Align(Align::CenterX)));
             add("Align right", r, a.align_right, C::Key(K::Align(Align::Right)));

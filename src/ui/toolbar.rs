@@ -681,6 +681,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
         ("Arrange (2+ selected)", bound(vec![
             ("Pack",                     a.pack),
             ("Group by type",            a.group_by_type),
+            ("Group by tags",            a.group_by_tags),
             ("Keep apart on / off",      a.keep_apart),
             ("Align left",               a.align_left),
             ("Align centres across",     a.align_center_x),

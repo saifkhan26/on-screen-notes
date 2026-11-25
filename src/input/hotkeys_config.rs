@@ -567,6 +567,7 @@ pub struct ToolbarSection {
 pub struct ArrangeSection {
     pub pack: String,
     pub group_by_type: String,
+    pub group_by_tags: String,
     /// Aligning slides objects until they touch, or piles them up.
     pub keep_apart: String,
     pub align_left: String,
@@ -837,6 +838,7 @@ pub struct ToolbarBindings {
 pub struct ArrangeBindings {
     pub pack: Option<Binding>,
     pub group_by_type: Option<Binding>,
+    pub group_by_tags: Option<Binding>,
     pub keep_apart: Option<Binding>,
     pub align_left: Option<Binding>,
     pub align_center_x: Option<Binding>,
@@ -1035,6 +1037,7 @@ impl HotkeysConfig {
             arrange: ArrangeBindings {
                 pack:           p("arrange.pack",           &ar.pack),
                 group_by_type:  p("arrange.group_by_type",  &ar.group_by_type),
+                group_by_tags:  p("arrange.group_by_tags",  &ar.group_by_tags),
                 keep_apart:     p("arrange.keep_apart",     &ar.keep_apart),
                 align_left:     p("arrange.align_left",     &ar.align_left),
                 align_center_x: p("arrange.align_center_x", &ar.align_center_x),
@@ -1432,6 +1435,7 @@ fn note(section: &str, key: &str) -> Option<String> {
 
         ("arrange", "pack")                  => "Pack the selection into a tight block, sizes kept",
         ("arrange", "group_by_type")         => "Group the selection: pictures, GIFs, videos, the rest",
+        ("arrange", "group_by_tags")         => "Group the selection by tag, untagged objects last",
         ("arrange", "keep_apart")            => "Keep-apart switch: aligning slides objects until they touch, or piles them up",
         ("arrange", "align_left")            => "Align the selection left",
         ("arrange", "align_center_x")        => "Align the selection's centres across",

@@ -114,6 +114,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
     let table = [
         (a.pack, KeyAction::Arrange(Arrange::Pack)),
         (a.group_by_type, KeyAction::Arrange(Arrange::GroupByType)),
+        (a.group_by_tags, KeyAction::Arrange(Arrange::GroupByTags)),
         (a.keep_apart, KeyAction::KeepApart),
         (a.align_left, KeyAction::Align(Align::Left)),
         (a.align_center_x, KeyAction::Align(Align::CenterX)),

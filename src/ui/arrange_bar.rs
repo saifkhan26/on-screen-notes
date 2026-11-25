@@ -213,7 +213,7 @@ pub fn show(
                     ui.label(egui::RichText::new(format!("{count} selected")).small().color(theme::TEXT_MUTED));
                     ui.add_space(6.0);
                     if count >= 2 {
-                        arrange_buttons(ui, count, apart, pack, keys, &mut picked);
+                        arrange_buttons(ui, count, !tags.is_empty(), apart, pack, keys, &mut picked);
                         divider(ui);
                     }
                     let k = &keys.arrange;
@@ -676,11 +676,12 @@ fn pack_mode_menu(ui: &mut egui::Ui, mode: &mut PackMode) {
 }
 
 /// Pack, group, align, distribute and match sizes, for two or more
-/// objects.
-fn arrange_buttons(ui: &mut egui::Ui, count: usize, apart: &mut bool, pack: &mut PackMode, keys: &ParsedHotkeys, picked: &mut Option<BarAction>) {
+/// objects; `tagged` when some of them carry a tag, for group by tags.
+fn arrange_buttons(ui: &mut egui::Ui, count: usize, tagged: bool, apart: &mut bool, pack: &mut PackMode, keys: &ParsedHotkeys, picked: &mut Option<BarAction>) {
     let k = &keys.arrange;
     let mut btn = |ui: &mut egui::Ui, op: Arrange, img: egui::ImageSource<'static>, tip: &str, key: Option<Binding>| {
-        if icon_btn(ui, img, count >= op.min_items(), &with_key(tip, key)) {
+        let can = count >= op.min_items() && (op != Arrange::GroupByTags || tagged);
+        if icon_btn(ui, img, can, &with_key(tip, key)) {
             *picked = Some(BarAction::Arrange(op));
         }
     };
@@ -693,6 +694,12 @@ fn arrange_buttons(ui: &mut egui::Ui, count: usize, apart: &mut bool, pack: &mut
     pack_mode_menu(ui, pack);
     btn(ui, Arrange::GroupByType, egui::include_image!("../../assets/icons/group-by-type.svg"),
         "Group by type — pictures, GIFs, videos and other objects each packed into their own cluster", k.group_by_type);
+    let tip = if tagged {
+        "Group by tags — the objects under each tag packed into their own cluster, A to Z, untagged ones last. One with several tags goes with the tag most of the selection shares"
+    } else {
+        "Group by tags — none of the selection is tagged yet (the tag button tags it)"
+    };
+    btn(ui, Arrange::GroupByTags, egui::include_image!("../../assets/icons/group-by-tags.svg"), tip, k.group_by_tags);
     divider(ui);
     let tip = if *apart {
         "Keep apart: on — aligning slides each object until it reaches the edge or bumps into another, so nothing ends up on top of anything. Click to let aligning pile objects up"

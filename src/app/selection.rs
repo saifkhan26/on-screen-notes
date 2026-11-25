@@ -320,7 +320,16 @@ impl OnScreenNotesApp {
         let c = self.canvases.active();
         let li = c.active_layer;
         let Some(layer) = c.layers.get(li) else { return };
-        let (strokes, shapes) = crate::tools::arrange::plan(layer, &self.ws.tool.select.sel, op, c.zoom);
+        let sel = &self.ws.tool.select.sel;
+        if op == crate::tools::arrange::Arrange::GroupByTags {
+            let stroke_tagged = sel.strokes.iter().any(|&i| layer.strokes.get(i).is_some_and(|s| !s.tags.is_empty()));
+            let shape_tagged = sel.shapes.iter().any(|&i| layer.shapes.get(i).is_some_and(|s| !s.tags().is_empty()));
+            if !stroke_tagged && !shape_tagged {
+                self.toast = Some(("None of the selection is tagged".to_string(), std::time::Instant::now()));
+                return;
+            }
+        }
+        let (strokes, shapes) = crate::tools::arrange::plan(layer, sel, op, c.zoom);
         if !self.canvases.active_mut().move_objects_each(li, &strokes, &shapes) {
             self.toast = Some(("Nothing to move".to_string(), std::time::Instant::now()));
         }

@@ -1,7 +1,7 @@
 //! Arrange: tidy a selection. Pack it into a compact block, rows or
 //! columns that fit the screen, line it up along an edge or centre
 //! (overlapping or not), space it evenly, sort it into clusters by media
-//! type, or give it one width or height.
+//! type or by tag, or give it one width or height.
 //!
 //! Pure geometry: each operation takes the objects' boxes and returns
 //! how far to move each one (`offsets`, `pack_offsets`) or how much to
@@ -15,6 +15,7 @@ use crate::canvas::affine::Affine;
 use crate::canvas::canvas::{shape_bounds, Layer};
 use crate::canvas::hit::Selection;
 use crate::canvas::shape::MediaType;
+use crate::canvas::units::tag_key;
 
 /// Axis-aligned box `[x0, y0, x1, y1]`, canvas-local.
 pub type Bounds = [f32; 4];
@@ -33,9 +34,59 @@ pub type Transforms = Vec<(usize, Affine)>;
 pub fn plan(layer: &Layer, sel: &Selection, op: Arrange, zoom: f32) -> (Moves, Moves) {
     let zoom = zoom.max(1e-3);
     let (units, owners) = gather(layer, sel, zoom);
-    let items: Vec<Item> = units.iter().map(|u| u.item).collect();
+    let mut items: Vec<Item> = units.iter().map(|u| u.item).collect();
+    if op == Arrange::GroupByTags {
+        let tags: Vec<Vec<&str>> = units.iter().map(|u| unit_tags(layer, u, &owners)).collect();
+        for (it, g) in items.iter_mut().zip(tag_groups(&tags)) {
+            it.group = g;
+        }
+    }
     let offsets = offsets(&items, op, 1.0 / zoom);
     per_object(&units, &owners, &offsets)
+}
+
+/// Every tag the objects of `unit` carry, as written.
+fn unit_tags<'a>(layer: &'a Layer, unit: &Unit, owners: &[(bool, usize)]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for &m in &unit.members {
+        let tags = match owners[m] {
+            (true, i) => layer.strokes.get(i).map(|s| s.tags.as_slice()),
+            (false, i) => layer.shapes.get(i).map(|s| s.tags()),
+        };
+        out.extend(tags.unwrap_or_default().iter().map(String::as_str));
+    }
+    out
+}
+
+/// Each unit's `GroupByTags` cluster, from every unit's tags. A unit
+/// carrying several tags goes under the one most units share, so the
+/// biggest clusters stay whole; on a tie, the first alphabetically.
+/// Clusters rank alphabetically, case aside; untagged units come last.
+pub fn tag_groups(tags: &[Vec<&str>]) -> Vec<u32> {
+    let keys: Vec<Vec<String>> = tags
+        .iter()
+        .map(|ts| {
+            let mut k: Vec<String> = ts.iter().map(|t| tag_key(t)).collect();
+            k.sort_unstable();
+            k.dedup();
+            k
+        })
+        .collect();
+    let mut count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for t in keys.iter().flatten() {
+        *count.entry(t).or_default() += 1;
+    }
+    let under: Vec<Option<&str>> = keys
+        .iter()
+        .map(|k| k.iter().map(String::as_str).max_by(|a, b| count[a].cmp(&count[b]).then(b.cmp(a))))
+        .collect();
+    let mut names: Vec<&str> = under.iter().flatten().copied().collect();
+    names.sort_unstable();
+    names.dedup();
+    under
+        .iter()
+        .map(|u| u.and_then(|t| names.binary_search(&t).ok()).map_or(u32::MAX, |r| r as u32))
+        .collect()
 }
 
 /// The moves that pack the selected strokes and shapes on `layer` the
@@ -182,6 +233,9 @@ pub enum Arrange {
     Pack,
     /// Pack each group on its own and set the groups side by side.
     GroupByType,
+    /// Pack the objects under each tag on their own (see `tag_groups`),
+    /// untagged ones last, and set the clusters out in rows.
+    GroupByTags,
     /// Line every object up with the selection's edge or centre.
     Align(Align),
     /// Slide every object toward the selection's edge or centre until
@@ -279,8 +333,9 @@ impl Arrange {
 #[derive(Debug, Clone, Copy)]
 pub struct Item {
     pub bounds: Bounds,
-    /// Cluster for `GroupByType`; lower groups go further left.
-    pub group: u8,
+    /// Cluster for `GroupByType`, or for `GroupByTags` once `plan` has
+    /// set it from the tags; lower groups come first.
+    pub group: u32,
 }
 
 /// Objects that Arrange moves as one: a picture / GIF / video with the
@@ -305,7 +360,7 @@ pub fn units(objects: &[(Bounds, Option<u8>)], tol: f32) -> Vec<Unit> {
     for (i, (b, g)) in objects.iter().enumerate() {
         if let Some(g) = g {
             unit_of_media[i] = out.len();
-            out.push(Unit { item: Item { bounds: *b, group: *g }, members: vec![i] });
+            out.push(Unit { item: Item { bounds: *b, group: u32::from(*g) }, members: vec![i] });
         }
     }
     let mut loose = Vec::new();
@@ -346,7 +401,7 @@ pub fn units(objects: &[(Bounds, Option<u8>)], tol: f32) -> Vec<Unit> {
         let r = root(&mut parent, k);
         if cluster_of_root[r] == usize::MAX {
             cluster_of_root[r] = out.len();
-            out.push(Unit { item: Item { bounds: objects[i].0, group: u8::MAX }, members: vec![i] });
+            out.push(Unit { item: Item { bounds: objects[i].0, group: u32::MAX }, members: vec![i] });
         } else {
             let u = &mut out[cluster_of_root[r]];
             u.item.bounds = union([u.item.bounds, objects[i].0].into_iter());
@@ -373,18 +428,36 @@ pub fn offsets(items: &[Item], op: Arrange, px: f32) -> Vec<[f32; 2]> {
                 out[i] = to(items[i].bounds, [all[0] + pos[k][0], all[1] + pos[k][1]]);
             }
         }
-        Arrange::GroupByType => {
-            let mut groups: Vec<u8> = items.iter().map(|it| it.group).collect();
+        Arrange::GroupByType | Arrange::GroupByTags => {
+            let mut groups: Vec<u32> = items.iter().map(|it| it.group).collect();
             groups.sort_unstable();
             groups.dedup();
-            let mut x = all[0];
-            for g in groups {
-                let idx: Vec<usize> = (0..items.len()).filter(|&i| items[i].group == g).collect();
-                let (pos, extent) = pack(&sizes(items, &idx));
+            // Each cluster packed on its own: its items, where each goes
+            // in it, and its size.
+            let packed: Vec<(Vec<usize>, Layout)> = groups
+                .iter()
+                .map(|&g| {
+                    let idx: Vec<usize> = (0..items.len()).filter(|&i| items[i].group == g).collect();
+                    let layout = pack(&sizes(items, &idx));
+                    (idx, layout)
+                })
+                .collect();
+            // Where each cluster goes: types side by side (there are only
+            // four), tags in rows, as there can be any number.
+            let at: Vec<[f32; 2]> = if op == Arrange::GroupByType {
+                let mut x = 0.0;
+                packed.iter().map(|(_, (_, e))| {
+                    let p = [x, 0.0];
+                    x += e[0] + gap;
+                    p
+                }).collect()
+            } else {
+                rows(&packed.iter().map(|(_, (_, e))| [e[0] + gap, e[1] + gap]).collect::<Vec<_>>())
+            };
+            for ((idx, (pos, _)), c) in packed.iter().zip(&at) {
                 for (k, &i) in idx.iter().enumerate() {
-                    out[i] = to(items[i].bounds, [x + pos[k][0], all[1] + pos[k][1]]);
+                    out[i] = to(items[i].bounds, [all[0] + c[0] + pos[k][0], all[1] + c[1] + pos[k][1]]);
                 }
-                x += extent[0] + gap;
             }
         }
         Arrange::Align(a) => {
@@ -594,6 +667,32 @@ fn lines(sizes: &[[f32; 2]], order: &[usize], room: [f32; 2], ax: usize) -> (Vec
     wrap(sizes, order, s * room[ax], ax)
 }
 
+/// Blocks of `sizes` in rows, in order, edge to edge, wrapping where the
+/// whole comes out most compact and nearest `TARGET_ASPECT` (scored as
+/// `pack_shaped` scores). Each block's top-left, relative to the first's.
+fn rows(sizes: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    let order: Vec<usize> = (0..sizes.len()).collect();
+    let mut best: Option<(f32, Vec<[f32; 2]>)> = None;
+    // A first row of one block, of two, … of all of them.
+    let mut len = 0.0;
+    for s in sizes {
+        len += s[0];
+        let (pos, extent) = wrap(sizes, &order, len, 0);
+        let score = score(extent, TARGET_ASPECT);
+        if best.as_ref().map_or(true, |b| score < b.0) {
+            best = Some((score, pos));
+        }
+    }
+    best.map_or_else(Vec::new, |b| b.1)
+}
+
+/// How badly a block of size `extent` packs: its area, made worse the
+/// further its shape is from `aspect`. Lower is better.
+fn score(extent: [f32; 2], aspect: f32) -> f32 {
+    let shape = extent[0].max(EPS) / extent[1].max(EPS);
+    (extent[0] * extent[1]).max(EPS) * (1.0 + 0.35 * (shape / aspect).ln().abs())
+}
+
 /// `lines` at one wrap length `len`.
 fn wrap(sizes: &[[f32; 2]], order: &[usize], len: f32, ax: usize) -> (Vec<[f32; 2]>, [f32; 2]) {
     let oth = 1 - ax;
@@ -681,8 +780,7 @@ fn pack_shaped(sizes: &[[f32; 2]], aspect: f32, room: Option<[f32; 2]>) -> Layou
         // side by side.
         let width = width.min(sum_w).max(widest);
         let (pos, extent) = skyline(sizes, &order, width);
-        let shape = extent[0].max(EPS) / extent[1].max(EPS);
-        let score = (extent[0] * extent[1]).max(EPS) * (1.0 + 0.35 * (shape / aspect).ln().abs());
+        let score = score(extent, aspect);
         let fits = room.map_or(true, |r| within(extent, r, 1.0));
         if best.as_ref().map_or(true, |b| (fits && !b.0) || (fits == b.0 && score < b.1)) {
             best = Some((fits, score, (pos, extent)));
@@ -753,7 +851,7 @@ fn raise(sky: &mut Vec<(f32, f32, f32)>, x: f32, w: f32, top: f32) {
 mod tests {
     use super::*;
 
-    fn item(x: f32, y: f32, w: f32, h: f32, group: u8) -> Item {
+    fn item(x: f32, y: f32, w: f32, h: f32, group: u32) -> Item {
         Item { bounds: [x, y, x + w, y + h], group }
     }
 
@@ -903,6 +1001,58 @@ mod tests {
         assert_eq!(after[3][0], 140.0);
         assert!(after[0][0] >= 280.0 && after[2][0] >= 280.0);
         assert!(!overlap(after[0], after[2]));
+    }
+
+    #[test]
+    fn each_unit_goes_under_its_most_shared_tag() {
+        let tags: Vec<Vec<&str>> = vec![
+            vec!["pose"],
+            vec!["Pose", "ref"], // "ref" is on more units than "pose"
+            vec!["ref"],
+            vec![],
+            vec!["REF", "ref"],
+            vec!["dog", "cat"], // a tie: the first alphabetically
+        ];
+        // Clusters: cat 0, pose 1, ref 2; untagged last.
+        assert_eq!(tag_groups(&tags), vec![1, 2, 2, u32::MAX, 2, 0]);
+        assert_eq!(tag_groups(&[vec![], vec![]]), vec![u32::MAX; 2]);
+    }
+
+    #[test]
+    fn group_by_tags_sets_many_clusters_out_in_rows() {
+        // Six clusters of one 100 × 100 each, scattered: two rows of
+        // three, a 40 px gap between, in cluster order.
+        let items: Vec<Item> = (0..6).map(|g| item((5 - g) as f32 * 300.0, (g % 2) as f32 * 700.0, 100.0, 100.0, g)).collect();
+        let after = moved(&items, &offsets(&items, Arrange::GroupByTags, 1.0));
+        let tl: Vec<[f32; 2]> = after.iter().map(|b| [b[0], b[1]]).collect();
+        assert_eq!(tl, vec![[0.0, 0.0], [140.0, 0.0], [280.0, 0.0], [0.0, 140.0], [140.0, 140.0], [280.0, 140.0]]);
+        // A few clusters stay in one row, as group by type sets them.
+        let items = [item(0.0, 0.0, 100.0, 100.0, 1), item(500.0, 0.0, 100.0, 100.0, 0), item(900.0, 0.0, 100.0, 100.0, u32::MAX)];
+        let after = moved(&items, &offsets(&items, Arrange::GroupByTags, 1.0));
+        assert_eq!([after[1][0], after[0][0], after[2][0]], [0.0, 140.0, 280.0]);
+        assert!(after.iter().all(|b| b[1] == 0.0));
+    }
+
+    #[test]
+    fn group_by_tags_clusters_a_slide_by_its_tags() {
+        use crate::canvas::shape::tests_support::rect;
+        let tagged = |x: f32, tags: &[&str]| {
+            let mut s = rect([x, 0.0], [x + 10.0, 10.0]);
+            s.set_tags(&tags.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+            s
+        };
+        let layer = Layer {
+            shapes: vec![tagged(0.0, &["b"]), tagged(500.0, &["a"]), tagged(1000.0, &[]), tagged(2000.0, &["A", "b"])],
+            ..Layer::default()
+        };
+        let sel = Selection { strokes: Vec::new(), shapes: (0..4).collect() };
+        let (strokes, shapes) = plan(&layer, &sel, Arrange::GroupByTags, 1.0);
+        assert!(strokes.is_empty());
+        let x = |i: usize| shape_bounds(&layer.shapes[i])[0] + shapes.iter().find(|m| m.0 == i).map_or(0.0, |m| m.1[0]);
+        // "a" (shapes 1 and 3, two of them) first, then "b", then the
+        // untagged one.
+        assert!(x(1).max(x(3)) < x(0), "{} {} {}", x(1), x(3), x(0));
+        assert!(x(0) < x(2));
     }
 
     #[test]
