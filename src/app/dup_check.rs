@@ -11,12 +11,17 @@
 //! starts a new check.
 //!
 //! Every picture on the slides is read once a run for this
-//! (`PictureIndex`, as find does), so the first check takes a few seconds.
+//! (`PictureIndex`, as find does, on its worker threads), so the first
+//! check takes a few seconds. The check itself runs on a thread of its own
+//! (`match_items`): the UI thread only lists the pictures (`gather`) and
+//! takes the answer, so a paste never holds up a frame.
 
 use super::*;
 use crate::canvas::shape::{MediaKind, PictureRef, RasterKind, Shape};
 use crate::persistence::copy_ignores::{CopyIgnores, Ignore};
 use crate::tools::similar::Print;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
 
 /// Pictures put in this soon after the last are checked with it, as one
@@ -83,6 +88,34 @@ pub(super) struct DupCheck {
     /// The copy "Show it" went to last, counting through every flagged
     /// picture's copies in turn.
     shown: Option<usize>,
+    /// The check under way on its thread.
+    job: Option<Job>,
+}
+
+/// A picture on the slides as the check's thread sees it: where it is,
+/// its bytes, its print once read, and whether its bytes are kept in the
+/// slide (it is then known by them, `similar::bytes_id`).
+struct Item {
+    spot: Spot,
+    png: Arc<Vec<u8>>,
+    print: Option<Print>,
+    inline: bool,
+}
+
+/// The check under way on its thread, and where each picture it was
+/// given is (by its index there).
+struct Job {
+    rx: mpsc::Receiver<Found>,
+    spots: Vec<Spot>,
+}
+
+/// What the thread found: each new picture with copies and theirs (by
+/// index), the bytes ids of those kept in their slide, and what was
+/// ignored in the duplicates list, if it had to be read.
+struct Found {
+    pairs: Vec<(usize, Vec<usize>)>,
+    bytes_ids: HashMap<usize, String>,
+    ignores: Option<CopyIgnores>,
 }
 
 impl DupCheck {
@@ -116,16 +149,6 @@ fn still_or_gif(shape: &Shape) -> Option<&Arc<Vec<u8>>> {
     match shape {
         Shape::Raster { png, kind: RasterKind::Image, media, .. } if !media.as_ref().is_some_and(|m| m.kind == MediaKind::Video) => Some(png),
         _ => None,
-    }
-}
-
-/// The same stored file shown the same way, or the same video or GIF file:
-/// copies whatever their prints say.
-fn same_file(a: &Shape, b: &Shape) -> bool {
-    match (a, b) {
-        (Shape::Raster { picture: Some(p), .. }, Shape::Raster { picture: Some(q), .. }) => similar::picture_id(p) == similar::picture_id(q),
-        (Shape::Raster { media: Some(m), .. }, Shape::Raster { media: Some(n), .. }) => m.file == n.file,
-        _ => false,
     }
 }
 
@@ -170,47 +193,69 @@ pub(crate) fn snapshot_bar(ctx: &egui::Context) {
     bar(ctx, "Duplicate of a picture on slide 47 \u{201c}Random Inspo 7\u{201d}", "Show it", false, true);
 }
 
-/// The copies on the slides of each of `new` that `print` (a picture's
-/// print, once read) or its file says are the same picture, leaving out
-/// pairs `apart` says are not copies (kept both).
-fn copies_of(
-    canvases: &crate::canvas::CanvasManager,
-    new: &[Spot],
-    print: impl Fn(&Arc<Vec<u8>>) -> Option<Print>,
-    apart: impl Fn(&Shape, &Shape) -> bool,
-) -> Vec<Flagged> {
-    let mut out = Vec::new();
-    for n in new {
-        let mut n = *n;
-        let Some(ns) = n.locate(canvases) else { continue };
-        let Some(npng) = still_or_gif(ns) else { continue };
-        let nprint = print(npng);
-        let mut copies = Vec::new();
-        for si in 0..canvases.count() {
-            let Some(c) = canvases.slide(si) else { continue };
-            for (li, l) in c.layers.iter().enumerate() {
-                for (shi, s) in l.shapes.iter().enumerate() {
-                    if (si, li, shi) == (n.slide, n.layer, n.shape) {
-                        continue;
-                    }
-                    let Some(png) = still_or_gif(s) else { continue };
-                    // Shared bytes: a copy made in the app, not one
-                    // brought in again.
-                    if Arc::ptr_eq(png, npng) {
-                        continue;
-                    }
-                    let alike = same_file(ns, s) || matches!((nprint, print(png)), (Some(a), Some(b)) if a.duplicate_of(&b));
-                    if alike && !apart(ns, s) {
-                        copies.push(Spot::of(si, li, shi, png));
-                    }
-                }
+/// Every picture and GIF on the slides, with its print as `print` has it,
+/// and which of them are `new` (by index). The one part of a check on the
+/// UI thread: it reads no file and compares nothing — a pointer, a print
+/// copied and a lookup per picture.
+fn gather(canvases: &crate::canvas::CanvasManager, new: &[Spot], print: impl Fn(&Arc<Vec<u8>>) -> Option<Print>) -> (Vec<Item>, Vec<usize>) {
+    // Sized first: growing it would copy every print again on each step.
+    let count = (0..canvases.count()).filter_map(|si| canvases.slide(si)).flat_map(|c| &c.layers).flat_map(|l| &l.shapes).filter(|s| still_or_gif(s).is_some()).count();
+    let mut items = Vec::with_capacity(count);
+    for si in 0..canvases.count() {
+        let Some(c) = canvases.slide(si) else { continue };
+        for (li, l) in c.layers.iter().enumerate() {
+            for (shi, s) in l.shapes.iter().enumerate() {
+                let Some(png) = still_or_gif(s) else { continue };
+                let inline = matches!(s, Shape::Raster { picture: None, media: None, .. });
+                items.push(Item { spot: Spot::of(si, li, shi, png), png: Arc::clone(png), print: print(png), inline });
             }
         }
-        if !copies.is_empty() {
-            out.push(Flagged { new: n, copies });
-        }
     }
-    out
+    let new = new
+        .iter()
+        .filter_map(|n| items.iter().position(|it| (it.spot.slide, it.spot.layer, it.spot.key) == (n.slide, n.layer, n.key)))
+        .collect();
+    (items, new)
+}
+
+/// For each of `new` (indexes into `items`), the others that are the same
+/// picture — maybe resized, re-saved, mirrored or turned
+/// (`Print::duplicate_of`). Shared bytes are a copy made in the app, not
+/// one brought in again: left out. Runs on the check's own thread.
+fn match_items(items: &[Item], new: &[usize]) -> Vec<(usize, Vec<usize>)> {
+    new.iter()
+        .filter_map(|&n| {
+            let it = items.get(n)?;
+            let p = it.print?;
+            let copies: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|&(j, o)| j != n && !Arc::ptr_eq(&o.png, &it.png) && o.print.is_some_and(|q| p.duplicate_of(&q)))
+                .map(|(j, _)| j)
+                .collect();
+            (!copies.is_empty()).then_some((n, copies))
+        })
+        .collect()
+}
+
+/// `pairs` without the copies kept apart from their new picture in the
+/// duplicates list (`apart`, each pair `(smaller, larger)`); `id` gives
+/// what a picture is known by there. A new picture left with no copies goes.
+fn drop_apart(pairs: Vec<(usize, Vec<usize>)>, id: impl Fn(usize) -> Option<String>, apart: &HashSet<(String, String)>) -> Vec<(usize, Vec<usize>)> {
+    if apart.is_empty() {
+        return pairs;
+    }
+    pairs
+        .into_iter()
+        .filter_map(|(n, copies)| {
+            let Some(a) = id(n) else { return Some((n, copies)) };
+            let copies: Vec<usize> = copies
+                .into_iter()
+                .filter(|&c| id(c).is_none_or(|b| !apart.contains(&if a <= b { (a.clone(), b) } else { (b, a.clone()) })))
+                .collect();
+            (!copies.is_empty()).then_some((n, copies))
+        })
+        .collect()
 }
 
 impl OnScreenNotesApp {
@@ -234,8 +279,10 @@ impl OnScreenNotesApp {
                 d.last = Instant::now();
                 d.flagged = None;
                 d.shown = None;
+                // A check under way is for fewer: its answer is let go.
+                d.job = None;
             }
-            _ => self.dup_check = Some(DupCheck { new: spots, last: Instant::now(), in_window, flagged: None, shown: None }),
+            _ => self.dup_check = Some(DupCheck { new: spots, last: Instant::now(), in_window, flagged: None, shown: None, job: None }),
         }
     }
 
@@ -251,6 +298,9 @@ impl OnScreenNotesApp {
             for s in &mut f.copies {
                 s.follow(swaps, canvases);
             }
+        }
+        for s in d.job.iter_mut().flat_map(|j| &mut j.spots) {
+            s.follow(swaps, canvases);
         }
     }
 
@@ -276,22 +326,35 @@ impl OnScreenNotesApp {
             return;
         }
         if d.flagged.is_none() {
-            match self.dup_matches(&d.new) {
-                Some(f) if f.is_empty() => return,
-                Some(f) => {
+            if d.job.is_none() {
+                d.job = self.dup_start(&d.new, ctx);
+            }
+            // Never waits: the answer is taken on the frame it is in.
+            match d.job.as_ref().map(|j| j.rx.try_recv()) {
+                Some(Ok(found)) => {
+                    let job = d.job.take().expect("a check is running");
+                    let f = self.dup_found(&job, found);
+                    if f.is_empty() {
+                        return;
+                    }
                     d.flagged = Some(f);
                     // A highlight like the menu's: on until hidden.
                     self.media_filter.duplicates = true;
                 }
-                None => ctx.request_repaint_after(Duration::from_millis(150)),
+                Some(Err(TryRecvError::Disconnected)) => {
+                    log::warn!("the duplicate check stopped without an answer");
+                    return;
+                }
+                Some(Err(TryRecvError::Empty)) | None => ctx.request_repaint_after(Duration::from_millis(100)),
             }
         }
         self.dup_check = Some(d);
     }
 
-    /// The copies of each of `new` on the slides, once every slide is in
-    /// and every picture on them read; `None` until then.
-    fn dup_matches(&mut self, new: &[Spot]) -> Option<Vec<Flagged>> {
+    /// Start checking `new` on a thread of its own, once every slide is in
+    /// and every picture on them read (until then `None`, tried again next
+    /// frame). On the UI thread only the pictures are listed (`gather`).
+    fn dup_start(&mut self, new: &[Spot], ctx: &egui::Context) -> Option<Job> {
         let canvases = &self.canvases;
         let active = canvases.active_index();
         let order: Vec<usize> = std::iter::once(active).chain((0..canvases.count()).filter(|&i| i != active)).collect();
@@ -299,6 +362,8 @@ impl OnScreenNotesApp {
         if slides.len() < canvases.count() {
             return None;
         }
+        // Hands new pictures to the index's worker threads, at most every
+        // `picture_index::LOOK_EVERY`; reading them happens there.
         let index = &mut self.picture_index;
         let first = index.progress().1 == 0;
         index.tick(slides.iter().copied(), first);
@@ -306,13 +371,62 @@ impl OnScreenNotesApp {
         if read < total || total == 0 {
             return None;
         }
-        let ignores = self.copy_ignores.get_or_insert_with(CopyIgnores::load);
-        let apart = |a: &Shape, b: &Shape| {
-            let (Some(a), Some(b)) = (persistent_id(a), persistent_id(b)) else { return false };
-            ignores.pairs().contains(&if a <= b { (a, b) } else { (b, a) })
-        };
         let index = &*index;
-        Some(copies_of(canvases, new, |png| index.print(png), apart))
+        let (items, new) = gather(canvases, new, |png| index.print(png));
+        if new.is_empty() {
+            return None;
+        }
+        let spots = items.iter().map(|it| it.spot).collect();
+        // The duplicates list's ignored pairs, read there if not yet.
+        let read_ignores = self.copy_ignores.is_none();
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new().name("osn-dup-check".into()).spawn(move || {
+            let t = Instant::now();
+            let pairs = match_items(&items, &new);
+            let mut bytes_ids = HashMap::new();
+            for &i in pairs.iter().flat_map(|(n, copies)| std::iter::once(n).chain(copies)) {
+                if items[i].inline {
+                    bytes_ids.entry(i).or_insert_with(|| similar::bytes_id(&items[i].png));
+                }
+            }
+            let ignores = (read_ignores && !pairs.is_empty()).then(CopyIgnores::load);
+            log::info!("{} new pictures checked against {} for copies in {} ms", new.len(), items.len(), t.elapsed().as_millis());
+            let _ = tx.send(Found { pairs, bytes_ids, ignores });
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        });
+        match spawned {
+            Ok(_) => Some(Job { rx, spots }),
+            Err(e) => {
+                log::warn!("could not start checking for copies: {e}");
+                None
+            }
+        }
+    }
+
+    /// The thread's answer as pictures to ring: each new one with its
+    /// copies, less those kept apart in the duplicates list (Keep both).
+    fn dup_found(&mut self, job: &Job, found: Found) -> Vec<Flagged> {
+        if let Some(read) = found.ignores {
+            self.copy_ignores.get_or_insert(read);
+        }
+        let canvases = &self.canvases;
+        // What each is known by there: its stored file, or its video or
+        // GIF file, else its bytes (hashed on the thread).
+        let id = |i: usize| -> Option<String> {
+            let mut s = *job.spots.get(i)?;
+            match s.locate(canvases)? {
+                Shape::Raster { picture: Some(p), .. } => Some(similar::picture_id(p)),
+                Shape::Raster { media: Some(m), .. } => Some(format!("media:{}", m.file)),
+                _ => found.bytes_ids.get(&i).cloned(),
+            }
+        };
+        let none = HashSet::new();
+        let apart = self.copy_ignores.as_ref().map_or(&none, |i| i.pairs());
+        drop_apart(found.pairs, id, apart)
+            .into_iter()
+            .filter_map(|(n, copies)| Some(Flagged { new: *job.spots.get(n)?, copies: copies.into_iter().filter_map(|c| job.spots.get(c).copied()).collect() }))
+            .collect()
     }
 
     /// The rings round the pictures just put in that have copies and
@@ -516,9 +630,20 @@ mod tests {
         Print::of_bytes(png)
     }
 
-    /// Where each flagged picture's copies are: `(slide, shape)`.
-    fn found(m: &CanvasManager, new: &[Spot], apart: impl Fn(&Shape, &Shape) -> bool) -> Vec<Vec<(usize, usize)>> {
-        copies_of(m, new, print, apart).into_iter().map(|f| f.copies.iter().map(|s| (s.slide, s.shape)).collect()).collect()
+    /// Where each flagged picture's copies are, `(slide, shape)`: listed
+    /// as the UI thread does, matched as the check's thread does, less the
+    /// pairs kept `apart` (pictures known as "slide:shape" here).
+    fn found(m: &CanvasManager, new: &[Spot], apart: &HashSet<(String, String)>) -> Vec<Vec<(usize, usize)>> {
+        let (items, new) = gather(m, new, print);
+        let id = |i: usize| Some(format!("{}:{}", items[i].spot.slide, items[i].spot.shape));
+        drop_apart(match_items(&items, &new), id, apart)
+            .into_iter()
+            .map(|(_, copies)| copies.into_iter().map(|c| (items[c].spot.slide, items[c].spot.shape)).collect())
+            .collect()
+    }
+
+    fn pairs(p: &[(&str, &str)]) -> HashSet<(String, String)> {
+        p.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
     }
 
     #[test]
@@ -527,9 +652,43 @@ mod tests {
         let again = png(200, 150, 1);
         let m = CanvasManager::for_tests(vec![slide(vec![picture(&other), picture(&a)]), slide(vec![picture(&again)])]);
         let new = [Spot::of(1, 0, 0, &again)];
-        assert_eq!(found(&m, &new, |_, _| false), vec![vec![(0, 1)]]);
+        assert_eq!(found(&m, &new, &HashSet::new()), vec![vec![(0, 1)]]);
         // Kept both before: not flagged again.
-        assert!(found(&m, &new, |_, _| true).is_empty());
+        assert!(found(&m, &new, &pairs(&[("0:1", "1:0")])).is_empty());
+    }
+
+    /// How long the UI thread's part (`gather`) and the check's thread
+    /// (`match_items`) take over 10,000 pictures on 77 slides.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn timings_over_ten_thousand_pictures() {
+        let prints: Vec<Print> = (0..8).map(|s| print(&png(64, 48, s)).unwrap()).collect();
+        let slides: Vec<Canvas> = (0..77).map(|_| slide((0..130).map(|_| picture(&Arc::new(vec![0u8; 8]))).collect())).collect();
+        let m = CanvasManager::for_tests(slides);
+        let keys: Vec<Arc<Vec<u8>>> = (0..10).map(|i| match &m.slide(76).unwrap().layers[0].shapes[i] {
+            Shape::Raster { png, .. } => Arc::clone(png),
+            _ => unreachable!(),
+        }).collect();
+        let new: Vec<Spot> = keys.iter().enumerate().map(|(i, k)| Spot::of(76, 0, i, k)).collect();
+        let fake = |png: &Arc<Vec<u8>>| Some(prints[(Arc::as_ptr(png) as usize >> 4) % prints.len()]);
+        let t = std::time::Instant::now();
+        let (items, idx) = gather(&m, &new, fake);
+        let ui = t.elapsed();
+        let t = std::time::Instant::now();
+        let pairs = match_items(&items, &idx);
+        let thread = t.elapsed();
+        println!("{} pictures, {} new: gather (UI thread) {:.2} ms, match_items (own thread) {:.2} ms, {} with copies",
+            items.len(), idx.len(), ui.as_secs_f64() * 1e3, thread.as_secs_f64() * 1e3, pairs.len());
+    }
+
+    #[test]
+    fn keeping_one_pair_apart_leaves_the_other_copies() {
+        let a = png(400, 300, 1);
+        let (again, third) = (png(200, 150, 1), png(300, 225, 1));
+        let m = CanvasManager::for_tests(vec![slide(vec![picture(&a), picture(&third)]), slide(vec![picture(&again)])]);
+        let new = [Spot::of(1, 0, 0, &again)];
+        assert_eq!(found(&m, &new, &HashSet::new()), vec![vec![(0, 0), (0, 1)]]);
+        assert_eq!(found(&m, &new, &pairs(&[("0:0", "1:0")])), vec![vec![(0, 1)]]);
     }
 
     #[test]
@@ -543,9 +702,9 @@ mod tests {
         // Slide 0: picture a, its in-app copy (same bytes), a grey fill and a
         // video showing a's frame. Slide 1, just put in: b and another fill.
         let m = CanvasManager::for_tests(vec![slide(vec![picture(&a), picture(&a), picture(&fill), video]), slide(vec![picture(&b), picture(&fill_again)])]);
-        assert!(found(&m, &[Spot::of(1, 0, 0, &b), Spot::of(1, 0, 1, &fill_again)], |_, _| false).is_empty());
+        assert!(found(&m, &[Spot::of(1, 0, 0, &b), Spot::of(1, 0, 1, &fill_again)], &HashSet::new()).is_empty());
         // a's copy made in the app shares its bytes: not a picture brought in again.
-        assert!(found(&m, &[Spot::of(0, 0, 1, &a)], |_, _| false).is_empty());
+        assert!(found(&m, &[Spot::of(0, 0, 1, &a)], &HashSet::new()).is_empty());
     }
 
     #[test]
