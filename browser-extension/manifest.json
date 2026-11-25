@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "Send to On-Screen Notes",
+  "version": "0.6.1",
+  "description": "Right-click a picture, GIF or video, or pick one, to put it on your On-Screen Notes slide.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "permissions": ["contextMenus", "storage", "scripting", "cookies"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "scripts": ["sites.js", "background.js"],
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["sites.js", "content.js", "lens.js", "grid.js"],
+      "all_frames": true,
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "Pick a picture, GIF or video to send to On-Screen Notes",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "commands": {
+    "send": { "description": "Send what's under the pointer" },
+    "post": { "description": "Send all pictures of the post under the pointer" },
+    "frame": { "description": "Send the frame of the video under the pointer" },
+    "record": { "description": "Record the video under the pointer as it plays" },
+    "artist": { "description": "Find the artist of the picture under the pointer, then send" },
+    "look": { "description": "Look for the picture under the pointer in my slides" },
+    "pick": { "description": "Pick media to send" },
+    "grid": { "description": "All media on this page" },
+    "tags": { "description": "Tags for what you send" },
+    "tag-artist": { "description": "Tag as the artist (Find artist): the highlighted name, or the link under the pointer" },
+    "same-artist": { "description": "Same as the last artist (Find artist)" }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "send-to-on-screen-notes@on-screen-notes",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  }
+}

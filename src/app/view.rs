@@ -3,6 +3,31 @@
 use super::*;
 
 impl OnScreenNotesApp {
+    /// Put the UI at the size the config asks for (`config.ui_scale`),
+    /// as egui's zoom factor: every point is that many times the
+    /// system's pixels. The slides keep their size and place on screen —
+    /// every view, the windows' too, is scaled the other way — so only
+    /// the toolbar, panels and bars change size. Run at the start of a
+    /// frame, outside the windows' passes.
+    pub(super) fn apply_ui_scale(&mut self, ctx: &egui::Context) {
+        let want = crate::config::clamp_ui_scale(self.config.ui_scale);
+        self.config.ui_scale = want;
+        let now = ctx.zoom_factor();
+        if (want - now).abs() < 1e-4 {
+            return;
+        }
+        let f = now / want;
+        self.canvases.scale_views(f);
+        for w in [self.slide_window.as_mut(), self.pins_window.as_mut()].into_iter().flatten() {
+            w.scale_view(f);
+        }
+        // A glide or a peek in flight was aimed at the old scale.
+        self.ws.view_glide = None;
+        self.ws.peek = None;
+        ctx.set_zoom_factor(want);
+        ctx.request_repaint();
+    }
+
     /// Canvas box around everything on the active slide's shown layers.
     pub(super) fn slide_bounds(&self) -> Option<[f32; 4]> {
         let c = self.canvases.active();
@@ -15,7 +40,7 @@ impl OnScreenNotesApp {
     pub(super) fn fit_area(&self, ctx: &egui::Context) -> [f32; 4] {
         const MARGIN: f32 = 32.0;
         let r = self.overlay_cache.canvas_rect(ctx);
-        let top = if self.ui_visible {
+        let top = if self.ws.ui_visible {
             // The find bar too: what it goes to should not land under it.
             [
                 ("osn_toolbar", egui::Order::Middle),
@@ -45,7 +70,7 @@ impl OnScreenNotesApp {
         let c = self.canvases.active();
         let about = [area[0] + area[2] * 0.5, area[1] + area[3] * 0.5];
         let glide = interaction::zoom_pan::ViewGlide::new(self.canvases.active_index(), (c.pan, c.zoom), to, about);
-        self.view_glide = Some(glide);
+        self.ws.view_glide = Some(glide);
         ctx.request_repaint();
     }
 
@@ -110,16 +135,16 @@ impl OnScreenNotesApp {
 
     /// One frame of a glide in progress.
     pub(super) fn step_view_glide(&mut self, ctx: &egui::Context) {
-        let Some(g) = self.view_glide.as_mut() else { return };
+        let Some(g) = self.ws.view_glide.as_mut() else { return };
         if g.slide != self.canvases.active_index() {
-            self.view_glide = None;
+            self.ws.view_glide = None;
             return;
         }
         let (pan, zoom) = self.canvases.active_view_mut();
         if g.step(pan, zoom, Instant::now()) {
             ctx.request_repaint();
         } else {
-            self.view_glide = None;
+            self.ws.view_glide = None;
         }
     }
 
@@ -130,17 +155,18 @@ impl OnScreenNotesApp {
         /// Shorter than this is a tap, which keeps the new view.
         const TAP: std::time::Duration = std::time::Duration::from_millis(300);
         let Some(b) = self.hotkeys_cfg.canvas.hold_zoom_to_selection else { return };
-        let typing = self.tool.in_progress_text.is_some()
-            || self.slide_panel.is_renaming()
-            || self.confirm_delete.is_some()
+        let typing = self.ws.tool.in_progress_text.is_some()
+            || self.ws.slide_panel.is_renaming()
+            || self.ws.confirm_delete.is_some()
+            || self.ws.confirm_edit.is_some()
             || ctx.wants_keyboard_input();
         let held = ctx.input(|i| {
             let ctrl = i.modifiers.ctrl || i.modifiers.command;
             // Once going, only the key itself matters.
             i.key_down(b.key)
-                && (self.peek.is_some() || (b.ctrl == ctrl && b.shift == i.modifiers.shift && b.alt == i.modifiers.alt))
+                && (self.ws.peek.is_some() || (b.ctrl == ctrl && b.shift == i.modifiers.shift && b.alt == i.modifiers.alt))
         });
-        match (&self.peek, held) {
+        match (&self.ws.peek, held) {
             (None, true) if !typing => {
                 let target = match self.selection_bounds() {
                     Some(sel) => Some((sel, interaction::zoom_pan::FIT_SELECTION_MAX_ZOOM)),
@@ -148,7 +174,7 @@ impl OnScreenNotesApp {
                 };
                 if let Some((bounds, max_zoom)) = target {
                     let c = self.canvases.active();
-                    self.peek = Some(Peek { slide: self.canvases.active_index(), back: (c.pan, c.zoom), since: Instant::now() });
+                    self.ws.peek = Some(Peek { slide: self.canvases.active_index(), back: (c.pan, c.zoom), since: Instant::now() });
                     let to = self.view_fitting(bounds, max_zoom, ctx);
                     self.glide_view(to, ctx);
                 }
@@ -158,7 +184,7 @@ impl OnScreenNotesApp {
                     let back = p.back;
                     self.glide_view(back, ctx);
                 }
-                self.peek = None;
+                self.ws.peek = None;
             }
             _ => {}
         }

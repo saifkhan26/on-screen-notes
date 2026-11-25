@@ -46,6 +46,17 @@ pub struct OverlayCache {
     /// Where the canvas was drawn last frame, to tell which pictures are
     /// on screen before this frame's layout runs.
     last_canvas_rect: Option<egui::Rect>,
+    /// The drawing pad open now (`canvas::pad`): the picture whose pixel
+    /// bytes start at this address shows this GPU texture instead.
+    pad: Option<(usize, egui::TextureId)>,
+    /// The slide window's frame is drawing (`enter_child`): nothing is
+    /// freed in it, since a texture the overlay made this frame could be
+    /// the one let go of, and its pictures stay out of the overlay's
+    /// loading count.
+    child: bool,
+    /// Textures replaced during the slide window's frame, let go of at
+    /// the next `begin_frame`.
+    retired: Vec<egui::TextureHandle>,
 }
 
 /// When a texture was last drawn: the `show` call and the time.
@@ -89,6 +100,12 @@ impl OverlayCache {
         for (from, to) in swaps {
             self.pictures.carry(from, to);
         }
+    }
+
+    /// The drawing pad open now: the picture whose `png` bytes are at
+    /// `key` shows `texture`, live, wherever it is drawn.
+    pub fn set_pad(&mut self, pad: Option<(usize, egui::TextureId)>) {
+        self.pad = pad;
     }
 
     /// Pictures are still loading at their on-screen size.
@@ -156,7 +173,11 @@ impl OverlayCache {
             egui::TextureOptions::LINEAR,
         );
         let id = tex.id();
-        self.layer_thumbs.insert(key, (fp, tex));
+        if let Some((_, old)) = self.layer_thumbs.insert(key, (fp, tex)) {
+            if self.child {
+                self.retired.push(old);
+            }
+        }
         Some(id)
     }
 
@@ -166,8 +187,26 @@ impl OverlayCache {
     /// `PictureCache::begin_frame`). `show` runs it; with the overlay
     /// hidden, the slide window does.
     pub fn begin_frame(&mut self, ctx: &egui::Context) {
+        if self.child {
+            return;
+        }
+        self.retired.clear();
         self.evict_idle();
         self.pictures.begin_frame(ctx);
+    }
+
+    /// The slide window's frame starts: `rect` is where its canvas was
+    /// last frame (and becomes `canvas_rect` until `leave_child`).
+    pub fn enter_child(&mut self, rect: &mut Option<egui::Rect>) {
+        self.child = true;
+        std::mem::swap(&mut self.last_canvas_rect, rect);
+    }
+
+    /// The slide window's frame is over: `rect` takes back where its
+    /// canvas was drawn, the overlay's comes back.
+    pub fn leave_child(&mut self, rect: &mut Option<egui::Rect>) {
+        std::mem::swap(&mut self.last_canvas_rect, rect);
+        self.child = false;
     }
 
     /// The textures slide `canvas_idx` paints with, shown in `view` (its
@@ -211,6 +250,7 @@ impl OverlayCache {
             let long = obb.half[0].max(obb.half[1]) * 2.0 * zoom * ppp;
             (long, r.intersects(near))
         };
+        let pad = self.pad;
         let pictures = &mut self.pictures;
         pictures.count_shown(overlay);
         let shapes = canvas
@@ -222,6 +262,12 @@ impl OverlayCache {
                     .iter()
                     .map(|shape| match shape {
                         Shape::Raster { png, media: m, picture, px_size, .. } => {
+                            // The pad being drawn on shows its live pixels.
+                            if let Some((key, tex)) = pad {
+                                if std::sync::Arc::as_ptr(png) as usize == key {
+                                    return Some(tex);
+                                }
+                            }
                             // A video's live frame, else its poster.
                             if let Some(tex) = m.as_ref().and_then(|m| media.texture(m.id)) {
                                 return Some(tex);
@@ -263,6 +309,7 @@ impl OverlayCache {
         use crate::canvas::hit::ObjRef;
         let ppp = ctx.pixels_per_point();
         let near = view.expand(view.width().max(view.height()) * 0.25);
+        let pad = self.pad;
         let pictures = &mut self.pictures;
         pictures.count_shown(overlay);
         let textures = pinned
@@ -275,6 +322,11 @@ impl OverlayCache {
                         let layer = p.canvas.layers.get(m.layer)?;
                         let shape = layer.shapes.get(si)?;
                         let Shape::Raster { png, media: md, picture, px_size, .. } = shape else { return None };
+                        if let Some((key, tex)) = pad {
+                            if std::sync::Arc::as_ptr(png) as usize == key {
+                                return Some(tex);
+                            }
+                        }
                         if let Some(tex) = md.as_ref().and_then(|md| media.texture(md.id)) {
                             return Some(tex);
                         }
@@ -330,7 +382,11 @@ impl OverlayCache {
                 color_image,
                 egui::TextureOptions::LINEAR,
             );
-            self.images.insert(key, (image.png.len(), handle, used));
+            if let Some((_, old, _)) = self.images.insert(key, (image.png.len(), handle, used)) {
+                if self.child {
+                    self.retired.push(old);
+                }
+            }
         }
         self.images.get_mut(&key).map(|(_, h, u)| {
             *u = used;
@@ -375,6 +431,9 @@ pub fn show(
     // Media types to highlight; the rest of the slide fades back.
     media_filter: &crate::ui::media_filter::MediaFilter,
     pin_marks: PinMarks,
+    // The arrange bar's "dim the rest": while the Select tool has
+    // objects selected, everything else fades back.
+    dim_unselected: bool,
 ) -> egui::Rect {
     // Select-tool gesture in flight: the selected objects preview under
     // its transform until pen-up commits it.
@@ -395,14 +454,16 @@ pub fn show(
     let (layer_image_textures, shape_textures) = {
         let active = manager.active();
         let view = cache.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect());
-        cache.slide_textures(ctx, canvas_idx, active, view, active.pan, active.zoom, media, true)
+        let overlay = !cache.child;
+        cache.slide_textures(ctx, canvas_idx, active, view, active.pan, active.zoom, media, overlay)
     };
     // Pins draw over the slide; their pictures and videos are looked up
     // like the active slide's, by their own slide's index.
     let pinned = manager.pinned();
     let pin_textures = {
         let view = cache.last_canvas_rect.unwrap_or_else(|| ctx.screen_rect());
-        cache.pin_textures(ctx, &pinned, view, view.min, 1.0, media, true)
+        let overlay = !cache.child;
+        cache.pin_textures(ctx, &pinned, view, view.min, 1.0, media, overlay)
     };
     let mut canvas_rect = egui::Rect::NOTHING;
     egui::CentralPanel::default()
@@ -427,8 +488,8 @@ pub fn show(
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    // Words, not ←/→: this font has no arrows.
-                    "Start drawing — Left / Right to switch canvas · hover ? for every shortcut",
+                    // Words, not ←/→: the default font has no arrows.
+                    "Start drawing — Left / Right to switch slides · hover the keyboard button for every shortcut",
                     egui::FontId::proportional(14.0),
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
                 );
@@ -451,6 +512,18 @@ pub fn show(
             let predicted = tool.in_progress_stroke.as_ref().map(predict_ahead);
             let preview_stroke_ref = predicted.as_ref();
 
+            // On the pins board the pins go under its ink, whatever layer
+            // that is on: ink is drawn over them there.
+            let on_board = manager.on_board();
+            let paint_pins = |painter: &egui::Painter| {
+                for (p, textures) in pinned.iter().zip(&pin_textures) {
+                    render::paint_pinned(painter, rect.min, p.canvas, p.members, p.pin.rigid(p.anchor()), p.pin.scale, position_passes, textures);
+                }
+            };
+            if on_board {
+                paint_pins(ui.painter());
+            }
+
             render::paint_canvas_egui(
                 ui.painter(),
                 rect.min,
@@ -467,18 +540,9 @@ pub fn show(
             );
 
             // Pins, over the slide and in the order they were last
-            // touched.
-            for (p, textures) in pinned.iter().zip(&pin_textures) {
-                render::paint_pinned(
-                    ui.painter(),
-                    rect.min,
-                    p.canvas,
-                    p.members,
-                    p.pin.rigid(p.anchor()),
-                    p.pin.scale,
-                    position_passes,
-                    textures,
-                );
+            // touched — on the pins board, under its ink (see above).
+            if !on_board {
+                paint_pins(ui.painter());
             }
 
             // Live preview of the in-progress text edit. Painted via
@@ -652,9 +716,20 @@ pub fn show(
 
             // Media filter — under the selection chrome, so a selection
             // made with "Select these" still shows its frame on top. Kept
-            // out of screenshots and recordings like the chrome is.
+            // out of screenshots and recordings like the chrome is. Its
+            // highlights follow objects a gesture is moving, as they show.
+            // "Dim the rest": with objects selected, everything else fades
+            // the same way, the selection's fade taking the filter's place
+            // (its outlines and labels still show).
+            let moving = crate::ui::media_filter::InFlight { sel: sel_preview, layer: layer_xform };
+            let dim_rest = dim_unselected && show_selection && tool.kind == ToolKind::Select && !tool.select.sel.is_empty();
+            if dim_rest {
+                let canvas = manager.active();
+                let holes = crate::ui::media_filter::selection_holes(rect, canvas, canvas.active_layer, &tool.select.sel, moving);
+                crate::ui::media_filter::fade(&ui.painter_at(rect), rect, &holes);
+            }
             if media_filter.any() && chrome_visible && show_selection {
-                crate::ui::media_filter::paint(&ui.painter_at(rect), rect, manager.active(), media_filter);
+                crate::ui::media_filter::paint(&ui.painter_at(rect), rect, manager.active(), media_filter, moving, !dim_rest);
             }
 
             // Select tool — frame, resize handles, rotate knob and the
@@ -769,8 +844,9 @@ pub fn show(
 /// screen point `q` shows at `origin + q`.
 pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos2, pinned: &[crate::canvas::pins::Pinned], marks: PinMarks) {
     let at = |q: [f32; 2]| origin + egui::vec2(q[0], q[1]);
-    let line = egui::Color32::from_rgb(86, 160, 255);
-    let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+    let line = crate::ui::theme::chrome_line();
+    let under = crate::ui::theme::CHROME_UNDER;
+    let ink = egui::Color32::from_gray(30);
     for p in pinned {
         let frame = p.frame();
         let corners: Vec<egui::Pos2> = frame.corners().iter().map(|c| at(*c)).collect();
@@ -786,28 +862,28 @@ pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos
                     crate::canvas::pins::PinHandle::Rotate => {
                         painter.circle_filled(h, 6.5, under);
                         painter.circle_filled(h, 5.0, egui::Color32::WHITE);
-                        painter.circle_stroke(h, 5.0, egui::Stroke::new(1.4, line));
+                        painter.circle_stroke(h, 5.0, egui::Stroke::new(1.4, ink));
                     }
                     crate::canvas::pins::PinHandle::Corner { .. } => {
                         let outer = egui::Rect::from_center_size(h, egui::vec2(11.0, 11.0));
                         let inner = egui::Rect::from_center_size(h, egui::vec2(8.0, 8.0));
                         painter.rect_filled(outer, egui::Rounding::same(2.0), under);
                         painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
-                        painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
+                        painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, ink));
                     }
                 }
             }
         } else if marks.outlines {
             let mut ring = corners.clone();
             ring.push(corners[0]);
-            let faint = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 150));
+            let faint = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(150));
             painter.extend(egui::Shape::dashed_line(&ring, faint, 6.0, 4.0));
         }
         if marks.outlines {
             // Badge on the top-right corner, turned with the pin but kept
             // upright.
             let c = at(frame.corners()[1]);
-            painter.circle_filled(c, 9.0, egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220));
+            painter.circle_filled(c, 9.0, crate::ui::theme::GLASS_FILL);
             let icon = egui::Rect::from_center_size(c, egui::vec2(11.0, 11.0));
             egui::Image::new(egui::include_image!("../../assets/icons/pin.svg"))
                 .tint(line)
@@ -823,31 +899,47 @@ pub fn paint_pin_marks(ui: &egui::Ui, painter: &egui::Painter, origin: egui::Pos
 /// grab at any zoom. The canvas sits on arbitrary desktop content, so
 /// every line is a light stroke over a dark one: it reads on both bright
 /// and dark backgrounds.
-/// Smart guides' colour: apart from the selection's blue.
-const GUIDE: egui::Color32 = egui::Color32::from_rgb(255, 72, 150);
-
 pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f32, chrome: &crate::tools::select_tool::Chrome) {
     let to_screen = |p: [f32; 2]| egui::pos2(origin.x + p[0] * zoom, origin.y + p[1] * zoom);
-    let line = egui::Color32::from_rgb(86, 160, 255);
-    let under = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+    let line = crate::ui::theme::chrome_line();
+    let under = crate::ui::theme::CHROME_UNDER;
+    let knob = egui::Color32::from_gray(30);
+    // Smart guides: dashed, so they read apart from the selection's frame.
+    let guide = line;
 
     if let Some(m) = chrome.marquee {
         let r = egui::Rect::from_two_pos(to_screen([m[0], m[1]]), to_screen([m[2], m[3]]));
-        painter.rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_rgba_unmultiplied(86, 160, 255, 28));
+        painter.rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_white_alpha(20));
+        painter.rect_stroke(r, egui::Rounding::ZERO, egui::Stroke::new(2.5, egui::Color32::from_black_alpha(90)));
         painter.rect_stroke(r, egui::Rounding::ZERO, egui::Stroke::new(1.0, line));
     }
-    // Smart guides the moving selection lined up on.
+    // Smart guides the moving selection lined up on: dashed over a dark
+    // halo, so they read apart from the selection's solid frame.
     for g in &chrome.guides {
-        painter.line_segment([to_screen(g[0]), to_screen(g[1])], egui::Stroke::new(1.0, GUIDE));
+        let seg = [to_screen(g[0]), to_screen(g[1])];
+        painter.line_segment(seg, egui::Stroke::new(2.5, egui::Color32::from_black_alpha(110)));
+        painter.extend(egui::Shape::dashed_line(&seg, egui::Stroke::new(1.0, guide), 5.0, 3.0));
         for p in g {
-            painter.circle_filled(to_screen(*p), 2.0, GUIDE);
+            painter.circle_filled(to_screen(*p), 3.0, under);
+            painter.circle_filled(to_screen(*p), 2.0, guide);
         }
     }
-    // Groups inside the selection: a light dashed box each.
+    // Each selected object, when there are two or more: a thin line round
+    // it, so one that only sits inside the frame shows as not selected.
+    for o in &chrome.objects {
+        let pts: Vec<egui::Pos2> = o.iter().map(|p| to_screen(*p)).collect();
+        painter.add(egui::Shape::closed_line(pts.clone(), egui::Stroke::new(2.5, egui::Color32::from_black_alpha(110))));
+        painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.0, line)));
+    }
+    // Groups inside the selection: a light dashed line round each one's
+    // members.
     for g in &chrome.groups {
+        if g.is_empty() {
+            continue;
+        }
         let mut pts: Vec<egui::Pos2> = g.iter().map(|p| to_screen(*p)).collect();
         pts.push(pts[0]);
-        let dash = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(160, 205, 255, 200));
+        let dash = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(190));
         painter.extend(egui::Shape::dashed_line(&pts, dash, 4.0, 3.0));
     }
     if let Some(frame) = chrome.frame {
@@ -865,14 +957,14 @@ pub fn paint_select_chrome(painter: &egui::Painter, origin: egui::Pos2, zoom: f3
                 crate::tools::select_tool::Handle::Rotate => {
                     painter.circle_filled(p, 6.5, under);
                     painter.circle_filled(p, 5.0, egui::Color32::WHITE);
-                    painter.circle_stroke(p, 5.0, egui::Stroke::new(1.4, line));
+                    painter.circle_stroke(p, 5.0, egui::Stroke::new(1.4, knob));
                 }
                 crate::tools::select_tool::Handle::Scale { .. } => {
                     let outer = egui::Rect::from_center_size(p, egui::vec2(11.0, 11.0));
                     let inner = egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0));
                     painter.rect_filled(outer, egui::Rounding::same(2.0), under);
                     painter.rect_filled(inner, egui::Rounding::same(1.0), egui::Color32::WHITE);
-                    painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, line));
+                    painter.rect_stroke(inner, egui::Rounding::same(1.0), egui::Stroke::new(1.4, knob));
                 }
             }
         }

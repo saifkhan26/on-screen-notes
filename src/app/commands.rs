@@ -10,9 +10,9 @@ impl OnScreenNotesApp {
         use crate::tools::arrange::Arrange;
         use interaction::action_keys::KeyAction as K;
         let say = |app: &mut Self, msg: String| app.toast = Some((msg, Instant::now()));
-        let selecting = self.tool.kind == crate::tools::ToolKind::Select
-            && !self.tool.select.sel.is_empty()
-            && self.tool.select.gesture.is_none();
+        let selecting = self.ws.tool.kind == crate::tools::ToolKind::Select
+            && !self.ws.tool.select.sel.is_empty()
+            && self.ws.tool.select.gesture.is_none();
         match action {
             K::Arrange(op) => {
                 if selecting && self.may_edit() {
@@ -38,21 +38,30 @@ impl OnScreenNotesApp {
                 };
                 say(self, msg.to_string());
             }
+            K::DimUnselected => {
+                self.config.dim_unselected = !self.config.dim_unselected;
+                let msg = if self.config.dim_unselected {
+                    "Dim the rest on: while objects are selected, everything else fades back"
+                } else {
+                    "Dim the rest off"
+                };
+                say(self, msg.to_string());
+            }
             K::MoveToSlide => {
                 if selecting {
-                    self.move_picker_pending = true;
+                    self.ws.move_picker_pending = true;
                 }
             }
             K::Colour(i) => {
                 if let Some(&c) = self.config.palette.get(i) {
-                    let (color, size) = (self.tool.color, self.tool.size);
-                    self.tool.color = c;
+                    let (color, size) = (self.ws.tool.color, self.ws.tool.size);
+                    self.ws.tool.color = c;
                     self.restyle_selection(color, size);
                 }
             }
             K::Size(n) => {
-                let (color, size) = (self.tool.color, self.tool.size);
-                interaction::zoom_pan::nudge_size(&mut self.tool, f32::from(n));
+                let (color, size) = (self.ws.tool.color, self.ws.tool.size);
+                interaction::zoom_pan::nudge_size(&mut self.ws.tool, f32::from(n));
                 self.restyle_selection(color, size);
             }
             K::InsertMedia => self.open_media_dialog(),
@@ -64,7 +73,7 @@ impl OnScreenNotesApp {
             K::HighlightTagged => self.media_filter.tagged = !self.media_filter.tagged,
             K::HighlightGone => self.media_filter.gone = !self.media_filter.gone,
             K::ResyncPureRef => {
-                self.commands.close();
+                self.ws.commands.close();
                 self.start_resync(self.canvases.active_index());
             }
             K::SelectHighlighted => {
@@ -102,6 +111,11 @@ impl OnScreenNotesApp {
                 self.config.bg_opacity = (self.config.bg_opacity + 0.1 * f32::from(n)).clamp(0.0, 1.0);
             }
             K::ResetBackground => self.config.bg_color = [0, 0, 0],
+            K::UiScale(step) => {
+                let to = if step == 0 { 1.0 } else { crate::config::ui_scale_step(self.config.ui_scale, step) };
+                self.config.ui_scale = to;
+                say(self, format!("UI size {:.0} %", to * 100.0));
+            }
             K::NewSlide => {
                 self.canvases.push_canvas(crate::canvas::canvas::Canvas::default());
                 say(self, format!("Slide {} added at the end", self.canvases.count()));
@@ -109,7 +123,7 @@ impl OnScreenNotesApp {
             K::ToggleSlidePanel => {
                 self.config.slide_panel_open = !self.config.slide_panel_open;
                 if self.config.slide_panel_open {
-                    self.ui_visible = true;
+                    self.ws.ui_visible = true;
                 }
             }
             K::ToggleSlideOrder => {
@@ -120,28 +134,23 @@ impl OnScreenNotesApp {
                 say(self, msg.to_string());
             }
             K::SlideWindow => {
-                if self.slide_window.is_some() {
+                if self.running == Some(WindowKind::Slide) {
+                    // Pressed in the slide window: it closes.
+                    self.window_close = true;
+                } else if self.slide_window.is_some() {
                     self.slide_window = None;
                 } else {
                     self.slide_window = Some(ui::slide_window::SlideWindow::new(self.canvases.active_index(), &self.config));
                 }
             }
+            K::SlideWindowRegion => self.begin_window_region(),
             K::NewLayer => {
                 if self.may_edit() {
                     self.canvases.active_mut().add_layer();
                 }
             }
-            K::DeleteLayer => {
-                if self.may_edit() {
-                    let c = self.canvases.active_mut();
-                    let (li, n) = (c.active_layer, c.layers.len());
-                    c.delete_layer(li);
-                    // Not undoable, as the layer panel's button is not:
-                    // say so, since an empty layer shows no change.
-                    let msg = if n > 1 { format!("Layer {} deleted", li + 1) } else { "The last layer stays".to_string() };
-                    say(self, msg);
-                }
-            }
+            // Asks first when the layer has something on it.
+            K::DeleteLayer => self.request_layer_delete(self.canvases.active().active_layer),
             K::MoveLayer(n) => {
                 if self.may_edit() {
                     let c = self.canvases.active_mut();
@@ -152,16 +161,20 @@ impl OnScreenNotesApp {
                 }
             }
             K::PinGoToSlide => {
-                if let Some(id) = self.pin_tool.selected {
+                if let Some(id) = self.ws.pin_tool.selected {
                     let area = self.overlay_cache.canvas_rect(ctx).size();
                     self.open_pin_slide(id, area);
                 }
             }
             K::PinThisSlideOnly => {
-                if let Some(id) = self.pin_tool.selected {
+                if let Some(id) = self.ws.pin_tool.selected {
                     if let Some(local) = self.canvases.pinned().iter().find(|p| p.pin.id == id).map(|p| p.pin.local) {
                         self.set_pin_local(id, !local);
                     }
+                } else if selecting && self.selection_pinned() {
+                    // Pinned objects selected where they are: their pins.
+                    let local = self.selection_pin_local() != Some(true);
+                    self.set_selection_pin_local(local);
                 }
             }
             K::Nudge(px) => {
@@ -183,8 +196,8 @@ impl OnScreenNotesApp {
             }
             K::Tag => {
                 if selecting {
-                    self.ui_visible = true;
-                    self.tag_edit = Some(ui::arrange_bar::TagEdit::new(&self.selection_tags()));
+                    self.ws.ui_visible = true;
+                    self.ws.tag_edit = Some(ui::arrange_bar::TagEdit::new(&self.selection_tags()));
                 }
             }
             K::PictureColours => {
@@ -193,21 +206,31 @@ impl OnScreenNotesApp {
                 }
             }
             K::FindSimilar => self.find_similar(),
+            K::Crop => {
+                if selecting {
+                    self.start_crop();
+                }
+            }
+            K::OpenInWindow => {
+                if selecting {
+                    self.show_selection_in_window(ctx);
+                }
+            }
             K::FindCopies => {
-                self.commands.close();
-                self.find.find_copies();
+                self.ws.commands.close();
+                self.ws.find.find_copies();
             }
             K::TextBox => {
-                self.tool.text_box = !self.tool.text_box;
+                self.ws.tool.text_box = !self.ws.tool.text_box;
                 self.apply_text_box_to_selection();
-                let msg = if self.tool.text_box { "Text in a box: on" } else { "Text in a box: off" };
+                let msg = if self.ws.tool.text_box { "Text in a box: on" } else { "Text in a box: off" };
                 say(self, msg.to_string());
             }
             K::Onion => self.toggle_onion(),
-            K::CommandPalette => self.commands.open(),
+            K::CommandPalette => self.ws.commands.open(),
             K::Find => {
-                self.commands.close();
-                self.find.open();
+                self.ws.commands.close();
+                self.ws.find.open();
             }
             K::Group(on) => {
                 if selecting {
@@ -215,8 +238,8 @@ impl OnScreenNotesApp {
                 }
             }
             K::TagList => {
-                self.commands.close();
-                self.find.open_tags();
+                self.ws.commands.close();
+                self.ws.find.open_tags();
             }
             K::MoveSlide(step) => {
                 let from = self.canvases.active_index();
@@ -241,36 +264,42 @@ impl OnScreenNotesApp {
         match cmd {
             C::Key(k) => self.apply_key_action(k, ctx),
             C::Tool(kind, style) => {
-                self.tool.kind = kind;
+                self.ws.tool.kind = kind;
                 if let Some(s) = style {
-                    self.tool.style = s;
+                    self.ws.tool.style = s;
                 }
             }
-            C::Eyedropper => self.tool.eyedropper_pending = true,
+            C::Eyedropper => self.ws.tool.eyedropper_pending = true,
+            // An open pad takes undo and redo for its own strokes.
+            C::Undo | C::Redo if self.ws.pad.is_open() => self.pad_undo(cmd == C::Redo),
+            // While cropping they wait: Esc first.
+            C::Undo | C::Redo if self.ws.crop.is_open() => {}
+            // Right after a slide was deleted, undo brings it back.
+            C::Undo if self.canvases.undo_restores_slide() => self.restore_deleted_slide(),
+            C::RestoreSlide => self.restore_deleted_slide(),
             C::Undo | C::Redo => {
                 if self.may_edit() {
                     let c = self.canvases.active_mut();
                     if cmd == C::Undo { c.undo() } else { c.redo() }
-                    self.restyle_run = None;
-                    self.nudge_run = None;
+                    self.ws.restyle_run = None;
+                    self.ws.nudge_run = None;
                 }
             }
-            C::ClearLayer => {
-                if self.may_edit() {
-                    self.canvases.active_mut().clear();
-                }
-            }
+            C::ClearLayer => self.request_layer_clear(),
             C::DeleteSlide => {
                 if self.may_edit() {
                     self.request_slide_delete();
                 }
             }
             C::LockSlide => self.toggle_lock(),
+            C::RenameSlide if self.canvases.in_view() => {
+                self.toast = Some(("Name slides in the main window's slide panel".to_string(), Instant::now()));
+            }
             C::RenameSlide => {
                 let i = self.canvases.active_index();
-                self.slide_panel.start_rename(i, self.canvases.name(i));
+                self.ws.slide_panel.start_rename(i, self.canvases.name(i));
                 self.config.slide_panel_open = true;
-                self.ui_visible = true;
+                self.ws.ui_visible = true;
             }
             C::ResetView => {
                 let (pan, zoom) = self.canvases.active_view_mut();
@@ -282,8 +311,8 @@ impl OnScreenNotesApp {
                     self.queue_freeze(ppp);
                 }
             }
-            C::ToggleUi => self.ui_visible = !self.ui_visible,
-            C::TogglePins => self.set_pins_hidden(!self.canvases.pins_hidden()),
+            C::ToggleUi => self.ws.ui_visible = !self.ws.ui_visible,
+            C::TogglePins => self.toggle_pins_window(),
             C::Duplicate => sel(self, SelAction::Duplicate),
             C::CopyToNewSlide => sel(self, SelAction::CopyToNewSlide),
             C::TogglePin => sel(self, SelAction::TogglePin),
@@ -292,11 +321,20 @@ impl OnScreenNotesApp {
             C::DeleteSelection => sel(self, SelAction::Delete),
             C::ShapeSnap => {
                 self.config.shape_snap = !self.config.shape_snap;
-                self.tool.shape_snap = self.config.shape_snap;
+                self.ws.tool.shape_snap = self.config.shape_snap;
                 let msg = if self.config.shape_snap { "Shape snap on" } else { "Shape snap off" };
                 self.toast = Some((msg.to_string(), Instant::now()));
             }
+            C::KeepProportions => {
+                self.config.keep_proportions = !self.config.keep_proportions;
+                self.ws.tool.select.keep_proportions = self.config.keep_proportions;
+                let msg = if self.config.keep_proportions { "Keep proportions on" } else { "Keep proportions off: handles stretch" };
+                self.toast = Some((msg.to_string(), Instant::now()));
+            }
             C::GoTo(i) => self.canvases.go_to(i),
+            C::NewPad => self.new_pad(ctx, canvas_rect),
+            C::DrawOnPicture => self.draw_on_selected_picture(),
+            C::FindArtist => self.find_artists(),
         }
     }
 }

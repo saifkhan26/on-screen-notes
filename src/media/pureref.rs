@@ -274,6 +274,7 @@ impl BoardItem {
                     tags: tags.clone(),
                     turn: 0.0,
                     link: link_id,
+                    paper: None,
                 }
             }
             BoardItem::Note { text, pos, font_size, color, rotation, background, tags, .. } => Shape::Text {

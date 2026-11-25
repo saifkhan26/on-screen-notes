@@ -14,6 +14,7 @@
 //!      and calls `OnScreenNotesApp::new` once on startup.
 
 mod app;
+mod browser_link;
 mod canvas;
 mod clipboard;
 mod config;
@@ -22,6 +23,7 @@ mod flood_fill;
 mod input;
 mod interaction;
 mod media;
+mod ml;
 mod perf;
 mod persistence;
 mod platform;

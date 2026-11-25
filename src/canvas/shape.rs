@@ -535,6 +535,12 @@ pub enum Shape {
         /// Same as `Text::link`.
         #[serde(default, skip_serializing_if = "is_unlinked")]
         link: u64,
+        /// Paper drawn behind the pixels, straight RGBA (alpha is its
+        /// opacity): a drawing pad's (`canvas::pad`), whose pixels hold
+        /// only the ink, so the paper's colour and opacity can change.
+        /// `None` for every other picture, and not written then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paper: Option<[u8; 4]>,
     },
 }
 
@@ -969,6 +975,7 @@ mod tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         };
         let text = ron::to_string(&raster).unwrap();
         assert!(!text.contains("rotation") && !text.contains("kind") && !text.contains("media"), "{text}");
@@ -986,6 +993,7 @@ mod tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         };
         let back: Shape = ron::from_str(&ron::to_string(&raster).unwrap()).unwrap();
         assert!(matches!(back, Shape::Raster { rotation, kind: RasterKind::Image, .. } if (rotation - 0.5).abs() < 1e-6));
@@ -1009,6 +1017,7 @@ mod tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         }
     }
 
@@ -1061,6 +1070,7 @@ mod tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         }
     }
 

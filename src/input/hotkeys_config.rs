@@ -497,17 +497,27 @@ pub struct CanvasSection {
     #[serde(default)] pub toggle_slide_order: String,
     /// Show the active slide in the slide window, or close the window.
     #[serde(default)] pub slide_window: String,
+    /// Drag a box on the canvas: the slide window shows that part.
+    #[serde(default)] pub slide_window_region: String,
     #[serde(default)] pub new_layer: String,
-    /// The active layer goes, as with the layer panel's bin: no undo.
+    /// The active layer goes, as with the layer panel's bin: asks first
+    /// when it holds anything, and undo brings it back.
     #[serde(default)] pub delete_layer: String,
-    /// The active layer one place up / down the stack. Like the panel's
-    /// arrows, this clears the slide's undo history.
+    /// The active layer one place up / down the stack, like the panel's
+    /// arrows. One undo step each.
     #[serde(default)] pub move_layer_up: String,
     #[serde(default)] pub move_layer_down: String,
     /// With a pin selected: go to the slide its objects are on.
     #[serde(default)] pub pin_go_to_slide: String,
     /// With a pin selected: show it on that slide only, or on every slide.
     #[serde(default)] pub pin_this_slide_only: String,
+    /// The UI (toolbar, panels, bars) one step bigger / smaller, or back
+    /// to 100 %; the slides keep their size on screen. Unbound until set
+    /// (egui's own Ctrl+= / Ctrl+- / Ctrl+0 zoom is off, so those keys
+    /// stay free for the actions bound to them).
+    #[serde(default)] pub ui_scale_up: String,
+    #[serde(default)] pub ui_scale_down: String,
+    #[serde(default)] pub ui_scale_reset: String,
 }
 
 /// The toolbar's buttons that are not tools. Unbound until set.
@@ -557,6 +567,7 @@ pub struct ToolbarSection {
 pub struct ArrangeSection {
     pub pack: String,
     pub group_by_type: String,
+    pub group_by_tags: String,
     /// Aligning slides objects until they touch, or piles them up.
     pub keep_apart: String,
     pub align_left: String,
@@ -585,6 +596,12 @@ pub struct ArrangeSection {
     pub tag: String,
     /// Find pictures like the selected one, or the copied one.
     pub find_similar: String,
+    /// Fade what is not selected, or stop.
+    pub dim_unselected: String,
+    /// Crop the selected picture or drawing pad.
+    pub crop: String,
+    /// Show the selection in the slide window.
+    pub open_in_window: String,
 }
 
 impl Default for CanvasSection {
@@ -652,12 +669,16 @@ impl Default for CanvasSection {
             toggle_slide_panel: String::new(),
             toggle_slide_order: String::new(),
             slide_window: String::new(),
+            slide_window_region: String::new(),
             new_layer: String::new(),
             delete_layer: String::new(),
             move_layer_up: String::new(),
             move_layer_down: String::new(),
             pin_go_to_slide: String::new(),
             pin_this_slide_only: String::new(),
+            ui_scale_up: String::new(),
+            ui_scale_down: String::new(),
+            ui_scale_reset: String::new(),
         }
     }
 }
@@ -735,8 +756,10 @@ fn d_media_next_frame() -> String { "period".into() }
 /// peek), flipping, the text box and a picture's colours; 6 moving
 /// slides; 7 groups; 8 onion skin; 9 the command palette; 10 find and tags;
 /// 11 select all (and lists finding like pictures and duplicates);
-/// 12 resync from PureRef; 13 hopping from object to object.
-const FORMAT: u32 = 13;
+/// 12 resync from PureRef; 13 hopping from object to object; 14 dimming
+/// what is not selected; 15 cropping a picture; 16 the slide window on a
+/// box or the selection.
+const FORMAT: u32 = 16;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -815,6 +838,7 @@ pub struct ToolbarBindings {
 pub struct ArrangeBindings {
     pub pack: Option<Binding>,
     pub group_by_type: Option<Binding>,
+    pub group_by_tags: Option<Binding>,
     pub keep_apart: Option<Binding>,
     pub align_left: Option<Binding>,
     pub align_center_x: Option<Binding>,
@@ -836,6 +860,9 @@ pub struct ArrangeBindings {
     pub picture_colours: Option<Binding>,
     pub tag: Option<Binding>,
     pub find_similar: Option<Binding>,
+    pub dim_unselected: Option<Binding>,
+    pub crop: Option<Binding>,
+    pub open_in_window: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -901,12 +928,16 @@ pub struct CanvasBindings {
     pub toggle_slide_panel: Option<Binding>,
     pub toggle_slide_order: Option<Binding>,
     pub slide_window: Option<Binding>,
+    pub slide_window_region: Option<Binding>,
     pub new_layer: Option<Binding>,
     pub delete_layer: Option<Binding>,
     pub move_layer_up: Option<Binding>,
     pub move_layer_down: Option<Binding>,
     pub pin_go_to_slide: Option<Binding>,
     pub pin_this_slide_only: Option<Binding>,
+    pub ui_scale_up: Option<Binding>,
+    pub ui_scale_down: Option<Binding>,
+    pub ui_scale_reset: Option<Binding>,
 }
 
 /// The `[global]` bindings, for showing them in the help panel. The OS
@@ -1006,6 +1037,7 @@ impl HotkeysConfig {
             arrange: ArrangeBindings {
                 pack:           p("arrange.pack",           &ar.pack),
                 group_by_type:  p("arrange.group_by_type",  &ar.group_by_type),
+                group_by_tags:  p("arrange.group_by_tags",  &ar.group_by_tags),
                 keep_apart:     p("arrange.keep_apart",     &ar.keep_apart),
                 align_left:     p("arrange.align_left",     &ar.align_left),
                 align_center_x: p("arrange.align_center_x", &ar.align_center_x),
@@ -1027,6 +1059,9 @@ impl HotkeysConfig {
                 picture_colours: p("arrange.picture_colours", &ar.picture_colours),
                 tag: p("arrange.tag", &ar.tag),
                 find_similar: p("arrange.find_similar", &ar.find_similar),
+                dim_unselected: p("arrange.dim_unselected", &ar.dim_unselected),
+                crop: p("arrange.crop", &ar.crop),
+                open_in_window: p("arrange.open_in_window", &ar.open_in_window),
             },
             canvas: CanvasBindings {
                 undo:          p("canvas.undo",          &self.canvas.undo),
@@ -1113,12 +1148,16 @@ impl HotkeysConfig {
                 toggle_slide_panel: p("canvas.toggle_slide_panel", &cv.toggle_slide_panel),
                 toggle_slide_order: p("canvas.toggle_slide_order", &cv.toggle_slide_order),
                 slide_window:       p("canvas.slide_window",       &cv.slide_window),
+                slide_window_region: p("canvas.slide_window_region", &cv.slide_window_region),
                 new_layer:          p("canvas.new_layer",          &cv.new_layer),
                 delete_layer:       p("canvas.delete_layer",       &cv.delete_layer),
                 move_layer_up:      p("canvas.move_layer_up",      &cv.move_layer_up),
                 move_layer_down:    p("canvas.move_layer_down",    &cv.move_layer_down),
                 pin_go_to_slide:    p("canvas.pin_go_to_slide",    &cv.pin_go_to_slide),
                 pin_this_slide_only: p("canvas.pin_this_slide_only", &cv.pin_this_slide_only),
+                ui_scale_up:        p("canvas.ui_scale_up",        &cv.ui_scale_up),
+                ui_scale_down:      p("canvas.ui_scale_down",      &cv.ui_scale_down),
+                ui_scale_reset:     p("canvas.ui_scale_reset",     &cv.ui_scale_reset),
             },
         }
     }
@@ -1396,6 +1435,7 @@ fn note(section: &str, key: &str) -> Option<String> {
 
         ("arrange", "pack")                  => "Pack the selection into a tight block, sizes kept",
         ("arrange", "group_by_type")         => "Group the selection: pictures, GIFs, videos, the rest",
+        ("arrange", "group_by_tags")         => "Group the selection by tag, untagged objects last",
         ("arrange", "keep_apart")            => "Keep-apart switch: aligning slides objects until they touch, or piles them up",
         ("arrange", "align_left")            => "Align the selection left",
         ("arrange", "align_center_x")        => "Align the selection's centres across",
@@ -1417,6 +1457,9 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("arrange", "picture_colours")       => "The selected picture's colours, to draw with or keep as the palette",
         ("arrange", "tag")                   => "Type the selection's tags: words find (Ctrl+F) knows it by",
         ("arrange", "find_similar")          => "Find pictures like the selected one (or the copied one): copies, edits, similar",
+        ("arrange", "dim_unselected")        => "Dim the rest: while objects are selected, everything else fades back",
+        ("arrange", "crop")                  => "Crop the selected picture or drawing pad (drag its edges; Enter crops, Esc cancels)",
+        ("arrange", "open_in_window")        => "Show the selection in the slide window (pops out over it if the window is closed)",
 
         ("canvas", "undo")                 => "Undo",
         ("canvas", "redo")                 => "Redo",
@@ -1458,7 +1501,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "group")                => "Make the selection one group (selects, moves and arranges as one)",
         ("canvas", "ungroup")              => "Take the selection out of its groups",
         ("canvas", "pin_selection")        => "Pin the selection to every slide, or unpin it",
-        ("canvas", "toggle_pins")          => "Hide / show every pin",
+        ("canvas", "toggle_pins")          => "Open the pins window (pins on every slide; draw there too), or close it",
         ("canvas", "bring_front")          => "Selection to the front",
         ("canvas", "send_back")            => "Selection to the back",
         ("canvas", "nudge_left_1px")       => "Selection 1 px left (wins over slide / layer keys while selected)",
@@ -1484,12 +1527,16 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "toggle_slide_panel")   => "Fold / unfold the slide panel",
         ("canvas", "toggle_slide_order")   => "Ctrl+Tab: slides in order, or recently used first",
         ("canvas", "slide_window")         => "Show the slide in the slide window, or close it",
+        ("canvas", "slide_window_region")  => "Drag a box on the canvas: the slide window shows that part (pops out over it if closed)",
         ("canvas", "new_layer")            => "New layer",
-        ("canvas", "delete_layer")         => "Delete the active layer (no undo)",
-        ("canvas", "move_layer_up")        => "Active layer one place up (clears the undo history)",
-        ("canvas", "move_layer_down")      => "Active layer one place down (clears the undo history)",
+        ("canvas", "delete_layer")         => "Delete the active layer (asks first; undo brings it back)",
+        ("canvas", "move_layer_up")        => "Active layer one place up",
+        ("canvas", "move_layer_down")      => "Active layer one place down",
         ("canvas", "pin_go_to_slide")      => "Selected pin: go to the slide its objects are on",
         ("canvas", "pin_this_slide_only")  => "Selected pin: show it on its slide only, or on every slide",
+        ("canvas", "ui_scale_up")          => "UI bigger (toolbar, panels, bars; the slides keep their size)",
+        ("canvas", "ui_scale_down")        => "UI smaller",
+        ("canvas", "ui_scale_reset")       => "UI back to 100 %",
         _ => return None,
     };
     Some(text.to_owned())
@@ -1732,7 +1779,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 13"));
+        assert!(up.contains("version = 16"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1741,7 +1788,7 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 13\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 16\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
         assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
@@ -1751,7 +1798,7 @@ mod tests {
         assert!(added("marker").ends_with("  # Marker (highlighter)"));
         assert!(added("align_left").ends_with("  # Align the selection left"));
         assert!(added("colour_3").ends_with("  # Palette colour 3 (recolours a selection)"));
-        assert!(added("delete_layer").ends_with("# Delete the active layer (no undo)"));
+        assert!(added("delete_layer").ends_with("# Delete the active layer (asks first; undo brings it back)"));
         assert_eq!(added("pencil"), "pencil = \"b\"");
         let column = |key: &str| added(key).find("  # ").unwrap();
         assert_eq!(column("marker"), column("dashed_border"));
@@ -1778,7 +1825,7 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 13\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 16\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
@@ -1915,7 +1962,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 13\n\n\
+             version = 16\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1936,13 +1983,13 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 13\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 16\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 13");
-        assert_eq!(upgrade_text("", 0), "version = 13\n");
+        assert_eq!(new, "version = 16");
+        assert_eq!(upgrade_text("", 0), "version = 16\n");
     }
 
     #[test]

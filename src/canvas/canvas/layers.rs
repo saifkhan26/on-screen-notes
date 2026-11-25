@@ -63,10 +63,10 @@ impl Canvas {
 
     /// Insert a new image-backed layer at the *bottom* of the stack
     /// (index 0) so the frozen frame sits underneath every other
-    /// layer's ink. Existing strokes' undo entries shift up one
-    /// layer index; we clear undo/redo so a later `Ctrl+Z` doesn't
-    /// rewind into the wrong layer slot.
+    /// layer's ink. One undo step: the older ones replay only after it
+    /// has taken the layer out again, so their layer numbers still hold.
     pub fn add_image_layer_bottom(&mut self, image: LayerImage, name: String) {
+        let before = self.active_layer;
         let l = Layer {
             name,
             visible: true,
@@ -82,15 +82,16 @@ impl Canvas {
         // Keep the user pointing at whichever ink layer they were
         // editing — bumped up by one because we inserted underneath.
         self.active_layer = (self.active_layer + 1).min(self.layers.len() - 1);
-        self.undo_log.clear();
+        self.undo_log.push(UndoEntry::LayerInserted(0, before));
         self.redo_log.clear();
         self.dirty = true;
     }
 
     /// Insert a new blank layer directly above the active one and make
     /// it active. The new layer is named "Layer N" where N is the next
-    /// integer not already in use.
+    /// integer not already in use. One undo step.
     pub fn add_layer(&mut self) {
+        let before = self.active_layer;
         let n = self.next_layer_number();
         let l = Layer {
             name: format!("Layer {n}"),
@@ -106,38 +107,81 @@ impl Canvas {
         let pos = (self.active_layer + 1).min(self.layers.len());
         self.layers.insert(pos, l);
         self.active_layer = pos;
+        self.undo_log.push(UndoEntry::LayerInserted(pos, before));
+        self.redo_log.clear();
         self.dirty = true;
     }
 
-    /// Remove the layer at `index`. Refuses to remove the last layer
-    /// (keeps at least one always present). Adjusts `active_layer` so
-    /// it still points at a real layer afterwards.
+    /// Remove the layer at `index`, as one undo step that puts it back
+    /// whole. Refuses to remove the last layer (keeps at least one
+    /// always present). Adjusts `active_layer` so it still points at a
+    /// real layer afterwards.
     pub fn delete_layer(&mut self, index: usize) {
         if self.layers.len() <= 1 || index >= self.layers.len() {
             return;
         }
-        self.layers.remove(index);
+        let before = self.active_layer;
+        let layer = self.layers.remove(index);
         if self.active_layer >= self.layers.len() {
             self.active_layer = self.layers.len() - 1;
         } else if self.active_layer > index {
             self.active_layer -= 1;
         }
-        // Edits referencing the deleted layer are dropped from the
-        // history; otherwise undo would resurrect strokes onto an
-        // index that no longer matches their original layer.
-        let cur_len = self.layers.len();
-        self.undo_log.retain(|e| layer_idx_of(e) < cur_len);
-        self.redo_log.retain(|e| layer_idx_of(e) < cur_len);
+        // The older history stays as it is: it names layers as they were
+        // with this one in the stack, and replays only after this step
+        // has put it back.
+        self.undo_log.push(UndoEntry::LayerRemoved(index, Box::new(layer), before));
+        self.redo_log.clear();
         self.dirty = true;
     }
 
     /// Move the layer at `index` to `new_index`, clamping the
-    /// destination into range. Keeps `active_layer` pointing at the
-    /// same layer instance after the swap.
+    /// destination into range, as one undo step. Keeps `active_layer`
+    /// pointing at the same layer instance after the swap.
     pub fn move_layer(&mut self, index: usize, new_index: usize) {
         if index >= self.layers.len() { return; }
         let new_index = new_index.min(self.layers.len() - 1);
         if index == new_index { return; }
+        self.reorder_layer(index, new_index);
+        self.undo_log.push(UndoEntry::LayerReordered(index, new_index));
+        self.redo_log.clear();
+        self.dirty = true;
+    }
+
+    /// Undo one of the layer-stack entries and return the entry that
+    /// undoes *that* (`history.rs`: undo and redo both use it).
+    pub(super) fn invert_layer_entry(&mut self, entry: UndoEntry) -> Option<UndoEntry> {
+        match entry {
+            UndoEntry::LayerRemoved(i, layer, active) => {
+                let i = i.min(self.layers.len());
+                let now = self.active_layer;
+                self.layers.insert(i, *layer);
+                self.active_layer = active.min(self.layers.len() - 1);
+                Some(UndoEntry::LayerInserted(i, now))
+            }
+            UndoEntry::LayerInserted(i, active) => {
+                if self.layers.len() <= 1 || i >= self.layers.len() {
+                    return None;
+                }
+                let now = self.active_layer;
+                let layer = self.layers.remove(i);
+                self.active_layer = active.min(self.layers.len() - 1);
+                Some(UndoEntry::LayerRemoved(i, Box::new(layer), now))
+            }
+            UndoEntry::LayerReordered(from, to) => {
+                if from >= self.layers.len() || to >= self.layers.len() {
+                    return None;
+                }
+                self.reorder_layer(to, from);
+                Some(UndoEntry::LayerReordered(to, from))
+            }
+            _ => None,
+        }
+    }
+
+    /// Move the layer at `index` to `new_index` (both in range), keeping
+    /// `active_layer` on the same layer. No undo step of its own.
+    fn reorder_layer(&mut self, index: usize, new_index: usize) {
         let layer = self.layers.remove(index);
         self.layers.insert(new_index, layer);
         // Update active index so it still points at the same logical
@@ -149,11 +193,6 @@ impl Canvas {
         } else if new_index <= self.active_layer && self.active_layer < index {
             self.active_layer += 1;
         }
-        // History indexes are now meaningless across the swap — drop
-        // them rather than chase rewrites.
-        self.undo_log.clear();
-        self.redo_log.clear();
-        self.dirty = true;
     }
 
     /// Toggle visibility of the layer at `index`.

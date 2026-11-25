@@ -397,13 +397,13 @@ enum Icon {
 fn icon_btn(ui: &mut egui::Ui, icon: Icon, active: bool, tooltip: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if active {
-        theme::ACCENT
+        theme::on_fill()
     } else if resp.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, Rounding::same(7.0), bg);
+    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), bg);
     let img = match icon {
         Icon::Play => egui::Image::new(egui::include_image!("../../assets/icons/play.svg")),
         Icon::Pause => egui::Image::new(egui::include_image!("../../assets/icons/pause.svg")),

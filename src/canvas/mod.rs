@@ -12,12 +12,16 @@
 pub mod affine;
 // `canvas::canvas::Canvas`: one slide, in its own file beside the manager.
 // Renaming it would touch every import for nothing.
-#[allow(clippy::module_inception)]
 pub mod board_link;
+#[allow(clippy::module_inception)]
 pub mod canvas;
+pub mod cover;
 pub mod hit;
 pub mod ink_gpu;
+pub mod pad;
+pub mod pad_gpu;
 pub mod picture_index;
+pub mod picture_vectors;
 pub mod picture_store;
 pub mod pins;
 pub mod render;
@@ -43,6 +47,23 @@ pub struct TagCount {
     pub objects: usize,
 }
 
+/// What `CanvasManager::enter_view` changed: the main window's active
+/// slide, and the second window's slide with its own view.
+struct ViewSwap {
+    main: usize,
+    slide: usize,
+    own: ([f32; 2], f32),
+    /// The window is locked: nothing on its slide takes edits.
+    locked: bool,
+    /// The slide shown is the pins board, put in at `slide` for the frame
+    /// (`enter_board`) and taken out again when it ends.
+    board: bool,
+}
+
+/// The slide a second window ended its frame on when that was the pins
+/// board (`CanvasManager::leave_view`).
+pub const BOARD: usize = usize::MAX;
+
 /// Top-level holder for all canvases.
 pub struct CanvasManager {
     /// One entry per slide. `None` is a slide whose file the background
@@ -51,6 +72,13 @@ pub struct CanvasManager {
     /// always points at a `Some`.
     canvases: Vec<Option<Canvas>>,
     active: usize,
+    /// A second window's frame is running (`enter_view`): its slide is
+    /// `active` for now, and this is what to put back.
+    view_swap: Option<ViewSwap>,
+    /// The pins board's ink, drawn in the pins window over the pins (its
+    /// units are the canvas area's screen points, like a pin's place).
+    /// Kept in `canvases/board.ron`, apart from the slides.
+    board: Canvas,
     /// One human-readable line per slide that could not be read at
     /// startup. Drained by the app into a toast.
     load_errors: Vec<String>,
@@ -122,6 +150,31 @@ pub struct CanvasManager {
     /// The last try at those renames failed; until one goes through,
     /// no further reorder is taken (it would no longer match the files).
     move_stuck: bool,
+    /// Slides deleted this session, the newest last, so an undo can put
+    /// them back (`restore_deleted`). Never saved: closing the app lets
+    /// go of them, and then of the media only they used.
+    deleted: Vec<DeletedSlide>,
+    /// Some slide file could not be read this run. Its pictures are not
+    /// known, so the media folder is not swept at exit (`may_sweep_media`).
+    unreadable: bool,
+}
+
+/// A slide's `Canvas::edit_stamp`.
+type EditStamp = (usize, usize, usize, Vec<(usize, usize, u64)>);
+
+/// A slide deleted this session, kept whole so it can come back.
+struct DeletedSlide {
+    /// The place it had.
+    index: usize,
+    canvas: Canvas,
+    name: String,
+    locked: bool,
+    /// It was the only slide, so it was emptied in place, not removed.
+    emptied: bool,
+    /// The slide shown right after the delete, and its edit stamp then.
+    /// While both still hold nothing was done since, and the undo key
+    /// brings this slide back rather than undoing on the one shown.
+    after: Option<(usize, EditStamp)>,
 }
 
 /// Stand-in for a slot whose file is missing or unreadable. It keeps
@@ -258,6 +311,8 @@ impl CanvasManager {
         let mut m = Self {
             canvases: Vec::new(),
             active: 0,
+            view_swap: None,
+            board: crate::persistence::load_board(passes),
             load_errors: Vec::new(),
             protected: Vec::new(),
             prune_orphans: false,
@@ -279,6 +334,8 @@ impl CanvasManager {
             deleting_media: false,
             pending_move: None,
             move_stuck: false,
+            deleted: Vec::new(),
+            unreadable: false,
         };
         // Every slot up to the highest file on disk gets an entry. A gap
         // or an unreadable file becomes a blank placeholder instead of
@@ -346,6 +403,8 @@ impl CanvasManager {
             recent_walk: None,
             canvases: canvases.into_iter().map(Some).collect(),
             active: 0,
+            view_swap: None,
+            board: Canvas { dirty: false, ..Canvas::default() },
             load_errors: Vec::new(),
             protected: Vec::new(),
             prune_orphans: false,
@@ -360,6 +419,8 @@ impl CanvasManager {
             deleting_media: false,
             pending_move: None,
             move_stuck: false,
+            deleted: Vec::new(),
+            unreadable: false,
         }
     }
 
@@ -405,6 +466,7 @@ impl CanvasManager {
     fn install(&mut self, idx: usize, load: SlotLoad) {
         if let Some(e) = load.error {
             self.load_errors.push(e);
+            self.unreadable = true;
         }
         if load.protected {
             self.protected.push(idx);
@@ -643,6 +705,37 @@ impl CanvasManager {
         (&mut c.pan, &mut c.zoom)
     }
 
+    /// Scale every slide's view by `f`, pan and zoom alike, read or not
+    /// yet: the UI size changed by `1 / f`, and the slides keep their
+    /// size and place on screen (a point is `1 / f` times as many pixels
+    /// now). Not an edit; the views are written again.
+    pub fn scale_views(&mut self, f: f32) {
+        use crate::interaction::zoom_pan::{MAX_ZOOM, MIN_ZOOM};
+        let scale = |pan: &mut [f32; 2], zoom: &mut f32| {
+            *pan = [pan[0] * f, pan[1] * f];
+            *zoom = (*zoom * f).clamp(MIN_ZOOM, MAX_ZOOM);
+        };
+        for c in self.canvases.iter_mut().flatten() {
+            scale(&mut c.pan, &mut c.zoom);
+        }
+        scale(&mut self.opening.pan, &mut self.opening.zoom);
+        for v in &mut self.file_views {
+            scale(&mut v.pan, &mut v.zoom);
+        }
+        if let Some(swap) = self.view_swap.as_mut() {
+            scale(&mut swap.own.0, &mut swap.own.1);
+        }
+    }
+
+    /// Put slide `idx`'s view at `pan` / `zoom`, as `active_view_mut`
+    /// does for the shown one: not an edit. Nothing for a slide not read.
+    pub fn set_view(&mut self, idx: usize, pan: [f32; 2], zoom: f32) {
+        if let Some(Some(c)) = self.canvases.get_mut(idx) {
+            c.pan = pan;
+            c.zoom = zoom;
+        }
+    }
+
     /// Read-only access to the active canvas (used by renderer +
     /// screenshot); a blank stand-in while it opens.
     pub fn active(&self) -> &Canvas {
@@ -701,7 +794,7 @@ impl CanvasManager {
 
     /// The active slide takes edits: it is read and not locked.
     pub fn active_editable(&self) -> bool {
-        self.canvases[self.active].is_some() && !self.is_locked(self.active)
+        self.canvases[self.active].is_some() && !self.is_locked(self.active) && !self.view_locked()
     }
 
     /// Index of the active canvas (for status bar display).
@@ -734,6 +827,9 @@ impl CanvasManager {
     /// "infinite canvases on right-arrow" feel — the user can keep pressing
     /// → to start a new sheet whenever they run out of space.
     pub fn next(&mut self) {
+        if self.on_board() {
+            return;
+        }
         if self.active + 1 >= self.canvases.len() {
             // At the end → grow a new blank canvas.
             self.canvases.push(Some(Canvas::default()));
@@ -747,6 +843,9 @@ impl CanvasManager {
     /// Move to the next canvas, wrapping from the last to the first —
     /// cycling never grows the deck, unlike `next`.
     pub fn cycle_next(&mut self) {
+        if self.on_board() {
+            return;
+        }
         self.go_to((self.active + 1) % self.canvases.len());
     }
 
@@ -755,6 +854,17 @@ impl CanvasManager {
     /// own `dirty` flag; a `Canvas::default()`-built one is dirty, so the
     /// next autosave writes it.
     pub fn push_canvas(&mut self, canvas: Canvas) -> usize {
+        // On the pins board a new slide goes before it, and the window
+        // stays on the board.
+        if let Some(v) = self.view_swap.as_mut().filter(|v| v.board) {
+            let n = v.slide;
+            self.canvases.insert(n, Some(canvas));
+            self.names.insert(n, String::new());
+            self.locks.insert(n, false);
+            v.slide += 1;
+            self.active = v.slide;
+            return n;
+        }
         self.canvases.push(Some(canvas));
         self.names.push(String::new());
         self.locks.push(false);
@@ -765,16 +875,26 @@ impl CanvasManager {
     /// Go to slide `idx`. One still being read shows as opening until
     /// it is in (see `open`).
     pub fn go_to(&mut self, idx: usize) {
+        // The pins board is no slide to go from.
+        if self.on_board() {
+            return;
+        }
         if idx < self.canvases.len() {
             self.active = idx;
             self.open(idx);
         }
     }
 
+    /// The slides visited, most recent first.
+    pub fn recent(&self) -> &[usize] {
+        &self.recent
+    }
+
     /// Note the active slide as the most recently visited. Call once a
-    /// frame; held back while a recently-used walk is under way.
+    /// frame; held back while a recently-used walk is under way, and
+    /// while a second window's frame runs (its slide is no visit).
     pub fn note_visit(&mut self) {
-        if self.recent_walk.is_none() && self.recent.first() != Some(&self.active) {
+        if self.recent_walk.is_none() && self.view_swap.is_none() && self.recent.first() != Some(&self.active) {
             let a = self.active;
             self.recent.retain(|&i| i != a);
             self.recent.insert(0, a);
@@ -788,6 +908,9 @@ impl CanvasManager {
     /// last two; more taps before `end_recent_walk` go further back.
     /// With fewer than two slides visited it steps by slide number.
     pub fn walk_recent(&mut self, older: bool) {
+        if self.on_board() {
+            return;
+        }
         self.note_visit();
         let n = self.recent.len();
         if n < 2 {
@@ -815,6 +938,9 @@ impl CanvasManager {
     /// the next save. Refused, with the reason, while that cannot be
     /// done safely.
     pub fn move_slide(&mut self, from: usize, to: usize) -> Result<(), &'static str> {
+        if self.on_board() {
+            return Err("The pins board is not a slide to move");
+        }
         let n = self.canvases.len();
         if from >= n || to >= n || from == to {
             return Ok(());
@@ -844,6 +970,10 @@ impl CanvasManager {
         let lock = self.locks.remove(from);
         self.locks.insert(to, lock);
         self.active = map(self.active);
+        if let Some(v) = self.view_swap.as_mut() {
+            v.main = map(v.main);
+            v.slide = map(v.slide);
+        }
         for i in &mut self.recent {
             *i = map(*i);
         }
@@ -915,6 +1045,16 @@ impl CanvasManager {
 
     /// The pins with objects to show on the active slide, bottom to top.
     pub fn pinned(&self) -> Vec<pins::Pinned<'_>> {
+        // Pins are the main window's: a second window shows none, except
+        // on the pins board, where the global ones show as the window
+        // sees them (so handles, hit tests and their bar need nothing
+        // else).
+        if let Some((pan, zoom)) = self.board_view() {
+            return self.window_pins().into_iter().map(|p| pins::Pinned { pin: p.pin.viewed(pan, zoom), ..p }).collect();
+        }
+        if self.view_swap.is_some() {
+            return Vec::new();
+        }
         self.pins.pinned(&self.canvases, self.active)
     }
 
@@ -999,8 +1139,14 @@ impl CanvasManager {
 
     /// Show the global pins in the slide window instead of on the canvas:
     /// `pinned` then leaves them out. Not an edit; not saved.
-    pub fn set_globals_away(&mut self, away: bool) {
-        self.pins.set_globals_away(away);
+    pub fn set_pins_away(&mut self, away: bool) {
+        self.pins.set_away(away);
+    }
+
+    /// What the pins window shows, as stored (canvas-area points): the
+    /// global pins. Local ones stay on their slide on the main window.
+    pub fn window_pins(&self) -> Vec<pins::Pinned<'_>> {
+        self.pins.globals(&self.canvases)
     }
 
     /// The canvas area is `area` points across: pins show wholly inside
@@ -1070,6 +1216,39 @@ impl CanvasManager {
         })
     }
 
+    /// Give the shape at `idx`, `li`, `shape` tag `tag` too, in one undo
+    /// step on its slide. False when its slide is locked or not read, it
+    /// is not there, or it has the tag already.
+    pub fn add_tag(&mut self, idx: usize, li: usize, shape: usize, tag: &str) -> bool {
+        if self.is_locked(idx) {
+            return false;
+        }
+        let Some(c) = self.canvases.get_mut(idx).and_then(|c| c.as_mut()) else { return false };
+        let Some(s) = c.layers.get(li).and_then(|l| l.shapes.get(shape)) else { return false };
+        if s.tags().iter().any(|t| same_tag(t, tag)) {
+            return false;
+        }
+        let mut tags = s.tags().to_vec();
+        tags.push(tag.to_string());
+        c.set_tags_each(li, &[], &[(shape, tags)])
+    }
+
+    /// Delete the shape at `idx`, `li`, `shape` in one undo step on its
+    /// slide, if it is still the picture whose bytes are `png`. False when
+    /// its slide is locked or not read, or it is not there any more.
+    pub fn delete_picture(&mut self, idx: usize, li: usize, shape: usize, png: &std::sync::Arc<Vec<u8>>) -> bool {
+        if self.is_locked(idx) {
+            return false;
+        }
+        let Some(c) = self.canvases.get_mut(idx).and_then(|c| c.as_mut()) else { return false };
+        let still = matches!(c.layers.get(li).and_then(|l| l.shapes.get(shape)), Some(shape::Shape::Raster { png: p, .. }) if std::sync::Arc::ptr_eq(p, png));
+        if !still {
+            return false;
+        }
+        c.delete_objects(li, &[], &[shape]);
+        true
+    }
+
     /// Take tag `tag` off every object of every slide read. See `retag`.
     pub fn remove_tag(&mut self, tag: &str) -> (usize, usize) {
         self.retag(|tags| tags.iter().any(|t| same_tag(t, tag)).then(|| tags.iter().filter(|t| !same_tag(t, tag)).cloned().collect()))
@@ -1106,7 +1285,130 @@ impl CanvasManager {
     }
 
     pub fn has_pins(&self) -> bool {
-        self.pins.any(self.active)
+        if self.on_board() {
+            return !self.window_pins().is_empty();
+        }
+        self.view_swap.is_none() && self.pins.any(self.active)
+    }
+
+    /// For a second window's frame: slide `idx` becomes the active one,
+    /// seen through `pan` / `zoom`, so the app's code, which works on the
+    /// active slide, works on it. Pins and the visit history are the main
+    /// window's and keep out (`pinned` is empty). `None`, changing
+    /// nothing, while that slide is not read yet or a frame is in already.
+    pub fn enter_view(&mut self, idx: usize, pan: [f32; 2], zoom: f32, locked: bool) -> Option<()> {
+        if self.view_swap.is_some() {
+            return None;
+        }
+        let c = self.canvases.get_mut(idx)?.as_mut()?;
+        self.view_swap = Some(ViewSwap { main: self.active, slide: idx, own: (c.pan, c.zoom), locked, board: false });
+        c.pan = pan;
+        c.zoom = zoom;
+        self.active = idx;
+        Some(())
+    }
+
+    /// End a second window's frame: the main window's slide is active
+    /// again, and the window's slide has its own view back. Returns the
+    /// slide the window shows now (it may have gone to another) and its
+    /// view there.
+    pub fn leave_view(&mut self) -> Option<(usize, [f32; 2], f32)> {
+        let v = self.view_swap.take()?;
+        if v.board {
+            // The board goes back to its own place; the slides are as
+            // they were (nothing may delete, move or go past it).
+            let n = v.slide;
+            let (pan, zoom) = match self.canvases.get(n) {
+                Some(Some(c)) => (c.pan, c.zoom),
+                _ => ([0.0; 2], 1.0),
+            };
+            if n < self.canvases.len() {
+                let slot = self.canvases.remove(n);
+                self.names.remove(n);
+                self.locks.remove(n);
+                if let Some(mut b) = slot {
+                    (b.pan, b.zoom) = v.own;
+                    self.board = b;
+                }
+            }
+            self.active = v.main.min(self.canvases.len().saturating_sub(1));
+            return Some((BOARD, pan, zoom));
+        }
+        let now = self.active.min(self.canvases.len().saturating_sub(1));
+        let (pan, zoom) = match self.canvases.get(now) {
+            Some(Some(c)) => (c.pan, c.zoom),
+            _ => (self.opening.pan, self.opening.zoom),
+        };
+        // Its own view back, wherever it is now.
+        if let Some(Some(c)) = self.canvases.get_mut(v.slide) {
+            (c.pan, c.zoom) = v.own;
+        }
+        self.active = v.main.min(self.canvases.len().saturating_sub(1));
+        Some((now, pan, zoom))
+    }
+
+    /// While a second window's frame runs: the main window's slide and
+    /// its view there.
+    pub fn main_view(&self) -> Option<(usize, [f32; 2], f32)> {
+        let v = self.view_swap.as_ref()?;
+        if v.main == v.slide {
+            return Some((v.main, v.own.0, v.own.1));
+        }
+        let c = self.canvases.get(v.main)?.as_ref()?;
+        Some((v.main, c.pan, c.zoom))
+    }
+
+    /// For the slide window's frame on the pins board: the board becomes
+    /// the active slide, seen through `pan` / `zoom` (its units are the
+    /// canvas area's points, as pins' places), so every tool works on it.
+    /// The global pins are handed out as the window shows them
+    /// (`pinned`). `leave_view` takes it out again. `None`, changing
+    /// nothing, while another such frame is in.
+    pub fn enter_board(&mut self, pan: [f32; 2], zoom: f32, locked: bool) -> Option<()> {
+        if self.view_swap.is_some() {
+            return None;
+        }
+        let n = self.canvases.len();
+        let mut b = std::mem::take(&mut self.board);
+        let own = (b.pan, b.zoom);
+        b.pan = pan;
+        b.zoom = zoom;
+        self.canvases.push(Some(b));
+        self.names.push("Pins board".to_string());
+        self.locks.push(false);
+        self.view_swap = Some(ViewSwap { main: self.active, slide: n, own, locked, board: true });
+        self.active = n;
+        Some(())
+    }
+
+    /// The pins board's ink, drawn in the pins window (its own pan and
+    /// zoom are not used).
+    pub fn board(&self) -> &Canvas {
+        &self.board
+    }
+
+    /// The slide window's frame is on the pins board.
+    pub fn on_board(&self) -> bool {
+        self.view_swap.as_ref().is_some_and(|v| v.board)
+    }
+
+    /// On the pins board: the global pins as stored (not as the window
+    /// shows them), for writing a move back (`Pin::unviewed`), and the
+    /// view to undo.
+    pub fn board_view(&self) -> Option<([f32; 2], f32)> {
+        let v = self.view_swap.as_ref().filter(|v| v.board)?;
+        let c = self.canvases.get(v.slide)?.as_ref()?;
+        Some((c.pan, c.zoom))
+    }
+
+    /// A second window's frame is running.
+    pub fn in_view(&self) -> bool {
+        self.view_swap.is_some()
+    }
+
+    /// A second window's frame is running, and that window is locked.
+    pub fn view_locked(&self) -> bool {
+        self.view_swap.as_ref().is_some_and(|v| v.locked)
     }
 
     pub fn pins_hidden(&self) -> bool {
@@ -1130,6 +1432,11 @@ impl CanvasManager {
     /// leave it. One undo step on the slide. Returns the new pin's id, or
     /// `None` when nothing was chosen.
     pub fn pin_objects(&mut self, li: usize, strokes: &[usize], shapes: &[usize], offset: [f32; 2], local: bool) -> Option<u64> {
+        // The board's ink shows on every slide already; and the board is
+        // no slide a pin could point at.
+        if self.on_board() {
+            return None;
+        }
         let id = self.pins.fresh_id();
         let c = self.canvases[self.active].as_mut()?;
         let bounds = pins::objects_bounds(c.layers.get(li)?, strokes, shapes)?;
@@ -1185,6 +1492,9 @@ impl CanvasManager {
     /// (going-backwards is symmetrical: the user explicitly asked to leave
     /// the first sheet, so wrap them to the most recent one).
     pub fn prev(&mut self) {
+        if self.on_board() {
+            return;
+        }
         if self.active == 0 {
             self.active = self.canvases.len() - 1;
         } else {
@@ -1198,7 +1508,14 @@ impl CanvasManager {
     ///   the user always on at least one sheet).
     /// * Otherwise we remove it and shift the active index back by one
     ///   (or stay at 0 if we just removed canvas 0).
+    ///
+    /// Either way the slide is kept in memory until the app closes, so
+    /// `restore_deleted` can put it back.
     pub fn delete_active(&mut self) {
+        if self.on_board() {
+            log::warn!("delete slide ignored on the pins board");
+            return;
+        }
         // Every later slide gets rewritten one file slot down, so each
         // must be in memory first — a slide still being read has nothing
         // to rewrite, and its file would be pruned or overwritten. This
@@ -1218,16 +1535,27 @@ impl CanvasManager {
         }
         self.media_cleanup_due = true;
         if self.canvases.len() == 1 {
-            self.canvases[0] = Some(Canvas::default());
-            self.names[0].clear();
-            self.locks[0] = false;
+            let old = self.canvases[0].replace(Canvas::default());
+            let name = std::mem::take(&mut self.names[0]);
+            let locked = std::mem::replace(&mut self.locks[0], false);
             self.active = 0;
+            if let Some(canvas) = old {
+                self.keep_deleted(0, canvas, name, locked, true);
+            }
             return;
         }
         let i = self.active;
-        self.canvases.remove(i);
-        self.names.remove(i);
-        self.locks.remove(i);
+        let gone = self.canvases.remove(i);
+        let name = self.names.remove(i);
+        let locked = self.locks.remove(i);
+        // A second window deleted its slide: the main window's, if later,
+        // moved down one; the gone slide's view needs no putting back.
+        if let Some(v) = self.view_swap.as_mut() {
+            if v.main > i {
+                v.main -= 1;
+            }
+            v.slide = usize::MAX;
+        }
         // Every later slide moved down one place in the history too.
         self.recent_walk = None;
         self.recent.retain(|&j| j != i);
@@ -1240,15 +1568,95 @@ impl CanvasManager {
         // Pins are found by slide index, and every later slide just moved.
         self.pins.forget_scans();
         // Removing a canvas shifts every later one down a file slot, so
-        // their existing files now hold the wrong content — everything
-        // has to be rewritten, not just the deleted index.
-        for c in self.canvases.iter_mut().flatten() {
+        // their existing files now hold the wrong content and are
+        // rewritten. The ones before it keep their slot and their file:
+        // deleting the last slide rewrites nothing.
+        for c in self.canvases[i..].iter_mut().flatten() {
             c.dirty = true;
         }
-        // Best-effort: also remove the on-disk file for the removed slot,
-        // and shift down everything past it. Simplest is to re-save all,
-        // which `save_all` does on the next debounced tick.
+        // The files past the new count go at the next save, after the
+        // rewrites (`save_all`).
         self.prune_orphans = true;
+        if let Some(canvas) = gone {
+            self.keep_deleted(i, canvas, name, locked, false);
+        }
+    }
+
+    /// Keep a slide just deleted from place `index` for `restore_deleted`.
+    fn keep_deleted(&mut self, index: usize, canvas: Canvas, name: String, locked: bool, emptied: bool) {
+        let after = self.canvases.get(self.active).and_then(Option::as_ref).map(|c| (self.active, c.edit_stamp()));
+        self.deleted.push(DeletedSlide { index, canvas, name, locked, emptied, after });
+    }
+
+    /// How many deleted slides `restore_deleted` can still bring back.
+    pub fn deleted_count(&self) -> usize {
+        self.deleted.len()
+    }
+
+    /// The undo key should bring back the slide deleted last: it was the
+    /// last thing done — the slide shown since is the one shown right
+    /// after the delete, with no edit made to it. Not in a second
+    /// window's frame (`restore_deleted` refuses there).
+    pub fn undo_restores_slide(&self) -> bool {
+        let Some(d) = self.deleted.last() else { return false };
+        let Some((at, stamp)) = &d.after else { return false };
+        self.view_swap.is_none()
+            && *at == self.active
+            && self.canvases.get(self.active).and_then(Option::as_ref).is_some_and(|c| c.edit_stamp() == *stamp)
+    }
+
+    /// Put back the slide deleted last, at the place it had (or last, if
+    /// there are fewer slides now), and go to it. Its name, lock, view,
+    /// undo history and pins come back with it. Returns its new index,
+    /// or why it can't come back yet.
+    pub fn restore_deleted(&mut self) -> Result<usize, &'static str> {
+        if self.deleted.is_empty() {
+            return Err("No deleted slide to bring back");
+        }
+        if self.on_board() || self.view_swap.is_some() {
+            return Err("Bring the slide back from the main window");
+        }
+        if self.loading.is_some() {
+            return Err("The slides are still opening — try again in a moment");
+        }
+        if !self.protected.is_empty() {
+            return Err("A slide that could not be read is kept in place, so slides can't be added back");
+        }
+        if self.pending_move.is_some() || self.move_stuck {
+            return Err("A slide move is still being written — try again in a moment");
+        }
+        let d = self.deleted.pop().expect("checked above");
+        let mut canvas = d.canvas;
+        canvas.dirty = true;
+        // The only slide was emptied in place: while it is still empty it
+        // takes the slide back, rather than staying as a blank one.
+        let blank = self.canvases.len() == 1
+            && self.canvases[0].as_ref().is_some_and(|c| c.layers.iter().all(|l| l.strokes.is_empty() && l.shapes.is_empty() && l.image.is_none()));
+        if d.emptied && blank {
+            self.canvases[0] = Some(canvas);
+            self.names[0] = d.name;
+            self.locks[0] = d.locked;
+            self.active = 0;
+            self.pins.forget_scans();
+            return Ok(0);
+        }
+        let i = d.index.min(self.canvases.len());
+        self.canvases.insert(i, Some(canvas));
+        self.names.insert(i, d.name);
+        self.locks.insert(i, d.locked);
+        // Every later slide moved up one place.
+        self.recent_walk = None;
+        for j in &mut self.recent {
+            if *j >= i { *j += 1; }
+        }
+        self.active = i;
+        self.pins.forget_scans();
+        // Each later slide's file now holds the slide before it: rewrite
+        // them all one slot up, the last into a new file.
+        for c in self.canvases[i..].iter_mut().flatten() {
+            c.dirty = true;
+        }
+        Ok(i)
     }
 
     /// Files a PureRef resync stored that it may not have used: the next
@@ -1312,6 +1720,15 @@ impl CanvasManager {
                 }
             });
         }
+        if self.board.dirty && self.view_swap.is_none() {
+            self.board.dirty = false;
+            let board = self.board.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = crate::persistence::save_board(&board) {
+                    log::warn!("failed to save the pins board: {e}");
+                }
+            });
+        }
         if let Some(locks) = self.take_changed_locks() {
             std::thread::spawn(move || {
                 if let Err(e) = crate::persistence::save_locks(&locks) {
@@ -1336,10 +1753,11 @@ impl CanvasManager {
             }
         }
         let count = self.canvases.len();
-        if dirty.is_empty() {
+        if dirty.is_empty() && !self.prune_orphans {
             // Nothing changed — skip the worker entirely. Most ticks
             // hit this path; the heavy work only fires after a real
-            // edit.
+            // edit. (Deleting the last slide leaves nothing to rewrite,
+            // only files to remove.)
             return;
         }
         let prune = std::mem::take(&mut self.prune_orphans);
@@ -1390,8 +1808,16 @@ impl CanvasManager {
         for c in self.canvases.iter().flatten() {
             c.media_files(&mut used);
         }
+        // The pins board's pictures and videos are in use too.
+        self.board.media_files(&mut used);
         self.media_to_check.retain(|f| !used.contains(f));
-        let unused: Vec<String> = self.media_to_check.iter().filter(|f| !keep.contains(*f)).cloned().collect();
+        // A deleted slide that can still come back holds its files like
+        // `keep` does: they stay listed, for the check at exit.
+        let mut held = HashSet::new();
+        for d in &self.deleted {
+            d.canvas.media_files(&mut held);
+        }
+        let unused: Vec<String> = self.media_to_check.iter().filter(|f| !keep.contains(*f) && !held.contains(*f)).cloned().collect();
         for f in &unused {
             self.media_to_check.remove(f);
         }
@@ -1427,6 +1853,12 @@ impl CanvasManager {
                 log::warn!("failed to save slide names: {e}");
             }
         }
+        if self.board.dirty && self.view_swap.is_none() {
+            match crate::persistence::save_board(&self.board) {
+                Ok(()) => self.board.dirty = false,
+                Err(e) => log::warn!("failed to save the pins board: {e}"),
+            }
+        }
         if let Some(locks) = self.take_changed_locks() {
             if let Err(e) = crate::persistence::save_locks(&locks) {
                 log::warn!("failed to save slide locks: {e}");
@@ -1444,14 +1876,113 @@ impl CanvasManager {
         if std::mem::take(&mut self.prune_orphans) {
             remove_stale_canvas_files(self.canvases.len());
         }
-        // The clipboard and any unfinished import end with the app, so
-        // only the slides still count.
-        if !self.media_to_check.is_empty() {
+        // The clipboard, any unfinished import, the undo history and the
+        // deleted slides kept for undo end with the app, so only what the
+        // slides' files name still counts.
+        self.deleted.clear();
+        if let Some(why) = self.sweep_blocker() {
+            log::info!("media folder not swept at exit: {why}");
+        }
+        if self.may_sweep_media() {
+            // Every file no slide uses goes: deleted pictures and layers,
+            // pictures a pad drew over, deleted slides' media alike.
+            self.media_to_check.clear();
+            self.media_cleanup_due = false;
+            if let Ok(dir) = crate::persistence::paths::media_dir() {
+                let (n, bytes) = sweep_media_in(&dir, &self.saved_media(), SWEEP_GRACE);
+                if n > 0 {
+                    log::info!("removed {n} media files no slide uses ({:.1} MB)", bytes as f64 / 1e6);
+                }
+            }
+        } else if !self.media_to_check.is_empty() {
+            // Not every slide is known as written: only the media deleted
+            // slides used, as during the run.
             self.media_cleanup_due = false;
             let unused = self.unused_media(&HashSet::new());
             delete_media_files(&unused);
         }
     }
+
+    /// The media folder may lose every file no slide names (at exit, after
+    /// `save_all_blocking` wrote them): every slide is read, none of them
+    /// failed to read or is kept from being written, every one is on disk
+    /// as it is in memory, and no picture is on its way into the folder.
+    fn may_sweep_media(&self) -> bool {
+        self.sweep_blocker().is_none()
+    }
+
+    /// Why `may_sweep_media` says no, if it does.
+    fn sweep_blocker(&self) -> Option<&'static str> {
+        if self.loading.is_some() || self.canvases.iter().any(Option::is_none) {
+            Some("slides still being read")
+        } else if self.canvases.iter().flatten().any(|c| c.dirty) {
+            Some("a slide could not be written")
+        } else if !self.protected.is_empty() || self.unreadable {
+            Some("a slide could not be read this run")
+        } else if self.board.dirty {
+            Some("the pins board could not be written")
+        } else if self.view_swap.is_some() {
+            Some("a second window's frame is running")
+        } else if self.pictures.busy() {
+            Some("pictures are still being stored")
+        } else {
+            None
+        }
+    }
+
+    /// Every media file the slides' files and the pins board name.
+    fn saved_media(&self) -> HashSet<String> {
+        let mut used = HashSet::new();
+        for c in self.canvases.iter().flatten() {
+            c.saved_media_files(&mut used);
+        }
+        self.board.saved_media_files(&mut used);
+        used
+    }
+}
+
+/// A file stored this recently is left for the next sweep: an import or a
+/// picture being stored as the app closes may not be in a slide yet.
+const SWEEP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether `name` is one of the app's own media files: 16 lowercase hex
+/// digits (a hash of the contents) and an extension. Nothing else in the
+/// folder is ever swept.
+fn is_app_media_name(name: &str) -> bool {
+    let Some((stem, ext)) = name.split_once('.') else { return false };
+    stem.len() == 16
+        && stem.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && (1..=5).contains(&ext.len())
+        && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Delete from `dir` the app's media files that `used` does not name and
+/// that were not written in the last `grace`. Returns how many went and
+/// their bytes. A file that cannot be deleted (open elsewhere) is logged
+/// and left for next time.
+fn sweep_media_in(dir: &std::path::Path, used: &HashSet<String>, grace: std::time::Duration) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0) };
+    let now = std::time::SystemTime::now();
+    let (mut n, mut bytes) = (0, 0);
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !is_app_media_name(&name) || used.contains(&name) {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        let recent = meta.modified().ok().and_then(|m| now.duration_since(m).ok()).is_none_or(|age| age < grace);
+        if !meta.is_file() || recent {
+            continue;
+        }
+        match std::fs::remove_file(e.path()) {
+            Ok(()) => {
+                n += 1;
+                bytes += meta.len();
+            }
+            Err(err) => log::warn!("could not delete unused media {}: {err}", e.path().display()),
+        }
+    }
+    (n, bytes)
 }
 
 /// Clears `CanvasManager::saving` when the save thread ends.
@@ -1529,14 +2060,7 @@ fn delete_media_files_in(dir: &std::path::Path, names: &[String]) {
 /// right after the user deleted a canvas, when those slots are known to
 /// hold content that has just been rewritten one index lower.
 fn remove_stale_canvas_files(count: usize) {
-    if let Ok(dir) = crate::persistence::paths::canvases_dir() {
-        for extra in count..(count + 10) {
-            let p = dir.join(format!("canvas_{extra}.ron"));
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
+    crate::persistence::remove_canvas_files_from(count);
 }
 
 #[cfg(test)]
@@ -1560,6 +2084,7 @@ mod media_cleanup_tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         }
     }
 
@@ -1569,6 +2094,16 @@ mod media_cleanup_tests {
 
     fn names(v: &[&str]) -> HashSet<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_pins_boards_media_counts_as_used() {
+        let mut m = CanvasManager::for_tests(vec![Canvas::default()]);
+        m.enter_board([0.0; 2], 1.0, false);
+        m.edit_active(|c| c.layers[0].shapes.push(video("board.mp4")));
+        m.leave_view();
+        m.media_to_check.extend(names(&["board.mp4", "gone.mp4"]));
+        assert_eq!(m.unused_media(&HashSet::new()), vec!["gone.mp4".to_string()]);
     }
 
     #[test]
@@ -1593,6 +2128,10 @@ mod media_cleanup_tests {
 
         m.delete_active();
         assert!(m.media_cleanup_due);
+        // While undo can still bring the slide back, none of its files go.
+        assert!(m.unused_media(&names(&["copied.gif"])).is_empty());
+        // Closing the app lets go of it (`save_all_blocking`).
+        m.deleted.clear();
         let mut unused = m.unused_media(&names(&["copied.gif"]));
         unused.sort();
         assert_eq!(unused, vec!["in-undo.mp4".to_string(), "only-here.mp4".to_string()]);
@@ -1609,7 +2148,135 @@ mod media_cleanup_tests {
         only.layers[0].shapes.push(video("v.mp4"));
         let mut m = manager(vec![only]);
         m.delete_active();
+        assert!(m.unused_media(&HashSet::new()).is_empty(), "kept while it can come back");
+        m.deleted.clear();
         assert_eq!(m.unused_media(&HashSet::new()), vec!["v.mp4".to_string()]);
+    }
+
+    #[test]
+    fn the_exit_sweep_takes_only_the_apps_files_no_slide_uses() {
+        let dir = std::env::temp_dir().join(format!("osn-media-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = [
+            "0123456789abcdef.png", // used: stays
+            "fedcba9876543210.jpg", // unused: goes
+            "aaaaaaaaaaaaaaaa.mp4", // unused: goes
+            "ABCDEFABCDEFABCD.png", // not a name the app writes: stays
+            "notes.txt",            // likewise
+            ".store-12-3.tmp",      // likewise (startup clears these)
+        ];
+        for f in files {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let used = names(&["0123456789abcdef.png"]);
+        // Just written: left for the next sweep.
+        assert_eq!(sweep_media_in(&dir, &used, std::time::Duration::from_secs(3600)), (0, 0));
+        assert_eq!(sweep_media_in(&dir, &used, std::time::Duration::ZERO), (2, 2));
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec![".store-12-3.tmp", "0123456789abcdef.png", "ABCDEFABCDEFABCD.png", "notes.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_what_the_slides_files_name_counts_at_exit() {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(video("on-slide.mp4"));
+        c.undo_log.push(UndoEntry::ObjectsRemoved(0, Vec::new(), vec![(0, video("deleted.mp4"))]));
+        let m = manager(vec![c]);
+        assert_eq!(m.saved_media(), names(&["on-slide.mp4"]), "the undo history ends with the app");
+    }
+
+    #[test]
+    fn no_sweep_unless_every_slide_is_read_and_written() {
+        let mut m = manager(vec![Canvas::default(), Canvas::default()]);
+        for c in m.canvases.iter_mut().flatten() {
+            c.dirty = false;
+        }
+        assert!(m.may_sweep_media());
+        m.canvases[1].as_mut().unwrap().dirty = true;
+        assert!(!m.may_sweep_media(), "a slide not written as it is");
+        m.canvases[1].as_mut().unwrap().dirty = false;
+        m.unreadable = true;
+        assert!(!m.may_sweep_media(), "a slide that failed to read: its pictures are unknown");
+        m.unreadable = false;
+        m.canvases[1] = None;
+        assert!(!m.may_sweep_media(), "a slide still being read");
+    }
+
+    #[test]
+    fn a_deleted_layers_media_stays_in_use_while_undo_can_bring_it_back() {
+        let mut c = Canvas::default();
+        c.add_layer();
+        c.layers[0].shapes.push(video("layer.mp4"));
+        c.delete_layer(0);
+        let mut m = manager(vec![c]);
+        m.media_to_check.insert("layer.mp4".into());
+        assert!(m.unused_media(&HashSet::new()).is_empty());
+    }
+
+    fn files_of(m: &CanvasManager, i: usize) -> HashSet<String> {
+        let mut out = HashSet::new();
+        m.slide(i).unwrap().media_files(&mut out);
+        out
+    }
+
+    #[test]
+    fn a_deleted_slide_comes_back_in_its_place_with_its_name_and_media() {
+        let with = |f: &str| {
+            let mut c = Canvas::default();
+            c.layers[0].shapes.push(video(f));
+            c
+        };
+        let mut m = manager(vec![with("a.mp4"), with("b.mp4"), with("c.mp4")]);
+        m.rename(1, "Random Inspo 9");
+        m.go_to(1);
+        m.delete_active();
+        assert_eq!(m.count(), 2);
+        assert!(m.undo_restores_slide(), "nothing done since: undo brings it back");
+        for c in m.canvases.iter_mut().flatten() {
+            c.dirty = false;
+        }
+
+        assert_eq!(m.restore_deleted(), Ok(1));
+        assert_eq!((m.count(), m.active_index()), (3, 1));
+        assert_eq!(m.name(1), "Random Inspo 9");
+        assert_eq!([files_of(&m, 0), files_of(&m, 1), files_of(&m, 2)], [names(&["a.mp4"]), names(&["b.mp4"]), names(&["c.mp4"])]);
+        // From its slot on every file is rewritten, one slot up.
+        let dirty: Vec<bool> = (0..3).map(|i| m.slide(i).unwrap().dirty).collect();
+        assert_eq!(dirty, vec![false, true, true]);
+        // Its video is in use again: no longer a candidate for deletion.
+        assert!(m.unused_media(&HashSet::new()).is_empty());
+        assert!(m.media_to_check.is_empty());
+        assert!(m.restore_deleted().is_err(), "nothing left to bring back");
+        assert!(!m.undo_restores_slide());
+    }
+
+    #[test]
+    fn undo_brings_a_slide_back_only_until_the_next_edit() {
+        let mut m = manager(vec![Canvas::default(), Canvas::default()]);
+        m.delete_active();
+        assert!(m.undo_restores_slide());
+        m.edit_active(|c| c.add_layer());
+        assert!(!m.undo_restores_slide(), "undo is the new edit's now");
+        // Bringing it back on purpose still works.
+        assert_eq!(m.restore_deleted(), Ok(0));
+        assert_eq!(m.count(), 2);
+    }
+
+    #[test]
+    fn the_only_slide_emptied_comes_back_in_place() {
+        let mut only = Canvas::default();
+        only.layers[0].shapes.push(video("v.mp4"));
+        let mut m = manager(vec![only]);
+        m.rename(0, "Only");
+        m.delete_active();
+        assert_eq!((m.count(), m.name(0)), (1, ""));
+        assert_eq!(m.restore_deleted(), Ok(0));
+        assert_eq!(m.count(), 1, "the emptied slide takes it back, no blank one left over");
+        assert_eq!(m.name(0), "Only");
+        assert_eq!(files_of(&m, 0), names(&["v.mp4"]));
     }
 
     #[test]
@@ -1632,6 +2299,24 @@ mod view_tests {
 
     fn clean() -> Canvas {
         Canvas { dirty: false, ..Canvas::default() }
+    }
+
+    #[test]
+    fn scaling_the_views_keeps_each_slide_where_it_is_on_screen() {
+        let mut a = clean();
+        a.pan = [10.0, -20.0];
+        a.zoom = 2.0;
+        let mut m = CanvasManager::for_tests(vec![a, clean()]);
+        // The UI goes from 100 % to 125 %: a point is 1.25 × the pixels,
+        // so every view shrinks by 1 / 1.25 to stay put.
+        m.scale_views(1.0 / 1.25);
+        let (pan, zoom) = m.active_view_mut();
+        assert!((pan[0] - 8.0).abs() < 1e-4 && (pan[1] + 16.0).abs() < 1e-4, "{pan:?}");
+        assert!((*zoom - 1.6).abs() < 1e-4, "{zoom}");
+        m.go_to(1);
+        let (_, zoom) = m.active_view_mut();
+        assert!((*zoom - 0.8).abs() < 1e-4, "{zoom}");
+        assert!(!m.active().dirty, "a view change is not an edit");
     }
 
     #[test]
@@ -1942,6 +2627,7 @@ mod loader_tests {
 
         slides_still_loading_are_never_written(&dir);
         moved_slides_are_renamed_not_rewritten(&dir);
+        deleted_last_slides_stay_deleted(&dir);
 
         std::env::remove_var("OSN_DATA_DIR");
         let _ = std::fs::remove_dir_all(&root);
@@ -1989,6 +2675,46 @@ mod loader_tests {
         let m = CanvasManager::load_or_default(&AppConfig::default());
         assert_eq!((m.name(0), m.name(2)), ("", "First"));
         assert_eq!(m.slide(2).unwrap().pan, [0.0, 0.0]);
+    }
+
+    /// Empty slides deleted off the end, several before one save, are
+    /// gone at the next start: every file past the last slide goes, however
+    /// far past, and the slides before them are not rewritten. Runs inside
+    /// the test above, which owns `OSN_DATA_DIR`.
+    fn deleted_last_slides_stay_deleted(dir: &std::path::Path) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            std::fs::remove_file(e.unwrap().path()).unwrap();
+        }
+        let modified = |i: usize| std::fs::metadata(dir.join(format!("canvas_{i}.ron"))).unwrap().modified().unwrap();
+        for i in 0..3 {
+            let c = Canvas { pan: [i as f32, 0.0], ..Canvas::default() };
+            std::fs::write(dir.join(format!("canvas_{i}.ron")), crate::persistence::serialize_canvas(&c).unwrap()).unwrap();
+        }
+        // Empty slides left far past the others, 3..=19 missing between.
+        let empty = crate::persistence::serialize_canvas(&Canvas::default()).unwrap();
+        for i in 20..26 {
+            std::fs::write(dir.join(format!("canvas_{i}.ron")), &empty).unwrap();
+        }
+        let before: Vec<_> = (0..3).map(modified).collect();
+
+        let mut m = CanvasManager::load_or_default(&AppConfig::default());
+        assert_eq!(m.count(), 26);
+        while m.count() > 3 {
+            m.go_to(m.count() - 1);
+            m.delete_active();
+        }
+        m.save_all(Some(&HashSet::new()));
+        while m.saving.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut left: Vec<usize> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.strip_prefix("canvas_")?.strip_suffix(".ron")?.parse().ok())
+            .collect();
+        left.sort_unstable();
+        assert_eq!(left, [0, 1, 2], "no file past the last slide is left");
+        assert_eq!((0..3).map(modified).collect::<Vec<_>>(), before, "the slides kept are not rewritten");
+        assert_eq!(CanvasManager::load_or_default(&AppConfig::default()).count(), 3);
     }
 
     /// A slide the background loader has not read yet is never written,
@@ -2166,25 +2892,118 @@ mod pin_tests {
     }
 
     #[test]
-    fn global_pins_can_move_to_the_slide_window_and_back() {
+    fn the_pins_board_is_worked_on_like_a_slide_and_put_back() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide()]);
+        m.go_to(1);
+        let global = m.pin_objects(0, &[0], &[], [0.0, 0.0], false).expect("pinned");
+        let before = m.pin_board().members(global).map(|(s, _)| s);
+
+        assert!(m.enter_board([10.0, 20.0], 0.5, false).is_some());
+        assert!(m.on_board() && m.active_editable());
+        assert_eq!(m.active_index(), 2, "the board is the active slide for the frame");
+        assert_eq!(m.count(), 3);
+        // The global pin, as the window shows it.
+        let shown: Vec<pins::Pin> = m.pinned().iter().map(|p| p.pin).collect();
+        let stored = m.pin_board().get_mut(global).map(|p| *p).unwrap();
+        assert_eq!(shown, vec![stored.viewed([10.0, 20.0], 0.5)]);
+        // Ink drawn there lands on the board.
+        m.edit_active(|c| c.layers[0].shapes.push(line(5.0)));
+        // Nothing here may delete, move, go past or pin the board.
+        m.delete_active();
+        assert_eq!(m.count(), 3);
+        assert!(m.move_slide(2, 0).is_err());
+        m.next();
+        m.go_to(0);
+        assert_eq!(m.active_index(), 2);
+        assert!(m.pin_objects(0, &[], &[0], [0.0, 0.0], false).is_none());
+        // A new slide goes before it.
+        let new = m.push_canvas(Canvas::default());
+        assert_eq!((new, m.active_index()), (2, 3));
+
+        assert_eq!(m.leave_view(), Some((BOARD, [10.0, 20.0], 0.5)));
+        assert_eq!(m.count(), 3, "the new slide stays, the board went back");
+        assert_eq!(m.active_index(), 1, "the main window's slide again");
+        assert_eq!(m.board().layers[0].shapes.len(), 1, "the ink is on the board");
+        assert!(m.board().dirty);
+        assert_eq!(m.pin_board().members(global).map(|(s, _)| s), before, "the pin's objects stay on their slide");
+    }
+
+    #[test]
+    fn a_second_window_works_on_its_slide_and_gives_the_view_back() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide(), slide()]);
+        m.go_to(0);
+        m.set_view(1, [5.0, 6.0], 0.5);
+        m.pin_objects(0, &[0], &[], [0.0, 0.0], false).expect("pinned");
+        assert!(!m.pinned().is_empty());
+
+        assert!(m.enter_view(1, [100.0, 200.0], 2.0, false).is_some());
+        assert_eq!(m.active_index(), 1, "the window's slide is the active one");
+        assert_eq!((m.active().pan, m.active().zoom), ([100.0, 200.0], 2.0), "seen through the window's view");
+        assert!(m.pinned().is_empty(), "pins are the main window's");
+        assert!(m.enter_view(2, [0.0; 2], 1.0, false).is_none(), "one at a time");
+        let (pan, zoom) = m.active_view_mut();
+        *pan = [110.0, 210.0];
+        *zoom = 3.0;
+        assert_eq!(m.leave_view(), Some((1, [110.0, 210.0], 3.0)), "the window's view as it left it");
+        assert_eq!(m.active_index(), 0, "the main window's slide again");
+        assert_eq!((m.slide(1).unwrap().pan, m.slide(1).unwrap().zoom), ([5.0, 6.0], 0.5), "slide 2 keeps its own view");
+        assert!(!m.pinned().is_empty());
+
+        // Locked: nothing on it takes edits.
+        m.enter_view(1, [0.0; 2], 1.0, true);
+        assert!(!m.active_editable() && m.view_locked());
+        m.leave_view();
+        assert!(m.active_editable());
+
+        // The window goes to another slide meanwhile.
+        m.enter_view(1, [0.0; 2], 1.0, false);
+        m.go_to(2);
+        let (now, _, _) = m.leave_view().unwrap();
+        assert_eq!((now, m.active_index()), (2, 0));
+    }
+
+    #[test]
+    fn a_slide_deleted_in_the_second_window_keeps_the_main_one_in_place() {
+        let mut m = CanvasManager::for_tests(vec![slide(), slide(), slide()]);
+        m.go_to(2);
+        m.enter_view(0, [0.0; 2], 1.0, false);
+        m.delete_active();
+        let (now, _, _) = m.leave_view().unwrap();
+        assert_eq!(m.count(), 2);
+        assert_eq!(m.active_index(), 1, "the main window's slide moved down one");
+        assert_eq!(now, 0);
+    }
+
+    #[test]
+    fn global_pins_go_to_the_pins_window_and_local_ones_stay_on_their_slide() {
         let mut m = CanvasManager::for_tests(vec![slide(), slide()]);
         let global = m.pin_objects(0, &[0], &[], [0.0, 0.0], false).expect("pinned");
         let local = m.pin_objects(0, &[], &[1], [0.0, 0.0], true).expect("pinned");
         let ids = |v: Vec<pins::Pinned>| v.iter().map(|p| p.pin.id).collect::<Vec<_>>();
         assert_eq!(ids(m.pinned()), [global, local]);
 
-        m.set_globals_away(true);
-        assert_eq!(ids(m.pinned()), [local], "the canvas keeps its local pin only");
-        assert_eq!(ids(m.global_pins()), [global], "the window gets the global one");
+        m.set_pins_away(true);
+        assert_eq!(ids(m.pinned()), [local], "the canvas keeps its local pin");
+        assert!(m.has_pins());
+        assert_eq!(ids(m.window_pins()), [global], "the pins window has the global one only");
         m.next();
-        assert!(m.pinned().is_empty(), "on another slide nothing is left on the canvas");
-        assert_eq!(ids(m.global_pins()), [global], "the window shows it whatever the slide");
+        assert!(m.pinned().is_empty() && !m.has_pins(), "another slide: no pin on the canvas");
+        assert_eq!(ids(m.window_pins()), [global], "the pins window shows it whatever the slide");
+        // On the board, as the window shows them.
+        m.enter_board([0.0; 2], 1.0, false);
+        assert_eq!(ids(m.pinned()), [global]);
+        m.leave_view();
+        // The slide window shows none.
+        m.prev();
+        m.enter_view(0, [0.0; 2], 1.0, false);
+        assert!(m.pinned().is_empty());
+        m.leave_view();
 
         m.set_pins_hidden(true);
-        assert!(m.global_pins().is_empty(), "hiding pins hides them in the window too");
+        assert!(m.window_pins().is_empty() && m.pinned().is_empty(), "hiding pins hides them everywhere");
         m.set_pins_hidden(false);
-        m.set_globals_away(false);
-        assert_eq!(ids(m.pinned()), [global], "back on the canvas");
+        m.set_pins_away(false);
+        assert_eq!(ids(m.pinned()), [global, local], "back on the canvas");
     }
 
     #[test]
@@ -2286,6 +3105,7 @@ mod pin_tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         });
         c.layers[0].opacity = 0.25;
         let mut m = CanvasManager::for_tests(vec![c]);

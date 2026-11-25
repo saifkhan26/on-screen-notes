@@ -42,13 +42,17 @@ const MIN_SCALE: f32 = 0.02;
 const GUIDE_REACH_PX: f32 = 6.0;
 /// Rotation snap while Shift is held.
 const ROTATE_SNAP: f32 = std::f32::consts::PI / 12.0;
+/// Gaps narrower than this (screen px) between a group's members are
+/// inside its outline in the selection, as in the groups highlight.
+const GROUP_BRIDGE_PX: f32 = 12.0;
 
 /// One of the grab points on the selection frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handle {
     /// Resize handle at `(x, y)` on the frame, each of −1, 0 or 1 in the
-    /// frame's own axes. Both non-zero is a corner (proportional
-    /// resize); one zero is a side (stretch along one axis).
+    /// frame's own axes. Both non-zero is a corner; one zero is a side.
+    /// Both keep the selection's proportions while `keep_proportions` is
+    /// on; off, a corner stretches both ways and a side along one axis.
     Scale { x: i8, y: i8 },
     Rotate,
 }
@@ -62,8 +66,9 @@ pub enum Gesture {
     Marquee { start: [f32; 2], cur: [f32; 2], click_target: Option<CanvasHit> },
     Move { start: [f32; 2], cur: [f32; 2] },
     /// `frame` is the selection frame as it stood at pen-down; the
-    /// resize is measured against it for the whole gesture.
-    Resize { x: i8, y: i8, frame: Obb, cur: [f32; 2] },
+    /// resize is measured against it for the whole gesture. `stretch`:
+    /// the proportions may change (taken at pen-down, see `begin_gesture`).
+    Resize { x: i8, y: i8, frame: Obb, cur: [f32; 2], stretch: bool },
     Rotate { frame: Obb, start: [f32; 2], cur: [f32; 2] },
 }
 
@@ -88,9 +93,15 @@ pub struct Chrome {
     pub rotate_stem: Option<([f32; 2], [f32; 2])>,
     /// Rubber-band box `[x0, y0, x1, y1]`.
     pub marquee: Option<[f32; 4]>,
-    /// Corners of the box around each group in the selection, when the
-    /// selection is more than one group: groups show inside the frame.
-    pub groups: Vec<[[f32; 2]; 4]>,
+    /// The outline round each group in the selection, when the selection
+    /// is more than one group: groups show inside the frame. Closed loops
+    /// round the group's members (`cover::outline`), gaps narrower than
+    /// `GROUP_BRIDGE_PX` on screen bridged.
+    pub groups: Vec<Vec<[f32; 2]>>,
+    /// The corners of each selected object's own box, when two or more
+    /// are selected: what is in the selection and what only sits inside
+    /// its frame tells apart.
+    pub objects: Vec<[[f32; 2]; 4]>,
     /// Smart guides the moving selection lines up on: each from one end
     /// to the other.
     pub guides: Vec<[[f32; 2]; 2]>,
@@ -109,6 +120,9 @@ pub struct SelectState {
     pub alt: bool,
     /// Smart guides on (the settings' switch), pushed in by the app.
     pub guides_on: bool,
+    /// Resizing keeps the selection's proportions (the settings' switch,
+    /// on by default), pushed in by the app.
+    pub keep_proportions: bool,
     /// What the selection being moved can line up with, taken when the
     /// move began.
     guides: Option<Guides>,
@@ -247,14 +261,21 @@ impl SelectState {
         Some(frame)
     }
 
-    /// Whether the side handles (one-axis stretch) are offered. They are
-    /// only shown where the stretch can be stored exactly: a single
-    /// shape stretches along its own sides, and strokes / lines / arrows
-    /// / unrotated boxes stretch along the canvas axes. Text has one
-    /// font size for both axes, and a box turned relative to the frame
-    /// would have to shear, so those selections resize from the corners
-    /// only.
+    /// Whether the side handles are offered. Keeping proportions, a side
+    /// scales the whole selection evenly, which any selection can take.
+    /// Otherwise a side stretches along one axis, so they show only where
+    /// that can be stored (`stretchable`).
     fn side_handles(&self, layer: &Layer) -> bool {
+        self.keep_proportions || self.stretchable(layer)
+    }
+
+    /// Whether the selection can be stretched (its proportions changed)
+    /// exactly: a single shape stretches along its own sides, and strokes
+    /// / lines / arrows / unrotated boxes stretch along the canvas axes.
+    /// Text has one font size for both axes, and a box turned relative to
+    /// the frame would have to shear, so those selections always keep
+    /// their proportions.
+    fn stretchable(&self, layer: &Layer) -> bool {
         let shape = |i: &usize| layer.shapes.get(*i);
         if self.sel.strokes.is_empty() && self.sel.shapes.len() == 1 {
             return !matches!(shape(&self.sel.shapes[0]), Some(Shape::Text { .. }) | None);
@@ -314,24 +335,31 @@ impl SelectState {
                 }
                 Affine::rotate_about(c, angle)
             }
-            Gesture::Resize { x, y, frame, cur } => {
+            Gesture::Resize { x, y, frame, cur, stretch } => {
                 let [hw, hh] = frame.half;
                 let q = frame.to_local(cur);
-                // The handle opposite the one being dragged stays put.
+                // The handle opposite the one being dragged stays put (for
+                // a side, the middle of the opposite side).
                 let anchor = [-(x as f32) * hw, -(y as f32) * hh];
-                let (sx, sy) = if x != 0 && y != 0 {
-                    // Corner: project the pointer onto the frame's
-                    // diagonal so the resize stays proportional however
-                    // the pointer wanders off it.
-                    let diag = [2.0 * x as f32 * hw, 2.0 * y as f32 * hh];
-                    let s = ((q[0] - anchor[0]) * diag[0] + (q[1] - anchor[1]) * diag[1])
-                        / (diag[0] * diag[0] + diag[1] * diag[1]);
-                    let s = s.max(MIN_SCALE);
-                    (s, s)
-                } else if x != 0 {
-                    (((q[0] - anchor[0]) / (2.0 * x as f32 * hw)).max(MIN_SCALE), 1.0)
-                } else {
-                    (1.0, ((q[1] - anchor[1]) / (2.0 * y as f32 * hh)).max(MIN_SCALE))
+                // How far the pointer has taken each axis the handle pulls.
+                let along_x = || ((q[0] - anchor[0]) / (2.0 * x as f32 * hw)).max(MIN_SCALE);
+                let along_y = || ((q[1] - anchor[1]) / (2.0 * y as f32 * hh)).max(MIN_SCALE);
+                let (sx, sy) = match (x != 0, y != 0) {
+                    (true, true) if stretch => (along_x(), along_y()),
+                    (true, true) => {
+                        // Corner: project the pointer onto the frame's
+                        // diagonal so the resize stays proportional however
+                        // the pointer wanders off it.
+                        let diag = [2.0 * x as f32 * hw, 2.0 * y as f32 * hh];
+                        let s = ((q[0] - anchor[0]) * diag[0] + (q[1] - anchor[1]) * diag[1])
+                            / (diag[0] * diag[0] + diag[1] * diag[1]);
+                        let s = s.max(MIN_SCALE);
+                        (s, s)
+                    }
+                    (true, false) if stretch => (along_x(), 1.0),
+                    (true, false) => (along_x(), along_x()),
+                    (false, _) if stretch => (1.0, along_y()),
+                    (false, _) => (along_y(), along_y()),
                 };
                 // Into the frame's own axes, scale about the anchor, and
                 // back out.
@@ -350,7 +378,15 @@ impl SelectState {
     /// Frame, handles and marquee as they should be drawn right now —
     /// i.e. with the in-flight gesture applied.
     pub fn chrome(&self, canvas: &Canvas) -> Chrome {
-        let mut out = Chrome { frame: None, handles: Vec::new(), rotate_stem: None, marquee: None, groups: Vec::new(), guides: Vec::new() };
+        let mut out = Chrome {
+            frame: None,
+            handles: Vec::new(),
+            rotate_stem: None,
+            marquee: None,
+            groups: Vec::new(),
+            objects: Vec::new(),
+            guides: Vec::new(),
+        };
         if let Some(Gesture::Marquee { start, cur, .. }) = self.gesture {
             out.marquee = Some([
                 start[0].min(cur[0]), start[1].min(cur[1]),
@@ -374,7 +410,14 @@ impl SelectState {
         }
         let c = base.corners().map(|p| m.apply(p));
         out.frame = Some(c);
-        out.groups = self.group_boxes(layer).into_iter().map(|b| aabb_frame(b).corners().map(|p| m.apply(p))).collect();
+        for members in self.group_members(layer) {
+            let boxes: Vec<egui::Rect> =
+                members.iter().map(|b| egui::Rect::from_min_max(egui::pos2(b[0], b[1]), egui::pos2(b[2], b[3]))).collect();
+            for l in crate::canvas::cover::outline(&boxes, GROUP_BRIDGE_PX / zoom) {
+                out.groups.push(l.into_iter().map(|p| m.apply([p.x, p.y])).collect());
+            }
+        }
+        out.objects = self.object_corners(layer, &m);
 
         let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
         let corners = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
@@ -399,11 +442,11 @@ impl SelectState {
         out
     }
 
-    /// The box around each group with objects in the selection — none
-    /// when the selection is a single group and nothing else, whose box
-    /// the frame already is.
-    fn group_boxes(&self, layer: &Layer) -> Vec<[f32; 4]> {
-        let mut boxes: Vec<(u64, [f32; 4])> = Vec::new();
+    /// The boxes of the selected members of each group with objects in
+    /// the selection — none when the selection is a single group and
+    /// nothing else, which the frame already shows.
+    fn group_members(&self, layer: &Layer) -> Vec<Vec<[f32; 4]>> {
+        let mut groups: Vec<(u64, Vec<[f32; 4]>)> = Vec::new();
         let mut loose = false;
         let mut add = |g: u64, b: Option<[f32; 4]>| {
             let Some(b) = b else { return };
@@ -411,9 +454,9 @@ impl SelectState {
                 loose = true;
                 return;
             }
-            match boxes.iter_mut().find(|(id, _)| *id == g) {
-                Some((_, a)) => *a = [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
-                None => boxes.push((g, b)),
+            match groups.iter_mut().find(|(id, _)| *id == g) {
+                Some((_, boxes)) => boxes.push(b),
+                None => groups.push((g, vec![b])),
             }
         };
         for &i in &self.sel.strokes {
@@ -422,10 +465,36 @@ impl SelectState {
         for &i in &self.sel.shapes {
             if let Some(s) = layer.shapes.get(i) { add(s.group(), Some(shape_bounds(s))); }
         }
-        if boxes.len() == 1 && !loose {
+        if groups.len() == 1 && !loose {
             return Vec::new();
         }
-        boxes.into_iter().map(|(_, b)| b).collect()
+        groups.into_iter().map(|(_, b)| b).collect()
+    }
+
+    /// Each selected object's own box as it shows under the gesture's
+    /// transform `m`, when two or more are selected (one object's box is
+    /// the frame). A box, an ellipse, a picture or a label keeps its own
+    /// turn; ink and lines get the box round them.
+    fn object_corners(&self, layer: &Layer, m: &Affine) -> Vec<[[f32; 2]; 4]> {
+        if self.sel.strokes.len() + self.sel.shapes.len() < 2 {
+            return Vec::new();
+        }
+        let moving = !m.is_identity();
+        let strokes = self.sel.strokes.iter().filter_map(|&i| {
+            let b = layer.strokes.get(i)?.bounds()?;
+            Some(aabb_frame(b).corners().map(|p| m.apply(p)))
+        });
+        let shapes = self.sel.shapes.iter().filter_map(|&i| {
+            let s = layer.shapes.get(i)?;
+            Some(if moving {
+                let mut moved = s.clone();
+                moved.apply_affine(m);
+                moved.obb().corners()
+            } else {
+                s.obb().corners()
+            })
+        });
+        strokes.chain(shapes).collect()
     }
 
     /// Handle under `p`, if any. The rotate knob is checked first, then
@@ -548,7 +617,10 @@ impl SelectState {
         if let (Some(h), Some(frame)) = (self.handle_at(p, canvas), self.frame(layer, canvas.zoom)) {
             self.gesture = Some(match h {
                 Handle::Rotate => Gesture::Rotate { frame, start: p, cur: p },
-                Handle::Scale { x, y } => Gesture::Resize { x, y, frame, cur: p },
+                Handle::Scale { x, y } => {
+                    let stretch = !self.keep_proportions && self.stretchable(layer);
+                    Gesture::Resize { x, y, frame, cur: p, stretch }
+                }
             });
             return;
         }
@@ -789,6 +861,7 @@ mod tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         }
     }
 
@@ -801,10 +874,22 @@ mod tests {
         c
     }
 
+    /// The tool as the app sets it up: keeping proportions (the default).
     fn tool(c: &Canvas) -> SelectState {
-        let mut t = SelectState::default();
+        let mut t = SelectState { keep_proportions: true, ..Default::default() };
         t.sync(true, 0, c);
         t
+    }
+
+    fn raster_box(c: &Canvas) -> ([f32; 2], [f32; 2]) {
+        match &c.layers[0].shapes[0] {
+            Shape::Raster { pos, size, .. } => (*pos, *size),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn near(a: [f32; 2], b: [f32; 2]) -> bool {
+        (a[0] - b[0]).abs() < 1e-2 && (a[1] - b[1]).abs() < 1e-2
     }
 
     fn click(t: &mut SelectState, c: &mut Canvas, p: [f32; 2]) {
@@ -971,17 +1056,38 @@ mod tests {
     }
 
     #[test]
-    fn side_handle_stretches_one_axis() {
+    fn a_side_handle_scales_evenly_about_the_opposite_side() {
         let mut c = Canvas::default();
         c.layers[0].shapes.push(image([0.0, 0.0], [100.0, 50.0]));
         let mut t = tool(&c);
         click(&mut t, &mut c, [50.0, 25.0]);
-        // Right-hand side handle, pulled 50 px further right.
+        // Right-hand side handle, pulled 50 px further right: half as big
+        // again both ways, the left side's middle staying put.
         t.begin([100.0, 25.0], &mut c);
-        assert!(matches!(t.gesture, Some(Gesture::Resize { x: 1, y: 0, .. })));
+        assert!(matches!(t.gesture, Some(Gesture::Resize { x: 1, y: 0, stretch: false, .. })));
         t.end([150.0, 25.0], &mut c);
-        assert!(matches!(&c.layers[0].shapes[0], Shape::Raster { size, .. }
-            if (size[0] - 150.0).abs() < 1e-2 && (size[1] - 50.0).abs() < 1e-2));
+        let (pos, size) = raster_box(&c);
+        assert!(near(size, [150.0, 75.0]), "{size:?}");
+        assert!(near(pos, [0.0, -12.5]), "{pos:?}");
+    }
+
+    #[test]
+    fn with_proportions_off_the_handles_stretch() {
+        let mut c = Canvas::default();
+        c.layers[0].shapes.push(image([0.0, 0.0], [100.0, 50.0]));
+        let mut t = tool(&c);
+        t.keep_proportions = false;
+        click(&mut t, &mut c, [50.0, 25.0]);
+        // Right-hand side handle: along one axis only.
+        t.begin([100.0, 25.0], &mut c);
+        assert!(matches!(t.gesture, Some(Gesture::Resize { x: 1, y: 0, stretch: true, .. })));
+        t.end([150.0, 25.0], &mut c);
+        assert!(near(raster_box(&c).1, [150.0, 50.0]), "{:?}", raster_box(&c));
+        // Bottom-right corner: each way as far as the pointer goes.
+        t.begin([150.0, 50.0], &mut c);
+        t.end([300.0, 60.0], &mut c);
+        let (pos, size) = raster_box(&c);
+        assert!(near(pos, [0.0, 0.0]) && near(size, [300.0, 60.0]), "{pos:?} {size:?}");
     }
 
     #[test]
@@ -1105,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_selection_with_text_gets_corner_handles_only() {
+    fn text_in_a_selection_never_stretches() {
         let mut c = Canvas::default();
         c.layers[0].strokes.push(stroke([0.0, 0.0], [100.0, 0.0]));
         c.layers[0].shapes.push(Shape::Text {
@@ -1119,13 +1225,19 @@ mod tests {
         });
         let mut t = tool(&c);
         t.sel = Selection { strokes: vec![0], shapes: vec![0] };
-        let scale_handles = t
-            .chrome(&c)
-            .handles
-            .iter()
-            .filter(|(_, h)| matches!(h, Handle::Scale { .. }))
-            .count();
-        assert_eq!(scale_handles, 4);
+        let scale_handles = |t: &SelectState| {
+            t.chrome(&c).handles.iter().filter(|(_, h)| matches!(h, Handle::Scale { .. })).count()
+        };
+        // Keeping proportions, its sides scale it evenly: all eight.
+        assert_eq!(scale_handles(&t), 8);
+        // Stretching, text can't follow: corners only, and they keep
+        // its proportions.
+        t.keep_proportions = false;
+        assert_eq!(scale_handles(&t), 4);
+        let corner = t.chrome(&c).handles[2].0;
+        t.begin(corner, &mut c);
+        assert!(matches!(t.gesture, Some(Gesture::Resize { x: 1, y: 1, stretch: false, .. })));
+        t.cancel();
         // Strokes alone can stretch, so all eight are offered.
         t.sel = Selection { strokes: vec![0], shapes: vec![] };
         assert_eq!(t.chrome(&c).handles.len(), 9);
@@ -1293,5 +1405,65 @@ mod tests {
         assert_eq!(t.sel.shapes, vec![0, 1]);
         assert!(matches!(&c.layers[0].shapes[0], Shape::Raster { .. }));
         assert!(matches!(&c.layers[0].shapes[1], Shape::Rect { .. }));
+    }
+
+    /// `p` is inside the box with these corners (not turned).
+    fn holds(q: &[[f32; 2]; 4], p: [f32; 2]) -> bool {
+        let (xs, ys) = (q.map(|c| c[0]), q.map(|c| c[1]));
+        let min = |v: [f32; 4]| v.into_iter().fold(f32::MAX, f32::min);
+        let max = |v: [f32; 4]| v.into_iter().fold(f32::MIN, f32::max);
+        (min(xs)..=max(xs)).contains(&p[0]) && (min(ys)..=max(ys)).contains(&p[1])
+    }
+
+    /// Two objects selected with one between them: each selected one
+    /// shows its own box, the one between has none, and a move in flight
+    /// takes the boxes along. One object alone: its frame is its box.
+    #[test]
+    fn each_selected_object_shows_its_own_box() {
+        let mut c = Canvas { zoom: 1.0, pan: [0.0, 0.0], ..Default::default() };
+        c.layers[0].shapes = vec![rect([0.0, 0.0], [10.0, 10.0]), rect([20.0, 0.0], [30.0, 10.0]), rect([40.0, 0.0], [50.0, 10.0])];
+        let mut t = tool(&c);
+        t.sel.insert(ObjRef::Shape(0));
+        t.sel.insert(ObjRef::Shape(2));
+        let ch = t.chrome(&c);
+        assert_eq!(ch.objects.len(), 2);
+        assert!(holds(&ch.objects[0], [5.0, 5.0]) && holds(&ch.objects[1], [45.0, 5.0]));
+        assert!(!ch.objects.iter().any(|q| holds(q, [25.0, 5.0])), "the one between is not marked");
+        t.gesture = Some(Gesture::Move { start: [5.0, 5.0], cur: [105.0, 5.0] });
+        let ch = t.chrome(&c);
+        assert!(holds(&ch.objects[0], [105.0, 5.0]) && !holds(&ch.objects[0], [5.0, 5.0]));
+        t.gesture = None;
+        t.sel.clear();
+        t.sel.insert(ObjRef::Shape(1));
+        assert!(t.chrome(&c).objects.is_empty());
+    }
+
+    /// Two groups selected: each shows a line round its own members —
+    /// one far apart from the rest of its group gets a loop of its own —
+    /// not one box over whatever lies between them.
+    #[test]
+    fn groups_in_the_selection_are_outlined_round_their_members() {
+        let mut c = Canvas { zoom: 1.0, pan: [0.0, 0.0], ..Default::default() };
+        let grouped = |a: [f32; 2], g: u64| {
+            let mut s = rect(a, [a[0] + 10.0, a[1] + 10.0]);
+            s.set_group(g);
+            s
+        };
+        c.layers[0].shapes = vec![grouped([0.0, 0.0], 1), grouped([100.0, 100.0], 1), grouped([200.0, 0.0], 2), rect([50.0, 50.0], [60.0, 60.0])];
+        let mut t = tool(&c);
+        for i in 0..3 {
+            t.sel.insert(ObjRef::Shape(i));
+        }
+        let ch = t.chrome(&c);
+        assert_eq!(ch.groups.len(), 3, "group 1 in two pieces, group 2 in one");
+        assert!(ch.groups.iter().all(|l| l.len() == 4));
+        // Nothing round the unselected object between group 1's members.
+        let around = |l: &Vec<[f32; 2]>, p: [f32; 2]| holds(&[l[0], l[1], l[2], l[3]], p);
+        assert!(!ch.groups.iter().any(|l| around(l, [55.0, 55.0])));
+        // One group alone: the frame is its outline.
+        t.sel.clear();
+        t.sel.insert(ObjRef::Shape(0));
+        t.sel.insert(ObjRef::Shape(1));
+        assert!(t.chrome(&c).groups.is_empty());
     }
 }

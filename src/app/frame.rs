@@ -14,10 +14,12 @@ impl OnScreenNotesApp {
         self.canvases.poll_loads();
         let stored = self.canvases.store_pictures();
         self.overlay_cache.carry_pictures(&stored);
+        self.pad_follow_store(&stored);
+        self.dup_follow_store(&stored);
         self.canvases.refresh_pins();
-        // The global pins are on the canvas, or in the slide window when
-        // its "Pins" toggle is on; never both.
-        self.canvases.set_globals_away(self.slide_window.as_ref().is_some_and(|w| w.shows_pins()));
+        // Global pins show in the pins window only; local ones stay on
+        // their slide on the canvas.
+        self.canvases.set_pins_away(true);
         // Every pin shows wholly on the canvas area, whatever its size now.
         let area = self.overlay_cache.canvas_rect(ctx).size();
         self.canvases.set_pin_area([area.x, area.y]);
@@ -67,7 +69,7 @@ impl OnScreenNotesApp {
         if do_capture {
             if let Some(ps) = self.pending_screenshot.take() {
                 self.do_screenshot(&ps);
-                self.ui_visible = ps.ui_visible_before;
+                self.ws.ui_visible = ps.ui_visible_before;
                 self.config.bg_opacity = ps.bg_opacity_before;
             }
         }
@@ -86,7 +88,7 @@ impl OnScreenNotesApp {
         };
         if let Some((ppp, ui_prev, bg_prev)) = do_freeze {
             self.do_freeze(ppp);
-            self.ui_visible = ui_prev;
+            self.ws.ui_visible = ui_prev;
             self.config.bg_opacity = bg_prev;
             self.pending_freeze = None;
         }
@@ -112,7 +114,7 @@ impl OnScreenNotesApp {
         if do_lasso {
             if let Some(ps) = self.pending_lasso.take() {
                 self.do_lasso_capture(ps.pixels_per_point, ps.pan, ps.zoom, &ps.polygon);
-                self.ui_visible = ps.ui_visible_before;
+                self.ws.ui_visible = ps.ui_visible_before;
                 self.config.bg_opacity = ps.bg_opacity_before;
             }
         }
@@ -135,6 +137,15 @@ impl OnScreenNotesApp {
         }
     }
 
+    /// Where the main window's client area starts on screen, in pixels:
+    /// what pen samples are taken relative to.
+    pub(super) fn client_origin(&self, ctx: &egui::Context) -> [i32; 2] {
+        let ppp = ctx.pixels_per_point().max(1e-3);
+        crate::platform::client_rect(self.osn_hwnd).map(|(l, t, _, _)| [l, t]).unwrap_or_else(|| {
+            ctx.input(|i| i.viewport().inner_rect.map(|r| [(r.min.x * ppp).round() as i32, (r.min.y * ppp).round() as i32]).unwrap_or([0, 0]))
+        })
+    }
+
     /// This frame's pen events, smoothed for the active smoothing mode (the
     /// ones a gesture over the slide window owns taken out), and where the window's
     /// client area is on screen.
@@ -143,17 +154,24 @@ impl OnScreenNotesApp {
         //    * `client_origin` = screen-pixel coordinate of our window's
         //      client area's top-left. The Wintab backend reports packets
         //      in screen pixels; subtracting `client_origin` converts to
-        //      window-client coordinates.
-        //    * After polling, we transform each sample from window-client
-        //      to canvas-local (subtract canvas rect, pan, divide zoom),
-        //      then dispatch to tools.
-        let client_origin = ctx.input(|i| {
-            i.viewport()
-                .inner_rect
-                .map(|r| [r.min.x as i32, r.min.y as i32])
-                .unwrap_or([0, 0])
-        });
-        let raw_pen_events = self.pen.poll(client_origin);
+        //      window-client pixels. They are smoothed, and the slide
+        //      windows claim theirs, in pixels.
+        //    * Then each sample goes to window-client *points* (÷ ppp), the
+        //      space egui, `canvas_rect` and `canvas.pan` are in. A point is
+        //      a pixel only at 100 % — the system's scaling and the UI size
+        //      (`config.ui_scale`, egui's zoom) both change that.
+        let ppp = ctx.pixels_per_point().max(1e-3);
+        let client_origin = self.client_origin(ctx);
+        // What the frame's hold read while it waited comes first.
+        let mut raw_pen_events = std::mem::take(&mut self.early_pen);
+        raw_pen_events.extend(self.pen.poll(client_origin));
+        // The packets still show the pen touching, none has come for a
+        // while, and the mouse moves or clicks here: the pen's lift was
+        // lost, so lift it now. Until then the mouse would be ignored as
+        // the pen's own (see `PenInput::release_if_stale`).
+        if raw_pen_events.is_empty() && ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed()) {
+            raw_pen_events.extend(self.pen.release_if_stale(PEN_OWNS_POINTER));
+        }
 
         // ---- Smooth raw pen samples --------------------------------------
         // Wintab packets carry digitizer noise; at low pen speed the noise
@@ -171,7 +189,7 @@ impl OnScreenNotesApp {
         // config. A new stroke begun this frame will lock-in the
         // current options at pen-down; an in-progress stroke keeps the
         // snapshot it was started with.
-        self.tool.smoothing = self.config.smoothing;
+        self.ws.tool.smoothing = self.config.smoothing;
         // Push the render-side fan-corner toggle so the ribbon mesh
         // builder can read it lock-free on the hot path.
         crate::canvas::render::set_fan_corners(
@@ -224,6 +242,10 @@ impl OnScreenNotesApp {
         if let Some(win) = self.slide_window.as_mut() {
             win.claim_pen(&mut pen_events, client_origin);
         }
+        if let Some(win) = self.pins_window.as_mut() {
+            win.claim_pen(&mut pen_events, client_origin);
+        }
+        let pen_events = pen_events.into_iter().map(|ev| pen_in_points(ev, ppp)).collect();
         (pen_events, client_origin)
     }
 
@@ -249,11 +271,11 @@ impl OnScreenNotesApp {
             }
         }
         // Esc also closes the layer-preview popup, and lets go of a pin.
-        if self.show_layer_preview && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.show_layer_preview = false;
+        if self.ws.show_layer_preview && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.ws.show_layer_preview = false;
         }
-        if self.pin_tool.selected.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.pin_tool.clear();
+        if self.ws.pin_tool.selected.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.ws.pin_tool.clear();
         }
         if self.pin_picking {
             // Force click-through so the visible click lands on the
@@ -325,7 +347,7 @@ impl OnScreenNotesApp {
             let z_held = ctx.input(|i| i.key_down(egui::Key::Z));
             let z_ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
             // A "z" typed into a slide name is not the loupe.
-            let z_modal = z_held && !z_ctrl && !self.slide_panel.is_renaming();
+            let z_modal = z_held && !z_ctrl && !self.ws.slide_panel.is_renaming();
             if z_modal && self.loupe.is_none() {
                 match ui::loupe::LoupeState::start_live(ctx, self.osn_hwnd) {
                     Ok(l) => self.loupe = Some(l),
@@ -357,9 +379,9 @@ impl OnScreenNotesApp {
                 .interactable(false)
                 .show(ctx, |ui| {
                     egui::Frame::none()
-                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140))
-                        .rounding(6.0)
-                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                        .fill(ui::theme::GLASS_FILL)
+                        .rounding(10.0)
+                        .inner_margin(egui::Margin::symmetric(10.0, 5.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 // Pulsing red dot — alpha modulated by
@@ -395,10 +417,17 @@ impl OnScreenNotesApp {
                     .interactable(false)
                     .show(ctx, |ui| {
                         egui::Frame::none()
-                            .fill(egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220))
-                            .rounding(8.0)
-                            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                            .fill(ui::theme::GLASS_FILL)
+                            .rounding(12.0)
+                            .shadow(ui::theme::card_shadow())
+                            .inner_margin(egui::Margin::symmetric(16.0, 10.0))
                             .show(ui, |ui| {
+                                // One line when it fits, wrapped past 520
+                                // points: the area's width from an older,
+                                // shorter toast must not wrap this one.
+                                let font = egui::TextStyle::Body.resolve(ui.style());
+                                let w = ui.fonts(|f| f.layout_no_wrap(msg.clone(), font, egui::Color32::WHITE).size().x);
+                                ui.set_width(w.min(520.0).ceil());
                                 ui.label(msg);
                             });
                     });
@@ -406,72 +435,189 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// The slide window, after the overlay drew this frame (it shares the
-    /// overlay's texture cache), looking like the overlay and following it live.
-    pub(super) fn show_slide_window(&mut self, ctx: &egui::Context, space_held: bool) {
-        // ---- Slide window ------------------------------------------------
-        // After the overlay drew this frame: the window shares its
+    /// The slide window and the pins window, after the overlay drew this
+    /// frame (they share its texture cache), looking like the overlay and
+    /// following it live. Each runs the app's own frame (`view_pass`)
+    /// with its own state: its slide, or for the pins window the pins
+    /// board, is the active one meanwhile (`CanvasManager::enter_view`,
+    /// `enter_board`), so its tools and keys are the overlay's.
+    pub(super) fn show_windows(&mut self, ctx: &egui::Context) {
+        if self.slide_window.is_none() {
+            self.window_ws = None;
+        }
+        if self.pins_window.is_none() {
+            self.pins_ws = None;
+        }
+        if self.slide_window.is_none() && self.pins_window.is_none() {
+            return;
+        }
+        if self.canvases.count() == 0 {
+            self.slide_window = None;
+            self.pins_window = None;
+            return;
+        }
+        // After the overlay drew this frame: the windows share its
         // texture cache, whose once-a-frame start the overlay ran — or,
         // with the overlay hidden, runs here.
-        if let Some(win) = self.slide_window.as_mut() {
-            if !self.overlay_visible {
-                self.overlay_cache.begin_frame(ctx);
-            }
-            // It looks like the overlay, and follows it live.
-            let look = ui::slide_window::Look {
-                background: ui::slide_window::Look::background(self.config.bg_color, self.config.bg_opacity),
-                chrome: self.ui_visible,
-                owner: self.osn_hwnd,
+        if !self.overlay_visible {
+            self.overlay_cache.begin_frame(ctx);
+        }
+        self.main_canvas = crate::platform::client_rect(self.osn_hwnd).map(|(l, t, _, _)| MainCanvas {
+            rect: self.overlay_cache.canvas_rect(ctx),
+            origin_px: [l as f32, t as f32],
+            ppp: ctx.pixels_per_point(),
+        });
+        for kind in [WindowKind::Slide, WindowKind::Pins] {
+            let (win, ws) = match kind {
+                WindowKind::Slide => (self.slide_window.take(), self.window_ws.take()),
+                WindowKind::Pins => (self.pins_window.take(), self.pins_ws.take()),
             };
-            // Where the canvas is on screen, for a selection dragged out of
-            // the window onto it; and whether one dragged on the canvas is
-            // over the window now.
-            let ppp = ctx.pixels_per_point();
-            let canvas_min = self.overlay_cache.canvas_rect(ctx).min;
-            let main = crate::platform::client_rect(self.osn_hwnd).map(|(l, t, _, _)| ui::slide_edit::MainCanvas {
-                hwnd: self.osn_hwnd,
-                origin_px: [l as f32 + canvas_min.x * ppp, t as f32 + canvas_min.y * ppp],
-                ppp,
-            });
-            let dragging_selection = self.tool.kind == crate::tools::ToolKind::Select
-                && !self.tool.select.sel.is_empty()
-                && matches!(self.tool.select.gesture, Some(crate::tools::select_tool::Gesture::Move { .. }));
-            let drop_hover = dragging_selection
-                && win.hwnd() != 0
-                && crate::platform::cursor_pos().is_some_and(|(x, y)| crate::platform::top_level_window_at(x, y) == win.hwnd());
-            let input = ui::slide_edit::Input {
-                space: space_held,
-                pen_owns_pointer: self.pen.is_down() || self.pen.used_within(PEN_OWNS_POINTER),
-                keys: &self.hotkeys_cfg,
-                main,
-                drop_hover,
-                main_area: {
-                    let s = self.overlay_cache.canvas_rect(ctx).size();
-                    [s.x, s.y]
-                },
-            };
-            let open = ui::slide_window::show(
-                ctx,
-                win,
-                &mut self.overlay_cache,
-                &mut self.canvases,
-                self.config.smoothing_level.position_passes(),
-                &self.media,
-                &look,
-                &mut self.tool,
-                &input,
-            );
-            if let Some(msg) = win.take_notice() {
-                self.toast = Some((msg, Instant::now()));
-            }
-            if let Some(id) = win.take_open_pin() {
-                let area = self.overlay_cache.canvas_rect(ctx).size();
-                self.open_pin_slide(id, area);
-            }
-            if !open {
-                self.slide_window = None;
+            let Some(win) = win else { continue };
+            let (win, ws) = self.run_window(ctx, kind, win, ws);
+            match kind {
+                WindowKind::Slide => {
+                    self.slide_window = win;
+                    self.window_ws = ws;
+                }
+                WindowKind::Pins => {
+                    self.pins_window = win;
+                    self.pins_ws = ws;
+                }
             }
         }
+    }
+
+    /// One frame of a second window: `win` with its state `ws` (made if
+    /// it has none yet). Both back, or none once the window was closed.
+    fn run_window(
+        &mut self,
+        ctx: &egui::Context,
+        kind: WindowKind,
+        mut win: ui::slide_window::SlideWindow,
+        ws: Option<workspace::Workspace>,
+    ) -> (Option<ui::slide_window::SlideWindow>, Option<workspace::Workspace>) {
+        win.keep_in_range(&mut self.canvases);
+        let mut ws = ws.unwrap_or_else(|| {
+            let tool = ActiveTool::from_config(&self.config);
+            let mut eraser = ActiveTool::from_config(&self.config);
+            eraser.kind = crate::tools::ToolKind::Eraser;
+            workspace::Workspace::new(tool, eraser)
+        });
+        // It looks like the overlay, and follows it live.
+        let look = ui::slide_window::Look {
+            background: ui::slide_window::Look::background(self.config.bg_color, self.config.bg_opacity),
+        };
+        let builder = win.builder(&self.canvases);
+        self.running = Some(kind);
+        let open = ctx.show_viewport_immediate(win.viewport(), builder, |ctx, class| {
+            // A backend with one window would draw this over the canvas.
+            // Desktop eframe always makes a real window.
+            if class == egui::ViewportClass::Embedded {
+                return false;
+            }
+            let mut open = !ctx.input(|i| i.viewport().close_requested());
+            ui::slide_window::paint_background(ctx, look.background);
+            // Room the window's bar takes, kept clear when fitting.
+            let top = if ws.ui_visible { ui::slide_window::bar_bottom(ctx).map_or(56.0, |b| b + 6.0) } else { 0.0 };
+            win.before_pass(ctx, &self.canvases, top);
+            win.lock_hint(ctx, ws.tool.kind);
+            let (events, origin) = win.take_pen_events(ctx.pixels_per_point());
+            let (slide, pan, zoom) = win.view();
+            // The pins window works on the pins board like a slide.
+            let entered = if win.shows_pins() {
+                self.canvases.enter_board(pan, zoom, win.locked())
+            } else {
+                self.canvases.enter_view(slide, pan, zoom, win.locked())
+            };
+            if entered.is_some() {
+                std::mem::swap(&mut self.ws, &mut ws);
+                self.ws.hwnd = win.hwnd();
+                self.overlay_cache.enter_child(win.canvas_rect_mut());
+                self.view_pass(ctx, &events, origin, true);
+                self.overlay_cache.leave_child(win.canvas_rect_mut());
+                std::mem::swap(&mut self.ws, &mut ws);
+                if let Some((s, p, z)) = self.canvases.leave_view() {
+                    win.after_pass(s, p, z, ctx.pixels_per_point());
+                }
+            } else {
+                ui::slide_window::opening(ctx);
+            }
+            let (stays, picked) = ui::slide_window::chrome(
+                ctx,
+                &mut win,
+                &self.canvases,
+                ws.ui_visible,
+                &ws.tool,
+                &mut self.config.palette,
+                &mut self.config.slide_window_ui,
+            );
+            open &= stays;
+            if picked.is_some() {
+                ws.picked_colour = picked;
+            }
+            open
+        });
+        self.running = None;
+        win.find_handle(self.osn_hwnd);
+        // Dropped on the main window from this one: selected there.
+        if let Some((slide, placed)) = self.main_select.take() {
+            if slide == self.canvases.active_index() {
+                if let Some(c) = self.canvases.slide(slide) {
+                    self.ws.tool.kind = crate::tools::ToolKind::Select;
+                    self.ws.tool.select.sel = placed;
+                    self.ws.tool.select.gesture = None;
+                    self.ws.tool.select.rebind(slide, c);
+                }
+            }
+        }
+        if let Some(msg) = win.take_notice() {
+            self.toast = Some((msg, Instant::now()));
+        }
+        // A pin double-clicked in the pins window: the main window goes to
+        // its slide.
+        if let Some(id) = self.pin_to_open.take() {
+            let area = self.overlay_cache.canvas_rect(ctx).size();
+            self.open_pin_slide(id, area);
+        }
+        // Pad textures let go of in the window's frame are freed by the
+        // overlay's next one, never in the window's own pass.
+        self.ws.pad.take_retired(&mut ws.pad);
+        if open && !std::mem::take(&mut self.window_close) {
+            (Some(win), Some(ws))
+        } else {
+            (None, None)
+        }
+    }
+
+    /// Start and stop the video and GIF players for what both windows
+    /// show, and upload their new frames: once a frame, before either
+    /// paints. `view` is the overlay's canvas area; the slide window's is
+    /// where it drew last frame.
+    pub(super) fn sync_media(&mut self, ctx: &egui::Context, view: egui::Rect) {
+        // The pins play in the pins window, as it shows them.
+        let pins_view = self.pins_window.as_ref().and_then(|w| w.media_view());
+        let pins: Vec<crate::canvas::pins::Pinned> = match pins_view {
+            Some((_, pan, zoom, _)) => self
+                .canvases
+                .window_pins()
+                .into_iter()
+                .map(|p| crate::canvas::pins::Pinned { pin: p.pin.viewed(pan, zoom), ..p })
+                .collect(),
+            None => Vec::new(),
+        };
+        // The main window's own: its slide and that slide's local pins.
+        let local = self.canvases.pinned();
+        let c = self.canvases.active();
+        let mut views = vec![crate::media::ShownIn { canvas: c, pan: c.pan, zoom: c.zoom, pins: &local, view }];
+        if let Some((idx, pan, zoom, rect)) = self.slide_window.as_ref().and_then(|w| w.media_view()) {
+            if let Some(c) = self.canvases.slide(idx) {
+                views.push(crate::media::ShownIn { canvas: c, pan, zoom, pins: &[], view: rect });
+            }
+        }
+        if let Some((_, pan, zoom, rect)) = pins_view {
+            views.push(crate::media::ShownIn { canvas: self.canvases.board(), pan, zoom, pins: &pins, view: rect });
+        }
+        self.media.sync_views(ctx, &views, ctx.pixels_per_point());
     }
 
     /// Every 5 s: save what changed (in the background) and the config.
@@ -509,24 +655,28 @@ impl OnScreenNotesApp {
     pub(super) fn show_layer_panel(&mut self, ctx: &egui::Context) {
         // ---- Layer panel ---------------------------------------------
         // Hidden when the master UI toggle is off.
-        if self.ui_visible {
+        if self.ws.ui_visible {
             let canvas_idx = self.canvases.active_index();
             // Pass the manager, not `active_mut()`: taking the mutable
             // canvas borrow every frame just to paint would flag it
             // dirty ~60×/s and put the autosave back into a permanent
             // rewrite loop. The panel takes it only on a real click.
-            ui::layer_panel::show(
+            let delete = ui::layer_panel::show(
                 ctx,
                 &mut self.overlay_cache,
                 canvas_idx,
                 &mut self.canvases,
             );
+            // Its delete button asks first when the layer holds anything.
+            if let Some(li) = delete {
+                self.request_layer_delete(li);
+            }
         }
         // Layer preview popup — large centred thumbnail of the
         // active layer. Toggled by the `canvas.preview_layer`
         // hotkey (`q` by default). Esc closes (handled earlier in
         // this frame).
-        if self.show_layer_preview {
+        if self.ws.show_layer_preview {
             let canvas_idx = self.canvases.active_index();
             let active_li = self.canvases.active().active_layer;
             let layer_clone = self.canvases.active().layers[active_li].clone();
@@ -582,6 +732,40 @@ impl OnScreenNotesApp {
                         );
                     });
                 });
+        }
+    }
+}
+
+/// A pen event at window-client pixels `pos`, moved to window-client
+/// points: what the overlay's frame works in.
+fn pen_in_points(ev: crate::input::pen::PenEvent, ppp: f32) -> crate::input::pen::PenEvent {
+    use crate::input::pen::PenEvent;
+    let to = |s: crate::canvas::stroke::PenSample| crate::canvas::stroke::PenSample { pos: [s.pos[0] / ppp, s.pos[1] / ppp], ..s };
+    match ev {
+        PenEvent::Down(s) => PenEvent::Down(to(s)),
+        PenEvent::Move(s) => PenEvent::Move(to(s)),
+        PenEvent::Up(s) => PenEvent::Up(to(s)),
+    }
+}
+
+#[cfg(test)]
+mod pen_point_tests {
+    use super::*;
+    use crate::canvas::stroke::PenSample;
+    use crate::input::pen::PenEvent;
+
+    #[test]
+    fn pen_pixels_become_points_at_any_ui_size() {
+        let s = PenSample { pos: [300.0, 150.0], pressure: 0.5, tilt: [0.0, 0.0] };
+        // 100 %: a point is a pixel, nothing moves.
+        assert!(matches!(pen_in_points(PenEvent::Down(s), 1.0), PenEvent::Down(p) if p.pos == [300.0, 150.0]));
+        // 150 % (system scaling or UI size): the same pixel is fewer points.
+        match pen_in_points(PenEvent::Move(s), 1.5) {
+            PenEvent::Move(p) => {
+                assert_eq!(p.pos, [200.0, 100.0]);
+                assert_eq!(p.pressure, 0.5);
+            }
+            other => panic!("{other:?}"),
         }
     }
 }

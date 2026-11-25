@@ -121,6 +121,9 @@ layers.
   or on every slide, each pin moved and sized on its own. See
   [Pinning](#pinning)
 - **Freeze frame** — bake the current screen behind into a new layer
+- **Close button** — the × at the end of the toolbar closes the app,
+  saving everything first. It asks only when slides deleted this run
+  (which undo can bring back until then) would be gone for good
 
 ---
 
@@ -277,6 +280,13 @@ layer makes that layer the active one.
 
 Every action is one undo step. Things worth knowing:
 
+- **Big deletes ask first**: deleting 20 or more objects at once, deleting
+  a layer that has anything on it (its bin in the layer panel, or the
+  `delete_layer` key), clearing a layer (`Ctrl+Delete`) and deleting a
+  slide. `Enter` (or the same key again) goes ahead, `Esc` keeps it.
+  Each is one undo step too: `Ctrl+Z` brings the layer, the objects or
+  the slide back until the app closes. Adding, deleting and moving layers
+  no longer wipes the slide's undo history.
 - An image, video or GIF on the **active layer** is picked up and moved
   as soon as you drag it. One on **another layer** (say, a screenshot
   under the ink you are drawing) is selected by a **click**; dragging
@@ -286,7 +296,9 @@ Every action is one undo step. Things worth knowing:
   underneath. Neither eraser removes images — delete them here.
 - With **two or more objects selected**, a bar under the toolbar arranges
   them: pack into a tight block, group by type (pictures, GIFs, videos,
-  everything else), align edges or centres, distribute evenly. Pictures,
+  everything else), group by tags (a cluster per tag, A to Z, untagged
+  last; an object with several tags joins the one most of the selection
+  shares), align edges or centres, distribute evenly. Pictures,
   GIFs and videos move one by one, taking the ink drawn on them along;
   other ink moves in touching clusters, so handwriting stays in one
   piece. Its last button copies the selection to a new slide.
@@ -317,7 +329,19 @@ Every action is one undo step. Things worth knowing:
   slide (each type outlined in its own colour, the rest dimmed), its
   groups (each boxed whole), and what is tagged: everything tagged, or
   just the tags picked from the slide's list, each labelled with its
-  tags. "Select these" selects them, ready to arrange or copy.
+  tags. "Select these" selects them, ready to arrange or copy;
+  "Unhighlight all" turns every highlight off.
+- **Duplicates just added**: a picture or GIF pasted or dropped in that
+  is already on a slide — the same picture, maybe resized, re-saved,
+  mirrored or turned — gets a ring (and so does the copy, when it is on
+  the slide shown). A bar says where the copy is: *Show it* goes there
+  (and on through several), *Remove this one* deletes the new one
+  (undoable), *Keep both* marks the pair as not copies for good (find's
+  duplicates list leaves them out too). The rings stay until you hide
+  them: the bar's ×, or the funnel menu's *Duplicates* switch or
+  *Unhighlight all*. The first check in a run reads every picture on the
+  slides, which takes a few seconds; copies made inside the app (copy,
+  duplicate) are not flagged.
 - Captures made by older versions, and frozen frames, are stored as a
   layer's background rather than as objects. Clicking one turns it into
   an ordinary image object in place — nothing moves — and from then on
@@ -480,8 +504,8 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Tool switch | letter keys above |
 | Eraser (modifier) | hold `Ctrl` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Shift+Z` |
-| Clear active layer | `Ctrl+Delete` |
-| Delete active canvas (asks first unless it is empty; `Enter` deletes, `Esc` keeps it) | `Ctrl+Shift+Backspace` |
+| Clear active layer (asks first; `Ctrl+Z` brings it back) | `Ctrl+Delete` |
+| Delete active canvas (asks first unless it is empty; `Enter` deletes, `Esc` keeps it). `Ctrl+Z` right after, or *Bring back the deleted slide* in the command palette, puts it back until the app closes | `Ctrl+Shift+Backspace` |
 | Previous / next canvas | `←` / `→` |
 | Previous / next slide, wrapping round (never adds a slide) — or, with the slide panel's clock button on, back / forward through recently used slides | `Ctrl+Shift+Tab` / `Ctrl+Tab` |
 | First / last slide | `Home` / `End` |
@@ -507,6 +531,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Active layer opacity — step | `-` −10 %, `=` +10 % |
 | Layer preview popup (active layer) | `Q` (toggle) |
 | Toggle floating UI | `Tab` |
+| UI bigger / smaller / back to 100 % — toolbar, panels and popups; the slides keep their size on screen (also Settings → General → UI size) | unbound; set `ui_scale_up` / `ui_scale_down` / `ui_scale_reset` (`Ctrl+=` / `Ctrl+-` / `Ctrl+0` are free to bind: egui's own zoom keys are off) |
 | Cancel pending (eyedropper / lasso / text / selection) | `Esc` |
 | Selection: delete / duplicate | `Delete` / `Ctrl+D` |
 | Selection: copy to a new slide | `Ctrl+Shift+D` |
@@ -735,13 +760,27 @@ the original does not break the slide and inserting the same file twice
 stores it once. Slides keep only the file name plus a small poster
 frame. Copying slides to another computer means copying `media` too.
 
-Deleting a slide (`Ctrl+Shift+Backspace`) also deletes the copies of its
-videos, GIFs and pictures — once the slides have been saved without it, and only
-copies nothing else still uses: no other slide, no undo history on
-another slide, nothing in the in-app clipboard (those wait until the
-app closes). Deleting a single object leaves its file in place, since
-Ctrl+Z can bring it back. The file you originally dropped or picked is
-never touched.
+Deleted objects, layers and slides keep their files in `media` while the
+app is open, since `Ctrl+Z` can bring them back. **When the app closes**,
+after every slide is saved, `media` loses every file no slide uses any
+more: those deleted pictures, videos and GIFs, and the picture a drawing
+pad drew over. The cleanup is skipped (and tried again at the next
+close) when a slide failed to read or to save, slides are still opening,
+or pictures are still being stored; files written in the last minute
+wait for the next close too. Only the app's own files (named by a hash of
+their contents) are ever removed; the file you originally dropped or
+picked is never touched.
+
+A **drawing pad** puts its pixels into the slide only when you put it
+away (`Esc`, a click outside it, another tool or slide, closing the app),
+not while you draw: one new file per time the pad was open. If the app
+crashes while a pad is open, what was drawn since it was opened is lost.
+
+After a **crash** nothing is cleaned up (the cleanup runs only on a
+normal close). The slides come back as last autosaved, about a second
+and a half before the crash; the undo history is gone, so objects
+deleted before the crash stay deleted. Their files stay in `media` until
+the next normal close.
 
 ### PureRef boards
 

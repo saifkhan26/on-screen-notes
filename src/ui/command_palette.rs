@@ -15,7 +15,7 @@ use crate::interaction::action_keys::KeyAction;
 use crate::tools::arrange::{Align, Arrange, Match};
 use crate::tools::ToolKind;
 use crate::ui::theme;
-use egui::{Color32, Vec2};
+use egui::Vec2;
 
 /// What running an entry does.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,6 +30,8 @@ pub enum Command {
     Redo,
     ClearLayer,
     DeleteSlide,
+    /// Put back the slide deleted last (kept until the app closes).
+    RestoreSlide,
     LockSlide,
     RenameSlide,
     ResetView,
@@ -43,7 +45,15 @@ pub enum Command {
     ToBack,
     DeleteSelection,
     ShapeSnap,
+    KeepProportions,
     GoTo(usize),
+    /// A new drawing pad (white paper) in the middle of the view.
+    NewPad,
+    /// Draw on the selected picture (`canvas::pad`).
+    DrawOnPicture,
+    /// Find who made the selected pictures, in the browser
+    /// (`app::browser::find_artists`).
+    FindArtist,
 }
 
 /// One row: what it says, where it belongs, its keys, what it does.
@@ -73,6 +83,8 @@ pub struct Context<'a> {
     /// Every slide's name, in order.
     pub slides: Vec<String>,
     pub active_slide: usize,
+    /// Deleted slides that can still come back this run.
+    pub deleted_slides: usize,
 }
 
 /// The entries `cx` allows, in the order they show with no query.
@@ -126,6 +138,8 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         add("Turn left 90°", s, a.rotate_left, C::Key(K::Rotate(false)));
         add("Turn right 90°", s, a.rotate_right, C::Key(K::Rotate(true)));
         add("Zoom to the selection", s, c.zoom_to_selection, C::Key(K::ZoomToSelection));
+        add("Show the selection in the slide window", s, a.open_in_window, C::Key(K::OpenInWindow));
+        add("Dim the rest on / off (fade what is not selected)", s, a.dim_unselected, C::Key(K::DimUnselected));
         add("Tag the selection (find knows it by its tags)", s, a.tag, C::Key(K::Tag));
         for (dir, key) in crate::tools::hop::Dir::ALL.into_iter().zip(c.hop) {
             add(&format!("Select the nearest object {}", dir.name()), s, key, C::Key(K::Hop(dir)));
@@ -142,6 +156,9 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
             add("Ungroup", s, c.ungroup, C::Key(K::Group(false)));
         }
         if cx.picture {
+            add("Draw on this picture (pen, pencil, eraser; Esc when done)", s, None, C::DrawOnPicture);
+            add("Find the artist (Google Lens, in the browser)", s, None, C::FindArtist);
+            add("Crop this picture (drag its edges; Enter crops)", s, a.crop, C::Key(K::Crop));
             add("A picture's colours", s, a.picture_colours, C::Key(K::PictureColours));
             add("Find pictures like this one (copies, edits, similar)", s, a.find_similar, C::Key(K::FindSimilar));
         }
@@ -149,6 +166,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
             let r = "Arrange";
             add("Pack", r, a.pack, C::Key(K::Arrange(Arrange::Pack)));
             add("Group by type", r, a.group_by_type, C::Key(K::Arrange(Arrange::GroupByType)));
+            add("Group by tags", r, a.group_by_tags, C::Key(K::Arrange(Arrange::GroupByTags)));
             add("Align left", r, a.align_left, C::Key(K::Align(Align::Left)));
             add("Align centres across", r, a.align_center_x, C::Key(K::Align(Align::CenterX)));
             add("Align right", r, a.align_right, C::Key(K::Align(Align::Right)));
@@ -177,7 +195,9 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Clear the active layer", e, c.clear_layer, C::ClearLayer);
     add("Text in a box on / off", e, tb.text_box, C::Key(K::TextBox));
     add("Shape snap on / off", e, None, C::ShapeSnap);
+    add("Keep proportions on / off (resizing)", e, None, C::KeepProportions);
     add("Insert a picture, video, GIF or PureRef board", e, tb.insert_media, C::Key(K::InsertMedia));
+    add("New drawing pad (paper to draw on with the pen and pencil)", e, None, C::NewPad);
     add("Pen size up", e, tb.size_up, C::Key(K::Size(1)));
     add("Pen size down", e, tb.size_down, C::Key(K::Size(-1)));
     for (i, colour) in cx.palette.iter().enumerate().take(8) {
@@ -194,7 +214,10 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Zoom to fit the slide", v, c.zoom_to_fit, C::Key(K::ZoomToFit));
     add("Reset zoom and pan", v, c.reset_view, C::ResetView);
     add("Hide / show the toolbar and panels", v, c.toggle_ui, C::ToggleUi);
-    add("Hide / show every pin", v, c.toggle_pins, C::TogglePins);
+    add("UI bigger (toolbar, panels; slides keep their size)", v, c.ui_scale_up, C::Key(K::UiScale(1)));
+    add("UI smaller", v, c.ui_scale_down, C::Key(K::UiScale(-1)));
+    add("UI size back to 100 %", v, c.ui_scale_reset, C::Key(K::UiScale(0)));
+    add("Open the pins window / close it", v, c.toggle_pins, C::TogglePins);
     add("Onion skin on / off (GIFs and videos)", v, c.media_onion, C::Key(K::Onion));
     add("Highlight pictures", v, tb.highlight[0], C::Key(K::Highlight(crate::canvas::shape::MediaType::Picture)));
     add("Highlight GIFs", v, tb.highlight[1], C::Key(K::Highlight(crate::canvas::shape::MediaType::Gif)));
@@ -214,10 +237,14 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Lock / unlock the slide", sl, c.lock_slide, C::LockSlide);
     add("Resync from PureRef", sl, c.resync_pureref, C::Key(K::ResyncPureRef));
     add("Delete the slide", sl, c.delete_canvas, C::DeleteSlide);
+    if cx.deleted_slides > 0 {
+        add("Bring back the deleted slide", sl, None, C::RestoreSlide);
+    }
     add("Move the slide up", sl, c.move_slide_up, C::Key(K::MoveSlide(-1)));
     add("Move the slide down", sl, c.move_slide_down, C::Key(K::MoveSlide(1)));
     add("Freeze the screen into a new layer", sl, c.freeze_frame, C::FreezeFrame);
     add("Open the slide window / close it", sl, c.slide_window, C::Key(K::SlideWindow));
+    add("Show a part of the slide in the slide window (drag a box)", sl, c.slide_window_region, C::Key(K::SlideWindowRegion));
     add("Fold / unfold the slide panel", sl, c.toggle_slide_panel, C::Key(K::ToggleSlidePanel));
     add("Every tag (find, rename, remove)", sl, c.tag_list, C::Key(K::TagList));
     add("Ctrl+Tab: slides in order / recently used", sl, c.toggle_slide_order, C::Key(K::ToggleSlideOrder));
@@ -381,6 +408,9 @@ impl Palette {
                     ui.set_width(WIDTH - 16.0);
                     let edit = egui::TextEdit::singleline(&mut self.query)
                         .hint_text("Type a command — a few letters will do")
+                        .font(egui::FontId::proportional(15.0))
+                        .margin(egui::vec2(10.0, 8.0))
+                        .frame(false)
                         .desired_width(f32::INFINITY);
                     let r = ui.add(edit);
                     if std::mem::take(&mut self.focus_pending) || !r.has_focus() {
@@ -389,7 +419,9 @@ impl Palette {
                     if r.changed() {
                         self.cursor = 0;
                     }
-                    ui.add_space(4.0);
+                    let rule = ui.available_rect_before_wrap();
+                    ui.painter().hline(rule.x_range(), rule.top(), egui::Stroke::new(1.0, theme::HAIRLINE));
+                    ui.add_space(6.0);
                     if list.is_empty() {
                         ui.label(egui::RichText::new("No command matches").color(theme::TEXT_MUTED));
                         return;
@@ -400,14 +432,15 @@ impl Palette {
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::click());
                         let lit = k == self.cursor || resp.hovered();
                         if lit {
-                            ui.painter().rect_filled(rect, egui::Rounding::same(5.0), if k == self.cursor { theme::ACCENT } else { Color32::from_white_alpha(16) });
+                            ui.painter().rect_filled(rect, egui::Rounding::same(theme::CONTROL_ROUNDING), if k == self.cursor { theme::on_fill() } else { theme::HOVER });
                         }
                         let y = rect.center().y;
                         ui.painter().text(egui::pos2(rect.left() + 8.0, y), egui::Align2::LEFT_CENTER, &e.label, egui::FontId::proportional(13.5), theme::TEXT_PRIMARY);
                         let right = match &e.keys {
                             Some(k) => {
-                                let g = ui.painter().text(egui::pos2(rect.right() - 8.0, y), egui::Align2::RIGHT_CENTER, k, egui::FontId::monospace(11.5), Color32::from_rgb(232, 200, 200));
-                                g.left() - 10.0
+                                let g = ui.painter().text(egui::pos2(rect.right() - 10.0, y), egui::Align2::RIGHT_CENTER, k, egui::FontId::monospace(11.5), theme::TEXT_PRIMARY);
+                                ui.painter().rect_filled(g.expand2(egui::vec2(5.0, 2.0)), egui::Rounding::same(5.0), theme::SURFACE);
+                                g.left() - 14.0
                             }
                             None => rect.right() - 8.0,
                         };
@@ -452,7 +485,7 @@ mod tests {
     }
 
     fn context<'a>(keys: &'a ParsedHotkeys, selected: usize, palette: &'a [[u8; 4]]) -> Context<'a> {
-        Context { keys, selected, picture: false, grouped: false, inside_group: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0 }
+        Context { keys, selected, picture: false, grouped: false, inside_group: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0, deleted_slides: 0 }
     }
 
     #[test]

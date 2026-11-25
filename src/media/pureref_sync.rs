@@ -399,6 +399,7 @@ fn with_shown(item: &BoardItem, shown: Shown, link: &BoardLink, group: u64, id: 
         tags: item.tags().to_vec(),
         turn: 0.0,
         link: id,
+        paper: None,
     };
     place(&mut s, item, link);
     show(&mut s, &shown);

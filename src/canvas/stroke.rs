@@ -874,6 +874,15 @@ pub fn apply_curve(raw: f32, curve: f32) -> f32 {
     raw.clamp(0.0, 1.0).powf(curve)
 }
 
+/// A line's width where the pressure, after the curve, is `p`:
+/// `base_width` scaled by it, floored so a near-zero pressure still paints
+/// a hairline rather than nothing. `px` is a screen point in the same
+/// units. Ink and drawing pads (`pad::Brush::radius`) both draw with it, so
+/// pressure looks the same on and off a pad.
+pub fn width_at_pressure(base_width: f32, p: f32, px: f32) -> f32 {
+    (base_width * p.clamp(0.05, 1.0)).max(0.8 * px)
+}
+
 // ---- Ribbon spine builder ---------------------------------------------
 //
 // Shared geometry core for both the committed cache (`build_cache_with`)
@@ -914,9 +923,7 @@ pub fn build_spine(samples: &[PenSample], base_width: f32, px: f32, position_pas
     if n == 0 {
         return StrokeCache { points: Vec::new(), widths: Vec::new(), rev: next_cache_rev() };
     }
-    // Width at a node: base_width scaled by (curved) pressure, floored so a
-    // near-zero-pressure sample still paints a hairline rather than nothing.
-    let width_at = |pr: f32| (base_width * pr.clamp(0.05, 1.0)).max(0.8 * px);
+    let width_at = |pr: f32| width_at_pressure(base_width, pr, px);
     if n == 1 {
         let s = samples[0];
         let w = (base_width * apply_curve(s.pressure, curve).max(0.1)).max(0.8 * px);

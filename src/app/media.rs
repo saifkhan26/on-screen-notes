@@ -26,7 +26,7 @@ impl OnScreenNotesApp {
         use crate::canvas::shape::MediaKind;
         if crate::media::import::media_kind(&path) == Some(MediaKind::Video) && crate::media::ffmpeg::tools().is_none() {
             self.media_waiting.push((path, at));
-            self.media_ui.ffmpeg_window = true;
+            self.ws.media_ui.ffmpeg_window = true;
             return;
         }
         let mut job = crate::media::import::ImportJob::start(path, at);
@@ -86,7 +86,7 @@ impl OnScreenNotesApp {
 
         let (dropped, hovering) = ctx.input(|i| (i.raw.dropped_files.clone(), !i.raw.hovered_files.is_empty()));
         // Dropped on find: look for pictures like it, insert nothing.
-        if !dropped.is_empty() && self.find.is_open() {
+        if !dropped.is_empty() && self.ws.find.is_open() {
             if let Some(path) = dropped.into_iter().find_map(|f| f.path) {
                 self.find_like_file(path);
             }
@@ -113,7 +113,7 @@ impl OnScreenNotesApp {
                 .interactable(false)
                 .show(ctx, |ui| {
                     ui::theme::card_frame().inner_margin(egui::Margin::symmetric(16.0, 10.0)).show(ui, |ui| {
-                        ui.label(if self.find.is_open() {
+                        ui.label(if self.ws.find.is_open() {
                             "Drop a picture to find ones like it"
                         } else {
                             "Drop to insert picture / video / GIF, or open a PureRef board"
@@ -132,22 +132,34 @@ impl OnScreenNotesApp {
         });
         for (path, at, beside, name, result) in finished {
             use crate::media::import::ImportError;
+            // Sent from the browser: it goes where it was sent, with its
+            // tags, and where it came from is kept (`app::browser`).
+            let from_browser = self.browser.sent(&path);
             match result {
+                Ok(imported) if from_browser => {
+                    self.insert_sent(&path, imported, &name, beside, canvas_rect, ctx.pixels_per_point(), None);
+                    continue;
+                }
                 Ok(_) if self.canvases.is_locked(self.canvases.active_index()) => {
                     self.toast = Some((format!("Not inserted: this slide is locked — {} unlocks it", self.lock_key()), Instant::now()));
                 }
                 Ok(imported) => {
-                    self.insert_media(imported, at, beside, canvas_rect, ctx.pixels_per_point());
+                    self.insert_media(imported, at, beside, canvas_rect, ctx.pixels_per_point(), Vec::new());
                     self.toast = Some((format!("Inserted {name}"), Instant::now()));
                 }
                 Err(ImportError::NeedsFfmpeg) => {
                     self.media_waiting.push((path, at));
-                    self.media_ui.ffmpeg_window = true;
+                    self.ws.media_ui.ffmpeg_window = true;
+                    continue;
                 }
                 Err(ImportError::Failed(e)) => {
                     log::warn!("import of {name} failed: {e}");
                     self.toast = Some((format!("Couldn't insert {name}: {e}"), Instant::now()));
                 }
+            }
+            if from_browser {
+                let slide = self.canvases.active_index();
+                self.browser_import_done(&path, None, &name, slide);
             }
         }
 
@@ -312,10 +324,10 @@ impl OnScreenNotesApp {
         let shapes: Vec<usize> = added.iter().filter(|(l, _)| *l == li).map(|&(_, i)| i).collect();
         let selected = active && !shapes.is_empty();
         if selected {
-            self.tool.kind = crate::tools::ToolKind::Select;
-            self.tool.select.gesture = None;
-            self.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
-            self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+            self.ws.tool.kind = crate::tools::ToolKind::Select;
+            self.ws.tool.select.gesture = None;
+            self.ws.tool.select.sel = crate::canvas::hit::Selection { strokes: Vec::new(), shapes };
+            self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
         }
         self.toast = Some((resync_message(name, slide, &report, selected), Instant::now()));
     }
@@ -371,6 +383,8 @@ impl OnScreenNotesApp {
     /// or video at its size (`beside_selection`) — and select it (a
     /// video's playback bar then shows). Several dropped at once beside
     /// one each go beside the one in before them.
+    /// With `tags` on it from the start (sent from the browser with them).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn insert_media(
         &mut self,
         imported: crate::media::import::Imported,
@@ -378,42 +392,19 @@ impl OnScreenNotesApp {
         beside: bool,
         canvas_rect: egui::Rect,
         pixels_per_point: f32,
+        tags: Vec<String>,
     ) {
         let (pan, zoom) = {
             let c = self.canvases.active();
             (c.pan, c.zoom.max(1e-3))
         };
-        let ppp = pixels_per_point.max(0.01);
-        let [w, h] = imported.size;
-        let mut size = [w.max(1) as f32 / ppp / zoom, h.max(1) as f32 / ppp / zoom];
-        let view = [canvas_rect.width() / zoom, canvas_rect.height() / zoom];
-        let fit = (view[0] * 0.9 / size[0]).min(view[1] * 0.9 / size[1]).min(1.0);
-        if fit > 0.0 {
-            size = [size[0] * fit, size[1] * fit];
-        }
-        let screen = at.unwrap_or(canvas_rect.center()) - canvas_rect.min;
-        let center = [(screen.x - pan[0]) / zoom, (screen.y - pan[1]) / zoom];
-        let mut shape = crate::canvas::shape::Shape::Raster {
-            pos: [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
-            size,
-            png: std::sync::Arc::new(imported.png),
-            px_size: imported.png_size,
-            color: [0, 0, 0, 0],
-            rotation: 0.0,
-            kind: crate::canvas::shape::RasterKind::Image,
-            media: imported.media.map(Box::new),
-            picture: None,
-            pin: 0,
-            flip: false,
-            group: 0,
-            tags: Vec::new(),
-            turn: 0.0,
-            link: 0,
-        };
+        let mut shape = media_shape(imported, at, pan, zoom, canvas_rect, pixels_per_point, tags);
         if let Some((a, b)) = beside.then(|| self.beside_selection(crate::canvas::canvas::shape_bounds(&shape))).flatten() {
             shape.transform(a, b);
         }
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
+        // Already on a slide? Ringed if so (`app::dup_check`).
+        self.dup_watch_selection();
     }
 
     /// Carry out what the playback bars and the FFmpeg window asked for.
@@ -433,7 +424,7 @@ impl OnScreenNotesApp {
             for (path, at) in std::mem::take(&mut self.media_waiting) {
                 self.start_media_import(path, at);
             }
-        } else if !self.media_ui.ffmpeg_window {
+        } else if !self.ws.media_ui.ffmpeg_window {
             // Set-up window closed without FFmpeg: give up on those.
             self.media_waiting.clear();
         }
@@ -481,5 +472,48 @@ fn resync_message(name: &str, slide: usize, r: &crate::media::pureref_sync::Repo
         format!("Slide {} is up to date with {name}", slide + 1)
     } else {
         format!("Resynced slide {} from {name} — {}", slide + 1, parts.join(", "))
+    }
+}
+
+/// An imported picture, video or GIF as a shape at its natural size on
+/// screen (shrunk to fit the view), centred on `at` or on the view, for a
+/// slide seen through `pan` / `zoom`.
+pub(super) fn media_shape(
+    imported: crate::media::import::Imported,
+    at: Option<egui::Pos2>,
+    pan: [f32; 2],
+    zoom: f32,
+    canvas_rect: egui::Rect,
+    pixels_per_point: f32,
+    tags: Vec<String>,
+) -> crate::canvas::shape::Shape {
+    let ppp = pixels_per_point.max(0.01);
+    let zoom = zoom.max(1e-3);
+    let [w, h] = imported.size;
+    let mut size = [w.max(1) as f32 / ppp / zoom, h.max(1) as f32 / ppp / zoom];
+    let view = [canvas_rect.width() / zoom, canvas_rect.height() / zoom];
+    let fit = (view[0] * 0.9 / size[0]).min(view[1] * 0.9 / size[1]).min(1.0);
+    if fit > 0.0 {
+        size = [size[0] * fit, size[1] * fit];
+    }
+    let screen = at.unwrap_or(canvas_rect.center()) - canvas_rect.min;
+    let center = [(screen.x - pan[0]) / zoom, (screen.y - pan[1]) / zoom];
+    crate::canvas::shape::Shape::Raster {
+        pos: [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
+        size,
+        png: std::sync::Arc::new(imported.png),
+        px_size: imported.png_size,
+        color: [0, 0, 0, 0],
+        rotation: 0.0,
+        kind: crate::canvas::shape::RasterKind::Image,
+        media: imported.media.map(Box::new),
+        picture: None,
+        pin: 0,
+        flip: false,
+        group: 0,
+        tags,
+        turn: 0.0,
+        link: 0,
+        paper: None,
     }
 }

@@ -21,6 +21,8 @@ pub enum KeyAction {
     Match(Match),
     /// Flip the arrange bar's "keep apart" switch.
     KeepApart,
+    /// Flip the arrange bar's "dim the rest" switch.
+    DimUnselected,
     /// Open "Move to slide…".
     MoveToSlide,
     /// Pick the palette's colour at this index.
@@ -42,6 +44,8 @@ pub enum KeyAction {
     ToggleSlidePanel,
     ToggleSlideOrder,
     SlideWindow,
+    /// Drag a box on the canvas for the slide window to show.
+    SlideWindowRegion,
     NewLayer,
     DeleteLayer,
     /// Move the active layer one place up (+1) or down (−1).
@@ -64,6 +68,10 @@ pub enum KeyAction {
     Tag,
     /// Find pictures like the selected one, or else the copied one.
     FindSimilar,
+    /// Crop the selected picture or pad.
+    Crop,
+    /// Show the selection in the slide window.
+    OpenInWindow,
     /// Text labels in a box, or not.
     TextBox,
     /// Move the active slide one place toward the first (−1) or last (+1).
@@ -92,6 +100,8 @@ pub enum KeyAction {
     StepIn,
     /// Inside a group: select the whole group again.
     StepOut,
+    /// The UI one step bigger (+1), smaller (−1), or back to 100 % (0).
+    UiScale(i8),
 }
 
 /// The nudge keys' directions, in `CanvasBindings::nudge_1px` order.
@@ -104,6 +114,7 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
     let table = [
         (a.pack, KeyAction::Arrange(Arrange::Pack)),
         (a.group_by_type, KeyAction::Arrange(Arrange::GroupByType)),
+        (a.group_by_tags, KeyAction::Arrange(Arrange::GroupByTags)),
         (a.keep_apart, KeyAction::KeepApart),
         (a.align_left, KeyAction::Align(Align::Left)),
         (a.align_center_x, KeyAction::Align(Align::CenterX)),
@@ -125,6 +136,9 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (a.picture_colours, KeyAction::PictureColours),
         (a.tag, KeyAction::Tag),
         (a.find_similar, KeyAction::FindSimilar),
+        (a.crop, KeyAction::Crop),
+        (a.open_in_window, KeyAction::OpenInWindow),
+        (a.dim_unselected, KeyAction::DimUnselected),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));
     for (i, b) in t.colour.iter().enumerate() {
@@ -166,12 +180,16 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (c.toggle_slide_panel, KeyAction::ToggleSlidePanel),
         (c.toggle_slide_order, KeyAction::ToggleSlideOrder),
         (c.slide_window, KeyAction::SlideWindow),
+        (c.slide_window_region, KeyAction::SlideWindowRegion),
         (c.new_layer, KeyAction::NewLayer),
         (c.delete_layer, KeyAction::DeleteLayer),
         (c.move_layer_up, KeyAction::MoveLayer(1)),
         (c.move_layer_down, KeyAction::MoveLayer(-1)),
         (c.pin_go_to_slide, KeyAction::PinGoToSlide),
         (c.pin_this_slide_only, KeyAction::PinThisSlideOnly),
+        (c.ui_scale_up, KeyAction::UiScale(1)),
+        (c.ui_scale_down, KeyAction::UiScale(-1)),
+        (c.ui_scale_reset, KeyAction::UiScale(0)),
     ];
     out.extend(table.into_iter().filter(|(b, _)| hit(*b)).map(|(_, act)| act));
     for (bindings, step) in [(&c.nudge_1px, 1.0), (&c.nudge_10px, 10.0)] {

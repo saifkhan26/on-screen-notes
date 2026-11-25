@@ -9,19 +9,15 @@ impl OnScreenNotesApp {
         // One nudge so a copy does not sit exactly on its original. Kept
         // constant on screen, so it is divided by the zoom.
         let step = 16.0 / self.canvases.active().zoom.max(1e-3);
-        let sel = self.tool.select.sel.clone();
-        let has_selection = self.tool.kind == crate::tools::ToolKind::Select && !sel.is_empty();
+        let sel = self.ws.tool.select.sel.clone();
+        let has_selection = self.ws.tool.kind == crate::tools::ToolKind::Select && !sel.is_empty();
         match action {
             // Deleting a selected pin unpins it; its objects stay.
-            SelAction::Delete if self.pin_tool.selected.is_some() => self.unpin_selected_pin(),
+            SelAction::Delete if self.ws.pin_tool.selected.is_some() => self.unpin_selected_pin(),
             SelAction::TogglePin if has_selection => self.toggle_pin_selection(),
-            SelAction::TogglePin if self.pin_tool.selected.is_some() => self.unpin_selected_pin(),
-            SelAction::Delete if has_selection => {
-                let c = self.canvases.active_mut();
-                let li = c.active_layer;
-                c.delete_objects(li, &sel.strokes, &sel.shapes);
-                self.tool.select.sel.clear();
-            }
+            SelAction::TogglePin if self.ws.pin_tool.selected.is_some() => self.unpin_selected_pin(),
+            // A large selection asks first (`app::confirm::BIG_DELETE`).
+            SelAction::Delete if has_selection => self.request_objects_delete(sel.strokes, sel.shapes),
             SelAction::Duplicate if has_selection => {
                 let (strokes, shapes) = self.selected_objects();
                 self.insert_and_select(strokes, shapes, [step, step]);
@@ -31,7 +27,7 @@ impl OnScreenNotesApp {
                 let to_front = matches!(action, SelAction::ToFront);
                 let c = self.canvases.active_mut();
                 let li = c.active_layer;
-                self.tool.select.sel = c.reorder_objects(li, &sel.strokes, &sel.shapes, to_front);
+                self.ws.tool.select.sel = c.reorder_objects(li, &sel.strokes, &sel.shapes, to_front);
             }
             SelAction::Copy | SelAction::Cut if has_selection => {
                 self.obj_clipboard = self.selected_objects();
@@ -48,7 +44,7 @@ impl OnScreenNotesApp {
                     let c = self.canvases.active_mut();
                     let li = c.active_layer;
                     c.delete_objects(li, &sel.strokes, &sel.shapes);
-                    self.tool.select.sel.clear();
+                    self.ws.tool.select.sel.clear();
                 }
             }
             SelAction::PasteObjects => self.paste_objects(step),
@@ -56,7 +52,7 @@ impl OnScreenNotesApp {
             // A selection command with nothing selected.
             _ => {}
         }
-        self.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
+        self.ws.tool.select.rebind(self.canvases.active_index(), self.canvases.active());
     }
 
     /// Paste the in-app clipboard's objects, each paste a step further
@@ -130,14 +126,17 @@ impl OnScreenNotesApp {
     /// they always did.
     pub(super) fn beside_selection(&self, incoming: [f32; 4]) -> Option<(f32, [f32; 2])> {
         use crate::tools::beside;
-        if self.tool.kind != crate::tools::ToolKind::Select {
+        if self.ws.tool.kind != crate::tools::ToolKind::Select {
             return None;
         }
         let c = self.canvases.active();
         let layer = c.layers.get(c.active_layer)?;
         let media = |i: usize| layer.shapes.get(i).filter(|s| s.media_type().is_some()).map(crate::canvas::canvas::shape_bounds);
         let side = self.config.beside_side;
-        let anchor = beside::anchor(self.tool.select.sel.shapes.iter().filter_map(|&i| media(i)), side)?;
+        // In paint order, so a stack goes on the topmost selected one.
+        let mut picked = self.ws.tool.select.sel.shapes.clone();
+        picked.sort_unstable();
+        let anchor = beside::anchor(picked.into_iter().filter_map(media), side)?;
         let others: Vec<[f32; 4]> = (0..layer.shapes.len()).filter_map(media).collect();
         beside::place(incoming, anchor, self.config.beside_fit, side, &others, 1.0 / c.zoom.max(1e-3))
     }
@@ -199,11 +198,14 @@ impl OnScreenNotesApp {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         };
         if let Some((a, b)) = self.beside_selection(crate::canvas::canvas::shape_bounds(&shape)) {
             shape.transform(a, b);
         }
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         self.toast = Some(("Image pasted onto the active layer".to_string(), std::time::Instant::now()));
+        // Already on a slide? Ringed if so (`app::dup_check`).
+        self.dup_watch_selection();
     }
 }

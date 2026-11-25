@@ -183,6 +183,35 @@ pub struct AppConfig {
     /// around it. On unless turned off in the settings.
     #[serde(default = "default_shape_snap")]
     pub smart_guides: bool,
+    /// Resizing a selection keeps its proportions, from the corners and
+    /// the sides alike. On unless turned off in the settings; off, the
+    /// handles stretch it where its objects can be stretched.
+    #[serde(default = "default_shape_snap")]
+    pub keep_proportions: bool,
+    /// The arrange bar's "dim the rest": while objects are selected,
+    /// everything else on the slide fades back. Off until switched on.
+    #[serde(default)]
+    pub dim_unselected: bool,
+    /// What the slide window leaves out of its UI (its bar's View menu).
+    #[serde(default)]
+    pub slide_window_ui: SlideWindowUi,
+    /// Picture search: find's "pictures like this" lists pictures of the
+    /// same subject, and typed words find the pictures that show them,
+    /// from a vision model run on the GPU or CPU (`canvas::picture_vectors`).
+    /// Off until switched on in the settings, as it downloads about 215 MB
+    /// the first time, and 570 MB more the first time words are looked for.
+    #[serde(default)]
+    pub picture_search: bool,
+
+    /// The browser extension's way in (`browser_link`): pictures, GIFs
+    /// and videos sent from the browser land on the slide. On unless
+    /// turned off in the settings; it listens on this computer only, and
+    /// an extension must be let in once before it can send.
+    #[serde(default = "default_shape_snap")]
+    pub browser_link: bool,
+    /// The port it listens on (the extension's options say the same).
+    #[serde(default = "default_browser_link_port")]
+    pub browser_link_port: u16,
 
     /// How the arrange bar's Pack lays objects out: the tightest block,
     /// rows or columns. Picked from the arrow beside it.
@@ -197,12 +226,97 @@ pub struct AppConfig {
     /// …and lands on this side of it.
     #[serde(default)]
     pub beside_side: BesideSide,
+
+    /// The paper a new drawing pad gets: the last one picked, straight
+    /// RGBA (alpha is its opacity). White to start.
+    #[serde(default = "default_pad_paper")]
+    pub pad_paper: [u8; 4],
+
+    /// How big the UI is drawn — toolbar, panels, bars, popups — as a
+    /// multiple of the system's own scaling (1.0 = 100 %). The slides
+    /// keep their size on screen: the views are rescaled with it. One of
+    /// `UI_SCALES`; picked in the settings or with `canvas.ui_scale_*`.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+
+    /// The UI's accent: what marks the tool in use, a switch that is on,
+    /// the picked option, the selection on the canvas (`ui::theme`). Its
+    /// near-white default keeps the UI black, white and grey.
+    #[serde(default = "default_accent")]
+    pub accent: [u8; 3],
 }
+
+fn default_accent() -> [u8; 3] { crate::ui::theme::MONO }
+
+fn default_ui_scale() -> f32 { 1.0 }
+
+/// The UI sizes on offer, smallest first.
+pub const UI_SCALES: [f32; 9] = [0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+
+/// The UI size `steps` places from `now` in `UI_SCALES`, stopping at
+/// either end. A size between two steps (a hand-edited config) goes to
+/// the next one that way.
+pub fn ui_scale_step(now: f32, steps: i8) -> f32 {
+    let mut at = now;
+    for _ in 0..steps.unsigned_abs() {
+        at = if steps > 0 {
+            UI_SCALES.iter().copied().find(|&s| s > at + 1e-3).unwrap_or(UI_SCALES[UI_SCALES.len() - 1])
+        } else {
+            UI_SCALES.iter().rev().copied().find(|&s| s < at - 1e-3).unwrap_or(UI_SCALES[0])
+        };
+    }
+    at
+}
+
+/// A UI size from the config, kept to what the settings offer.
+pub fn clamp_ui_scale(s: f32) -> f32 {
+    if s.is_finite() { s.clamp(UI_SCALES[0], UI_SCALES[UI_SCALES.len() - 1]) } else { 1.0 }
+}
+
+#[cfg(test)]
+mod ui_scale_tests {
+    use super::*;
+
+    #[test]
+    fn ui_scale_steps_through_the_sizes_and_stops_at_the_ends() {
+        assert_eq!(ui_scale_step(1.0, 1), 1.1);
+        assert_eq!(ui_scale_step(1.0, -1), 0.9);
+        assert_eq!(ui_scale_step(1.0, 2), 1.25);
+        assert_eq!(ui_scale_step(2.0, 1), 2.0);
+        assert_eq!(ui_scale_step(0.75, -1), 0.75);
+        // Between two sizes (a hand-edited config): to the next one that way.
+        assert_eq!(ui_scale_step(1.05, 1), 1.1);
+        assert_eq!(ui_scale_step(1.05, -1), 1.0);
+        assert_eq!(clamp_ui_scale(9.0), 2.0);
+        assert_eq!(clamp_ui_scale(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn a_config_without_an_accent_loads_monochrome() {
+        let cfg = AppConfig { accent: [64, 156, 255], ..AppConfig::default() };
+        let text = ron::to_string(&cfg).unwrap();
+        assert!(text.contains(",accent:(64,156,255)"), "{text}");
+        let old: AppConfig = ron::from_str(&text.replace(",accent:(64,156,255)", "")).unwrap();
+        assert_eq!(old.accent, crate::ui::theme::MONO);
+    }
+
+    #[test]
+    fn a_config_without_a_ui_scale_loads_at_100_percent() {
+        let cfg = AppConfig { ui_scale: 1.5, ..AppConfig::default() };
+        let text = ron::to_string(&cfg).unwrap();
+        assert!(text.contains(",ui_scale:1.5"), "{text}");
+        let old: AppConfig = ron::from_str(&text.replace(",ui_scale:1.5", "")).unwrap();
+        assert_eq!(old.ui_scale, 1.0);
+    }
+}
+
+fn default_pad_paper() -> [u8; 4] { [255, 255, 255, 255] }
 
 fn default_slide_panel_open() -> bool { true }
 
 fn default_arrange_apart() -> bool { true }
 fn default_shape_snap() -> bool { true }
+fn default_browser_link_port() -> u16 { crate::browser_link::DEFAULT_PORT }
 
 fn default_pressure_curve() -> f32 { 1.0 }
 
@@ -220,6 +334,19 @@ pub fn default_palette() -> Vec<[u8; 4]> {
         [240, 240, 240, 255], // white
         [30,  30,  35,  255], // near-black
     ]
+}
+
+/// The parts of its UI the slide window leaves out, from its bar's View
+/// menu. All shown at first; Tab still hides everything at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlideWindowUi {
+    /// No layer panel.
+    pub hide_layers: bool,
+    /// No play bars on videos and GIFs.
+    pub hide_media_bars: bool,
+    /// The bar shows only while the pointer is near the window's top.
+    pub bar_autohide: bool,
 }
 
 impl Default for AppConfig {
@@ -250,9 +377,18 @@ impl Default for AppConfig {
             arrange_apart: true,
             shape_snap: true,
             smart_guides: true,
+            keep_proportions: true,
+            ui_scale: 1.0,
+            accent: default_accent(),
+            dim_unselected: false,
+            slide_window_ui: SlideWindowUi::default(),
+            picture_search: false,
+            browser_link: true,
+            browser_link_port: default_browser_link_port(),
             pack_mode: PackMode::default(),
             beside_fit: BesideFit::default(),
             beside_side: BesideSide::default(),
+            pad_paper: default_pad_paper(),
         }
     }
 }

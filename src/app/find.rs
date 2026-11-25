@@ -13,6 +13,13 @@ pub(super) struct FindFlash {
     since: Instant,
 }
 
+/// Where find started: the slide shown then, and each slide's view as it
+/// was before find first moved it, so Esc can put everything back.
+pub(super) struct FindStart {
+    slide: usize,
+    views: Vec<(usize, ([f32; 2], f32))>,
+}
+
 /// How long the flash lasts, the part of it spent closing in on the
 /// label, and the part at the end spent fading.
 const FLASH: f32 = 1.6;
@@ -28,17 +35,25 @@ const SEEN: f32 = 0.4;
 impl OnScreenNotesApp {
     /// The find bar while it is open; go to the label it picks.
     pub(super) fn show_find_bar(&mut self, ctx: &egui::Context) {
-        self.find.free_retired();
+        self.ws.find.free_retired();
         self.poll_find_reading(ctx);
-        if !self.find.is_open() {
-            self.find_paste_prev = false;
+        if !self.ws.find.is_open() {
+            self.ws.find_paste_prev = false;
+            self.ws.find_start = None;
             return;
+        }
+        if self.ws.find_start.is_none() {
+            let (slide, c) = (self.canvases.active_index(), self.canvases.active());
+            self.ws.find_start = Some(FindStart { slide, views: vec![(slide, (c.pan, c.zoom))] });
         }
         self.take_find_paste(ctx);
         let reading = self.update_picture_results(ctx).or_else(|| self.update_copies(ctx));
+        self.update_word_pictures(ctx);
+        self.update_tag_suggestions();
         let canvases = &self.canvases;
         let unread = (0..canvases.count()).filter(|&i| canvases.slide(i).is_none()).count();
-        let picked = self.find.show(
+        self.ws.find.artist_tags = self.browser.artist_set();
+        let picked = self.ws.find.show(
             ctx,
             |q| ui::find_bar::search(q, (0..canvases.count()).filter_map(|i| canvases.slide(i).map(|c| (i, c)))),
             unread,
@@ -50,9 +65,21 @@ impl OnScreenNotesApp {
         if let Some(hit) = picked {
             self.go_to_find_hit(&hit, ctx);
         }
-        match self.find.take_request() {
+        if self.ws.find.take_cancelled() {
+            self.back_to_find_start(ctx);
+        }
+        // Closed any other way: stay where it went.
+        if !self.ws.find.is_open() {
+            self.ws.find_start = None;
+        }
+        match self.ws.find.take_request() {
             Some(ui::find_bar::Request::SelectExtras { slide, layer, shapes }) => self.select_extras(slide, layer, shapes, ctx),
             Some(ui::find_bar::Request::Tag(a)) => self.apply_tag_action(a),
+            Some(ui::find_bar::Request::TagPicture { slide, layer, shape, tag }) => self.tag_suggested(slide, layer, shape, &tag),
+            Some(ui::find_bar::Request::NotThis { slide, layer, shape, tag }) => self.reject_suggested(slide, layer, shape, &tag),
+            Some(ui::find_bar::Request::DeleteCopy { slide, layer, shape, png }) => self.delete_copy(slide, layer, shape, &png),
+            Some(ui::find_bar::Request::IgnoreCopies(i)) => self.ignore_copies(i),
+            Some(ui::find_bar::Request::ShowCopiesAgain(i)) => self.show_copies_again(i),
             None => {}
         }
     }
@@ -60,7 +87,12 @@ impl OnScreenNotesApp {
     /// Go to `hit`'s slide and glide the view there, centred: at the zoom
     /// it had if the match fits and can be made out there, else at one
     /// where it can — a label read, an object seen. It flashes once there.
-    fn go_to_find_hit(&mut self, hit: &Hit, ctx: &egui::Context) {
+    pub(super) fn go_to_find_hit(&mut self, hit: &Hit, ctx: &egui::Context) {
+        if let (Some(start), Some(c)) = (&mut self.ws.find_start, self.canvases.slide(hit.slide)) {
+            if !start.views.iter().any(|v| v.0 == hit.slide) {
+                start.views.push((hit.slide, (c.pan, c.zoom)));
+            }
+        }
         if hit.slide != self.canvases.active_index() {
             self.canvases.go_to(hit.slide);
         }
@@ -93,10 +125,30 @@ impl OnScreenNotesApp {
             area[1] + area[3] * 0.5 - (b[1] + b[3]) * 0.5 * zoom,
         ];
         self.glide_view((pan, zoom), ctx);
-        self.find_flash = Some(FindFlash { slide: hit.slide, layer: hit.layer, found: hit.found.clone(), since: Instant::now() });
+        self.ws.find_flash = Some(FindFlash { slide: hit.slide, layer: hit.layer, found: hit.found.clone(), since: Instant::now() });
         if hit.hidden {
             let msg = format!("That is on layer {}, which is hidden", hit.layer + 1);
             self.toast = Some((msg, Instant::now()));
+        }
+    }
+
+    /// Esc closed find: put back every view it moved and go back to the
+    /// slide it started from, gliding when that is the slide shown.
+    fn back_to_find_start(&mut self, ctx: &egui::Context) {
+        let Some(start) = self.ws.find_start.take() else { return };
+        self.ws.find_flash = None;
+        self.ws.view_glide = None;
+        for &(slide, (pan, zoom)) in &start.views {
+            if slide != start.slide {
+                self.canvases.set_view(slide, pan, zoom);
+            }
+        }
+        let Some(&(_, view)) = start.views.iter().find(|v| v.0 == start.slide) else { return };
+        if start.slide == self.canvases.active_index() {
+            self.glide_view(view, ctx);
+        } else {
+            self.canvases.go_to(start.slide);
+            self.canvases.set_view(start.slide, view.0, view.1);
         }
     }
 
@@ -104,7 +156,7 @@ impl OnScreenNotesApp {
     /// fades. Follows the view while it glides; gone on another slide,
     /// or once what it marked is not there any more.
     pub(super) fn show_find_flash(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) {
-        let Some(f) = &self.find_flash else { return };
+        let Some(f) = &self.ws.find_flash else { return };
         let t = f.since.elapsed().as_secs_f32();
         let ease = |x: f32| 1.0 - (1.0 - x.clamp(0.0, 1.0)).powi(3);
         // Screen points out from it: from far to snug.
@@ -140,11 +192,12 @@ impl OnScreenNotesApp {
             }
         });
         let Some(ring) = ring else {
-            self.find_flash = None;
+            self.ws.find_flash = None;
             return;
         };
-        let glow = FOUND.gamma_multiply(0.25 * alpha);
-        painter.add(egui::Shape::closed_line(ring.clone(), egui::Stroke::new(7.0, glow)));
+        // A light ring over a dark halo: it shows on a white page too.
+        let glow = egui::Color32::BLACK.gamma_multiply(0.45 * alpha);
+        painter.add(egui::Shape::closed_line(ring.clone(), egui::Stroke::new(6.0, glow)));
         painter.add(egui::Shape::closed_line(ring, egui::Stroke::new(2.5, FOUND.gamma_multiply(alpha))));
         ctx.request_repaint();
     }

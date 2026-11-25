@@ -280,11 +280,17 @@ pub fn raster_solid_at(png: &[u8], u: f32, v: f32, may_decode: bool) -> bool {
 }
 
 /// For a raster shape already known to contain `p` in its box: is the
-/// image actually visible there? Always true for every other shape, and
-/// for videos and GIFs, whose `png` is only the first frame — a GIF
-/// that starts transparent would otherwise be unclickable there.
+/// image actually visible there? Always true for every other shape, for
+/// videos and GIFs, whose `png` is only the first frame — a GIF that
+/// starts transparent would otherwise be unclickable there — and for a
+/// drawing pad with paper that shows: the whole sheet is there, though
+/// its pixels hold only the ink (`canvas::pad`). With its paper at 0 %
+/// only the ink is.
 fn shape_solid_at(shape: &Shape, p: [f32; 2], may_decode: bool) -> bool {
-    let Shape::Raster { png, media: None, flip, .. } = shape else { return true };
+    let Shape::Raster { png, media: None, flip, paper, .. } = shape else { return true };
+    if paper.is_some_and(|p| p[3] > 0) {
+        return true;
+    }
     let o = shape.obb();
     let q = o.to_local(p);
     let (hw, hh) = (o.half[0].max(1e-3), o.half[1].max(1e-3));
@@ -433,6 +439,7 @@ mod tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         }
     }
 
@@ -494,6 +501,27 @@ mod tests {
         c.layers[0].shapes.push(image([0.0, 0.0], [100.0, 100.0], png(64, 64, |x, _| x >= 32)));
         assert_eq!(pick(&c, [80.0, 50.0], 2.0, true), Some(CanvasHit::Object(0, ObjRef::Shape(1))));
         assert_eq!(pick(&c, [20.0, 50.0], 2.0, true), Some(CanvasHit::Object(0, ObjRef::Shape(0))));
+    }
+
+    #[test]
+    fn a_pad_is_picked_anywhere_on_its_paper() {
+        let mut c = Canvas::default();
+        // Ink only in the right half, as a pad's pixels hold.
+        let mut pad = image([0.0, 0.0], [100.0, 100.0], png(66, 66, |x, _| x >= 33));
+        let set_paper = |s: &mut Shape, to: Option<[u8; 4]>| {
+            if let Shape::Raster { paper, .. } = s {
+                *paper = to;
+            }
+        };
+        set_paper(&mut pad, Some([250, 245, 230, 255]));
+        c.layers[0].shapes.push(pad);
+        // On the paper, away from the ink: still the pad, click or hover.
+        assert_eq!(pick(&c, [20.0, 50.0], 2.0, true), Some(CanvasHit::Object(0, ObjRef::Shape(0))));
+        assert_eq!(pick(&c, [20.0, 50.0], 2.0, false), Some(CanvasHit::Object(0, ObjRef::Shape(0))));
+        // Paper turned all the way down: only the ink is there.
+        set_paper(&mut c.layers[0].shapes[0], Some([250, 245, 230, 0]));
+        assert_eq!(pick(&c, [20.0, 50.0], 2.0, true), None);
+        assert_eq!(pick(&c, [80.0, 50.0], 2.0, true), Some(CanvasHit::Object(0, ObjRef::Shape(0))));
     }
 
     #[test]

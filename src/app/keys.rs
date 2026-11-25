@@ -12,6 +12,10 @@ pub(super) struct FrameKeys {
     rename_slide: bool,
     toggle_lock: bool,
     delete_slide: bool,
+    /// The clear-layer key: asks first (`request_layer_clear`).
+    clear_layer: bool,
+    /// The undo key right after a slide was deleted: it comes back.
+    restore_slide: bool,
     key_actions: Vec<interaction::action_keys::KeyAction>,
     refused: bool,
 }
@@ -93,7 +97,7 @@ impl OnScreenNotesApp {
         // dispatcher so typing "t" / "Ctrl+Z" lands in the label,
         // not as a tool change or an undo.
         // A slide name being typed owns the keys the same way.
-        let text_consumed = slides.typing || interaction::route_text_input(ctx, &mut self.tool, &mut self.canvases);
+        let text_consumed = slides.typing || interaction::route_text_input(ctx, &mut self.ws.tool, &mut self.canvases);
 
         // Select-tool commands found in this frame's events. They
         // are only collected inside the input closure and run after
@@ -111,14 +115,18 @@ impl OnScreenNotesApp {
         let mut toggle_lock = false;
         // Ctrl+Shift+Backspace (delete it, once confirmed), likewise.
         let mut delete_slide = false;
+        // The clear-layer key (asks first), and the undo key bringing a
+        // deleted slide back, likewise.
+        let mut clear_layer = false;
+        let mut restore_slide = false;
         // Keys bound to buttons (`interaction::action_keys`), likewise.
         let mut key_actions: Vec<interaction::action_keys::KeyAction> = Vec::new();
         // With objects selected a nudge key moves them and does
         // nothing else, even when it is a slide or layer key too (the
         // arrows are, by default).
-        let nudge_live = self.tool.kind == crate::tools::ToolKind::Select
-            && !self.tool.select.sel.is_empty()
-            && self.tool.select.gesture.is_none();
+        let nudge_live = self.ws.tool.kind == crate::tools::ToolKind::Select
+            && !self.ws.tool.select.sel.is_empty()
+            && self.ws.tool.select.gesture.is_none();
         // Likewise a hop key selects the next object and does nothing
         // else, even when it is a slide or layer key too (the arrows are,
         // by default) or a tool or media key; and inside a group the step-out key goes
@@ -126,13 +134,20 @@ impl OnScreenNotesApp {
         // drop the selection). Enter closes a lasso polygon, not this.
         let step_out_live = nudge_live && {
             let c = self.canvases.active();
-            c.layers.get(c.active_layer).is_some_and(|l| crate::tools::hop::inside_group(l, &self.tool.select.sel).is_some())
+            c.layers.get(c.active_layer).is_some_and(|l| crate::tools::hop::inside_group(l, &self.ws.tool.select.sel).is_some())
         };
-        let step_in_live = self.tool.select.gesture.is_none()
-            && !matches!(self.tool.kind, crate::tools::ToolKind::LassoErase | crate::tools::ToolKind::LassoSelect);
+        let step_in_live = self.ws.tool.select.gesture.is_none()
+            && !matches!(self.ws.tool.kind, crate::tools::ToolKind::LassoErase | crate::tools::ToolKind::LassoSelect);
         // An edit key on a slide that takes no edits, to say why
         // nothing happened.
         let mut refused = false;
+        // The wheel over the UI — a dropdown's or popup's list, the
+        // toolbar, a panel, the help — is the UI's: it scrolls that and
+        // never zooms the slide under it. egui's scroll areas read the
+        // wheel too, but its raw events stay in the input for the canvas
+        // below, so the two must be told apart here. The canvas itself is
+        // a background panel, which does not count.
+        let over_ui = ui::theme::pointer_over_ui(ctx);
 
         ctx.input(|i| {
             let mods = i.modifiers;
@@ -142,7 +157,13 @@ impl OnScreenNotesApp {
             let shift = mods.shift;
             // "Delete this slide?", the command palette, the find bar
             // and the tag row take the keys while they are up.
-            if text_consumed || self.confirm_delete.is_some() || self.commands.is_open() || self.find.is_open() || self.tag_edit.is_some() {
+            if text_consumed
+                || self.ws.confirm_delete.is_some()
+                || self.ws.confirm_edit.is_some()
+                || self.ws.commands.is_open()
+                || self.ws.find.is_open()
+                || self.ws.tag_edit.is_some()
+            {
                 // Still allow scroll-wheel events (handled below
                 // outside this for-loop) but drop key events.
                 // Falling through to the wheel block below means
@@ -219,7 +240,7 @@ impl OnScreenNotesApp {
                 }
                 if let egui::Event::Key { key, pressed: true, .. } = ev {
                     // Tool switch shortcuts.
-                    interaction::react_tool_shortcut(*key, mods, &mut self.tool, keys);
+                    interaction::react_tool_shortcut(*key, mods, &mut self.ws.tool, keys);
                     let collected = key_actions.len();
                     interaction::action_keys::collect(*key, mods, keys, &mut key_actions);
                     let nudged = nudge_live
@@ -231,7 +252,7 @@ impl OnScreenNotesApp {
                     // the one before may have gone to another slide.
                     let editable = self.canvases.active_editable();
                     if editable {
-                        self.canvases.edit_active(|c| interaction::react_lasso_keys(*key, mods, &mut self.tool, c));
+                        self.canvases.edit_active(|c| interaction::react_lasso_keys(*key, mods, &mut self.ws.tool, c));
                     }
                     // Canvas + layer navigation. A slide's active layer is
                     // part of it, so it stays put on a locked slide.
@@ -244,7 +265,7 @@ impl OnScreenNotesApp {
                     // Toggle floating UI chrome.
                     if let Some(b) = keys.canvas.toggle_ui {
                         if b.matches(*key, mods) {
-                            self.ui_visible = !self.ui_visible;
+                            self.ws.ui_visible = !self.ws.ui_visible;
                         }
                     }
                     if keys.canvas.toggle_pins.is_some_and(|b| b.matches(*key, mods)) {
@@ -267,6 +288,12 @@ impl OnScreenNotesApp {
                         .chain(kc.opacity)
                         .flatten()
                         .any(|b| b.matches(*key, mods));
+                    // Right after a slide was deleted, undo brings it back,
+                    // whatever the slide shown now takes.
+                    if keys.canvas.undo.is_some_and(|b| b.matches(*key, mods)) && self.canvases.undo_restores_slide() {
+                        restore_slide = true;
+                        continue;
+                    }
                     if !editable && edit_key {
                         refused = true;
                         continue;
@@ -277,19 +304,19 @@ impl OnScreenNotesApp {
                             self.canvases.active_mut().undo();
                             // The entry a size-slider run or a run of
                             // nudges was being folded into may be gone now.
-                            self.restyle_run = None;
-                            self.nudge_run = None;
+                            self.ws.restyle_run = None;
+                            self.ws.nudge_run = None;
                         }
                     }
                     if let Some(b) = keys.canvas.redo {
                         if b.matches(*key, mods) {
                             self.canvases.active_mut().redo();
-                            self.restyle_run = None;
-                            self.nudge_run = None;
+                            self.ws.restyle_run = None;
+                            self.ws.nudge_run = None;
                         }
                     }
-                    if let Some(b) = keys.canvas.clear_layer {
-                        if b.matches(*key, mods) { self.canvases.active_mut().clear(); }
+                    if keys.canvas.clear_layer.is_some_and(|b| b.matches(*key, mods)) {
+                        clear_layer = true;
                     }
                     if keys.canvas.delete_canvas.is_some_and(|b| b.matches(*key, mods)) {
                         delete_slide = true;
@@ -326,7 +353,7 @@ impl OnScreenNotesApp {
                     }
                     if let Some(b) = keys.canvas.preview_layer {
                         if b.matches(*key, mods) {
-                            self.show_layer_preview = !self.show_layer_preview;
+                            self.ws.show_layer_preview = !self.ws.show_layer_preview;
                         }
                     }
                     // Same as the layer panel's eye. Said in a toast
@@ -384,8 +411,8 @@ impl OnScreenNotesApp {
                 // unit mapping used inside `handle_scroll`.
                 raw_delta_y += zoom_delta_extra.ln() / 1.10_f32.ln();
             }
-            // Over the slide panel the wheel scrolls its list instead.
-            if (notches != 0 || raw_delta_y.abs() > 1e-4) && !slides.hovered {
+            // Over the slide panel (or any UI) the wheel scrolls it instead.
+            if (notches != 0 || raw_delta_y.abs() > 1e-4) && !slides.hovered && !over_ui {
                 if let Some(l) = self.loupe.as_mut() {
                     if notches != 0 {
                         l.zoom = (l.zoom + notches as f32 * 0.25).clamp(1.5, 12.0);
@@ -418,19 +445,31 @@ impl OnScreenNotesApp {
                         ctrl,
                         shift,
                         space_held,
-                        &mut self.tool,
+                        &mut self.ws.tool,
                         &mut self.canvases,
                         &mut self.config.bg_opacity,
                     );
                 }
             }
         });
-        FrameKeys { text_consumed, sel_actions, media_keys, toggle_pins, rename_slide, toggle_lock, delete_slide, key_actions, refused }
+        FrameKeys { text_consumed, sel_actions, media_keys, toggle_pins, rename_slide, toggle_lock, delete_slide, clear_layer, restore_slide, key_actions, refused }
     }
 
     /// Run what `take_keys` collected, and the slide panel's pick, in that order.
     pub(super) fn run_keys(&mut self, ctx: &egui::Context, keys: FrameKeys, slides: ui::slide_panel::Shown, canvas_rect: egui::Rect, media_objs: &[ui::media_controls::OnScreen], media_selected: Option<u64>) {
-        let FrameKeys { text_consumed, mut sel_actions, media_keys, toggle_pins, rename_slide, toggle_lock, delete_slide, key_actions, refused } = keys;
+        let FrameKeys {
+            text_consumed,
+            mut sel_actions,
+            media_keys,
+            toggle_pins,
+            rename_slide,
+            toggle_lock,
+            delete_slide,
+            clear_layer,
+            restore_slide,
+            key_actions,
+            refused,
+        } = keys;
         // ---- Select-tool commands -----------------------------------
         // Ctrl+V with only an image on the clipboard produces no egui
         // event at all, so watch the physical chord for that case.
@@ -439,10 +478,10 @@ impl OnScreenNotesApp {
         let chord = crate::platform::paste_chord_down() && ctx.input(|i| i.focused);
         // Not into a text field (find, the tag row, …): Ctrl+V pastes
         // text there.
-        if chord && !self.paste_chord_prev && !text_consumed && !ctx.wants_keyboard_input() {
+        if chord && !self.ws.paste_chord_prev && !text_consumed && !ctx.wants_keyboard_input() {
             sel_actions.push(SelAction::PasteImage);
         }
-        self.paste_chord_prev = chord;
+        self.ws.paste_chord_prev = chord;
         if !sel_actions.is_empty() {
             let ppp = ctx.pixels_per_point();
             for action in sel_actions {
@@ -460,14 +499,21 @@ impl OnScreenNotesApp {
         if delete_slide {
             self.request_slide_delete();
         }
+        if clear_layer {
+            self.request_layer_clear();
+        }
+        if restore_slide {
+            self.restore_deleted_slide();
+        }
         if toggle_lock {
             self.toggle_lock();
         }
         if refused {
             self.may_edit();
         }
+        // Shift+P opens the pins window or closes it.
         if toggle_pins {
-            self.set_pins_hidden(!self.canvases.pins_hidden());
+            self.toggle_pins_window();
         }
         match slides.action {
             Some(ui::slide_panel::SlideAction::GoTo(i)) => self.canvases.go_to(i),
@@ -477,6 +523,10 @@ impl OnScreenNotesApp {
             }
             Some(ui::slide_panel::SlideAction::Move(from, to)) => self.move_slide(from, to),
             Some(ui::slide_panel::SlideAction::Resync(i)) => self.start_resync(i),
+            // In the slide window's own panel: it shows that slide.
+            Some(ui::slide_panel::SlideAction::OpenWindow(i) | ui::slide_panel::SlideAction::OpenRegion(i)) if self.canvases.in_view() => {
+                self.canvases.go_to(i);
+            }
             Some(ui::slide_panel::SlideAction::OpenWindow(i)) => match self.slide_window.as_mut() {
                 // One slide window: asking again shows the slide there.
                 Some(win) => {
@@ -485,14 +535,22 @@ impl OnScreenNotesApp {
                 }
                 None => self.slide_window = Some(ui::slide_window::SlideWindow::new(i, &self.config)),
             },
+            Some(ui::slide_panel::SlideAction::OpenRegion(i)) => {
+                if i != self.canvases.active_index() {
+                    self.canvases.go_to(i);
+                }
+                self.begin_window_region();
+            }
             None => {}
         }
-        if rename_slide {
+        if rename_slide && self.canvases.in_view() {
+            self.toast = Some(("Name slides in the main window's slide panel".to_string(), Instant::now()));
+        } else if rename_slide {
             // The name field lives in the panel, so bring it up.
             let i = self.canvases.active_index();
-            self.slide_panel.start_rename(i, self.canvases.name(i));
+            self.ws.slide_panel.start_rename(i, self.canvases.name(i));
             self.config.slide_panel_open = true;
-            self.ui_visible = true;
+            self.ws.ui_visible = true;
         }
         if !media_keys.is_empty() {
             let pointer = ctx.input(|i| i.pointer.hover_pos());

@@ -15,5 +15,7 @@ pub mod picture_cache;
 pub mod slide_panel;
 pub mod slide_edit;
 pub mod slide_window;
+#[cfg(test)]
+pub mod snapshot;
 pub mod theme;
 pub mod toolbar;

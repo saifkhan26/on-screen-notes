@@ -9,7 +9,12 @@
 //!     and fall back to defaults.
 
 mod blobs;
+pub mod artist_tags;
+pub mod copy_ignores;
 pub mod paths;
+pub mod sources;
+pub mod tag_rejections;
+pub mod vectors;
 
 use crate::canvas::canvas::Canvas;
 use crate::config::AppConfig;
@@ -101,18 +106,39 @@ pub enum LoadOutcome {
 /// middle cannot hide the ones after it.
 pub fn max_canvas_index() -> Option<usize> {
     let dir = paths::canvases_dir().ok()?;
-    std::fs::read_dir(dir)
-        .ok()?
+    canvas_indices_in(&dir).into_iter().max()
+}
+
+/// Every `N` for which `dir` holds a `canvas_N.ron` (not the
+/// `.ron.moving` / `.ron.unreadable-…` copies beside them).
+fn canvas_indices_in(dir: &Path) -> Vec<usize> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries
         .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            e.file_name()
-                .to_str()?
-                .strip_prefix("canvas_")?
-                .strip_suffix(".ron")?
-                .parse::<usize>()
-                .ok()
-        })
-        .max()
+        .filter_map(|e| e.file_name().to_str()?.strip_prefix("canvas_")?.strip_suffix(".ron")?.parse::<usize>().ok())
+        .collect()
+}
+
+/// Delete every `canvas_N.ron` with `N >= count`, however far past the
+/// end it is. Only for right after a slide delete, once every slide has
+/// been written into `0..count`: any file past them is an old copy, and
+/// since the loader makes the deck as long as the highest file, one left
+/// behind brings back blank slides up to it at the next start.
+pub fn remove_canvas_files_from(count: usize) {
+    if let Ok(dir) = paths::canvases_dir() {
+        remove_canvas_files_from_in(&dir, count);
+    }
+}
+
+pub(crate) fn remove_canvas_files_from_in(dir: &Path, count: usize) {
+    for i in canvas_indices_in(dir).into_iter().filter(|&i| i >= count) {
+        let p = dir.join(format!("canvas_{i}.ron"));
+        match std::fs::remove_file(&p) {
+            Ok(()) => log::info!("removed {p:?}, past the last slide"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("could not remove {p:?}, past the last slide: {e}"),
+        }
+    }
 }
 
 /// Copy an unreadable canvas file aside so a later save into the same
@@ -259,6 +285,40 @@ pub fn load_views() -> Vec<SlideView> {
         log::warn!("views.ron could not be read ({e}); keeping each slide's saved view");
         Vec::new()
     })
+}
+
+/// Write the pins board's ink (the slide window's Pins view draws it, the
+/// main window shows it over every slide) to `canvases/board.ron`, in a
+/// slide's format. Not a slide: `max_canvas_index` and the slide files
+/// never see it.
+pub fn save_board(canvas: &Canvas) -> Result<()> {
+    let path = paths::canvases_dir()?.join("board.ron");
+    let serialized = serialize_canvas(canvas)?;
+    atomic_write(&path, serialized.as_bytes())
+}
+
+/// The ink `save_board` wrote; empty (and not dirty, so nothing is
+/// written until it is drawn on) when there is none. A file that does not
+/// read is copied aside first, so the next save cannot lose it.
+pub fn load_board(position_passes: usize) -> Canvas {
+    let empty = || Canvas { dirty: false, ..Canvas::default() };
+    let Ok(path) = paths::canvases_dir().map(|d| d.join("board.ron")) else { return empty() };
+    let Ok(s) = std::fs::read_to_string(&path) else { return empty() };
+    match parse_canvas_counting(&s, position_passes, None) {
+        Ok(mut c) => {
+            c.dirty = false;
+            c
+        }
+        Err(e) => {
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let aside = path.with_file_name(format!("board.ron.unreadable-{stamp}"));
+            match std::fs::copy(&path, &aside) {
+                Ok(_) => log::warn!("board.ron could not be read ({e}); kept as {}", aside.display()),
+                Err(c) => log::warn!("board.ron could not be read ({e}) nor copied aside ({c})"),
+            }
+            empty()
+        }
+    }
 }
 
 /// Write every pin's place to `canvases/pins.ron`. Kept apart from the
@@ -447,6 +507,24 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `canvas_N.ron` from `count` on goes, however far past; the
+    /// files kept aside beside them and the other files stay.
+    #[test]
+    fn files_past_the_last_slide_are_removed() {
+        let dir = std::env::temp_dir().join(format!("osn-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = ["canvas_0.ron", "canvas_2.ron", "canvas_3.ron", "canvas_90.ron", "canvas_5.ron.moving", "canvas_7.ron.unreadable-1", "views.ron"];
+        for n in names {
+            std::fs::write(dir.join(n), "x").unwrap();
+        }
+        remove_canvas_files_from_in(&dir, 3);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, ["canvas_0.ron", "canvas_2.ron", "canvas_5.ron.moving", "canvas_7.ron.unreadable-1", "views.ron"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `canvas_N.ron`, not `views.ron` / `pins.ron` beside it.
     fn is_slide_file(p: &std::path::Path) -> bool {

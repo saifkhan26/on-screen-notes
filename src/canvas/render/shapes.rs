@@ -27,6 +27,19 @@ pub(super) fn paint_shape(
     layer_opacity: f32,
     raster_tex: Option<egui::TextureId>,
 ) {
+    // A drawing pad's paper goes under its pixels (`canvas::pad`).
+    // Premultiplied in the stored values, as its ink is and as copies and
+    // thumbnails blend it (`col` premultiplies in linear light, which
+    // shows see-through paper lighter than it saves).
+    if let Shape::Raster { paper: Some(p), .. } = shape {
+        let a = p[3] as f32 / 255.0 * layer_opacity.clamp(0.0, 1.0);
+        if a > 0.0 {
+            let pm = |c: u8| (c as f32 * a).round() as u8;
+            let fill = egui::Color32::from_rgba_premultiplied(pm(p[0]), pm(p[1]), pm(p[2]), (a * 255.0).round() as u8);
+            let corners: Vec<egui::Pos2> = shape.obb().corners().into_iter().map(to_screen).collect();
+            painter.add(egui::Shape::convex_polygon(corners, fill, egui::Stroke::NONE));
+        }
+    }
     match shape {
         // A turned rectangle is no longer an `egui::Rect`, so it is
         // drawn as an outline through its four turned corners instead.

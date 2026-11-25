@@ -209,6 +209,12 @@ impl Print {
             colour_gap(&mine, &theirs) <= DUPLICATE_COLOUR && mine.aspect.max(theirs.aspect) / mine.aspect.min(theirs.aspect).max(1e-6) <= DUPLICATE_ASPECT
         })
     }
+
+    /// `is_copy_of`, but never for a picture of one flat colour, whose
+    /// hash says nothing (as `copies_apart` leaves those out).
+    pub fn duplicate_of(&self, other: &Print) -> bool {
+        !self.flat() && !other.flat() && self.is_copy_of(other)
+    }
 }
 
 /// A picture on the slides, for `copies`.
@@ -232,7 +238,15 @@ const _: () = assert!(CHUNKS > DUPLICATE_BITS, "a copy must share a chunk");
 
 /// The sets of copies among `items`: each set's items in the order given,
 /// the sets in the order of their first item. Items in no set are left out.
+#[cfg(test)]
 pub fn copies(items: &[Item]) -> Vec<Vec<usize>> {
+    copies_apart(items, |_, _| false)
+}
+
+/// As `copies`, but two items `apart` says are not copies (ignored in
+/// the duplicates list) are never joined directly; they still share a
+/// set when other copies link them.
+pub fn copies_apart(items: &[Item], apart: impl Fn(usize, usize) -> bool) -> Vec<Vec<usize>> {
     let mut parent: Vec<usize> = (0..items.len()).collect();
     fn root(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
@@ -247,15 +261,18 @@ pub fn copies(items: &[Item]) -> Vec<Vec<usize>> {
             parent[ra.max(rb)] = ra.min(rb);
         }
     };
-    let mut first: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    // Every earlier item with each key, so one kept apart from the first
+    // can still join another.
+    let mut with: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for (i, item) in items.iter().enumerate() {
         for k in &item.keys {
-            match first.get(k.as_str()) {
-                Some(&j) => join(&mut parent, i, j),
-                None => {
-                    first.insert(k, i);
+            let earlier = with.entry(k.as_str()).or_default();
+            for &j in earlier.iter() {
+                if root(&mut parent, i) != root(&mut parent, j) && !apart(i, j) {
+                    join(&mut parent, i, j);
                 }
             }
+            earlier.push(i);
         }
     }
     let chunk = |h: u64, k: u32| ((h >> (1 + k * CHUNK)) & ((1 << CHUNK) - 1)) as u16;
@@ -272,7 +289,7 @@ pub fn copies(items: &[Item]) -> Vec<Vec<usize>> {
         for h in p.hashes {
             for k in 0..CHUNKS {
                 for &j in buckets.get(&(k, chunk(h, k))).map_or(&[][..], Vec::as_slice) {
-                    if j != i && root(&mut parent, i) != root(&mut parent, j) && items[j].print.is_some_and(|q| p.is_copy_of(&q)) {
+                    if j != i && root(&mut parent, i) != root(&mut parent, j) && items[j].print.is_some_and(|q| p.is_copy_of(&q)) && !apart(i, j) {
                         join(&mut parent, i, j);
                     }
                 }
@@ -532,10 +549,138 @@ pub fn search<'a>(
     out
 }
 
+/// Most pictures listed by subject, or for typed words.
+const MOST_BY_SUBJECT: usize = 24;
+const MOST_BY_WORDS: usize = 24;
+/// How far from the typical picture towards the closest one a picture
+/// must be to be listed. How close "typical" is depends on the query:
+/// measured 2026-11-18 on 7,186 reference pictures, a picture's median
+/// likeness to the rest ran from 0.36 to 0.68 and its closest from 0.63
+/// to 0.94, so no fixed bar fits every query. Words stand out less
+/// (closest 0.11–0.16 over a median of 0.03–0.09), so their bar is
+/// higher up.
+const SUBJECT_CUT: f32 = 0.5;
+const WORDS_CUT: f32 = 0.6;
+/// Least likeness the closest picture must have for any to be listed for
+/// typed words: below it the model gives the words under 0.1% odds of
+/// showing in it. Real words on 1,639 references reached 0.109 to 0.158;
+/// "the" 0.082, "spreadsheet invoice total" 0.055. (Some nonsense, such
+/// as "zzz", reaches 0.111 and still lists its closest.)
+const WORDS_LEAST: f32 = 0.09;
+/// Likeness at which two listed pictures are the same picture: only the
+/// first is listed.
+const SAME_PICTURE: f32 = 0.985;
+
+/// The pictures among `others` (an id and a vector of length 1 each,
+/// from `canvas::picture_vectors`) that show what `query` shows, most
+/// alike first, each with a score from 0 (typical) to 1 (the same). A
+/// picture that is the same as one listed already is left out.
+pub fn by_subject<'v>(query: &[f32], others: impl IntoIterator<Item = (usize, &'v [f32])>) -> Vec<(usize, f32)> {
+    closest(query, others, SUBJECT_CUT, f32::MIN, MOST_BY_SUBJECT, |like, median, _| (like - median) / (1.0 - median).max(1e-6))
+}
+
+/// The pictures among `others` that show typed words whose vector is
+/// `words`, most likely first, each with a score from 0 (typical) to 1
+/// (the closest). A picture the same as one listed already is left out.
+pub fn by_words<'v>(words: &[f32], others: impl IntoIterator<Item = (usize, &'v [f32])>) -> Vec<(usize, f32)> {
+    closest(words, others, WORDS_CUT, WORDS_LEAST, MOST_BY_WORDS, |like, median, top| (like - median) / (top - median).max(1e-6))
+}
+
+/// The `most` of `others` closest to `query`, past `cut` of the way from
+/// the median to the closest, none unless the closest reaches `least`;
+/// `score(likeness, median, closest)` for each.
+fn closest<'v>(
+    query: &[f32],
+    others: impl IntoIterator<Item = (usize, &'v [f32])>,
+    cut: f32,
+    least: f32,
+    most: usize,
+    score: impl Fn(f32, f32, f32) -> f32,
+) -> Vec<(usize, f32)> {
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+    let mut all: Vec<(usize, &[f32], f32)> = others.into_iter().map(|(id, v)| (id, v, dot(query, v))).collect();
+    all.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let Some(&(_, _, top)) = all.first() else { return Vec::new() };
+    if top < least {
+        return Vec::new();
+    }
+    let median = all[all.len() / 2].2;
+    let bar = median + cut * (top - median);
+    let mut kept: Vec<(usize, &[f32], f32)> = Vec::new();
+    for (id, v, like) in all {
+        if like < bar || like <= median || kept.len() == most {
+            break;
+        }
+        if kept.iter().any(|k| dot(k.1, v) >= SAME_PICTURE) {
+            continue;
+        }
+        kept.push((id, v, like));
+    }
+    kept.into_iter().map(|(id, _, like)| (id, score(like, median, top).clamp(0.0, 1.0))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// A vector of length 1 whose likeness to `toward(0, 0.0)` is `like`,
+    /// the rest of it along its own `axis` (so pictures differ).
+    fn liking(like: f32, axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0; 16];
+        v[0] = like;
+        v[axis] = (1.0 - like * like).sqrt();
+        v
+    }
+
+    #[test]
+    fn by_words_lists_the_pictures_that_stand_out() {
+        let mut w = vec![0.0; 16];
+        w[0] = 1.0;
+        // Typical pictures near 0.05; two stand out.
+        let likes = [0.04, 0.05, 0.05, 0.06, 0.05, 0.15, 0.13, 0.08];
+        let others: Vec<Vec<f32>> = likes.iter().enumerate().map(|(i, &l)| liking(l, i + 1)).collect();
+        let found = by_words(&w, others.iter().enumerate().map(|(i, v)| (i, v.as_slice())));
+        assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), [5, 6]);
+        assert!((found[0].1 - 1.0).abs() < 1e-6 && found[1].1 < 1.0);
+        // Words nothing shows: none, however the rest compare.
+        let weak: Vec<Vec<f32>> = [0.02, 0.08, 0.03].iter().enumerate().map(|(i, &l)| liking(l, i + 1)).collect();
+        assert!(by_words(&w, weak.iter().enumerate().map(|(i, v)| (i, v.as_slice()))).is_empty());
+    }
+
+    /// A vector of length 1 pointing mostly along `axis`, `lean` of the
+    /// way towards the next one.
+    fn toward(axis: usize, lean: f32) -> Vec<f32> {
+        let mut v = vec![0.0; 8];
+        v[axis] = 1.0 - lean;
+        v[(axis + 1) % 8] = lean;
+        crate::ml::prep::unit(&v)
+    }
+
+    #[test]
+    fn by_subject_lists_the_close_ones_first_and_stops_at_the_typical() {
+        let q = toward(0, 0.0);
+        let others: Vec<Vec<f32>> = vec![
+            toward(0, 0.1), // close
+            toward(3, 0.0), // unrelated
+            toward(0, 0.3), // fairly close
+            toward(4, 0.0),
+            toward(5, 0.0),
+            toward(6, 0.0),
+        ];
+        let found = by_subject(&q, others.iter().enumerate().map(|(i, v)| (i, v.as_slice())));
+        assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), [0, 2]);
+        assert!(found[0].1 > found[1].1 && found[0].1 <= 1.0);
+        assert!(by_subject(&q, std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn by_subject_lists_a_picture_once_however_many_copies() {
+        let q = toward(0, 0.0);
+        let others = [toward(0, 0.2), toward(0, 0.2), toward(0, 0.21), toward(2, 0.0), toward(3, 0.0), toward(4, 0.0)];
+        let found = by_subject(&q, others.iter().enumerate().map(|(i, v)| (i, v.as_slice())));
+        assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), [0]);
+    }
 
     /// A made-up picture: a gradient with a few blocks and a disc, laid
     /// out and coloured by `seed`.
@@ -686,6 +831,7 @@ mod tests {
             tags: Vec::new(),
             turn: 0.0,
             link: 0,
+            paper: None,
         }
     }
 
@@ -798,6 +944,12 @@ mod tests {
         ];
         assert_eq!(copies(&items), vec![vec![0, 2, 4], vec![1, 5], vec![8, 9]]);
         assert!(copies(&[]).is_empty());
+        // Kept apart: 0 from 2 and 4 (it is not a copy of them), and the
+        // same file 8 from 9 (that set ignored).
+        let apart = |i: usize, j: usize| matches!((i.min(j), i.max(j)), (0, 2) | (0, 4) | (8, 9));
+        assert_eq!(copies_apart(&items, apart), vec![vec![1, 5], vec![2, 4]]);
+        // Kept apart from one, a copy still joins through another.
+        assert_eq!(copies_apart(&items, |i, j| (i.min(j), i.max(j)) == (0, 2)), vec![vec![0, 2, 4], vec![1, 5], vec![8, 9]]);
     }
 
     /// Every picture on a folder of slides (a copy: `OSN_TEST_SLIDES_DIR`)

@@ -11,11 +11,14 @@ impl OnScreenNotesApp {
         // A pen gesture in another app's window is swallowed
         // (`pen_blocked`); it needs no frames here, let alone uncapped
         // ones while the user draws elsewhere.
-        (self.pen.is_down() && !self.pen_blocked)
-            || self.tool.in_progress_stroke.is_some()
+        (self.pen.is_down() && !self.ws.pen_blocked)
+            || self.ws.tool.in_progress_stroke.is_some()
             // Drawing in the slide window: its frames are the main
             // window's (an immediate viewport).
             || self.slide_window.as_ref().is_some_and(|w| w.busy())
+            || self.window_ws.as_ref().is_some_and(|w| w.tool.in_progress_stroke.is_some() || w.tool.select.gesture.is_some())
+            || self.pins_window.as_ref().is_some_and(|w| w.busy())
+            || self.pins_ws.as_ref().is_some_and(|w| w.tool.in_progress_stroke.is_some() || w.tool.select.gesture.is_some() || w.pin_tool.busy())
             || self.pending_screenshot.is_some()
             || self.pending_freeze.is_some()
             || self.pending_lasso.is_some()
@@ -28,21 +31,21 @@ impl OnScreenNotesApp {
     /// in flight shows progress.
     pub(super) fn needs_steady_frames(&self, ctx: &egui::Context) -> bool {
         let canvas = self.canvases.active();
-        self.mouse_gesture
+        self.ws.mouse_gesture
             || ctx.input(|i| i.pointer.any_down())
-            || self.tool.select.gesture.is_some()
-            || self.layer_xform.is_some()
-            || self.pan_drag_anchor.is_some()
-            || self.middle_pan_anchor.is_some()
+            || self.ws.tool.select.gesture.is_some()
+            || self.ws.layer_xform.is_some()
+            || self.ws.pan_drag_anchor.is_some()
+            || self.ws.middle_pan_anchor.is_some()
             || self.region_select.is_some()
             || self.loupe.is_some()
             // Polls the mouse button itself while the overlay is
             // click-through, so it gets no input events.
             || self.pin_picking
             || self.pen.seen_within(PEN_NEARBY)
-            || !self.tool.laser_strokes.is_empty()
+            || !self.ws.tool.laser_strokes.is_empty()
             // The lasso's dashes march.
-            || !self.tool.lasso.points().is_empty()
+            || !self.ws.tool.lasso.points().is_empty()
             || !self.pureref_jobs.is_empty()
             || !self.media_imports.is_empty()
             || self.canvases.is_loading()
@@ -58,12 +61,33 @@ impl OnScreenNotesApp {
     /// frame that starts with a button or pen press is never held, and
     /// once ink is going down frames are not held either, so drawing
     /// latency is unchanged.
+    ///
+    /// Wintab wakes nothing, so a pen touching down mid-wait used to sit
+    /// unread for the rest of it, up to a whole refresh before its first
+    /// ink. With the pen in range the wait is taken in short steps, the
+    /// pen read between them (kept for this frame, `early_pen`), and a
+    /// touch-down ends it.
     pub(super) fn hold_to_refresh_rate(&mut self, ctx: &egui::Context) {
         let pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { pressed: true, .. })));
         if !pressed && !self.needs_live_frames() {
-            if let Some(since) = self.last_frame_at.map(|t| t.elapsed()) {
-                if since < self.idle_frame {
-                    std::thread::sleep(self.idle_frame - since);
+            if let Some(due) = self.last_frame_at.map(|t| t + self.idle_frame) {
+                if self.pen.seen_within(PEN_NEARBY) {
+                    let origin = self.client_origin(ctx);
+                    loop {
+                        let now = Instant::now();
+                        if now >= due {
+                            break;
+                        }
+                        std::thread::sleep((due - now).min(PEN_WATCH_STEP));
+                        let events = self.pen.poll(origin);
+                        let down = events.iter().any(|e| matches!(e, crate::input::pen::PenEvent::Down(_)));
+                        self.early_pen.extend(events);
+                        if down {
+                            break;
+                        }
+                    }
+                } else if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
                 }
             }
         }

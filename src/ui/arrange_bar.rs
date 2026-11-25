@@ -4,7 +4,8 @@
 //! there are two or more; flips it and zooms to it; shows a lone
 //! picture's colours (`tools::picture_colours`) in a row of its own;
 //! copies it to a new slide, moves it to another slide, and pins it
-//! (see `canvas::pins`), and tags it for find (Ctrl+F) to know it by.
+//! (see `canvas::pins`), and tags it for find (Ctrl+F) to know it by. Its
+//! "dim the rest" switch fades everything that is not selected.
 //! A selected pin gets a bar of its own in the
 //! same place, which also shows it on one slide or every slide.
 
@@ -14,7 +15,7 @@ use crate::tools::arrange::{Align, Arrange, Match, PackMode};
 use crate::ui::theme;
 use egui::{Color32, Rounding, Vec2};
 
-const BTN: f32 = 28.0;
+const BTN: f32 = 30.0;
 
 /// `tip`, followed by the keys that press the button when it has any.
 fn with_key(tip: &str, key: Option<Binding>) -> String {
@@ -27,6 +28,9 @@ fn with_key(tip: &str, key: Option<Binding>) -> String {
 /// What a click on the bar asks for.
 pub enum BarAction {
     Arrange(Arrange),
+    /// The selection's pins show on this slide only (`true`) or on every
+    /// slide.
+    PinScope(bool),
     /// Give every selected object this width or height.
     Match(Match),
     CopyToNewSlide,
@@ -39,10 +43,14 @@ pub enum BarAction {
     /// Turn the selection a quarter turn right (`true`, clockwise) or left.
     Rotate(bool),
     ZoomToSelection,
+    /// Show the selection in the slide window.
+    OpenInWindow,
     /// Show the selected picture's colours, or hide them.
     PictureColours,
     /// Find pictures like the selected one.
     FindSimilar,
+    /// Crop the selected picture.
+    Crop,
     /// Draw with this colour.
     UseColour([u8; 4]),
     /// The picture's colours become the toolbar's palette.
@@ -54,6 +62,45 @@ pub enum BarAction {
     /// The tag row was saved: it showed tags `was` and now holds `now`
     /// (see `parse_row`). Each object's tags change by the difference.
     SetTags { was: Vec<String>, now: Vec<(String, bool)> },
+    /// Find everything tagged so (a click on one of the selection's tags).
+    FindTag(String),
+    /// Tag the selected pictures posted by this handle with it (a click
+    /// on a `FromPost` chip).
+    TagFromPost(String),
+    /// Whoever posted the selected pictures under this handle is not who
+    /// made them: stop offering it (a right-click on the chip).
+    NotFromPost(String),
+    /// Find who made the selected pictures, in the browser.
+    FindArtist,
+}
+
+/// A tag offered for the selection because the pictures were sent from
+/// the browser off a post by this handle (`browser_link`): only offered,
+/// never put on by itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FromPost {
+    /// The handle, spelled as a tag the app has already if one matches.
+    pub tag: String,
+    /// Where it was posted: "X", "Instagram".
+    pub site: String,
+    /// How many selected pictures were posted by it and lack the tag.
+    pub count: usize,
+    /// No object has the tag yet.
+    pub new: bool,
+}
+
+impl FromPost {
+    /// The chip's tooltip.
+    fn tip(&self) -> String {
+        let site = if self.site.is_empty() { String::new() } else { format!(" on {}", self.site) };
+        let what = if self.count == 1 { "it".to_string() } else { format!("these {}", self.count) };
+        let mut tip = format!("Posted by @{}{site} — click to tag {what} #{}. Right-click if the poster is not the artist", self.tag, self.tag);
+        if self.new {
+            tip.push_str("
+A new tag: nothing has it yet");
+        }
+        tip
+    }
 }
 
 /// What the tag row holds (as `shape::parse_tags` reads it): each tag
@@ -88,6 +135,13 @@ pub struct TagEdit {
     /// Every tag in the app with how many objects carry it, most used
     /// first: what the row suggests. The app fills it in.
     pub known: Vec<(String, usize)>,
+    /// Tags the selected picture probably has, and how closely it fits
+    /// each (`tools::tag_suggest::fits_bars`), most likely first. The app fills
+    /// it in while picture search is on.
+    pub likely: Vec<(String, f32)>,
+    /// The handles the selected pictures were posted by
+    /// (`FromPost`). The app fills it in.
+    pub from_post: Vec<FromPost>,
 }
 
 impl TagEdit {
@@ -98,7 +152,7 @@ impl TagEdit {
         if !text.is_empty() {
             text.push(' ');
         }
-        TagEdit { text, was: current.iter().map(|(t, _)| t.clone()).collect(), focus: true, known: Vec::new() }
+        TagEdit { text, was: current.iter().map(|(t, _)| t.clone()).collect(), focus: true, known: Vec::new(), likely: Vec::new(), from_post: Vec::new() }
     }
 
     /// Where the tag being typed starts: after the last space or comma.
@@ -157,27 +211,37 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 /// one of them is in a pin; `slides` for the list "Move to slide" opens.
 /// `apart` is the "keep apart" switch: on, the align buttons slide
 /// objects until they touch rather than piling them up; the bar flips
-/// it when clicked. `pack` is how Pack lays objects out, picked from the
+/// it when clicked. `dim` is the "dim the rest" switch: on, everything
+/// not selected fades back; the bar flips it too. `pack` is how Pack lays objects out, picked from the
 /// arrow beside it. `keys` label the buttons' tooltips; `open_move`
 /// opens "Move to slide…" as its key asks; `picture` is set when the
 /// selection is one picture, for its palette button; `grouped` when some
 /// of it is in a group, for the ungroup button. `tags` are the
 /// selection's (`.1` set for one only some of it carries), shown beside
-/// the tag button; `tag_edit` is the row for typing them while it is
-/// open. Returns what was clicked this frame, if anything.
+/// the tag button; `from_post` the tags offered for it because of who
+/// posted its pictures (`FromPost`), shown after them; `tag_edit` is the
+/// row for typing them while it is open. Returns what was clicked this
+/// frame, if anything.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
     count: usize,
     pinned: bool,
+    // While `pinned`: the pins show on this slide only (`Some(true)`), on
+    // every slide (`Some(false)`), or some each way (`None`).
+    pin_local: Option<bool>,
     slides: &CanvasManager,
     apart: &mut bool,
+    dim: &mut bool,
     pack: &mut PackMode,
     keys: &ParsedHotkeys,
     open_move: bool,
     picture: Option<ColourRow<'_>>,
     grouped: bool,
     tags: &[(String, bool)],
+    from_post: &[FromPost],
+    // Some of the selection is a picture, GIF or video: "Find artist" shows.
+    pictures: bool,
     tag_edit: &mut Option<TagEdit>,
 ) -> Option<BarAction> {
     let pos = bar_pos(ctx);
@@ -194,7 +258,7 @@ pub fn show(
                     ui.label(egui::RichText::new(format!("{count} selected")).small().color(theme::TEXT_MUTED));
                     ui.add_space(6.0);
                     if count >= 2 {
-                        arrange_buttons(ui, count, apart, pack, keys, &mut picked);
+                        arrange_buttons(ui, count, !tags.is_empty(), apart, pack, keys, &mut picked);
                         divider(ui);
                     }
                     let k = &keys.arrange;
@@ -233,6 +297,14 @@ pub fn show(
                     if icon_btn(ui, egui::include_image!("../../assets/icons/zoom-selection.svg"), true, &tip) {
                         picked = Some(BarAction::ZoomToSelection);
                     }
+                    let tip = if *dim {
+                        "Dim the rest: on — while objects are selected, everything else fades back. Click to stop"
+                    } else {
+                        "Dim the rest: off — click to fade everything that is not selected, so it is plain what is"
+                    };
+                    if toggle_btn(ui, egui::include_image!("../../assets/icons/dim-rest.svg"), *dim, &with_key(tip, k.dim_unselected)) {
+                        *dim = !*dim;
+                    }
                     if let Some(row) = &picture {
                         let tip = with_key("Colours in this picture — draw with one, or keep them all as the palette", k.picture_colours);
                         if toggle_btn(ui, egui::include_image!("../../assets/icons/palette.svg"), row.shown.is_some(), &tip) {
@@ -241,6 +313,16 @@ pub fn show(
                         let tip = with_key("Find similar — copies of this picture (resized, recoloured, mirrored or turned) and pictures like it, on every slide", k.find_similar);
                         if icon_btn(ui, egui::include_image!("../../assets/icons/find-similar.svg"), true, &tip) {
                             picked = Some(BarAction::FindSimilar);
+                        }
+                        let tip = with_key("Crop — drag its edges or corners; Enter crops, Esc cancels", k.crop);
+                        if icon_btn(ui, egui::include_image!("../../assets/icons/crop.svg"), true, &tip) {
+                            picked = Some(BarAction::Crop);
+                        }
+                    }
+                    if pictures {
+                        let tip = "Find the artist — the browser extension looks the picture up with Google Lens, and you pick who made it there";
+                        if icon_btn(ui, egui::include_image!("../../assets/icons/find-artist.svg"), true, tip) {
+                            picked = Some(BarAction::FindArtist);
                         }
                     }
                     divider(ui);
@@ -251,19 +333,43 @@ pub fn show(
                     if let Some(to) = move_btn(ui, slides, keys.arrange.move_to_slide, open_move) {
                         picked = Some(BarAction::MoveToSlide(to));
                     }
+                    let tip = with_key("Show in the slide window — it pops out over the selection, or the open one shows it", k.open_in_window);
+                    if icon_btn(ui, egui::include_image!("../../assets/icons/open-in-window.svg"), true, &tip) {
+                        picked = Some(BarAction::OpenInWindow);
+                    }
                     let tip = if pinned {
                         "Unpin — stop showing these as a pin"
                     } else {
-                        "Pin to every slide — the objects stay here, and a pin you can move and resize shows them on every slide; its bar can keep it to this slide"
+                        "Pin — the objects stay here, and the pins window shows them on every slide; or keep the pin to this slide, on the main window, from the choice that comes up"
                     };
                     let tip = with_key(tip, keys.canvas.pin_selection);
                     if toggle_btn(ui, egui::include_image!("../../assets/icons/pin.svg"), pinned, &tip) {
                         picked = Some(BarAction::TogglePin);
                     }
+                    // Where a pin of these shows: this slide or every one.
+                    if pinned {
+                        let only = with_key("Show the pin on this slide only, here on the main window", keys.canvas.pin_this_slide_only);
+                        if ui.selectable_label(pin_local == Some(true), "This slide").on_hover_text(only).clicked() {
+                            picked = Some(BarAction::PinScope(true));
+                        }
+                        let every = with_key("Show the pin on every slide, in the pins window", keys.canvas.pin_this_slide_only);
+                        if ui.selectable_label(pin_local == Some(false), "Every slide").on_hover_text(every).clicked() {
+                            picked = Some(BarAction::PinScope(false));
+                        }
+                    }
                     let tip = with_key("Tags — words find (Ctrl+F) knows the selection by", k.tag);
                     let mut open = toggle_btn(ui, egui::include_image!("../../assets/icons/tag.svg"), tag_edit.is_some(), &tip);
                     if !tags.is_empty() && tag_edit.is_none() {
-                        open |= tag_chips(ui, tags);
+                        match tag_chips(ui, tags) {
+                            Some(ChipPick::Find(tag)) => picked = Some(BarAction::FindTag(tag)),
+                            Some(ChipPick::Edit) => open = true,
+                            None => {}
+                        }
+                    }
+                    if tag_edit.is_none() {
+                        if let Some(a) = from_post_chips(ui, from_post) {
+                            picked = Some(a);
+                        }
                     }
                     if open {
                         *tag_edit = match tag_edit {
@@ -293,18 +399,96 @@ pub fn show(
     picked
 }
 
-/// The selection's tags beside the tag button, cut short if long, one
-/// only some of it carries marked `*`; a click opens them for typing,
-/// as the button does.
-fn tag_chips(ui: &mut egui::Ui, tags: &[(String, bool)]) -> bool {
-    let shown: Vec<String> = tags.iter().map(|(t, some)| if *some { format!("{t}*") } else { t.clone() }).collect();
-    let all = crate::ui::media_filter::tags_text(&shown, usize::MAX);
-    let text = egui::RichText::new(crate::ui::media_filter::tags_text(&shown, 32)).small().color(crate::ui::media_filter::TAG_COLOUR);
-    let mut tip = format!("{all} — click to change");
-    if tags.iter().any(|(_, some)| *some) {
-        tip.push_str("\n* only some of the selection has it");
+/// Room for the tags beside the tag button, in characters.
+const CHIP_ROOM: usize = 32;
+
+/// What a click on the tags beside the tag button asks for.
+enum ChipPick {
+    /// Find everything tagged so.
+    Find(String),
+    /// Open the tags for typing, as the button does.
+    Edit,
+}
+
+/// How many of `tags` (`#tag` each, a space between) fit in `room`
+/// characters; the first always does, cut short if long.
+fn chips_that_fit(tags: &[String], room: usize) -> usize {
+    let mut used = 0;
+    tags.iter()
+        .take_while(|t| {
+            let len = t.chars().count() + 1;
+            let fits = used == 0 || used + 1 + len <= room;
+            used += if used == 0 { len } else { 1 + len };
+            fits
+        })
+        .count()
+}
+
+/// The selection's tags beside the tag button, one only some of it
+/// carries marked `*`, as many as fit: a click on one finds everything
+/// tagged so (as `#tag` typed in find would); on the count of the rest,
+/// opens them for typing, as the button does.
+fn tag_chips(ui: &mut egui::Ui, tags: &[(String, bool)]) -> Option<ChipPick> {
+    use crate::ui::media_filter::tags_text;
+    let names: Vec<String> = tags.iter().map(|(t, some)| if *some { format!("{t}*") } else { t.clone() }).collect();
+    let fit = chips_that_fit(&names, CHIP_ROOM);
+    let mut out = None;
+    ui.add_space(2.0);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+        for ((tag, some), name) in tags.iter().zip(&names).take(fit) {
+            let text = egui::RichText::new(tags_text(std::slice::from_ref(name), CHIP_ROOM)).small().color(theme::TEXT_PRIMARY);
+            let mut tip = format!("Find everything tagged #{tag} — the tag button changes the tags");
+            if *some {
+                tip.push_str("\n* only some of the selection has it");
+            }
+            let r = ui.add(egui::Button::new(text).rounding(Rounding::same(9.0))).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
+            if r.clicked() {
+                out = Some(ChipPick::Find(tag.clone()));
+            }
+        }
+        if fit < tags.len() {
+            let text = egui::RichText::new(format!("+{}", tags.len() - fit)).small().color(theme::TEXT_MUTED);
+            let tip = format!("{} — click to change", tags_text(&names[fit..], usize::MAX));
+            if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
+                out = Some(ChipPick::Edit);
+            }
+        }
+    });
+    out
+}
+
+/// The tags offered because of who posted the selected pictures, after
+/// the selection's own: `+#handle`, a click puts it on them, a
+/// right-click says the poster is not the artist.
+fn from_post_chips(ui: &mut egui::Ui, from_post: &[FromPost]) -> Option<BarAction> {
+    if from_post.is_empty() {
+        return None;
     }
-    ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked()
+    let mut out = None;
+    ui.add_space(2.0);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+        for fp in from_post.iter().take(3) {
+            let mut label = format!("+{}", crate::ui::media_filter::tags_text(std::slice::from_ref(&fp.tag), CHIP_ROOM));
+            if fp.count > 1 {
+                label.push_str(&format!(" ({})", fp.count));
+            }
+            let text = egui::RichText::new(label).small().color(theme::TEXT_MUTED);
+            let r = ui
+                .add(egui::Button::new(text).rounding(Rounding::same(9.0)).fill(Color32::TRANSPARENT))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(fp.tip());
+            if r.clicked() {
+                out = Some(BarAction::TagFromPost(fp.tag.clone()));
+            } else if r.secondary_clicked() {
+                out = Some(BarAction::NotFromPost(fp.tag.clone()));
+            }
+        }
+    });
+    out
 }
 
 /// The row for typing the selection's tags, with the tags already used
@@ -340,13 +524,43 @@ fn tag_row(ui: &mut egui::Ui, edit: &mut TagEdit) -> Option<Option<String>> {
             let note = "tag* — stays only on the objects that have it; take the * off to put it on all";
             ui.label(egui::RichText::new(note).small().color(theme::TEXT_MUTED));
         }
+        let typed = parse_row(&edit.text);
+        let likely: Vec<(String, f32)> =
+            edit.likely.iter().filter(|(t, _)| !typed.iter().any(|(h, _)| crate::canvas::units::same_tag(h, t))).cloned().collect();
+        if !likely.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new("Looks like").small().color(theme::TEXT_MUTED));
+                for (tag, close) in &likely {
+                    let text = egui::RichText::new(format!("#{tag} {:.0}%", close * 100.0)).small().color(theme::TEXT_PRIMARY);
+                    let tip = format!("It looks like the pictures tagged #{tag}. Click to add it");
+                    if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
+                        picked = Some(tag.clone());
+                    }
+                }
+            });
+        }
+        let posted: Vec<&FromPost> = edit.from_post.iter().filter(|f| !typed.iter().any(|(h, _)| crate::canvas::units::same_tag(h, &f.tag))).collect();
+        if !posted.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new("From post").small().color(theme::TEXT_MUTED));
+                for fp in posted {
+                    let site = if fp.site.is_empty() { String::new() } else { format!(" · {}", fp.site) };
+                    let text = egui::RichText::new(format!("#{}{site}", fp.tag)).small().color(theme::TEXT_PRIMARY);
+                    if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(fp.tip()).clicked() {
+                        picked = Some(fp.tag.clone());
+                    }
+                }
+            });
+        }
         let offered = edit.suggestions(SUGGESTED);
         if !offered.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(egui::RichText::new("Used").small().color(theme::TEXT_MUTED));
                 for (k, tag) in offered.iter().enumerate() {
-                    let text = egui::RichText::new(format!("#{tag}")).small().color(crate::ui::media_filter::TAG_COLOUR);
+                    let text = egui::RichText::new(format!("#{tag}")).small().color(theme::TEXT_PRIMARY);
                     let tip = if k == 0 { "Click, or Tab, to add it" } else { "Click to add it" };
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
                         picked = Some(tag.clone());
@@ -468,13 +682,13 @@ fn move_btn(ui: &mut egui::Ui, slides: &CanvasManager, key: Option<Binding>, ope
     let open = ui.memory(|m| m.is_popup_open(popup));
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if open {
-        theme::ACCENT
+        theme::on_fill()
     } else if others && response.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, Rounding::same(7.0), bg);
+    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), bg);
     let tint = if others { theme::TEXT_PRIMARY } else { Color32::from_white_alpha(60) };
     let icon = rect.shrink(rect.width() * 0.22);
     egui::Image::new(egui::include_image!("../../assets/icons/move-to-slide.svg"))
@@ -528,9 +742,9 @@ fn pack_mode_menu(ui: &mut egui::Ui, mode: &mut PackMode) {
     let open = ui.memory(|m| m.is_popup_open(popup));
     let (rect, response) = ui.allocate_exact_size(Vec2::new(14.0, BTN), egui::Sense::click());
     let bg = if open {
-        theme::ACCENT
+        theme::on_fill()
     } else if response.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
@@ -564,11 +778,12 @@ fn pack_mode_menu(ui: &mut egui::Ui, mode: &mut PackMode) {
 }
 
 /// Pack, group, align, distribute and match sizes, for two or more
-/// objects.
-fn arrange_buttons(ui: &mut egui::Ui, count: usize, apart: &mut bool, pack: &mut PackMode, keys: &ParsedHotkeys, picked: &mut Option<BarAction>) {
+/// objects; `tagged` when some of them carry a tag, for group by tags.
+fn arrange_buttons(ui: &mut egui::Ui, count: usize, tagged: bool, apart: &mut bool, pack: &mut PackMode, keys: &ParsedHotkeys, picked: &mut Option<BarAction>) {
     let k = &keys.arrange;
     let mut btn = |ui: &mut egui::Ui, op: Arrange, img: egui::ImageSource<'static>, tip: &str, key: Option<Binding>| {
-        if icon_btn(ui, img, count >= op.min_items(), &with_key(tip, key)) {
+        let can = count >= op.min_items() && (op != Arrange::GroupByTags || tagged);
+        if icon_btn(ui, img, can, &with_key(tip, key)) {
             *picked = Some(BarAction::Arrange(op));
         }
     };
@@ -581,6 +796,12 @@ fn arrange_buttons(ui: &mut egui::Ui, count: usize, apart: &mut bool, pack: &mut
     pack_mode_menu(ui, pack);
     btn(ui, Arrange::GroupByType, egui::include_image!("../../assets/icons/group-by-type.svg"),
         "Group by type — pictures, GIFs, videos and other objects each packed into their own cluster", k.group_by_type);
+    let tip = if tagged {
+        "Group by tags — the objects under each tag packed into their own cluster, A to Z, untagged ones last. One with several tags goes with the tag most of the selection shares"
+    } else {
+        "Group by tags — none of the selection is tagged yet (the tag button tags it)"
+    };
+    btn(ui, Arrange::GroupByTags, egui::include_image!("../../assets/icons/group-by-tags.svg"), tip, k.group_by_tags);
     divider(ui);
     let tip = if *apart {
         "Keep apart: on — aligning slides each object until it reaches the edge or bumps into another, so nothing ends up on top of anything. Click to let aligning pile objects up"
@@ -634,13 +855,13 @@ fn divider(ui: &mut egui::Ui) {
 fn toggle_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, on: bool, tooltip: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BTN), egui::Sense::click());
     let bg = if on {
-        Color32::from_rgba_unmultiplied(86, 160, 255, 70)
+        theme::on_fill()
     } else if resp.hovered() {
-        Color32::from_white_alpha(22)
+        theme::HOVER
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, Rounding::same(7.0), bg);
+    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), bg);
     let icon = rect.shrink(rect.width() * 0.24);
     egui::Image::new(img).tint(theme::TEXT_PRIMARY).fit_to_exact_size(icon.size()).paint_at(ui, icon);
     resp.on_hover_text(tooltip).clicked()
@@ -649,8 +870,8 @@ fn toggle_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, on: bool, tool
 fn icon_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, enabled: bool, tooltip: &str) -> bool {
     let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BTN), sense);
-    let bg = if enabled && resp.hovered() { Color32::from_white_alpha(22) } else { Color32::TRANSPARENT };
-    ui.painter().rect_filled(rect, Rounding::same(7.0), bg);
+    let bg = if enabled && resp.hovered() { theme::HOVER } else { Color32::TRANSPARENT };
+    ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), bg);
     let tint = if enabled { theme::TEXT_PRIMARY } else { Color32::from_white_alpha(70) };
     let icon = rect.shrink(rect.width() * 0.24);
     egui::Image::new(img).tint(tint).fit_to_exact_size(icon.size()).paint_at(ui, icon);
@@ -661,9 +882,20 @@ fn icon_btn(ui: &mut egui::Ui, img: egui::ImageSource<'static>, enabled: bool, t
 mod tests {
     use super::*;
 
+    #[test]
+    fn as_many_tag_chips_as_fit_the_first_always() {
+        let tags = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // "#pose #ref" is 10 characters.
+        assert_eq!(chips_that_fit(&tags(&["pose", "ref"]), 10), 2);
+        assert_eq!(chips_that_fit(&tags(&["pose", "ref"]), 9), 1);
+        assert_eq!(chips_that_fit(&tags(&["a-very-long-tag-indeed"]), 5), 1, "one alone is cut, not left out");
+        assert_eq!(chips_that_fit(&tags(&["a", "bb", "c"]), 7), 2, "#a #bb");
+        assert_eq!(chips_that_fit(&[], 10), 0);
+    }
+
     fn edit(text: &str) -> TagEdit {
         let known = [("pose", 9), ("ref", 4), ("portrait", 6), ("prop", 1), ("hands", 2)];
-        TagEdit { text: text.into(), was: Vec::new(), focus: false, known: known.iter().map(|(t, n)| (t.to_string(), *n)).collect() }
+        TagEdit { text: text.into(), was: Vec::new(), focus: false, known: known.iter().map(|(t, n)| (t.to_string(), *n)).collect(), likely: Vec::new(), from_post: Vec::new() }
     }
 
     #[test]
