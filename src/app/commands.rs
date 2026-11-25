@@ -334,6 +334,7 @@ impl OnScreenNotesApp {
             C::GoTo(i) => self.canvases.go_to(i),
             C::NewPad => self.new_pad(ctx, canvas_rect),
             C::DrawOnPicture => self.draw_on_selected_picture(),
+            C::FindArtist => self.find_artists(),
         }
     }
 }

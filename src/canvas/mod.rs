@@ -885,6 +885,11 @@ impl CanvasManager {
         }
     }
 
+    /// The slides visited, most recent first.
+    pub fn recent(&self) -> &[usize] {
+        &self.recent
+    }
+
     /// Note the active slide as the most recently visited. Call once a
     /// frame; held back while a recently-used walk is under way, and
     /// while a second window's frame runs (its slide is no visit).

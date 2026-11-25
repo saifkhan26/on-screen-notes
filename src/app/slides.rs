@@ -297,12 +297,21 @@ impl OnScreenNotesApp {
     /// highlight's picked tags follow.
     pub(super) fn apply_tag_action(&mut self, a: ui::find_bar::TagAction) {
         use crate::canvas::units::same_tag;
+        match &a {
+            ui::find_bar::TagAction::Artist(tag, on) => {
+                self.mark_artist_tag(tag, *on);
+                return;
+            }
+            ui::find_bar::TagAction::Rename(from, to) => self.rename_artist_tag(from, to),
+            ui::find_bar::TagAction::Remove(_) => {}
+        }
         let tags_text = |tags: &[String]| tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
         let (what, (n, locked)) = match &a {
             ui::find_bar::TagAction::Rename(from, to) => {
                 (format!("#{from} is now {}", tags_text(to)), self.canvases.rename_tag(from, to))
             }
             ui::find_bar::TagAction::Remove(tag) => (format!("#{tag} removed"), self.canvases.remove_tag(tag)),
+            ui::find_bar::TagAction::Artist(..) => return,
         };
         let picked = &mut self.media_filter.tags;
         match a {

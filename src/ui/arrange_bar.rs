@@ -64,6 +64,43 @@ pub enum BarAction {
     SetTags { was: Vec<String>, now: Vec<(String, bool)> },
     /// Find everything tagged so (a click on one of the selection's tags).
     FindTag(String),
+    /// Tag the selected pictures posted by this handle with it (a click
+    /// on a `FromPost` chip).
+    TagFromPost(String),
+    /// Whoever posted the selected pictures under this handle is not who
+    /// made them: stop offering it (a right-click on the chip).
+    NotFromPost(String),
+    /// Find who made the selected pictures, in the browser.
+    FindArtist,
+}
+
+/// A tag offered for the selection because the pictures were sent from
+/// the browser off a post by this handle (`browser_link`): only offered,
+/// never put on by itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FromPost {
+    /// The handle, spelled as a tag the app has already if one matches.
+    pub tag: String,
+    /// Where it was posted: "X", "Instagram".
+    pub site: String,
+    /// How many selected pictures were posted by it and lack the tag.
+    pub count: usize,
+    /// No object has the tag yet.
+    pub new: bool,
+}
+
+impl FromPost {
+    /// The chip's tooltip.
+    fn tip(&self) -> String {
+        let site = if self.site.is_empty() { String::new() } else { format!(" on {}", self.site) };
+        let what = if self.count == 1 { "it".to_string() } else { format!("these {}", self.count) };
+        let mut tip = format!("Posted by @{}{site} — click to tag {what} #{}. Right-click if the poster is not the artist", self.tag, self.tag);
+        if self.new {
+            tip.push_str("
+A new tag: nothing has it yet");
+        }
+        tip
+    }
 }
 
 /// What the tag row holds (as `shape::parse_tags` reads it): each tag
@@ -102,6 +139,9 @@ pub struct TagEdit {
     /// each (`tools::tag_suggest::fits_bars`), most likely first. The app fills
     /// it in while picture search is on.
     pub likely: Vec<(String, f32)>,
+    /// The handles the selected pictures were posted by
+    /// (`FromPost`). The app fills it in.
+    pub from_post: Vec<FromPost>,
 }
 
 impl TagEdit {
@@ -112,7 +152,7 @@ impl TagEdit {
         if !text.is_empty() {
             text.push(' ');
         }
-        TagEdit { text, was: current.iter().map(|(t, _)| t.clone()).collect(), focus: true, known: Vec::new(), likely: Vec::new() }
+        TagEdit { text, was: current.iter().map(|(t, _)| t.clone()).collect(), focus: true, known: Vec::new(), likely: Vec::new(), from_post: Vec::new() }
     }
 
     /// Where the tag being typed starts: after the last space or comma.
@@ -178,8 +218,10 @@ fn bar_pos(ctx: &egui::Context) -> egui::Pos2 {
 /// selection is one picture, for its palette button; `grouped` when some
 /// of it is in a group, for the ungroup button. `tags` are the
 /// selection's (`.1` set for one only some of it carries), shown beside
-/// the tag button; `tag_edit` is the row for typing them while it is
-/// open. Returns what was clicked this frame, if anything.
+/// the tag button; `from_post` the tags offered for it because of who
+/// posted its pictures (`FromPost`), shown after them; `tag_edit` is the
+/// row for typing them while it is open. Returns what was clicked this
+/// frame, if anything.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
@@ -197,6 +239,9 @@ pub fn show(
     picture: Option<ColourRow<'_>>,
     grouped: bool,
     tags: &[(String, bool)],
+    from_post: &[FromPost],
+    // Some of the selection is a picture, GIF or video: "Find artist" shows.
+    pictures: bool,
     tag_edit: &mut Option<TagEdit>,
 ) -> Option<BarAction> {
     let pos = bar_pos(ctx);
@@ -274,6 +319,12 @@ pub fn show(
                             picked = Some(BarAction::Crop);
                         }
                     }
+                    if pictures {
+                        let tip = "Find the artist — the browser extension looks the picture up with Google Lens, and you pick who made it there";
+                        if icon_btn(ui, egui::include_image!("../../assets/icons/find-artist.svg"), true, tip) {
+                            picked = Some(BarAction::FindArtist);
+                        }
+                    }
                     divider(ui);
                     let tip = with_key("Copy to a new slide (added after the last slide)", keys.canvas.copy_to_new_slide);
                     if icon_btn(ui, egui::include_image!("../../assets/icons/copy-to-slide.svg"), true, &tip) {
@@ -313,6 +364,11 @@ pub fn show(
                             Some(ChipPick::Find(tag)) => picked = Some(BarAction::FindTag(tag)),
                             Some(ChipPick::Edit) => open = true,
                             None => {}
+                        }
+                    }
+                    if tag_edit.is_none() {
+                        if let Some(a) = from_post_chips(ui, from_post) {
+                            picked = Some(a);
                         }
                     }
                     if open {
@@ -403,6 +459,38 @@ fn tag_chips(ui: &mut egui::Ui, tags: &[(String, bool)]) -> Option<ChipPick> {
     out
 }
 
+/// The tags offered because of who posted the selected pictures, after
+/// the selection's own: `+#handle`, a click puts it on them, a
+/// right-click says the poster is not the artist.
+fn from_post_chips(ui: &mut egui::Ui, from_post: &[FromPost]) -> Option<BarAction> {
+    if from_post.is_empty() {
+        return None;
+    }
+    let mut out = None;
+    ui.add_space(2.0);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+        for fp in from_post.iter().take(3) {
+            let mut label = format!("+{}", crate::ui::media_filter::tags_text(std::slice::from_ref(&fp.tag), CHIP_ROOM));
+            if fp.count > 1 {
+                label.push_str(&format!(" ({})", fp.count));
+            }
+            let text = egui::RichText::new(label).small().color(theme::TEXT_MUTED);
+            let r = ui
+                .add(egui::Button::new(text).rounding(Rounding::same(9.0)).fill(Color32::TRANSPARENT))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(fp.tip());
+            if r.clicked() {
+                out = Some(BarAction::TagFromPost(fp.tag.clone()));
+            } else if r.secondary_clicked() {
+                out = Some(BarAction::NotFromPost(fp.tag.clone()));
+            }
+        }
+    });
+    out
+}
+
 /// The row for typing the selection's tags, with the tags already used
 /// in the app offered under it: a click, or `Tab` for the first, puts
 /// one in. `Some(Some(text))` once `Enter` saves them, `Some(None)` when
@@ -448,6 +536,20 @@ fn tag_row(ui: &mut egui::Ui, edit: &mut TagEdit) -> Option<Option<String>> {
                     let tip = format!("It looks like the pictures tagged #{tag}. Click to add it");
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
                         picked = Some(tag.clone());
+                    }
+                }
+            });
+        }
+        let posted: Vec<&FromPost> = edit.from_post.iter().filter(|f| !typed.iter().any(|(h, _)| crate::canvas::units::same_tag(h, &f.tag))).collect();
+        if !posted.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new("From post").small().color(theme::TEXT_MUTED));
+                for fp in posted {
+                    let site = if fp.site.is_empty() { String::new() } else { format!(" · {}", fp.site) };
+                    let text = egui::RichText::new(format!("#{}{site}", fp.tag)).small().color(theme::TEXT_PRIMARY);
+                    if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(fp.tip()).clicked() {
+                        picked = Some(fp.tag.clone());
                     }
                 }
             });
@@ -793,7 +895,7 @@ mod tests {
 
     fn edit(text: &str) -> TagEdit {
         let known = [("pose", 9), ("ref", 4), ("portrait", 6), ("prop", 1), ("hands", 2)];
-        TagEdit { text: text.into(), was: Vec::new(), focus: false, known: known.iter().map(|(t, n)| (t.to_string(), *n)).collect(), likely: Vec::new() }
+        TagEdit { text: text.into(), was: Vec::new(), focus: false, known: known.iter().map(|(t, n)| (t.to_string(), *n)).collect(), likely: Vec::new(), from_post: Vec::new() }
     }
 
     #[test]

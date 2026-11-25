@@ -48,8 +48,10 @@ pub fn show(
     // New media beside the selected picture: what it matches and which
     // side, in the settings popup.
     beside: (&mut BesideFit, &mut BesideSide),
-    // Picture search on / off, and where it is, in the settings popup.
-    picture_search: (&mut bool, &str),
+    // Picture search on / off and where it is, then the browser link on /
+    // off, where it is, and "Disconnect all" (set when clicked), in the
+    // settings popup.
+    services: (&mut bool, &str, &mut bool, &str, &mut bool),
     pinned_hwnd: &mut Option<isize>,
     pin_picking: &mut bool,
     // Set when the "Insert video / GIF" button is clicked.
@@ -157,8 +159,11 @@ pub fn show(
                         keep_proportions: snaps.2,
                         beside_fit: beside.0,
                         beside_side: beside.1,
-                        picture_search: picture_search.0,
-                        picture_status: picture_search.1,
+                        picture_search: services.0,
+                        picture_status: services.1,
+                        browser_link: services.2,
+                        browser_status: services.3,
+                        forget_browsers: services.4,
                         keys,
                     };
                     interacted |= settings_btn(ui, settings);
@@ -963,6 +968,9 @@ struct Settings<'a> {
     beside_side: &'a mut BesideSide,
     picture_search: &'a mut bool,
     picture_status: &'a str,
+    browser_link: &'a mut bool,
+    browser_status: &'a str,
+    forget_browsers: &'a mut bool,
     keys: &'a ParsedHotkeys,
 }
 
@@ -1225,6 +1233,25 @@ fn editing_page(ui: &mut egui::Ui, s: Settings) {
     if *s.picture_search && !s.picture_status.is_empty() {
         ui.label(egui::RichText::new(s.picture_status).small().color(theme::TEXT_MUTED));
     }
+
+    theme::section(ui, "Browser extension");
+    theme::setting_row(
+        ui,
+        "Receive from the browser",
+        Some("The On-Screen Notes extension for Firefox and Chrome sends pictures, GIFs and videos straight to the slide: right-click one, or pick it. Listens on this computer only, and asks before an extension may send"),
+        |ui| theme::switch(ui, s.browser_link),
+    );
+    if *s.browser_link && !s.browser_status.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.browser_status).small().color(theme::TEXT_MUTED));
+            if s.browser_status.contains("connected:") {
+                let tip = "Let every connected browser go: each asks again (Connect) the next time it sends";
+                if ui.small_button("Disconnect all").on_hover_text(tip).clicked() {
+                    *s.forget_browsers = true;
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1287,7 +1314,7 @@ mod tests {
             &mut cfg.accent,
             (&mut cfg.shape_snap, &mut cfg.smart_guides, &mut cfg.keep_proportions),
             (&mut cfg.beside_fit, &mut cfg.beside_side),
-            (&mut cfg.picture_search, "Reading pictures: 12 of 340"),
+            (&mut cfg.picture_search, "Reading pictures: 12 of 340", &mut cfg.browser_link, "Listening on 127.0.0.1:47823 · connected: Firefox", &mut false),
             &mut pin,
             &mut picking,
             &mut insert,

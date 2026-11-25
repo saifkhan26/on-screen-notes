@@ -49,6 +49,7 @@ mod workspace;
 mod view_pass;
 mod window_region;
 mod press_log;
+mod browser;
 
 pub struct OnScreenNotesApp {
     config: AppConfig,
@@ -220,6 +221,8 @@ pub struct OnScreenNotesApp {
     main_select: Option<(usize, crate::canvas::hit::Selection)>,
     /// Files being copied in and read as videos / GIFs.
     media_imports: Vec<crate::media::import::ImportJob>,
+    /// The browser extension's way in, and where sent pictures came from.
+    browser: browser::BrowserState,
     /// Videos picked or dropped before FFmpeg was set up, with where
     /// they were dropped. Imported once it is; dropped if the setup
     /// window is closed without it.
@@ -602,6 +605,7 @@ impl OnScreenNotesApp {
             pins_ws: None,
             running: None,
             media_imports: Vec::new(),
+            browser: Default::default(),
             media_waiting: Vec::new(),
             media_dialog: None,
             resync_dialog: None,
@@ -736,6 +740,8 @@ impl eframe::App for OnScreenNotesApp {
     fn on_exit(&mut self) {
         // Picture search's threads stop before ONNX Runtime is unloaded.
         self.picture_vectors.stop();
+        // Nothing more comes in from the browser.
+        self.browser.stop();
         // A pad still open goes into its slide first.
         self.close_pad(false);
         // Shutdown path: block until every dirty canvas is on disk.

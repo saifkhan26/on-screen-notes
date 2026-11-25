@@ -9,8 +9,10 @@
 //!     and fall back to defaults.
 
 mod blobs;
+pub mod artist_tags;
 pub mod copy_ignores;
 pub mod paths;
+pub mod sources;
 pub mod tag_rejections;
 pub mod vectors;
 

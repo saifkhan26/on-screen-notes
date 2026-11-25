@@ -203,6 +203,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub picture_search: bool,
 
+    /// The browser extension's way in (`browser_link`): pictures, GIFs
+    /// and videos sent from the browser land on the slide. On unless
+    /// turned off in the settings; it listens on this computer only, and
+    /// an extension must be let in once before it can send.
+    #[serde(default = "default_shape_snap")]
+    pub browser_link: bool,
+    /// The port it listens on (the extension's options say the same).
+    #[serde(default = "default_browser_link_port")]
+    pub browser_link_port: u16,
+
     /// How the arrange bar's Pack lays objects out: the tightest block,
     /// rows or columns. Picked from the arrow beside it.
     #[serde(default)]
@@ -306,6 +316,7 @@ fn default_slide_panel_open() -> bool { true }
 
 fn default_arrange_apart() -> bool { true }
 fn default_shape_snap() -> bool { true }
+fn default_browser_link_port() -> u16 { crate::browser_link::DEFAULT_PORT }
 
 fn default_pressure_curve() -> f32 { 1.0 }
 
@@ -372,6 +383,8 @@ impl Default for AppConfig {
             dim_unselected: false,
             slide_window_ui: SlideWindowUi::default(),
             picture_search: false,
+            browser_link: true,
+            browser_link_port: default_browser_link_port(),
             pack_mode: PackMode::default(),
             beside_fit: BesideFit::default(),
             beside_side: BesideSide::default(),

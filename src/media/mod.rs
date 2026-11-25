@@ -12,6 +12,7 @@ pub mod import;
 pub mod pureref;
 pub mod pureref_sync;
 pub mod video_player;
+pub mod ytdlp;
 
 use crate::canvas::canvas::Canvas;
 use crate::canvas::shape::{MediaKind, MediaMeta};

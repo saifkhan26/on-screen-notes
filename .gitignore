@@ -17,3 +17,6 @@ Thumbs.db
 /scratch/
 
 .claude/
+
+# Signed browser extension builds (browser-extension/sign-firefox.ps1)
+browser-extension/web-ext-artifacts/

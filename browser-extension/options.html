@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Send to On-Screen Notes</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #fafafa; --fg: #18181b; --muted: #71717a; --line: #d4d4d8; --card: #ffffff; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #18181b; --fg: #f4f4f5; --muted: #a1a1aa; --line: #3f3f46; --card: #27272a; } }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, sans-serif; }
+    main { max-width: 560px; margin: 32px auto; padding: 0 16px; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    p { margin: 4px 0 12px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 14px 0; }
+    label { display: block; font-weight: 600; margin-bottom: 4px; }
+    input { font: inherit; width: 100px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
+    button { font: inherit; padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+    button:hover { border-color: var(--muted); }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    #state { font-weight: 600; }
+    kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+    table { width: 100%; border-collapse: collapse; margin: 6px 0 10px; }
+    td { padding: 5px 0; border-top: 1px solid var(--line); vertical-align: middle; }
+    td.key { text-align: right; white-space: nowrap; padding-left: 12px; }
+    button.key { min-width: 150px; font: 12px ui-monospace, monospace; }
+    button.key.none { color: var(--muted); }
+    button.key.rec { border-color: var(--fg); }
+    #keys-note { min-height: 1.5em; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Send to On-Screen Notes</h1>
+  <p class="muted">Right-click a picture, GIF or video and choose <b>Send to On-Screen Notes</b>, or pick one with the picker (the toolbar button, or its key below). It lands on the slide you have open.</p>
+
+  <section>
+    <label>Connection</label>
+    <p id="state">Checking…</p>
+    <div class="row">
+      <button id="check">Check again</button>
+      <button id="connect">Connect</button>
+    </div>
+    <p class="muted">Connect asks On-Screen Notes to let this browser in: press <b>Connect</b> in the app when it asks. The app must be running, with <b>Receive from the browser</b> on in its settings.</p>
+  </section>
+
+  <section id="access" hidden>
+    <label>Access to sites</label>
+    <p>The extension needs to read pictures on the sites you send them from, and to reach the app on this computer.</p>
+    <button id="grant">Allow access</button>
+  </section>
+
+  <section>
+    <label>Keys</label>
+    <p class="muted">They work on web pages. Click one to change it, then press the new keys — <kbd>Esc</kbd> keeps the old one, <kbd>Backspace</kbd> takes it off. Keys with <kbd>Alt</kbd> or <kbd>Ctrl</kbd> work anywhere on a page; a plain key only while you aren't typing.</p>
+    <table id="keys"></table>
+    <p class="muted" id="keys-note"></p>
+    <div class="row">
+      <button id="keys-reset">Back to the defaults</button>
+      <button id="shortcuts">Browser shortcuts…</button>
+    </div>
+    <p class="muted">Browser shortcuts are set in the browser instead, and work even while the address bar has the keyboard. Every action is there, with none set.</p>
+  </section>
+
+  <section>
+    <label for="port">Port</label>
+    <div class="row">
+      <input id="port" type="number" min="1024" max="65535">
+      <button id="save">Save</button>
+    </div>
+    <p class="muted">The same number as <code>browser_link_port</code> in the app's config (47823 unless changed).</p>
+  </section>
+</main>
+<script src="sites.js"></script>
+<script src="options.js"></script>
+</body>
+</html>

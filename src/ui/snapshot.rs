@@ -234,10 +234,10 @@ mod tests {
                 ctx, &mut tool, &mut cfg.bg_opacity, &mut cfg.bg_color, &mut pal, &mut cfg.smoothing_level, &mut cfg.smoothing,
                 &mut cfg.pressure_curve, &mut cfg.ui_scale, &mut cfg.accent,
                 (&mut cfg.shape_snap, &mut cfg.smart_guides, &mut cfg.keep_proportions),
-                (&mut cfg.beside_fit, &mut cfg.beside_side), (&mut cfg.picture_search, ""),
+                (&mut cfg.beside_fit, &mut cfg.beside_side), (&mut cfg.picture_search, "", &mut cfg.browser_link, "", &mut false),
                 &mut pin, &mut picking, &mut insert, &mut quit, &mut filter, &counts, &mut select, None, false, &keys,
             );
-            crate::ui::arrange_bar::show(ctx, 3, false, None, &m, &mut apart, &mut dim, &mut pack, &keys, false, None, false, &[], &mut None);
+            crate::ui::arrange_bar::show(ctx, 3, false, None, &m, &mut apart, &mut dim, &mut pack, &keys, false, None, false, &[], &[], false, &mut None);
             crate::ui::slide_panel::show(ctx, &mut panel, &mut cfg, 10.0, &m);
             crate::ui::layer_panel::show(ctx, &mut cache, 0, &mut m);
             if with_palette {
@@ -282,7 +282,7 @@ mod tests {
                 ctx, &mut tool, &mut cfg.bg_opacity, &mut cfg.bg_color, &mut pal, &mut cfg.smoothing_level, &mut cfg.smoothing,
                 &mut cfg.pressure_curve, &mut cfg.ui_scale, &mut cfg.accent,
                 (&mut cfg.shape_snap, &mut cfg.smart_guides, &mut cfg.keep_proportions),
-                (&mut cfg.beside_fit, &mut cfg.beside_side), (&mut cfg.picture_search, ""),
+                (&mut cfg.beside_fit, &mut cfg.beside_side), (&mut cfg.picture_search, "", &mut cfg.browser_link, "", &mut false),
                 &mut pin, &mut picking, &mut insert, &mut quit, &mut filter, &counts, &mut select, None, false, &keys,
             );
         });
@@ -301,7 +301,7 @@ mod tests {
         let tags: Vec<(String, bool)> = [("pose", false), ("character", false), ("ref", true), ("hands", false), ("study", false)].iter().map(|(t, s)| (t.to_string(), *s)).collect();
         let mut asked = None;
         let mut draw = |ctx: &egui::Context| {
-            if let Some(a) = crate::ui::arrange_bar::show(ctx, 1, false, None, &m, &mut apart, &mut dim, &mut pack, &keys, false, None, false, &tags, &mut None) {
+            if let Some(a) = crate::ui::arrange_bar::show(ctx, 1, false, None, &m, &mut apart, &mut dim, &mut pack, &keys, false, None, false, &tags, &[], false, &mut None) {
                 asked = Some(a);
             }
         };

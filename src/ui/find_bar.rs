@@ -622,6 +622,9 @@ pub enum TagAction {
     /// Put these tags in place of this one.
     Rename(String, Vec<String>),
     Remove(String),
+    /// This tag names an artist (`true`) or not ("Find artist" passes over
+    /// pictures with an artist's tag).
+    Artist(String, bool),
 }
 
 /// A small copy of `img` to show, its long side at most `THUMB` pixels.
@@ -681,6 +684,9 @@ pub struct FindBar {
     words: WordPictures,
     /// What a click asked of the app, until it takes it.
     request: Option<Request>,
+    /// The tags that name an artist, for the tag list's switches (the app
+    /// sets it); `None` hides them.
+    pub artist_tags: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     /// The tag being renamed in the tag list, and the name typed so far.
     tag_renaming: Option<(String, String)>,
     /// The rename field has yet to take the keyboard.
@@ -1296,7 +1302,7 @@ impl FindBar {
                         ui.label(egui::RichText::new(status).small().color(theme::TEXT_MUTED));
                     }
                     if self.rows().is_none() && self.query.trim().is_empty() {
-                        match tag_list(ui, &mut self.tag_renaming, &mut self.tag_focus, &mut self.tag_removing, &tags()) {
+                        match tag_list(ui, &mut self.tag_renaming, &mut self.tag_focus, &mut self.tag_removing, &tags(), self.artist_tags.as_deref()) {
                             Some(TagPick::Find(tag)) => {
                                 self.query = format!("#{tag}");
                                 hits = search(&self.query);
@@ -1523,7 +1529,16 @@ const TAG_LIST_HEIGHT: f32 = 300.0;
 /// Every tag in `index`, a click finding what has it, and beside each its
 /// counts, a rename (into `renaming`, `focus` for its first frame) and a
 /// remove (which asks first: `removing`).
-fn tag_list(ui: &mut egui::Ui, renaming: &mut Option<(String, String)>, focus: &mut bool, removing: &mut Option<String>, index: &[TagCount]) -> Option<TagPick> {
+/// `artists`: the tags that name an artist (as `units::tag_key` folds
+/// them), each row's switch for it; `None` hides the switches.
+fn tag_list(
+    ui: &mut egui::Ui,
+    renaming: &mut Option<(String, String)>,
+    focus: &mut bool,
+    removing: &mut Option<String>,
+    index: &[TagCount],
+    artists: Option<&std::collections::HashSet<String>>,
+) -> Option<TagPick> {
     ui.add_space(6.0);
     if index.is_empty() {
         ui.label(egui::RichText::new("No tags yet: select something, then the arrange bar's tag button").small().color(theme::TEXT_MUTED));
@@ -1587,6 +1602,18 @@ fn tag_list(ui: &mut egui::Ui, renaming: &mut Option<(String, String)>, focus: &
                         *renaming = Some((t.tag.clone(), t.tag.clone()));
                         *focus = true;
                         *removing = None;
+                    }
+                    if let Some(artists) = artists {
+                        let on = artists.contains(&crate::canvas::units::tag_key(&t.tag));
+                        let text = egui::RichText::new("artist").small().color(if on { theme::TEXT_PRIMARY } else { theme::TEXT_MUTED });
+                        let tip = if on {
+                            "An artist: Find artist passes over pictures tagged so. Click if it isn't one"
+                        } else {
+                            "Not an artist. Click if it names one: Find artist then passes over pictures tagged so"
+                        };
+                        if ui.selectable_label(on, text).on_hover_text(tip).clicked() {
+                            out = Some(TagPick::Change(TagAction::Artist(t.tag.clone(), !on)));
+                        }
                     }
                     let slides = if t.slides == 1 { "slide" } else { "slides" };
                     ui.label(egui::RichText::new(format!("{} {slides} · {}", t.slides, t.objects)).small().color(theme::TEXT_MUTED))

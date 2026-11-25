@@ -73,6 +73,8 @@ impl OnScreenNotesApp {
             let mut pins_hidden = self.canvases.pins_hidden();
             let has_pins = self.canvases.has_pins();
             let picture_status = self.picture_vectors.status();
+            let browser_status = self.browser.status();
+            let mut forget_browsers = false;
             // The slide window has no toolbar, only its bar's colours (see
             // `ui::slide_window::chrome`); every tool and action is the
             // keys', the palette's, the arrange bar's, as here.
@@ -93,7 +95,7 @@ impl OnScreenNotesApp {
                     &mut self.config.accent,
                     (&mut self.config.shape_snap, &mut self.config.smart_guides, &mut self.config.keep_proportions),
                     (&mut self.config.beside_fit, &mut self.config.beside_side),
-                    (&mut self.config.picture_search, picture_status.as_str()),
+                    (&mut self.config.picture_search, picture_status.as_str(), &mut self.config.browser_link, browser_status.as_str(), &mut forget_browsers),
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
                     &mut insert_media,
@@ -109,6 +111,10 @@ impl OnScreenNotesApp {
                 false
             };
             self.set_pins_hidden(pins_hidden);
+            if forget_browsers {
+                self.browser.forget_browsers();
+                self.toast = Some(("Every browser is disconnected — each asks again (Connect) the next time it sends".to_string(), Instant::now()));
+            }
             if quit {
                 self.request_quit(ctx);
             }
@@ -160,6 +166,8 @@ impl OnScreenNotesApp {
                 let grouped = self.selection_grouped();
                 let open_move = std::mem::take(&mut self.ws.move_picker_pending);
                 self.fill_likely_tags(ctx);
+                let from_post = self.post_tag_offers();
+                let pictures = self.selection_has_pictures();
                 let keys = &self.hotkeys_cfg;
                 let row = picture.map(|_| ui::arrange_bar::ColourRow {
                     shown: self.ws.picture_colours.as_ref().map(|p| p.colours.as_slice()),
@@ -169,6 +177,7 @@ impl OnScreenNotesApp {
                 if let Some(e) = self.ws.tag_edit.as_mut() {
                     let (index, _) = self.canvases.tag_index();
                     e.known = index.into_iter().map(|t| (t.tag, t.objects)).collect();
+                    e.from_post = from_post.clone();
                 }
                 match ui::arrange_bar::show(
                     ctx,
@@ -184,6 +193,8 @@ impl OnScreenNotesApp {
                     row,
                     grouped,
                     &tags,
+                    &from_post,
+                    pictures,
                     &mut self.ws.tag_edit,
                 ) {
                     Some(BarAction::Group(on)) => self.group_selection(on),
@@ -210,6 +221,9 @@ impl OnScreenNotesApp {
                         self.ws.commands.close();
                         self.ws.find.find_words(format!("#{tag}"));
                     }
+                    Some(BarAction::TagFromPost(tag)) => self.tag_from_post(&tag),
+                    Some(BarAction::NotFromPost(tag)) => self.not_from_post(&tag),
+                    Some(BarAction::FindArtist) => self.find_artists(),
                     None => {}
                 }
             } else {
@@ -297,6 +311,7 @@ impl OnScreenNotesApp {
             // so a tap on a bar counts as UI, never as ink.
             // Files dropped, dialogs and imports land on the overlay's slide.
             if !self.canvases.in_view() {
+                self.poll_browser_link(ctx, canvas_rect);
                 self.poll_media_inputs(ctx, canvas_rect);
             }
             let mut media_objs = ui::media_controls::media_on_screen(self.canvases.active(), canvas_rect);

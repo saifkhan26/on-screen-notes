@@ -52,6 +52,7 @@ impl OnScreenNotesApp {
         self.update_tag_suggestions();
         let canvases = &self.canvases;
         let unread = (0..canvases.count()).filter(|&i| canvases.slide(i).is_none()).count();
+        self.ws.find.artist_tags = self.browser.artist_set();
         let picked = self.ws.find.show(
             ctx,
             |q| ui::find_bar::search(q, (0..canvases.count()).filter_map(|i| canvases.slide(i).map(|c| (i, c)))),
