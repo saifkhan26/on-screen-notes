@@ -65,6 +65,7 @@ impl OnScreenNotesApp {
             let prev_text_box = self.ws.tool.text_box;
             let text_selected = !self.selected_text().is_empty();
             let mut insert_media = false;
+            let mut quit = false;
             let mut select_filtered = false;
             self.update_dup_check(ctx);
             let mut media_counts = ui::media_filter::counts(self.canvases.active());
@@ -96,6 +97,7 @@ impl OnScreenNotesApp {
                     &mut self.pinned_hwnd,
                     &mut self.pin_picking,
                     &mut insert_media,
+                    &mut quit,
                     &mut self.media_filter,
                     &media_counts,
                     &mut select_filtered,
@@ -107,6 +109,9 @@ impl OnScreenNotesApp {
                 false
             };
             self.set_pins_hidden(pins_hidden);
+            if quit {
+                self.request_quit(ctx);
+            }
             self.ws.tool.shape_snap = self.config.shape_snap;
             self.ws.tool.select.guides_on = self.config.smart_guides;
             self.ws.tool.select.keep_proportions = self.config.keep_proportions;

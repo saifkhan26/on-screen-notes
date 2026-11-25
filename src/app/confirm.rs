@@ -20,6 +20,9 @@ pub(super) enum PendingEdit {
     DeleteLayer { slide: usize, layer: usize },
     ClearLayer { slide: usize, layer: usize },
     DeleteObjects { slide: usize, layer: usize, strokes: Vec<usize>, shapes: Vec<usize> },
+    /// Close the app (the toolbar's ×) though slides deleted this run,
+    /// kept for undo until then, would be gone for good.
+    Quit { deleted: usize },
 }
 
 /// How many objects a layer holds, and how many of them are pictures. Its
@@ -118,6 +121,16 @@ impl OnScreenNotesApp {
         self.toast = Some((msg, Instant::now()));
     }
 
+    /// The toolbar's close button: close the app (`on_exit` saves
+    /// everything on the way out), asking first when slides deleted this
+    /// run would be gone for good.
+    pub(super) fn request_quit(&mut self, ctx: &egui::Context) {
+        match self.canvases.deleted_count() {
+            0 => ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close),
+            deleted => self.ws.confirm_edit = Some(PendingEdit::Quit { deleted }),
+        }
+    }
+
     /// Clear the active layer, once confirmed. An empty one needs nothing.
     pub(super) fn request_layer_clear(&mut self) {
         if !self.may_edit() {
@@ -152,10 +165,11 @@ impl OnScreenNotesApp {
     pub(super) fn show_edit_confirm(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.ws.confirm_edit.clone() else { return };
         let slide = match &pending {
-            PendingEdit::DeleteLayer { slide, .. } | PendingEdit::ClearLayer { slide, .. } | PendingEdit::DeleteObjects { slide, .. } => *slide,
+            PendingEdit::DeleteLayer { slide, .. } | PendingEdit::ClearLayer { slide, .. } | PendingEdit::DeleteObjects { slide, .. } => Some(*slide),
+            PendingEdit::Quit { .. } => None,
         };
         // Another slide is shown now (a click on the slide panel): drop it.
-        if slide != self.canvases.active_index() {
+        if slide.is_some_and(|s| s != self.canvases.active_index()) {
             self.ws.confirm_edit = None;
             return;
         }
@@ -214,8 +228,24 @@ impl OnScreenNotesApp {
                     kc.delete_selection,
                 )
             }
+            PendingEdit::Quit { deleted } => {
+                let what = if *deleted == 1 { "1 slide deleted this session".to_string() } else { format!("{deleted} slides deleted this session") };
+                ask(
+                    ctx,
+                    "osn_confirm_quit",
+                    "Close On-Screen Notes?",
+                    &format!("{what} can't be brought back once it closes."),
+                    "Everything else is saved first.",
+                    "Close",
+                    None,
+                )
+            }
         };
         match asked {
+            Some(true) if matches!(pending, PendingEdit::Quit { .. }) => {
+                self.ws.confirm_edit = None;
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            }
             Some(true) => {
                 self.ws.confirm_edit = None;
                 self.do_pending_edit(pending);
@@ -259,6 +289,8 @@ impl OnScreenNotesApp {
                 let msg = format!("{n} objects deleted — {} brings them back", self.undo_key());
                 self.toast = Some((msg, Instant::now()));
             }
+            // Done where it is answered: it needs no editable slide.
+            PendingEdit::Quit { .. } => {}
         }
     }
 }

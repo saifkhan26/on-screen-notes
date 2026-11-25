@@ -121,6 +121,9 @@ layers.
   or on every slide, each pin moved and sized on its own. See
   [Pinning](#pinning)
 - **Freeze frame** — bake the current screen behind into a new layer
+- **Close button** — the × at the end of the toolbar closes the app,
+  saving everything first. It asks only when slides deleted this run
+  (which undo can bring back until then) would be gone for good
 
 ---
 

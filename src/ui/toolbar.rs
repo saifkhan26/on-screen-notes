@@ -54,6 +54,8 @@ pub fn show(
     pin_picking: &mut bool,
     // Set when the "Insert video / GIF" button is clicked.
     insert_media: &mut bool,
+    // Set when the close button (the bar's last) is clicked.
+    quit: &mut bool,
     media_filter: &mut MediaFilter,
     // Pictures / GIFs / videos on the slide, for the filter popup.
     media_counts: &media_filter::Counts,
@@ -161,6 +163,10 @@ pub fn show(
                     };
                     interacted |= settings_btn(ui, settings);
                     interacted |= help_btn(ui, keys);
+                    theme::divider(ui, BTN_SIZE);
+
+                    // Closing the app, apart at the end.
+                    interacted |= close_btn(ui, quit);
                 });
             });
         });
@@ -543,6 +549,23 @@ fn help_btn(ui: &mut egui::Ui, keys: &ParsedHotkeys) -> bool {
     // Hover is *not* a click — never report it as a user interaction so
     // pen events still flow to the canvas.
     false
+}
+
+/// Close the app: a drawn × (the icon set has none). Everything is saved
+/// first (`on_exit`); the app asks when slides deleted this run would be
+/// gone for good (`app::confirm`).
+fn close_btn(ui: &mut egui::Ui, quit: &mut bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
+    theme::paint_button(ui, rect, Look::Plain, &response);
+    let r = rect.shrink(rect.width() * 0.34);
+    let stroke = Stroke::new(1.6, theme::TEXT_PRIMARY);
+    ui.painter().line_segment([r.left_top(), r.right_bottom()], stroke);
+    ui.painter().line_segment([r.right_top(), r.left_bottom()], stroke);
+    let response = tip(response, "Close", None, "Close On-Screen Notes. Everything is saved first");
+    if response.clicked() {
+        *quit = true;
+    }
+    touched(&response)
 }
 
 /// One titled group of help rows, each an action and how to do it.
@@ -1247,7 +1270,7 @@ mod tests {
         crate::ui::theme::set_accent(ctx, cfg.accent);
         let keys = HotkeysConfig::default().parsed();
         let mut palette = cfg.palette.clone();
-        let (mut pin, mut picking, mut insert, mut select) = (None, false, false, false);
+        let (mut pin, mut picking, mut insert, mut quit, mut select) = (None, false, false, false, false);
         let mut filter = MediaFilter::default();
         let counts = media_filter::Counts::default();
         show(
@@ -1267,6 +1290,7 @@ mod tests {
             &mut pin,
             &mut picking,
             &mut insert,
+            &mut quit,
             &mut filter,
             &counts,
             &mut select,
@@ -1284,10 +1308,12 @@ mod tests {
         let mut tool = ActiveTool::from_config(&cfg);
         let size = [1500.0, 860.0];
         let Some(ctx) = shoot("toolbar", size, 1.0, &[Step::Idle], |ctx| show_default(ctx, &mut cfg, &mut tool)) else { return };
-        // The help is the toolbar's last button.
+        // The close button is the toolbar's last; before it, past a
+        // divider (9 points, 2 of spacing each side), the help.
         let bar = ctx.memory(|m| m.area_rect(egui::Id::new("osn_toolbar"))).expect("toolbar drawn");
         let y = bar.center().y;
-        let help = egui::pos2(bar.right() - 6.0 - BTN_SIZE * 0.5, y);
+        let close = egui::pos2(bar.right() - 6.0 - BTN_SIZE * 0.5, y);
+        let help = egui::pos2(close.x - BTN_SIZE - 13.0, y);
         let first = egui::pos2(bar.left() + 6.0 + BTN_SIZE * 1.5 + 2.0, y);
         let rest = |p| [Step::Move(p), Step::Move(p), Step::Move(p), Step::Move(p)];
         // A stack picked, to see the three-way picker.
@@ -1301,6 +1327,7 @@ mod tests {
         }
         shoot("toolbar-hover", size, 1.0, &rest(first), |ctx| show_default(ctx, &mut cfg, &mut tool));
         shoot("toolbar-help", size, 1.0, &rest(help), |ctx| show_default(ctx, &mut cfg, &mut tool));
+        shoot("toolbar-close", size, 1.0, &rest(close), |ctx| show_default(ctx, &mut cfg, &mut tool));
         cfg.ui_scale = 1.5;
         shoot("toolbar-150", size, 1.5, &[Step::Idle], |ctx| show_default(ctx, &mut cfg, &mut tool));
         // A colour accent: the tool in use, switches, picks. Run the
