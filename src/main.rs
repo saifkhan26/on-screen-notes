@@ -19,7 +19,6 @@ mod canvas;
 mod clipboard;
 mod config;
 mod error;
-mod flood_fill;
 mod input;
 mod interaction;
 mod media;

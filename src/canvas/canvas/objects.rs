@@ -155,6 +155,32 @@ impl Canvas {
         self.edit_objects(li, &[], &shapes, |_, _| {}, boxed)
     }
 
+    /// Fill the chosen rectangles and ellipses solid with their colour,
+    /// or take the fill out. A filled shape has a solid border: dashes
+    /// would vanish into the fill. One undo step; other shapes, and ones
+    /// already so, are left out of it. Returns false when nothing changed.
+    pub fn set_filled(&mut self, li: usize, shapes: &[usize], on: bool) -> bool {
+        use crate::canvas::shape::BorderStyle;
+        let Some(layer) = self.layers.get(li) else { return false };
+        let shapes: Vec<usize> = shapes
+            .iter()
+            .copied()
+            .filter(|&i| {
+                matches!(layer.shapes.get(i), Some(Shape::Rect { filled, border, .. } | Shape::Ellipse { filled, border, .. })
+                    if *filled != on || on && *border != BorderStyle::Solid)
+            })
+            .collect();
+        let fill = |_: usize, s: &mut Shape| {
+            if let Shape::Rect { filled, border, .. } | Shape::Ellipse { filled, border, .. } = s {
+                *filled = on;
+                if on {
+                    *border = BorderStyle::Solid;
+                }
+            }
+        };
+        self.edit_objects(li, &[], &shapes, |_, _| {}, fill)
+    }
+
     /// Recolour and / or re-width the chosen objects.
     ///
     /// `merge_into_last` folds this change into the undo entry on top of

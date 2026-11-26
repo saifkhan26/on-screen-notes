@@ -2,11 +2,11 @@
 //!
 //! Three textures the picture's size:
 //!   * the pad as it was before the stroke in hand;
-//!   * the stroke: the pen's and the eraser's stamps max-blended in, so
-//!     a stroke never darkens where it crosses itself, however many
-//!     stamps overlap; the pencil's piled up, each over the last, so it
-//!     builds up as graphite does. Half floats, so its light layers add
-//!     up without banding;
+//!   * the stroke: the pen's, the marker's and the eraser's stamps
+//!     max-blended in, so a stroke never darkens where it crosses itself,
+//!     however many stamps overlap; the pencil's and the airbrush's piled
+//!     up, each over the last, so they build up as graphite and spray do.
+//!     Half floats, so their light layers add up without banding;
 //!   * what shows: the pad with the stroke on it, rebuilt only where new
 //!     stamps fell. egui draws it in the picture's place
 //!     (`OverlayCache::set_pad`), so pan, zoom, turn, mirror and the slide
@@ -33,7 +33,7 @@ const STROKE_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const UNDO_BUDGET: u64 = 256 << 20;
 
 const STAMP_WGSL: &str = r#"
-struct U { size: vec2<f32>, hard: f32, _unused: f32, color: vec4<f32> };
+struct U { size: vec2<f32>, hard: f32, soft: f32, color: vec4<f32> };
 @group(0) @binding(0) var<uniform> u: U;
 
 struct VOut {
@@ -62,7 +62,12 @@ fn vs(@builtin(vertex_index) vi: u32, @location(0) c: vec2<f32>, @location(1) r:
 fn fs(i: VOut) -> @location(0) vec4<f32> {
   let d = length(i.local);
   let inner = i.r * u.hard;
-  let cov = clamp((i.r + 0.5 - d) / max(i.r + 0.5 - inner, 1.0), 0.0, 1.0);
+  var cov = clamp((i.r + 0.5 - d) / max(i.r + 0.5 - inner, 1.0), 0.0, 1.0);
+  if (u.soft > 0.5) {
+    // The airbrush: an S-curve from the middle to the edge, round and
+    // very soft, covering as much as the straight fade.
+    cov = cov * cov * (3.0 - 2.0 * cov);
+  }
   let a = cov * i.flow * u.color.a;
   return vec4<f32>(u.color.rgb * a, a);
 }
@@ -89,7 +94,8 @@ fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
 struct Uniforms {
     size: [f32; 2],
     hard: f32,
-    _unused: f32,
+    /// 1 for the airbrush's S-curve edge (`Look::soft`).
+    soft: f32,
     color: [f32; 4],
 }
 
@@ -259,7 +265,9 @@ pub struct Session {
     size: [u32; 2],
     pad: wgpu::Texture,
     display: wgpu::Texture,
-    /// Keeps the stroke texture (only ever used through its view).
+    /// The stroke in hand (drawn through `stroke_view`; a lasso's cover
+    /// is written into it directly).
+    stroke: wgpu::Texture,
     stroke_view: wgpu::TextureView,
     display_view: wgpu::TextureView,
     tex_id: egui::TextureId,
@@ -335,6 +343,7 @@ impl Session {
             size: [w, h],
             pad: pad_tex,
             display,
+            stroke,
             stroke_view,
             display_view,
             tex_id,
@@ -377,14 +386,14 @@ impl Session {
         let rgba = match brush {
             // Paints white back, or clears (only its coverage counts).
             Brush::Eraser => [1.0, 1.0, 1.0, 1.0],
-            _ => [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0, color[3] as f32 / 255.0],
+            _ => [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0, color[3] as f32 / 255.0 * brush.alpha()],
         };
         self.clearing = brush == Brush::Eraser && !self.erase_white;
         self.pile = brush.builds_up();
         let u = Uniforms {
             size: [self.size[0] as f32, self.size[1] as f32],
             hard: look.hard,
-            _unused: 0.0,
+            soft: if look.soft { 1.0 } else { 0.0 },
             color: rgba,
         };
         g.rs.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
@@ -419,18 +428,53 @@ impl Session {
             pass.set_vertex_buffer(0, self.instances.slice(..));
             pass.draw(0..6, 0..self.pending.len() as u32);
         }
-        // What shows, there: the pad with the whole stroke on it.
-        enc.copy_texture_to_texture(corner(&self.pad, rect[0], rect[1]), corner(&self.display, rect[0], rect[1]), extent(rect));
-        {
-            let mut pass = render_pass(&mut enc, &self.display_view, wgpu::LoadOp::Load);
-            pass.set_scissor_rect(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]);
-            pass.set_pipeline(if self.clearing { &g.clear } else { &g.over });
-            pass.set_bind_group(0, &self.compose_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        self.show(g, &mut enc, rect);
         g.rs.queue.submit(Some(enc.finish()));
         self.stroke_rect = Some(pad::union(self.stroke_rect, rect));
         self.pending.clear();
+    }
+
+    /// What shows in `rect`: the pad with the whole stroke on it.
+    fn show(&self, g: &Gpu, enc: &mut wgpu::CommandEncoder, rect: [u32; 4]) {
+        enc.copy_texture_to_texture(corner(&self.pad, rect[0], rect[1]), corner(&self.display, rect[0], rect[1]), extent(rect));
+        let mut pass = render_pass(enc, &self.display_view, wgpu::LoadOp::Load);
+        pass.set_scissor_rect(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]);
+        pass.set_pipeline(if self.clearing { &g.clear } else { &g.over });
+        pass.set_bind_group(0, &self.compose_bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Rub out the pad as the eraser does, by how much `cover` covers
+    /// each pixel of `rect` (one byte a pixel, row by row, 255 = all, as
+    /// `pad::cover` gives it): a lasso erase. One undo step. Ends a
+    /// stroke in hand first.
+    pub fn erase_cover(&mut self, rect: [u32; 4], cover: &[u8]) {
+        let Some(g) = GPU.get() else { return };
+        self.begin(Brush::Eraser, [0, 0, 0, 255]);
+        let [x0, y0, x1, y1] = rect;
+        if x0 >= x1 || y0 >= y1 || x1 > self.size[0] || y1 > self.size[1] || cover.len() != ((x1 - x0) * (y1 - y0)) as usize {
+            return;
+        }
+        // The stroke holds premultiplied white at the cover: as the
+        // eraser's stamps leave it.
+        let mut texels = Vec::with_capacity(cover.len() * 8);
+        for &c in cover {
+            let v = half::f16::from_f32(c as f32 / 255.0).to_le_bytes();
+            for _ in 0..4 {
+                texels.extend_from_slice(&v);
+            }
+        }
+        g.rs.queue.write_texture(
+            corner(&self.stroke, x0, y0),
+            &texels,
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some((x1 - x0) * 8), rows_per_image: Some(y1 - y0) },
+            extent(rect),
+        );
+        let mut enc = g.rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pad lasso") });
+        self.show(g, &mut enc, rect);
+        g.rs.queue.submit(Some(enc.finish()));
+        self.stroke_rect = Some(pad::union(self.stroke_rect, rect));
+        self.end();
     }
 
     /// Finish the stroke in hand: it becomes part of the pad, one undo step.
@@ -731,6 +775,136 @@ mod tests {
         draw(&mut s, 32.5, &[(8.0, 88.0), (88.0, 8.0)], 1.0);
         let twice = s.read_pixels().unwrap();        assert!(at(&twice, w, 48, 8)[3] > firm + 30, "{} vs {firm}", at(&twice, w, 48, 8)[3]);
         assert!(at(&twice, w, 48, 32)[3] > firm + 30, "{} vs {firm}", at(&twice, w, 48, 32)[3]);
+        free_texture(s.texture_id());
+    }
+
+    #[test]
+    fn the_marker_is_see_through_and_darkens_only_under_a_new_stroke() {
+        if gpu().is_none() {
+            return;
+        }
+        let (w, h) = (96u32, 32u32);
+        let mut s = Session::new(vec![0u8; (w * h * 4) as usize], w, h, true).expect("opens");
+        // One stroke going over itself, back and forth.
+        s.begin(Brush::Marker, [0, 0, 0, 255]);
+        let mut walk = pad::Walk::new(Brush::Marker, 4.0, 1.0);
+        let mut stamps = Vec::new();
+        line(&mut walk, [8.0, 16.0], [88.0, 16.0], &mut stamps);
+        line(&mut walk, [88.0, 16.0], [8.0, 16.0], &mut stamps);
+        s.push(&stamps);
+        s.end();
+        let once = at(&s.read_pixels().unwrap(), w, 48, 16)[3];
+        let want = (pad::MARKER_ALPHA * 255.0).round() as u8;
+        assert!(once.abs_diff(want) <= 3, "{once} vs {want}: one stroke never darkens itself");
+        // A second stroke over it does.
+        s.begin(Brush::Marker, [0, 0, 0, 255]);
+        let mut walk = pad::Walk::new(Brush::Marker, 4.0, 1.0);
+        let mut stamps = Vec::new();
+        line(&mut walk, [8.0, 16.0], [88.0, 16.0], &mut stamps);
+        s.push(&stamps);
+        s.end();
+        let twice = at(&s.read_pixels().unwrap(), w, 48, 16)[3];
+        assert!(twice > once + 50, "{twice} vs {once}");
+        free_texture(s.texture_id());
+    }
+
+    #[test]
+    fn the_airbrush_is_soft_and_builds_up() {
+        if gpu().is_none() {
+            return;
+        }
+        let (w, h) = (128u32, 64u32);
+        let mut s = Session::new(vec![0u8; (w * h * 4) as usize], w, h, true).expect("opens");
+        let spray = |s: &mut Session| {
+            s.begin(Brush::Airbrush, [0, 0, 0, 255]);
+            let mut walk = pad::Walk::new(Brush::Airbrush, 16.0, 1.0);
+            let mut stamps = Vec::new();
+            line(&mut walk, [20.0, 32.0], [108.0, 32.0], &mut stamps);
+            s.push(&stamps);
+            s.end();
+        };
+        spray(&mut s);
+        let px = s.read_pixels().unwrap();
+        let mid = at(&px, w, 64, 32)[3];
+        let want = (pad::AIRBRUSH_PASS * 255.0).round() as u8;
+        assert!(mid.abs_diff(want) <= 15, "{mid} vs {want}");
+        // Soft: it fades out towards its edge, with no hard rim.
+        let (half_out, near_edge) = (at(&px, w, 64, 40)[3], at(&px, w, 64, 44)[3]);
+        assert!(half_out < mid && near_edge < half_out && near_edge > 0, "{mid} {half_out} {near_edge}");
+        spray(&mut s);
+        assert!(at(&s.read_pixels().unwrap(), w, 64, 32)[3] > mid + 30, "a second pass builds it up");
+        free_texture(s.texture_id());
+    }
+
+    #[test]
+    fn a_lasso_rubs_out_what_it_covers_in_one_undo_step() {
+        if gpu().is_none() {
+            return;
+        }
+        let (w, h) = (64u32, 48u32);
+        let ink = vec![255u8; (w * h * 4) as usize];
+        let mut s = Session::new(ink.clone(), w, h, true).expect("opens");
+        let (rect, cov) = pad::cover(&[[10.0, 10.0], [40.0, 10.0], [40.0, 30.0], [10.0, 30.0]], [w, h]).unwrap();
+        s.erase_cover(rect, &cov);
+        let px = s.read_pixels().unwrap();
+        assert_eq!(at(&px, w, 20, 20)[3], 0, "inside: rubbed out");
+        assert_eq!(at(&px, w, 50, 20), [255; 4], "outside: kept");
+        assert_eq!(s.edits, 1);
+        assert!(s.undo(false));
+        assert_eq!(s.read_pixels().unwrap(), ink);
+        free_texture(s.texture_id());
+        // On an opaque picture with no paper it paints white back.
+        let red: Vec<u8> = (0..w * h).flat_map(|_| [200, 0, 0, 255]).collect();
+        let mut s = Session::new(red, w, h, false).expect("opens");
+        s.erase_cover(rect, &cov);
+        assert_eq!(at(&s.read_pixels().unwrap(), w, 20, 20), [255; 4]);
+        free_texture(s.texture_id());
+    }
+
+    /// Every brush on white paper, as a PNG to look at: a wavy stroke at
+    /// rising pressure, then the same stroke crossed by a second one,
+    /// and (for the airbrush) a spot held still for a second.
+    #[test]
+    #[ignore = "writes a PNG to OSN_SNAP_DIR"]
+    fn snapshot_brushes() {
+        let Some(dir) = crate::ui::snapshot::out_dir() else { return };
+        if gpu().is_none() {
+            return;
+        }
+        let (w, h) = (900u32, 560u32);
+        let mut s = Session::new(vec![0u8; (w * h * 4) as usize], w, h, true).expect("opens");
+        let brushes = [(Brush::Pen, [20, 20, 30, 255]), (Brush::Pencil, [20, 20, 30, 255]), (Brush::Marker, [230, 60, 40, 255]), (Brush::Airbrush, [40, 90, 220, 255])];
+        for (row, (brush, color)) in brushes.into_iter().enumerate() {
+            let y0 = 70.0 + row as f32 * 130.0;
+            for pass in 0..2 {
+                s.begin(brush, color);
+                let mut walk = pad::Walk::new(brush, 14.0, 1.0);
+                let mut stamps = Vec::new();
+                for k in 0..=300 {
+                    let t = k as f32 / 300.0;
+                    let x = 30.0 + t * 520.0;
+                    let y = y0 + if pass == 0 { (t * 9.0).sin() * 22.0 } else { 30.0 - t * 60.0 };
+                    walk.step([x, y], if pass == 0 { 0.1 + 0.9 * t } else { 1.0 }, &mut stamps);
+                }
+                s.push(&stamps);
+                s.end();
+            }
+            if brush == Brush::Airbrush {
+                s.begin(brush, color);
+                let mut walk = pad::Walk::new(brush, 30.0, 1.0);
+                let mut stamps = Vec::new();
+                walk.step([700.0, y0], 1.0, &mut stamps);
+                for _ in 0..61 {
+                    walk.hold(1.0 / 60.0, &mut stamps);
+                }
+                walk.step([800.0, y0], 1.0, &mut stamps);
+                s.push(&stamps);
+                s.end();
+            }
+        }
+        let mut img = image::RgbaImage::from_raw(w, h, s.read_pixels().unwrap()).unwrap();
+        pad::on_paper(&mut img, pad::WHITE);
+        img.save(dir.join("brushes.png")).unwrap();
         free_texture(s.texture_id());
     }
 

@@ -223,6 +223,7 @@ mod tests {
             slides: vec![String::new(); 4],
             active_slide: 0,
             deleted_slides: 0,
+            pad: false,
         };
         let entries = crate::ui::command_palette::entries(&cx);
         let mut draw = |ctx: &egui::Context, with_palette: bool| {
@@ -235,7 +236,7 @@ mod tests {
                 &mut cfg.pressure_curve, &mut cfg.ui_scale, &mut cfg.accent,
                 (&mut cfg.shape_snap, &mut cfg.smart_guides, &mut cfg.keep_proportions),
                 (&mut cfg.beside_fit, &mut cfg.beside_side), (&mut cfg.picture_search, "", &mut cfg.browser_link, "", &mut false),
-                &mut pin, &mut picking, &mut insert, &mut quit, &mut filter, &counts, &mut select, None, false, &keys,
+                &mut pin, &mut picking, &mut insert, &mut quit, &mut filter, &counts, &mut select, None, false, false, &keys,
             );
             crate::ui::arrange_bar::show(ctx, 3, false, None, &m, &mut apart, &mut dim, &mut pack, &keys, false, None, false, &[], &[], false, &mut None);
             crate::ui::slide_panel::show(ctx, &mut panel, &mut cfg, 10.0, &m);
@@ -283,7 +284,7 @@ mod tests {
                 &mut cfg.pressure_curve, &mut cfg.ui_scale, &mut cfg.accent,
                 (&mut cfg.shape_snap, &mut cfg.smart_guides, &mut cfg.keep_proportions),
                 (&mut cfg.beside_fit, &mut cfg.beside_side), (&mut cfg.picture_search, "", &mut cfg.browser_link, "", &mut false),
-                &mut pin, &mut picking, &mut insert, &mut quit, &mut filter, &counts, &mut select, None, false, &keys,
+                &mut pin, &mut picking, &mut insert, &mut quit, &mut filter, &counts, &mut select, None, false, false, &keys,
             );
         });
         shoot("duplicate-bar", [1100.0, 260.0], 1.0, &[Step::Idle], crate::app::snapshot_dup_bar);

@@ -847,7 +847,7 @@ mod tests {
     }
 
     fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, filled: false, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
     }
 
     fn image(pos: [f32; 2], size: [f32; 2]) -> Shape {

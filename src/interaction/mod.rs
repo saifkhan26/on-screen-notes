@@ -53,29 +53,28 @@ pub fn react_tool_shortcut(
 ) {
     let t = &keys.tool;
     // Pen + Pencil + Marker + Airbrush all select `ToolKind::Pen` and
-    // only differ in `tool.style` — the renderer picks the look from
-    // the style. Setting both fields in one shot.
+    // only differ in `tool.style`. Pencil, marker and airbrush are a
+    // drawing pad's brushes: with no pad open their keys only say so
+    // (`pad_only_brush`). The pen's key on a pad picks its plain pen;
+    // off one it keeps the pad's brush for the next pad.
     if let Some(b) = t.pen { if b.matches(key, mods) {
         tool.kind  = ToolKind::Pen;
-        tool.style = StrokeStyle::Default;
+        if tool.pad_open {
+            tool.style = StrokeStyle::Default;
+        }
         return;
     }}
-    if let Some(b) = t.pencil { if b.matches(key, mods) {
-        tool.kind  = ToolKind::Pen;
-        tool.style = StrokeStyle::Pencil;
-        return;
-    }}
-    if let Some(b) = t.marker { if b.matches(key, mods) {
-        tool.kind  = ToolKind::Pen;
-        tool.style = StrokeStyle::Marker;
-        return;
-    }}
-    if let Some(b) = t.airbrush { if b.matches(key, mods) {
-        tool.kind  = ToolKind::Pen;
-        tool.style = StrokeStyle::Airbrush;
-        return;
-    }}
-    if let Some(b) = t.fill           { if b.matches(key, mods) { tool.kind = ToolKind::Fill;       return; }}
+    for (b, style) in [(t.pencil, StrokeStyle::Pencil), (t.marker, StrokeStyle::Marker), (t.airbrush, StrokeStyle::Airbrush)] {
+        if b.is_some_and(|b| b.matches(key, mods)) {
+            if tool.pad_open {
+                tool.kind  = ToolKind::Pen;
+                tool.style = style;
+            } else {
+                tool.pad_only_brush = Some(style);
+            }
+            return;
+        }
+    }
     if let Some(b) = t.laser          { if b.matches(key, mods) { tool.kind = ToolKind::Laser;      return; }}
     if let Some(b) = t.text           { if b.matches(key, mods) { tool.kind = ToolKind::Text;       return; }}
     if let Some(b) = t.spotlight      { if b.matches(key, mods) {
@@ -96,13 +95,15 @@ pub fn react_tool_shortcut(
     if let Some(b) = t.freehand_arrow { if b.matches(key, mods) { tool.kind = ToolKind::FreehandArrow; return; }}
     if let Some(b) = t.arrow          { if b.matches(key, mods) { tool.kind = ToolKind::Arrow;      return; }}
     if let Some(b) = t.line           { if b.matches(key, mods) { tool.kind = ToolKind::Line;       return; }}
+    // The toolbar's filled-shape button, for the next rectangle or
+    // ellipse drawn (and the selected ones: the app follows it).
+    if let Some(b) = t.filled_shape   { if b.matches(key, mods) {
+        tool.toggle_fill();
+        return;
+    }}
     // The toolbar's dashed-border button, for the next shape drawn.
     if let Some(b) = t.dashed_border  { if b.matches(key, mods) {
-        use crate::canvas::shape::BorderStyle;
-        tool.border_style = match tool.border_style {
-            BorderStyle::Solid          => BorderStyle::DashedAnimated,
-            BorderStyle::DashedAnimated => BorderStyle::Solid,
-        };
+        tool.toggle_dashed();
         return;
     }}
 

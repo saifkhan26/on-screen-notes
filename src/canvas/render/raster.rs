@@ -329,7 +329,7 @@ pub(super) fn draw_shape(
     media_frames: Option<&MediaFrames>,
 ) {
     match shape {
-        Shape::Rect { a, b, color, stroke_width, border, rotation, .. } => {
+        Shape::Rect { a, b, color, stroke_width, border, rotation, filled, .. } => {
             let t = turned(t, *rotation, (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5);
             let mut pb = PathBuilder::new();
             // Normalise corners so width/height are positive.
@@ -344,8 +344,12 @@ pub(super) fn draw_shape(
             pb.close();
             if let Some(path) = pb.finish() {
                 let paint = rgba_paint(*color);
+                if *filled {
+                    pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, t, None);
+                }
                 let mut sk = TsStroke { width: *stroke_width, ..TsStroke::default() };
                 if let BorderStyle::DashedAnimated = border {
+                    sk.line_cap = tiny_skia::LineCap::Round;
                     // Same on/off pattern + phase the egui side uses,
                     // so a screenshot taken at frame N matches the
                     // live overlay at frame N.
@@ -356,7 +360,7 @@ pub(super) fn draw_shape(
                 pixmap.stroke_path(&path, &paint, &sk, t, None);
             }
         }
-        Shape::Ellipse { a, b, color, stroke_width, border, rotation, .. } => {
+        Shape::Ellipse { a, b, color, stroke_width, border, rotation, filled, .. } => {
             let cx = (a[0] + b[0]) * 0.5;
             let cy = (a[1] + b[1]) * 0.5;
             let rx = ((b[0] - a[0]) * 0.5).abs().max(1.0);
@@ -368,8 +372,12 @@ pub(super) fn draw_shape(
                 pb.push_oval(rect);
                 if let Some(path) = pb.finish() {
                     let paint = rgba_paint(*color);
+                    if *filled {
+                        pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, t, None);
+                    }
                     let mut sk = TsStroke { width: *stroke_width, ..TsStroke::default() };
                     if let BorderStyle::DashedAnimated = border {
+                        sk.line_cap = tiny_skia::LineCap::Round;
                         if let Some(d) = StrokeDash::new(vec![DASH_ON, DASH_OFF], dash_phase()) {
                             sk.dash = Some(d);
                         }
@@ -389,7 +397,7 @@ pub(super) fn draw_shape(
                     pb.line_to(b[0], b[1]);
                     if let Some(path) = pb.finish() {
                         let paint = rgba_paint(*color);
-                        let mut sk = TsStroke { width: *stroke_width, ..TsStroke::default() };
+                        let mut sk = TsStroke { width: *stroke_width, line_cap: tiny_skia::LineCap::Round, ..TsStroke::default() };
                         if let Some(d) = StrokeDash::new(vec![DASH_ON, DASH_OFF], dash_phase()) {
                             sk.dash = Some(d);
                         }
@@ -410,7 +418,7 @@ pub(super) fn draw_shape(
                     pb.line_to(b[0], b[1]);
                     if let Some(path) = pb.finish() {
                         let paint = rgba_paint(*color);
-                        let mut sk = TsStroke { width: *stroke_width, ..TsStroke::default() };
+                        let mut sk = TsStroke { width: *stroke_width, line_cap: tiny_skia::LineCap::Round, ..TsStroke::default() };
                         if let Some(d) = StrokeDash::new(vec![DASH_ON, DASH_OFF], dash_phase()) {
                             sk.dash = Some(d);
                         }
