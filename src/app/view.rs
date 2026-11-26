@@ -106,6 +106,44 @@ impl OnScreenNotesApp {
     }
 
     /// Glide the view to show everything on the slide.
+    /// Mirror the view left to right (or upside down), or back: the
+    /// slide itself is not changed (`ui::view_flip`).
+    pub(super) fn toggle_view_flip(&mut self, upside_down: bool) {
+        let f = &mut self.ws.view_flip;
+        if upside_down {
+            f.y = !f.y;
+        } else {
+            f.x = !f.x;
+        }
+        self.ws.flip_slide = self.canvases.active_index();
+    }
+
+    /// While the view is flipped, a quiet note at the bottom says so and
+    /// which keys flip it back.
+    pub(super) fn view_flip_notice(&self, ctx: &egui::Context, canvas_rect: egui::Rect) {
+        let Some(what) = self.ws.view_flip.describe() else { return };
+        if !self.ws.ui_visible {
+            return;
+        }
+        let c = &self.hotkeys_cfg.canvas;
+        let key = |b: Option<crate::input::hotkeys_config::Binding>| b.map(|b| b.label());
+        let back = match (self.ws.view_flip.x.then(|| key(c.flip_view_x)).flatten(), self.ws.view_flip.y.then(|| key(c.flip_view_y)).flatten()) {
+            (Some(a), Some(b)) => format!(" · {a} / {b} to flip back"),
+            (Some(a), None) | (None, Some(a)) => format!(" · {a} to flip back"),
+            (None, None) => String::new(),
+        };
+        egui::Area::new(egui::Id::new("osn_view_flip"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(egui::pos2(canvas_rect.center().x, canvas_rect.max.y - 14.0))
+            .show(ctx, |ui| {
+                ui::theme::card_frame().inner_margin(egui::Margin::symmetric(12.0, 6.0)).show(ui, |ui| {
+                    ui.label(egui::RichText::new(format!("{what} (view only){back}")).color(ui::theme::TEXT_PRIMARY));
+                });
+            });
+    }
+
     pub(super) fn zoom_to_fit(&mut self, ctx: &egui::Context) {
         match self.slide_bounds() {
             Some(b) => {

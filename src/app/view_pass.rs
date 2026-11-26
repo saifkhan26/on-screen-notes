@@ -13,6 +13,12 @@ impl OnScreenNotesApp {
     /// window's client points, from `client_origin` (screen pixels).
     /// Returns whether Space is held to pan.
     pub(super) fn view_pass(&mut self, ctx: &egui::Context, pen_events: &[crate::input::pen::PenEvent], client_origin: [i32; 2], canvas_shown: bool) -> bool {
+        // A flipped view goes back to normal on another slide.
+        if self.canvases.active_index() != self.ws.flip_slide {
+            self.ws.flip_slide = self.canvases.active_index();
+            self.ws.view_flip = Default::default();
+        }
+
         // The drawing pad: put away if it must be, shown live if open.
         self.pad_frame_start();
         self.crop_frame_start();
@@ -287,6 +293,9 @@ impl OnScreenNotesApp {
                 && self.pending_freeze.is_none()
                 && self.pending_lasso.is_none()
                 && self.region_select.is_none();
+            // What the canvas paints from here on is mirrored at the end
+            // of the frame when the view is flipped.
+            let flip_from = ctx.graphics(|g| g.get(egui::LayerId::background()).map_or(0, |l| l.next_idx().0));
             let canvas_rect = ui::overlay::show(
                 ctx,
                 &mut self.overlay_cache,
@@ -304,6 +313,7 @@ impl OnScreenNotesApp {
                     outlines: self.ws.ui_visible && self.ws.tool.kind == crate::tools::ToolKind::Select,
                 },
                 self.config.dim_unselected,
+                self.ws.view_flip,
             );
             self.pad_chrome(ctx, canvas_rect);
             self.crop_chrome(ctx, canvas_rect);
@@ -320,6 +330,10 @@ impl OnScreenNotesApp {
             let mut media_objs = ui::media_controls::media_on_screen(self.canvases.active(), canvas_rect);
             let pinned = self.canvases.pinned();
             media_objs.extend(ui::media_controls::pinned_media_on_screen(&pinned, canvas_rect));
+            // Their bars go where they show.
+            for m in &mut media_objs {
+                m.rect = self.ws.view_flip.rect(canvas_rect, m.rect);
+            }
             let media_selected = if self.ws.tool.kind == crate::tools::ToolKind::Select {
                 ui::media_controls::selected_media(self.canvases.active(), &self.ws.tool.select.sel)
                     .or_else(|| self.ws.pin_tool.selected.and_then(|id| ui::media_controls::pinned_media(&pinned, id)))
@@ -460,6 +474,11 @@ impl OnScreenNotesApp {
             if !(self.canvases.in_view() && self.config.slide_window_ui.hide_layers) {
                 self.show_layer_panel(ctx);
             }
+
+            // A flipped view: everything painted on the canvas this frame,
+            // mirrored, and a note saying so.
+            ui::view_flip::mirror_layer(ctx, egui::LayerId::background(), flip_from, self.ws.view_flip, canvas_rect);
+            self.view_flip_notice(ctx, canvas_rect);
         }
 
         // ---- Laser-stroke pruning ----------------------------------------

@@ -162,7 +162,7 @@ impl OnScreenNotesApp {
             } else if self.ws.tool.kind == crate::tools::ToolKind::Select && !on_ui {
                 // Say what a press here would do: grab a handle,
                 // move the selection, or pick the object underneath.
-                if let Some(p) = hover {
+                if let Some(p) = hover.map(|p| self.ws.view_flip.point(canvas_rect, p)) {
                     let c = self.canvases.active();
                     let local = [
                         ((p.x - canvas_rect.min.x) - c.pan[0]) / c.zoom,
@@ -320,8 +320,13 @@ impl OnScreenNotesApp {
                         }
                     }
                 }
+                // Where it lands on the slide, a flipped view mirrored back.
+                let flat = unflip_pen_event(*ev, self.ws.view_flip, canvas_rect);
+                let fs = match flat {
+                    PenEvent::Down(s) | PenEvent::Move(s) | PenEvent::Up(s) => s,
+                };
                 // An open drawing pad takes the pen (`app::pad`).
-                let to_pad = transform_pen_event(*ev, canvas_rect, self.canvases.active());
+                let to_pad = transform_pen_event(flat, canvas_rect, self.canvases.active());
                 if self.pad_pointer(to_pad, self.ws.pen_using_eraser) || self.crop_pointer(to_pad) {
                     if matches!(ev, PenEvent::Up(_)) {
                         self.ws.pen_using_eraser = false;
@@ -337,11 +342,11 @@ impl OnScreenNotesApp {
                     }
                 }
                 // Pins sit over the slide; see `pin_pointer`.
-                let q = [s.pos[0] - canvas_rect.min.x, s.pos[1] - canvas_rect.min.y];
+                let q = [fs.pos[0] - canvas_rect.min.x, fs.pos[1] - canvas_rect.min.y];
                 if editable && !self.ws.pen_using_eraser && self.pin_pointer(*ev, q, shift_held, canvas_rect.size()) {
                     continue;
                 }
-                let dispatched = transform_pen_event(*ev, canvas_rect, self.canvases.active());
+                let dispatched = transform_pen_event(flat, canvas_rect, self.canvases.active());
                 let target_tool: &mut ActiveTool = if self.ws.pen_using_eraser {
                     &mut self.ws.eraser_override
                 } else {
@@ -413,9 +418,11 @@ impl OnScreenNotesApp {
                 // while picking; otherwise a release would synthesise
                 // a pen-up event over the freshly picked colour.
             } else if let Some(p) = cursor {
+                // Where it lands on the slide, a flipped view mirrored back.
+                let flat = self.ws.view_flip.point(canvas_rect, p);
                 let cursor_screen = [
-                    (p.x - canvas_rect.min.x).max(0.0),
-                    (p.y - canvas_rect.min.y).max(0.0),
+                    (flat.x - canvas_rect.min.x).max(0.0),
+                    (flat.y - canvas_rect.min.y).max(0.0),
                 ];
                 if let Some(ev) = interaction::mouse_to_pen_event(
                     primary_now,

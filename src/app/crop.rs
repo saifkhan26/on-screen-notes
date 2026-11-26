@@ -277,7 +277,8 @@ impl OnScreenNotesApp {
         }
 
         // The bar: under the rectangle, or above it when there is no room.
-        let pts: Vec<egui::Pos2> = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].into_iter().map(|q| to_screen(obb.to_canvas(q))).collect();
+        // Where it shows, in a flipped view too.
+        let pts: Vec<egui::Pos2> = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].into_iter().map(|q| self.ws.view_flip.point(canvas_rect, to_screen(obb.to_canvas(q)))).collect();
         let (lo, hi) = pts.iter().fold((egui::pos2(f32::MAX, f32::MAX), egui::pos2(f32::MIN, f32::MIN)), |(a, b), p| {
             (egui::pos2(a.x.min(p.x), a.y.min(p.y)), egui::pos2(b.x.max(p.x), b.y.max(p.y)))
         });

@@ -218,6 +218,8 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     }
     add("Find every duplicate picture", v, c.find_duplicates, C::Key(K::FindCopies));
     add("Zoom to fit the slide", v, c.zoom_to_fit, C::Key(K::ZoomToFit));
+    add("Flip the view left to right (mirror), and back", v, c.flip_view_x, C::Key(K::FlipView(false)));
+    add("Flip the view upside down, and back", v, c.flip_view_y, C::Key(K::FlipView(true)));
     add("Reset zoom and pan", v, c.reset_view, C::ResetView);
     add("Hide / show the toolbar and panels", v, c.toggle_ui, C::ToggleUi);
     add("UI bigger (toolbar, panels; slides keep their size)", v, c.ui_scale_up, C::Key(K::UiScale(1)));

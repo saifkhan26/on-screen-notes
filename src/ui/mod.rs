@@ -19,3 +19,4 @@ pub mod slide_window;
 pub mod snapshot;
 pub mod theme;
 pub mod toolbar;
+pub mod view_flip;

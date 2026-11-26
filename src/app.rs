@@ -762,6 +762,22 @@ fn size_label(bytes: u64) -> String {
     }
 }
 
+/// `ev` (window-client points) as it lands on the slide's own, unmirrored
+/// view: mirrored back the way the view is flipped (`ui::view_flip`).
+fn unflip_pen_event(ev: crate::input::pen::PenEvent, flip: ui::view_flip::ViewFlip, canvas_rect: egui::Rect) -> crate::input::pen::PenEvent {
+    use crate::input::pen::PenEvent;
+    let m = |mut s: crate::canvas::stroke::PenSample| {
+        let p = flip.point(canvas_rect, egui::pos2(s.pos[0], s.pos[1]));
+        s.pos = [p.x, p.y];
+        s
+    };
+    match ev {
+        PenEvent::Down(s) => PenEvent::Down(m(s)),
+        PenEvent::Move(s) => PenEvent::Move(m(s)),
+        PenEvent::Up(s) => PenEvent::Up(m(s)),
+    }
+}
+
 /// Transform a `PenEvent` whose sample is in *window-client* pixels into one
 /// whose sample is in *canvas-local* coordinates by:
 ///   1. Subtracting the canvas rect's top-left to get canvas-rect-relative.

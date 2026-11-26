@@ -79,6 +79,22 @@ struct Locals {
     /// egui's feathering width, in points.
     feathering: f32,
     _pad: u32,
+    /// The view is mirrored about this screen point (points), each way
+    /// `flip` says (1 = mirrored): `set_view_flip`.
+    axis: [f32; 2],
+    flip: [u32; 2],
+}
+
+/// The flipped view, while ink is painted for it: which ways, and the
+/// screen point it is mirrored about. `None` most of the time.
+static VIEW_FLIP: Mutex<Option<([bool; 2], [f32; 2])>> = Mutex::new(None);
+
+/// Ink painted from now on shows mirrored about screen point `axis`
+/// (points), left to right and / or upside down; `None` ends it. Set
+/// only around painting the flipped canvas (`ui::view_flip`), so
+/// thumbnails and other views are left alone.
+pub(crate) fn set_view_flip(flip: Option<([bool; 2], [f32; 2])>) {
+    *VIEW_FLIP.lock().unwrap_or_else(|e| e.into_inner()) = flip;
 }
 
 // SAFETY: plain `repr(C)` structs of 4-byte fields with no padding
@@ -437,6 +453,7 @@ impl Run {
             ranges: std::mem::take(&mut self.ranges),
             xf: self.xf,
             feathering_px,
+            flip: *VIEW_FLIP.lock().unwrap_or_else(|e| e.into_inner()),
             locals: Mutex::new(None),
         };
         painter.add(egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(painter.clip_rect(), cb)));
@@ -449,6 +466,8 @@ struct InkCallback {
     /// `TessellationOptions::feathering_size_in_pixels`, or 0 with
     /// feathering off.
     feathering_px: f32,
+    /// The view's flip when it was painted (`set_view_flip`).
+    flip: Option<([bool; 2], [f32; 2])>,
     /// This draw's uniforms, made in `prepare`.
     locals: Mutex<Option<wgpu::BindGroup>>,
 }
@@ -475,6 +494,8 @@ impl egui_wgpu::CallbackTrait for InkCallback {
             dithering: DITHERING as u32,
             feathering: self.feathering_px / ppp,
             _pad: 0,
+            axis: self.flip.map_or([0.0; 2], |f| f.1),
+            flip: self.flip.map_or([0; 2], |f| [f.0[0] as u32, f.0[1] as u32]),
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ink locals"),

@@ -26,6 +26,10 @@ struct Locals {
     // egui's feathering width (TessellationOptions), in points.
     feathering: f32,
     _padding: u32,
+    // A flipped view: mirrored about `axis` (points) each way `flip`
+    // says (1 = mirrored).
+    axis: vec2<f32>,
+    flip: vec2<u32>,
 };
 @group(0) @binding(0) var<uniform> r_locals: Locals;
 
@@ -107,7 +111,14 @@ fn unpack_color(color: u32) -> vec4<f32> {
     ) / 255.0;
 }
 
-fn position_from_screen(screen_pos: vec2<f32>) -> vec4<f32> {
+fn position_from_screen(screen: vec2<f32>) -> vec4<f32> {
+    var screen_pos = screen;
+    if (r_locals.flip.x != 0u) {
+        screen_pos.x = 2.0 * r_locals.axis.x - screen_pos.x;
+    }
+    if (r_locals.flip.y != 0u) {
+        screen_pos.y = 2.0 * r_locals.axis.y - screen_pos.y;
+    }
     return vec4<f32>(
         2.0 * screen_pos.x / r_locals.screen_size.x - 1.0,
         1.0 - 2.0 * screen_pos.y / r_locals.screen_size.y,
