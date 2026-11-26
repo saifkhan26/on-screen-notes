@@ -68,6 +68,9 @@ pub fn show(
     pins_hidden: Option<&mut bool>,
     // Text labels are selected: the text-box switch shows for them.
     text_selected: bool,
+    // Rectangles or ellipses are selected: the filled-shape switch shows
+    // for them.
+    shapes_selected: bool,
     // The hotkeys as bound, for the tooltips and the help panel.
     keys: &ParsedHotkeys,
 ) -> bool {
@@ -85,13 +88,16 @@ pub fn show(
                     let t = &keys.tool;
 
                     // Drawing. Pen, pencil, marker and airbrush are one
-                    // `ToolKind::Pen`, told apart by `tool.style`. The
-                    // eraser has no button: hold Ctrl while drawing.
+                    // `ToolKind::Pen`, told apart by `tool.style`; the
+                    // last three are a drawing pad's brushes and show
+                    // only while one is open. The eraser has no button:
+                    // hold Ctrl while drawing.
                     interacted |= pen_style_btn(ui, tool, StrokeStyle::Default, t.pen, "Smooth ink that follows the pen's pressure. Hold Ctrl to erase");
-                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Pencil, t.pencil, "Grainy, see-through pencil");
-                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Marker, t.marker, "See-through highlighter: where strokes overlap, they darken");
-                    interacted |= pen_style_btn(ui, tool, StrokeStyle::Airbrush, t.airbrush, "Soft spray: hold still to build it up");
-                    interacted |= tool_btn(ui, tool, ToolKind::Fill, t.fill, "Fill a closed area with the colour");
+                    if tool.pad_open {
+                        interacted |= pen_style_btn(ui, tool, StrokeStyle::Pencil, t.pencil, "Soft pencil: going over it again darkens it");
+                        interacted |= pen_style_btn(ui, tool, StrokeStyle::Marker, t.marker, "See-through felt tip of one width: a stroke never darkens itself, a new one over it does");
+                        interacted |= pen_style_btn(ui, tool, StrokeStyle::Airbrush, t.airbrush, "Soft spray: pressing harder lays more, holding still builds it up");
+                    }
                     theme::divider(ui, BTN_SIZE);
 
                     // Marking up: text, and the pointers that leave nothing.
@@ -116,9 +122,13 @@ pub fn show(
                     interacted |= tool_btn(ui, tool, ToolKind::Line, t.line, "A straight line");
                     interacted |= tool_btn(ui, tool, ToolKind::Arrow, t.arrow, "A straight arrow");
                     interacted |= tool_btn(ui, tool, ToolKind::FreehandArrow, t.freehand_arrow, "Draw a path; an arrowhead goes on its end");
-                    // Contextual: the shapes that can have a dashed border.
+                    // Contextual: the shapes that can have a dashed border,
+                    // and the ones that can be filled (or are selected).
                     if matches!(tool.kind, ToolKind::Rect | ToolKind::Ellipse | ToolKind::Line | ToolKind::Arrow) {
                         interacted |= dash_toggle_btn(ui, tool, t.dashed_border);
+                    }
+                    if matches!(tool.kind, ToolKind::Rect | ToolKind::Ellipse) || shapes_selected {
+                        interacted |= fill_toggle_btn(ui, tool, t.filled_shape);
                     }
                     theme::divider(ui, BTN_SIZE);
 
@@ -206,19 +216,21 @@ fn pen_icon(style: StrokeStyle) -> egui::Image<'static> {
 }
 
 /// Pen / Pencil / Marker / Airbrush button. All select `ToolKind::Pen`;
-/// they differ only in `tool.style`, which the renderer uses to switch
-/// between the smooth opaque ribbon, the grainy pencil, the highlighter
-/// and the spray. Current when the pen tool is selected *and* its style
-/// matches `style`.
+/// they differ only in `tool.style`, which picks a drawing pad's brush
+/// (off a pad the pen draws plain ink: `ActiveTool::pen_style`). Current
+/// when the pen tool is selected *and* it draws with `style`. The pen's
+/// button off a pad keeps the pad's brush for the next pad.
 fn pen_style_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, style: StrokeStyle, key: Option<Binding>, about: &str) -> bool {
-    let current = tool.kind == ToolKind::Pen && tool.style == style;
+    let current = tool.kind == ToolKind::Pen && tool.pen_style() == style;
     let look = if current { Look::Current } else { Look::Plain };
     let response = theme::icon_button(ui, pen_icon(style), BTN_SIZE, look);
     let name = tool_name(ToolKind::Pen, style);
     let response = tip(response, name, key, about);
     if response.clicked() {
         tool.kind = ToolKind::Pen;
-        tool.style = style;
+        if tool.pad_open {
+            tool.style = style;
+        }
         return true;
     }
     touched(&response)
@@ -227,7 +239,7 @@ fn pen_style_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, style: StrokeStyle, k
 fn tool_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, kind: ToolKind, key: Option<Binding>, about: &str) -> bool {
     let look = if tool.kind == kind { Look::Current } else { Look::Plain };
     let response = theme::icon_button(ui, tool_icon(kind), BTN_SIZE, look);
-    let name = tool_name(kind, tool.style);
+    let name = tool_name(kind, tool.pen_style());
     let response = tip(response, name, key, about);
     if response.clicked() {
         tool.kind = kind;
@@ -372,9 +384,9 @@ pub(crate) fn active_tool(ui: &mut egui::Ui, tool: &ActiveTool) {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::hover());
     ui.painter().rect_filled(rect, Rounding::same(theme::CONTROL_ROUNDING), theme::accent());
     let icon = egui::Rect::from_center_size(rect.center(), Vec2::splat((BTN_SIZE * 0.56).round()));
-    let img = if tool.kind == ToolKind::Pen { pen_icon(tool.style) } else { tool_icon(tool.kind) };
+    let img = if tool.kind == ToolKind::Pen { pen_icon(tool.pen_style()) } else { tool_icon(tool.kind) };
     img.tint(theme::accent_ink()).fit_to_exact_size(icon.size()).paint_at(ui, icon);
-    response.on_hover_text(format!("{} — the tool keys pick another", tool_name(tool.kind, tool.style)));
+    response.on_hover_text(format!("{} — the tool keys pick another", tool_name(tool.kind, tool.pen_style())));
 }
 
 /// A tool's name, as its toolbar button calls it (`style` names the pen).
@@ -392,7 +404,6 @@ fn tool_name(kind: ToolKind, style: StrokeStyle) -> &'static str {
         ToolKind::Line => "Line",
         ToolKind::Arrow => "Arrow",
         ToolKind::FreehandArrow => "Freehand arrow",
-        ToolKind::Fill => "Fill",
         ToolKind::Laser => "Laser",
         ToolKind::Text => "Text",
         ToolKind::Spotlight => "Spotlight",
@@ -414,7 +425,6 @@ fn tool_icon(kind: ToolKind) -> egui::Image<'static> {
         ToolKind::Line => egui::Image::new(egui::include_image!("../../assets/icons/line.svg")),
         ToolKind::Arrow => egui::Image::new(egui::include_image!("../../assets/icons/arrow.svg")),
         ToolKind::FreehandArrow => egui::Image::new(egui::include_image!("../../assets/icons/freehand_arrow.svg")),
-        ToolKind::Fill => egui::Image::new(egui::include_image!("../../assets/icons/fill.svg")),
         ToolKind::Laser => egui::Image::new(egui::include_image!("../../assets/icons/laser.svg")),
         ToolKind::Text => egui::Image::new(egui::include_image!("../../assets/icons/text.svg")),
         ToolKind::Spotlight => egui::Image::new(egui::include_image!("../../assets/icons/spotlight.svg")),
@@ -662,6 +672,7 @@ fn help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
     let mut more = [
         ("Toolbar buttons", bound(vec![
             ("Dashed / solid border",    t.dashed_border),
+            ("Filled / outlined shapes", t.filled_shape),
             ("Colour 1",                 tb.colour[0]),
             ("Colour 2",                 tb.colour[1]),
             ("Colour 3",                 tb.colour[2]),
@@ -761,7 +772,6 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Pencil",                      k(t.pencil)),
             ("Marker (highlighter)",        k(t.marker)),
             ("Airbrush (spray)",            k(t.airbrush)),
-            ("Fill",                        k(t.fill)),
             ("Laser pointer",               k(t.laser)),
             ("Spotlight (again: pen)",      k(t.spotlight)),
             ("Text",                        k(t.text)),
@@ -894,13 +904,37 @@ fn dash_toggle_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, key: Option<Binding
     let response = if on {
         tip(response, "Dashed border", key, "New shapes get moving dashes. Click for a solid line")
     } else {
-        tip(response, "Solid border", key, "Click to give new shapes moving dashes")
+        tip(response, "Solid border", key, "Click to give new shapes moving dashes (a filled shape loses its fill)")
     };
     if response.clicked() {
-        tool.border_style = match tool.border_style {
-            BorderStyle::Solid => BorderStyle::DashedAnimated,
-            BorderStyle::DashedAnimated => BorderStyle::Solid,
-        };
+        tool.toggle_dashed();
+        return true;
+    }
+    touched(&response)
+}
+
+/// Contextual "filled shape" toggle, drawn like the dashed one: a small
+/// box, solid when on. Clicking flips `tool.fill_shapes`, which new
+/// rectangles and ellipses take (and the app applies to selected ones);
+/// filled and dashed turn each other off (`ActiveTool::toggle_fill`).
+fn fill_toggle_btn(ui: &mut egui::Ui, tool: &mut ActiveTool, key: Option<Binding>) -> bool {
+    let on = tool.fill_shapes;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BTN_SIZE), egui::Sense::click());
+    theme::paint_button(ui, rect, Look::on(on), &response);
+    let icon = egui::Rect::from_center_size(rect.center(), Vec2::splat((BTN_SIZE * 0.48).round()));
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(icon, Rounding::same(2.0), theme::TEXT_PRIMARY);
+    } else {
+        painter.rect_stroke(icon, Rounding::same(2.0), Stroke::new(1.6, theme::TEXT_PRIMARY));
+    }
+    let response = if on {
+        tip(response, "Filled", key, "Rectangles and ellipses are filled with the colour. Click for outlines")
+    } else {
+        tip(response, "Outlined", key, "Click to fill rectangles and ellipses with the colour (a dashed border turns solid)")
+    };
+    if response.clicked() {
+        tool.toggle_fill();
         return true;
     }
     touched(&response)
@@ -1324,6 +1358,7 @@ mod tests {
             &mut select,
             None,
             false,
+            false,
             &keys,
         );
     }
@@ -1336,6 +1371,16 @@ mod tests {
         let mut tool = ActiveTool::from_config(&cfg);
         let size = [1500.0, 860.0];
         let Some(ctx) = shoot("toolbar", size, 1.0, &[Step::Idle], |ctx| show_default(ctx, &mut cfg, &mut tool)) else { return };
+        // A pad open, the airbrush in hand: the pad's brushes show.
+        let mut on_pad = ActiveTool::from_config(&cfg);
+        on_pad.pad_open = true;
+        on_pad.style = StrokeStyle::Airbrush;
+        shoot("toolbar-pad", size, 1.0, &[Step::Idle], |ctx| show_default(ctx, &mut cfg, &mut on_pad));
+        // The rectangle tool, filling: its dashed and filled switches.
+        let mut rect = ActiveTool::from_config(&cfg);
+        rect.kind = ToolKind::Rect;
+        rect.fill_shapes = true;
+        shoot("toolbar-rect", size, 1.0, &[Step::Idle], |ctx| show_default(ctx, &mut cfg, &mut rect));
         // The close button is the toolbar's last; before it, past a
         // divider (9 points, 2 of spacing each side), the help.
         let bar = ctx.memory(|m| m.area_rect(egui::Id::new("osn_toolbar"))).expect("toolbar drawn");

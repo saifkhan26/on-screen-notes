@@ -399,7 +399,7 @@ mod layer_xform_tests {
     fn boxing_labels_is_one_undo_step_and_skips_other_shapes() {
         let mut c = Canvas::default();
         c.add_shape(Shape::Text { pos: [0.0, 0.0], content: "a".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0, link: 0 });
-        c.add_shape(Shape::Rect { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border: crate::canvas::shape::BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 });
+        c.add_shape(Shape::Rect { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border: crate::canvas::shape::BorderStyle::Solid, filled: false, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 });
         let steps = c.undo_log.len();
         assert!(c.set_text_box(0, &[0, 1], true));
         assert_eq!(c.undo_log.len(), steps + 1);
@@ -407,6 +407,28 @@ mod layer_xform_tests {
         assert!(!c.set_text_box(0, &[0, 1], true), "already boxed: nothing to do");
         c.undo();
         assert!(matches!(c.layers[0].shapes[0], Shape::Text { background: None, .. }));
+    }
+
+    /// Filling selected shapes: rectangles and ellipses only, their
+    /// dashes turned solid, one undo step; emptying them keeps the border.
+    #[test]
+    fn filling_shapes_makes_their_border_solid() {
+        use crate::canvas::shape::BorderStyle;
+        let mut c = Canvas::default();
+        let rect = |border| Shape::Rect { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border, filled: false, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 };
+        c.add_shape(rect(BorderStyle::DashedAnimated));
+        c.add_shape(Shape::Line { a: [0.0, 0.0], b: [5.0, 5.0], color: [0; 4], stroke_width: 1.0, border: BorderStyle::DashedAnimated, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 });
+        let steps = c.undo_log.len();
+        assert!(c.set_filled(0, &[0, 1], true));
+        assert_eq!(c.undo_log.len(), steps + 1);
+        assert!(matches!(c.layers[0].shapes[0], Shape::Rect { filled: true, border: BorderStyle::Solid, .. }));
+        assert!(matches!(c.layers[0].shapes[1], Shape::Line { border: BorderStyle::DashedAnimated, .. }), "a line is left alone");
+        assert!(!c.set_filled(0, &[0], true), "already filled: nothing to do");
+        assert!(c.set_filled(0, &[0], false));
+        assert!(matches!(c.layers[0].shapes[0], Shape::Rect { filled: false, border: BorderStyle::Solid, .. }));
+        c.undo();
+        c.undo();
+        assert!(matches!(c.layers[0].shapes[0], Shape::Rect { filled: false, border: BorderStyle::DashedAnimated, .. }));
     }
 
     #[test]
@@ -644,7 +666,7 @@ mod object_edit_tests {
         let mut c = Canvas::default();
         c.layers[0].shapes.push(Shape::Rect {
             a: [0.0, 0.0], b: [40.0, 20.0], color: [1, 2, 3, 255], stroke_width: 2.0,
-            border: BorderStyle::Solid, rotation: 0.0,
+            border: BorderStyle::Solid, filled: false, rotation: 0.0,
             pin: 0,
             group: 0,
             tags: Vec::new(),

@@ -64,6 +64,8 @@ impl OnScreenNotesApp {
             let (prev_color, prev_size) = (self.ws.tool.color, self.ws.tool.size);
             let prev_text_box = self.ws.tool.text_box;
             let text_selected = !self.selected_text().is_empty();
+            let prev_fill = (self.ws.tool.fill_shapes, self.ws.tool.border_style);
+            let shapes_selected = !self.selected_fillable().is_empty();
             let mut insert_media = false;
             let mut quit = false;
             let mut select_filtered = false;
@@ -105,6 +107,7 @@ impl OnScreenNotesApp {
                     &mut select_filtered,
                     has_pins.then_some(&mut pins_hidden),
                     text_selected,
+                    shapes_selected,
                     &self.hotkeys_cfg,
                 )
             } else {
@@ -361,6 +364,7 @@ impl OnScreenNotesApp {
                         slides: (0..self.canvases.count()).map(|i| self.canvases.name(i).to_string()).collect(),
                         active_slide: self.canvases.active_index(),
                         deleted_slides: self.canvases.deleted_count(),
+                        pad: self.ws.pad.is_open(),
                     };
                     let all = ui::command_palette::entries(&cx);
                     self.ws.commands.show(ctx, &all)
@@ -423,17 +427,34 @@ impl OnScreenNotesApp {
 
             self.middle_button_pan(ctx, space_held);
 
-            self.run_deferred_tools(ctx, canvas_rect);
+            self.run_deferred_tools(ctx);
 
             // This frame's stamps on the open pad, and its Esc / undo keys
             // before anything else reads the keys.
-            self.pad_flush();
+            self.pad_flush(ctx);
             self.pad_keys(ctx);
             self.crop_keys(ctx);
 
             let keys = self.take_keys(ctx, &slides, space_held, canvas_rect);
 
             self.run_keys(ctx, keys, slides, canvas_rect, &media_objs, media_selected);
+
+            // The filled-shape switch (its button or its key) changed:
+            // the selected rectangles and ellipses follow it. Not when
+            // the dashed switch turned it off: that one is for new
+            // shapes only.
+            if self.ws.tool.fill_shapes != prev_fill.0 && self.ws.tool.border_style == prev_fill.1 {
+                self.apply_fill_to_selection();
+            }
+            // A pad's brush picked by its key with no pad open.
+            if let Some(style) = self.ws.tool.pad_only_brush.take() {
+                let name = match style {
+                    crate::canvas::stroke::StrokeStyle::Pencil => "The pencil",
+                    crate::canvas::stroke::StrokeStyle::Marker => "The marker",
+                    _ => "The airbrush",
+                };
+                self.toast = Some((format!("{name} draws on drawing pads: open one (New drawing pad, or Draw on this picture)"), Instant::now()));
+            }
 
             // The slide window's View menu can leave it out.
             if !(self.canvases.in_view() && self.config.slide_window_ui.hide_layers) {

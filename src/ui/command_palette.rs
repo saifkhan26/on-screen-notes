@@ -85,6 +85,9 @@ pub struct Context<'a> {
     pub active_slide: usize,
     /// Deleted slides that can still come back this run.
     pub deleted_slides: usize,
+    /// A drawing pad is open: its brushes (pencil, marker, airbrush) are
+    /// listed.
+    pub pad: bool,
 }
 
 /// The entries `cx` allows, in the order they show with no query.
@@ -97,12 +100,11 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
 
     use Command as C;
     use KeyAction as K;
-    let tools: [(&str, Option<Binding>, ToolKind, Option<StrokeStyle>); 16] = [
+    let tools: [(&str, Option<Binding>, ToolKind, Option<StrokeStyle>); 15] = [
         ("Pen", t.pen, ToolKind::Pen, Some(StrokeStyle::Default)),
         ("Pencil", t.pencil, ToolKind::Pen, Some(StrokeStyle::Pencil)),
         ("Marker (highlighter)", t.marker, ToolKind::Pen, Some(StrokeStyle::Marker)),
         ("Airbrush", t.airbrush, ToolKind::Pen, Some(StrokeStyle::Airbrush)),
-        ("Fill", t.fill, ToolKind::Fill, None),
         ("Laser pointer", t.laser, ToolKind::Laser, None),
         ("Text", t.text, ToolKind::Text, None),
         ("Spotlight", t.spotlight, ToolKind::Spotlight, None),
@@ -116,6 +118,10 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
         ("Freehand arrow", t.freehand_arrow, ToolKind::FreehandArrow, None),
     ];
     for (label, key, kind, style) in tools {
+        let pad_brush = matches!(style, Some(StrokeStyle::Pencil | StrokeStyle::Marker | StrokeStyle::Airbrush));
+        if pad_brush && !cx.pad {
+            continue;
+        }
         add(label, "Tool", key, C::Tool(kind, style));
     }
     add("Eyedropper (pick a colour from the screen)", "Tool", t.eyedropper, C::Eyedropper);
@@ -197,7 +203,7 @@ pub fn entries(cx: &Context) -> Vec<Entry> {
     add("Shape snap on / off", e, None, C::ShapeSnap);
     add("Keep proportions on / off (resizing)", e, None, C::KeepProportions);
     add("Insert a picture, video, GIF or PureRef board", e, tb.insert_media, C::Key(K::InsertMedia));
-    add("New drawing pad (paper to draw on with the pen and pencil)", e, None, C::NewPad);
+    add("New drawing pad (paper to draw on with the pen, pencil, marker and airbrush)", e, None, C::NewPad);
     add("Pen size up", e, tb.size_up, C::Key(K::Size(1)));
     add("Pen size down", e, tb.size_down, C::Key(K::Size(-1)));
     for (i, colour) in cx.palette.iter().enumerate().take(8) {
@@ -485,7 +491,7 @@ mod tests {
     }
 
     fn context<'a>(keys: &'a ParsedHotkeys, selected: usize, palette: &'a [[u8; 4]]) -> Context<'a> {
-        Context { keys, selected, picture: false, grouped: false, inside_group: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0, deleted_slides: 0 }
+        Context { keys, selected, picture: false, grouped: false, inside_group: false, pin: false, palette, slides: vec!["".into(), "Intro".into()], active_slide: 0, deleted_slides: 0, pad: true }
     }
 
     #[test]

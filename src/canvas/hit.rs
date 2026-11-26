@@ -127,19 +127,22 @@ pub fn stroke_hit(stroke: &Stroke, p: [f32; 2], tol: f32) -> bool {
 }
 
 /// True if `p` lies within `tol` of what the shape draws: the outline
-/// for a rectangle or ellipse (they are not filled), the shaft for a
-/// line or arrow, anywhere in the box for text and rasters.
+/// for a rectangle or ellipse, and inside it too when it is filled; the
+/// shaft for a line or arrow; anywhere in the box for text and rasters.
 pub fn shape_hit(shape: &Shape, p: [f32; 2], tol: f32) -> bool {
     match shape {
         Shape::Line { a, b, stroke_width, .. } | Shape::Arrow { a, b, stroke_width, .. } => {
             let r = stroke_width * 0.5 + tol;
             dist_sq_to_segment(p, *a, *b) <= r * r
         }
-        Shape::Rect { stroke_width, .. } => {
+        Shape::Rect { stroke_width, filled, .. } => {
             let o = shape.obb();
             let q = o.to_local(p);
             let dx = q[0].abs() - o.half[0];
             let dy = q[1].abs() - o.half[1];
+            if *filled && dx <= 0.0 && dy <= 0.0 {
+                return true;
+            }
             // Distance to the rectangle's edge, from either side.
             let d = if dx > 0.0 || dy > 0.0 {
                 (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt()
@@ -148,7 +151,7 @@ pub fn shape_hit(shape: &Shape, p: [f32; 2], tol: f32) -> bool {
             };
             d <= stroke_width * 0.5 + tol
         }
-        Shape::Ellipse { stroke_width, .. } => {
+        Shape::Ellipse { stroke_width, filled, .. } => {
             let o = shape.obb();
             let q = o.to_local(p);
             let rx = o.half[0].max(1e-3);
@@ -157,6 +160,9 @@ pub fn shape_hit(shape: &Shape, p: [f32; 2], tol: f32) -> bool {
             // the direction of `q` turns it into an approximate distance —
             // exact for a circle, close enough for click slop otherwise.
             let k = ((q[0] / rx).powi(2) + (q[1] / ry).powi(2)).sqrt();
+            if *filled && k <= 1.0 {
+                return true;
+            }
             let radius = if k > 1e-6 {
                 (q[0] * q[0] + q[1] * q[1]).sqrt() / k
             } else {
@@ -372,7 +378,7 @@ mod tests {
     fn rect_is_hit_on_its_outline_only() {
         let r = Shape::Rect {
             a: [0.0, 0.0], b: [100.0, 60.0], color: [0; 4], stroke_width: 2.0,
-            border: BorderStyle::Solid, rotation: 0.0,
+            border: BorderStyle::Solid, filled: false, rotation: 0.0,
             pin: 0,
             group: 0,
             tags: Vec::new(),
@@ -388,7 +394,7 @@ mod tests {
     fn rotated_rect_is_hit_where_it_is_drawn() {
         let mut r = Shape::Rect {
             a: [0.0, 0.0], b: [100.0, 20.0], color: [0; 4], stroke_width: 2.0,
-            border: BorderStyle::Solid, rotation: 0.0,
+            border: BorderStyle::Solid, filled: false, rotation: 0.0,
             pin: 0,
             group: 0,
             tags: Vec::new(),
@@ -407,7 +413,7 @@ mod tests {
     fn ellipse_is_hit_on_its_outline_only() {
         let e = Shape::Ellipse {
             a: [0.0, 0.0], b: [100.0, 50.0], color: [0; 4], stroke_width: 2.0,
-            border: BorderStyle::Solid, rotation: 0.0,
+            border: BorderStyle::Solid, filled: false, rotation: 0.0,
             pin: 0,
             group: 0,
             tags: Vec::new(),

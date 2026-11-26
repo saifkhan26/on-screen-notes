@@ -898,6 +898,7 @@ mod tests {
             color: [255; 4],
             stroke_width: 0.0,
             border: Default::default(),
+            filled: false,
             rotation: 0.0,
             pin: 0,
             group: 0,

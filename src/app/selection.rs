@@ -424,6 +424,27 @@ impl OnScreenNotesApp {
         self.ws.tool.select.sel.shapes.iter().copied().filter(|&i| matches!(layer.shapes.get(i), Some(Shape::Text { .. }))).collect()
     }
 
+    /// Selected rectangles and ellipses, with the Select tool.
+    pub(super) fn selected_fillable(&self) -> Vec<usize> {
+        if self.ws.tool.kind != crate::tools::ToolKind::Select {
+            return Vec::new();
+        }
+        let c = self.canvases.active();
+        let Some(layer) = c.layers.get(c.active_layer) else { return Vec::new() };
+        self.ws.tool.select.sel.shapes.iter().copied().filter(|&i| matches!(layer.shapes.get(i), Some(Shape::Rect { .. } | Shape::Ellipse { .. }))).collect()
+    }
+
+    /// The filled-shape switch was flipped: the selected rectangles and
+    /// ellipses follow it.
+    pub(super) fn apply_fill_to_selection(&mut self) {
+        let shapes = self.selected_fillable();
+        if shapes.is_empty() || !self.may_edit() { return; }
+        let on = self.ws.tool.fill_shapes;
+        let c = self.canvases.active_mut();
+        let li = c.active_layer;
+        c.set_filled(li, &shapes, on);
+    }
+
     /// The text-box switch was flipped: the selected labels follow it.
     pub(super) fn apply_text_box_to_selection(&mut self) {
         let texts = self.selected_text();

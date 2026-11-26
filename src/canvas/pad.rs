@@ -1,5 +1,6 @@
 //! Drawing pads: painting into a picture's own pixels with a pen, a
-//! pencil and an eraser, the way a paint program does.
+//! pencil, a marker, an airbrush and an eraser, the way a paint program
+//! does.
 //!
 //! A pad is an ordinary still picture whose pixels hold only the ink,
 //! on clear, with its paper beside them: `Shape::Raster::paper`, a colour
@@ -17,7 +18,9 @@
 //! off a pad (the same curve, from the settings' slider, and the same
 //! floor). The pencil lays its colour in light layers that build up, a
 //! little darker the harder it is pressed; a light touch is thinner and
-//! lighter, never faint.
+//! lighter, never faint. The marker is a see-through felt tip of one
+//! width; the airbrush a very soft spray whose pressure sets how much it
+//! lays, and which keeps spraying while the pen is held still.
 
 use crate::canvas::shape::{Obb, Shape};
 
@@ -35,6 +38,21 @@ pub const PENCIL_PASS: f32 = 0.5;
 /// the pencil a little, and a light touch still shows.
 pub const PENCIL_LIGHT: f32 = 0.6;
 
+/// How much of its colour the marker lays: see-through, so a second
+/// stroke over the first darkens it (one stroke never darkens itself).
+pub const MARKER_ALPHA: f32 = 0.5;
+
+/// Share of its colour one pass of the airbrush lays at its middle,
+/// pressed firmly. Light, as a spray is: passes build up.
+pub const AIRBRUSH_PASS: f32 = 0.3;
+
+/// Share of a firm pass the lightest touch lays: pressure is how much
+/// paint the airbrush lets out.
+pub const AIRBRUSH_LIGHT: f32 = 0.1;
+
+/// Passes' worth the airbrush lays a second while held still.
+pub const AIRBRUSH_HOLD: f32 = 1.5;
+
 /// What a stroke on a pad does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Brush {
@@ -49,6 +67,14 @@ pub enum Brush {
     /// with see-through parts; on an opaque picture with no paper, back
     /// to white (`pad_gpu::Session::erase_white`).
     Eraser,
+    /// A felt tip: one width whatever the pressure, `MARKER_ALPHA` of the
+    /// colour. Within a stroke the strongest stamp wins, so crossing
+    /// itself does not darken it; a new stroke over it does.
+    Marker,
+    /// A very soft round spray of one size: pressure sets how much it
+    /// lays (`airbrush_pass`), passes build up, and holding the pen
+    /// still keeps spraying (`Walk::hold`).
+    Airbrush,
 }
 
 /// How a brush's stamps look.
@@ -58,14 +84,19 @@ pub struct Look {
     pub hard: f32,
     /// Gap between stamps, as a share of their diameter.
     pub spacing: f32,
+    /// The edge fades in an S-curve rather than straight: the
+    /// airbrush's soft, round falloff.
+    pub soft: bool,
 }
 
 impl Brush {
     pub fn look(self) -> Look {
         match self {
-            Brush::Pen => Look { hard: 0.8, spacing: 0.12 },
-            Brush::Pencil => Look { hard: 0.3, spacing: 0.1 },
-            Brush::Eraser => Look { hard: 0.6, spacing: 0.12 },
+            Brush::Pen => Look { hard: 0.8, spacing: 0.12, soft: false },
+            Brush::Pencil => Look { hard: 0.3, spacing: 0.1, soft: false },
+            Brush::Eraser => Look { hard: 0.6, spacing: 0.12, soft: false },
+            Brush::Marker => Look { hard: 0.85, spacing: 0.08, soft: false },
+            Brush::Airbrush => Look { hard: 0.0, spacing: 0.08, soft: true },
         }
     }
 
@@ -74,11 +105,12 @@ impl Brush {
     /// `px` pixels making a screen point. The pen and pencil follow
     /// pressure as ink does off a pad (`stroke::width_at_pressure`), never
     /// thinner than a pixel; the eraser reaches between half and all of
-    /// its size.
+    /// its size; the marker and the airbrush are always their size.
     pub fn radius(self, r_max: f32, p: f32, px: f32) -> f32 {
         match self {
             Brush::Pen | Brush::Pencil => 0.5 * crate::canvas::stroke::width_at_pressure(2.0 * r_max, p, px),
             Brush::Eraser => r_max * (0.5 + 0.5 * p.clamp(0.0, 1.0)),
+            Brush::Marker | Brush::Airbrush => r_max,
         }
         .max(0.5)
     }
@@ -91,7 +123,13 @@ impl Brush {
     /// Its stamps pile up, each adding a little colour (`flow`), rather
     /// than the strongest over a pixel winning.
     pub fn builds_up(self) -> bool {
-        self == Brush::Pencil
+        matches!(self, Brush::Pencil | Brush::Airbrush)
+    }
+
+    /// Share of its colour the brush lays at all: the marker is
+    /// see-through.
+    pub fn alpha(self) -> f32 {
+        if self == Brush::Marker { MARKER_ALPHA } else { 1.0 }
     }
 
     /// Share of its colour one pass of the pencil lays at pressure `p`
@@ -101,24 +139,39 @@ impl Brush {
         PENCIL_PASS * (PENCIL_LIGHT + (1.0 - PENCIL_LIGHT) * p.clamp(0.0, 1.0))
     }
 
+    /// Share of its colour one pass of the airbrush lays at pressure `p`
+    /// (after the curve): from `AIRBRUSH_LIGHT` of `AIRBRUSH_PASS` at the
+    /// lightest touch to all of it pressed firmly.
+    pub fn airbrush_pass(p: f32) -> f32 {
+        AIRBRUSH_PASS * (AIRBRUSH_LIGHT + (1.0 - AIRBRUSH_LIGHT) * p.clamp(0.0, 1.0))
+    }
+
     /// How many stamps of radius `r` one pass lays over a point on its
     /// line, each counted by how much of it covers the point: the stamp
-    /// shader's edge, full out to `hard` of the radius, then fading.
+    /// shader's edge, full out to `hard` of the radius, then fading (the
+    /// airbrush's S-curve covers as much as a straight fade).
     fn stamps_over(self, r: f32) -> f32 {
         let ramp = (r + 0.5 - r * self.look().hard).max(1.0);
         (2.0 * r + 1.0 - ramp) / self.spacing(r)
     }
 
     /// Share of the colour a stamp of radius `r` lays at pressure `p`.
-    /// The pencil's is set by how many of its stamps cover a point, so
-    /// one pass gives `pencil_pass(p)` whatever its size; the others lay
-    /// it all.
+    /// The pencil's and the airbrush's are set by how many of their
+    /// stamps cover a point, so one pass gives `pencil_pass(p)` (or
+    /// `airbrush_pass(p)`) whatever its size; the others lay it all.
     pub fn flow(self, r: f32, p: f32) -> f32 {
-        if self.builds_up() {
-            1.0 - (1.0 - Self::pencil_pass(p)).powf(1.0 / self.stamps_over(r))
-        } else {
-            1.0
-        }
+        let pass = match self {
+            Brush::Pencil => Self::pencil_pass(p),
+            Brush::Airbrush => Self::airbrush_pass(p),
+            _ => return 1.0,
+        };
+        1.0 - (1.0 - pass).powf(1.0 / self.stamps_over(r))
+    }
+
+    /// Stamps a second the airbrush lays in one place while the pen is
+    /// held still there: `AIRBRUSH_HOLD` passes' worth.
+    fn hold_rate(self, r: f32) -> f32 {
+        AIRBRUSH_HOLD * self.stamps_over(r)
     }
 }
 
@@ -201,6 +254,10 @@ pub struct Walk {
     carry: f32,
     /// Where the last stamp went.
     placed: Option<[f32; 2]>,
+    /// Stamps laid since the last `hold`: the pen is not still.
+    moved: bool,
+    /// Airbrush stamps owed for time held still, not yet whole.
+    held: f32,
 }
 
 impl Walk {
@@ -208,11 +265,38 @@ impl Walk {
     /// `px` pixels make a screen point.
     pub fn new(brush: Brush, r_max: f32, px: f32) -> Self {
         let px = if px.is_finite() && px > 0.0 { px } else { 1.0 };
-        Self { brush, r_max: r_max.max(0.5), px, last: None, carry: 0.0, placed: None }
+        Self { brush, r_max: r_max.max(0.5), px, last: None, carry: 0.0, placed: None, moved: false, held: 0.0 }
+    }
+
+    /// `dt` seconds went by with the pen down: an airbrush held still
+    /// (no stamps laid since last time) keeps spraying where it is. Other
+    /// brushes lay nothing.
+    pub fn hold(&mut self, dt: f32, out: &mut Vec<Stamp>) {
+        if self.brush != Brush::Airbrush {
+            return;
+        }
+        let Some((at, p)) = self.last else { return };
+        if std::mem::take(&mut self.moved) {
+            self.held = 0.0;
+            return;
+        }
+        let r = self.radius(p);
+        // A long stall (a dropped frame, a debugger) sprays at most 1/4 s.
+        self.held += self.brush.hold_rate(r) * dt.clamp(0.0, 0.25);
+        let n = self.held.floor();
+        self.held -= n;
+        for _ in 0..n as usize {
+            out.push(self.stamp(at, r, p));
+        }
     }
 
     fn radius(&self, p: f32) -> f32 {
         self.brush.radius(self.r_max, p, self.px)
+    }
+
+    /// The brush it lays.
+    pub fn brush(&self) -> Brush {
+        self.brush
     }
 
     fn stamp(&self, c: [f32; 2], r: f32, p: f32) -> Stamp {
@@ -227,6 +311,7 @@ impl Walk {
             self.last = Some((at, p));
             self.carry = 0.0;
             self.placed = Some(at);
+            self.moved = true;
             return;
         };
         let d = ((at[0] - from[0]).powi(2) + (at[1] - from[1]).powi(2)).sqrt();
@@ -257,6 +342,7 @@ impl Walk {
                 }
                 out.push(self.stamp(c, r, pf));
                 self.placed = Some(c);
+                self.moved = true;
             }
         }
         self.last = Some((at, p));
@@ -282,6 +368,42 @@ pub fn bounds(stamps: &[Stamp], size: [u32; 2]) -> Option<[u32; 4]> {
     let x1 = (c.ceil().max(0.0) as u32).min(size[0]);
     let y1 = (d.ceil().max(0.0) as u32).min(size[1]);
     (x0 < x1 && y0 < y1).then_some([x0, y0, x1, y1])
+}
+
+/// What a closed shape `poly` (in a picture's pixels) covers of a
+/// picture `size` big: the pixels round it, as `bounds` gives them, and
+/// one byte a pixel there, row by row (255 = all, smooth at its edge).
+/// `None` when it covers none.
+pub fn cover(poly: &[[f32; 2]], size: [u32; 2]) -> Option<([u32; 4], Vec<u8>)> {
+    if poly.len() < 3 || poly.iter().any(|p| !p[0].is_finite() || !p[1].is_finite()) {
+        return None;
+    }
+    let (mut a, mut b, mut c, mut d) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in poly {
+        a = a.min(p[0]);
+        b = b.min(p[1]);
+        c = c.max(p[0]);
+        d = d.max(p[1]);
+    }
+    let x0 = (a.floor().max(0.0) as u32).min(size[0]);
+    let y0 = (b.floor().max(0.0) as u32).min(size[1]);
+    let x1 = (c.ceil().max(0.0) as u32).min(size[0]);
+    let y1 = (d.ceil().max(0.0) as u32).min(size[1]);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(poly[0][0] - x0 as f32, poly[0][1] - y0 as f32);
+    for p in &poly[1..] {
+        pb.line_to(p[0] - x0 as f32, p[1] - y0 as f32);
+    }
+    pb.close();
+    let path = pb.finish()?;
+    let mut mask = tiny_skia::Mask::new(x1 - x0, y1 - y0)?;
+    // Even-odd, as lasso erase on ink counts what is inside a loop.
+    mask.fill_path(&path, tiny_skia::FillRule::EvenOdd, true, tiny_skia::Transform::identity());
+    let data = mask.data();
+    data.iter().any(|&v| v > 0).then(|| ([x0, y0, x1, y1], data.to_vec()))
 }
 
 /// Two rectangles' union (as `bounds` gives them).
@@ -438,9 +560,75 @@ mod tests {
         assert!(f.contains([60.0 + 20.0, 45.0 + 40.0]) && !f.contains([60.0 + 40.0, 45.0]));
         // Not a picture.
         let rect = Shape::Rect {
-            a: [0.0, 0.0], b: [1.0, 1.0], color: [0; 4], stroke_width: 1.0, border: Default::default(), rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0,
+            a: [0.0, 0.0], b: [1.0, 1.0], color: [0; 4], stroke_width: 1.0, border: Default::default(), filled: false, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0,
         };
         assert!(PadFrame::of(&rect, [10, 10]).is_none());
+    }
+
+    #[test]
+    fn the_marker_is_one_width_and_see_through() {
+        let b = Brush::Marker;
+        assert_eq!(b.radius(6.0, 0.1, 1.0), 6.0, "pressure does not thin it");
+        assert_eq!(b.radius(6.0, 1.0, 1.0), 6.0);
+        assert!(!b.builds_up(), "a stroke never darkens itself");
+        assert_eq!(b.flow(6.0, 0.3), 1.0);
+        assert_eq!(b.alpha(), MARKER_ALPHA);
+    }
+
+    #[test]
+    fn the_airbrush_lays_more_pressed_harder_and_sprays_while_held() {
+        let b = Brush::Airbrush;
+        assert_eq!(b.radius(20.0, 0.1, 1.0), 20.0, "one size");
+        assert!(b.builds_up() && b.look().soft);
+        assert!(b.flow(20.0, 1.0) > 2.0 * b.flow(20.0, 0.1), "pressure is how much it lays");
+        // A pass lays `airbrush_pass` at its middle whatever the size: the
+        // stamps over a point, each laying `flow`, add up to it.
+        for r in [4.0_f32, 20.0, 80.0] {
+            let n = b.stamps_over(r);
+            let laid = 1.0 - (1.0 - b.flow(r, 1.0)).powf(n);
+            assert!((laid - AIRBRUSH_PASS).abs() < 1e-4, "{r}: {laid}");
+        }
+        // Held still for a second it keeps spraying: `AIRBRUSH_HOLD`
+        // passes' worth of stamps in that spot.
+        let mut w = Walk::new(b, 20.0, 1.0);
+        let mut out = Vec::new();
+        w.step([50.0, 50.0], 1.0, &mut out);
+        w.hold(0.016, &mut out);
+        assert_eq!(out.len(), 1, "it had just moved");
+        for _ in 0..60 {
+            w.hold(1.0 / 60.0, &mut out);
+        }
+        let held = out.len() - 1;
+        let want = AIRBRUSH_HOLD * b.stamps_over(20.0);
+        assert!((held as f32 - want).abs() <= 1.5, "{held} vs {want}");
+        assert!(out.iter().all(|s| s.c == [50.0, 50.0]));
+        // Moving on lays by distance again; other brushes never spray.
+        w.step([90.0, 50.0], 1.0, &mut out);
+        let mut none = Vec::new();
+        w.hold(0.5, &mut none);
+        assert!(none.is_empty(), "it moved since");
+        let mut pen = Walk::new(Brush::Pen, 5.0, 1.0);
+        pen.step([0.0, 0.0], 1.0, &mut none);
+        none.clear();
+        pen.hold(1.0, &mut none);
+        pen.hold(1.0, &mut none);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_lasso_covers_the_pixels_inside_it() {
+        // A square 10..30, clipped by a 25 px picture.
+        let (rect, cov) = cover(&[[10.0, 10.0], [30.0, 10.0], [30.0, 30.0], [10.0, 30.0]], [25, 40]).unwrap();
+        assert_eq!(rect, [10, 10, 25, 30]);
+        let w = (rect[2] - rect[0]) as usize;
+        assert_eq!(cov.len(), w * 20);
+        assert_eq!(cov[5 * w + 5], 255, "inside");
+        // Half a pixel in at its edge: partly covered.
+        let (_, cov) = cover(&[[10.5, 10.0], [20.0, 10.0], [20.0, 20.0], [10.5, 20.0]], [40, 40]).unwrap();
+        assert!(cov[0] > 64 && cov[0] < 192, "{}", cov[0]);
+        // Off the picture, or no area: nothing.
+        assert!(cover(&[[50.0, 50.0], [60.0, 50.0], [60.0, 60.0]], [40, 40]).is_none());
+        assert!(cover(&[[1.0, 1.0], [5.0, 5.0]], [40, 40]).is_none());
     }
 
     #[test]

@@ -142,16 +142,12 @@ impl OnScreenNotesApp {
                     | crate::tools::ToolKind::FreehandArrow
                     | crate::tools::ToolKind::Laser,
             );
-            // The Fill tool needs a visible pointer because the user
-            // has to land the stroke's starting point precisely on
-            // the edge of the area they want to enclose. Showing the
-            // crosshair instead of the regular arrow matches what
-            // the user gets while picking a colour with Shift — a
-            // "precision aim" cue rather than a generic arrow.
+            // The lassos need a visible pointer: their corners land
+            // where it points. A crosshair, as while picking a colour
+            // with Shift — a "precision aim" cue.
             let tool_wants_crosshair = matches!(
                 self.ws.tool.kind,
-                crate::tools::ToolKind::Fill
-                    | crate::tools::ToolKind::LassoErase
+                crate::tools::ToolKind::LassoErase
                     | crate::tools::ToolKind::LassoSelect,
             );
             let hover = ctx.input(|i| i.pointer.hover_pos());
@@ -529,36 +525,8 @@ impl OnScreenNotesApp {
         }
     }
 
-    /// Run the fill and the lasso capture a pen-up asked for, now that the view's size and DPI are known.
-    pub(super) fn run_deferred_tools(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) {
-        // ---- Deferred flood-fill --------------------------------------
-        // The Fill tool's pen-down arms `tool.pending_fill_at`; we
-        // run the actual flood here so it has access to the
-        // viewport size + DPI.
-        if let Some(p) = self.ws.tool.pending_fill_at.take().filter(|_| self.canvases.active_editable()) {
-            let viewport = [canvas_rect.width(), canvas_rect.height()];
-            let ppp = ctx.pixels_per_point();
-            let result = crate::flood_fill::flood_fill_active(
-                self.canvases.active(),
-                p,
-                self.ws.tool.color,
-                viewport,
-                ppp,
-            );
-            match result {
-                crate::flood_fill::FillResult::Filled(shape) => {
-                    self.canvases.active_mut().add_shape(shape);
-                }
-                crate::flood_fill::FillResult::OpenRegion => {
-                    self.toast = Some((
-                        "Fill cancelled: no closed region under cursor".to_string(),
-                        std::time::Instant::now(),
-                    ));
-                }
-                crate::flood_fill::FillResult::Empty => {}
-            }
-        }
-
+    /// Run the lasso capture a pen-up asked for, now that the view's DPI is known.
+    pub(super) fn run_deferred_tools(&mut self, ctx: &egui::Context) {
         // ---- Deferred lasso-select capture ----------------------------
         // The Lasso-Select tool stashes the closed polygon on pen-up;
         // run the (chrome-hidden) screen capture here where the HWND +

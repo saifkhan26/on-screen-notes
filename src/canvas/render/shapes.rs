@@ -45,20 +45,22 @@ pub(super) fn paint_shape(
         // drawn as an outline through its four turned corners instead.
         // Unrotated rectangles fall through to the arm below and paint
         // exactly as they always have.
-        Shape::Rect { color, stroke_width, border, rotation, .. } if *rotation != 0.0 => {
+        Shape::Rect { color, stroke_width, border, rotation, filled, .. } if *rotation != 0.0 => {
             let o = shape.obb();
             let stroke = egui::Stroke::new(*stroke_width * zoom, col(*color, layer_opacity));
+            // Same corner radius rule as the unrotated arm, worked out
+            // in canvas units and traced as arcs.
+            let min_side = o.half[0].min(o.half[1]) * 2.0;
+            let corner = (*stroke_width * 2.5).max(0.0).min((min_side * 0.45).max(0.0));
+            let rounded = || -> Vec<egui::Pos2> {
+                rounded_box_outline(o.half, corner).into_iter().map(|q| to_screen(o.to_canvas(q))).collect()
+            };
+            if *filled {
+                painter.add(egui::Shape::convex_polygon(rounded(), stroke.color, egui::Stroke::NONE));
+            }
             match border {
                 BorderStyle::Solid => {
-                    // Same corner radius rule as the unrotated arm,
-                    // worked out in canvas units and traced as arcs.
-                    let min_side = o.half[0].min(o.half[1]) * 2.0;
-                    let corner = (*stroke_width * 2.5).max(0.0).min((min_side * 0.45).max(0.0));
-                    let pts: Vec<egui::Pos2> = rounded_box_outline(o.half, corner)
-                        .into_iter()
-                        .map(|q| to_screen(o.to_canvas(q)))
-                        .collect();
-                    painter.add(egui::Shape::closed_line(pts, stroke));
+                    painter.add(egui::Shape::closed_line(rounded(), stroke));
                 }
                 BorderStyle::DashedAnimated => {
                     let c = o.corners().map(to_screen);
@@ -66,7 +68,7 @@ pub(super) fn paint_shape(
                 }
             }
         }
-        Shape::Rect { a, b, color, stroke_width, border, .. } => {
+        Shape::Rect { a, b, color, stroke_width, border, filled, .. } => {
             let r = egui::Rect::from_two_pos(to_screen(*a), to_screen(*b));
             // Corner radius scales gently with stroke width, capped at
             // ~half the shorter side so a tiny rectangle stays a
@@ -79,6 +81,13 @@ pub(super) fn paint_shape(
             let max_corner  = (min_side * 0.45).max(0.0);
             let corner      = want_corner.min(max_corner);
             let stroke = egui::Stroke::new(*stroke_width * zoom, col(*color, layer_opacity));
+            if *filled {
+                // egui draws this outline outside the rectangle, so the
+                // fill reaches halfway under it: their soft edges never
+                // meet in a light seam.
+                let h = stroke.width * 0.5;
+                painter.rect_filled(r.expand(h), egui::Rounding::same(corner + h), stroke.color);
+            }
             match border {
                 BorderStyle::Solid => {
                     painter.rect_stroke(r, egui::Rounding::same(corner), stroke);
@@ -93,7 +102,7 @@ pub(super) fn paint_shape(
                 }
             }
         }
-        Shape::Ellipse { a, b, color, stroke_width, border, rotation, .. } => {
+        Shape::Ellipse { a, b, color, stroke_width, border, rotation, filled, .. } => {
             // egui has no native ellipse stroke; approximate with a
             // 64-segment polyline.
             let cx = (a[0] + b[0]) * 0.5;
@@ -116,6 +125,10 @@ pub(super) fn paint_shape(
                 })
                 .collect();
             let stroke = egui::Stroke::new(*stroke_width * zoom, col(*color, layer_opacity));
+            if *filled {
+                // The last point repeats the first.
+                painter.add(egui::Shape::convex_polygon(pts[..N].to_vec(), stroke.color, egui::Stroke::NONE));
+            }
             match border {
                 BorderStyle::Solid => {
                     painter.add(egui::Shape::line(pts, stroke));
@@ -459,44 +472,129 @@ pub(crate) fn paint_dashed_polyline(
     // in screen space. Floor at 2 px so dashes are never sub-pixel.
     let on  = (DASH_ON  * zoom).max(2.0);
     let off = (DASH_OFF * zoom).max(1.0);
+    for dash in dash_runs(pts, on, off, dash_phase() * zoom) {
+        paint_dash(painter, &dash, stroke.width, stroke.color);
+    }
+}
+
+/// The dashes along `pts`: `on` long, `off` apart, the pattern moved
+/// on by `phase`. Each is the points it runs through, so a dash going
+/// round a corner (or along a curve) is one dash, not one per side.
+fn dash_runs(pts: &[egui::Pos2], on: f32, off: f32, phase: f32) -> Vec<Vec<egui::Pos2>> {
     let period = on + off;
-    let phase = dash_phase() * zoom;
-
-    // We walk the polyline in arc-length, alternating "draw" and "skip"
-    // chunks. `cursor` tracks distance along the polyline modulo
-    // `period`; if we're inside `[0, on)` we paint, otherwise we skip.
-    // To make this concrete: shift cursor by `-phase` so animation
-    // advances the pattern forward in time (positive phase = dashes
-    // appear to move along the path).
-    let mut cursor = -phase;
-    // Normalise into [0, period) for cleaner arithmetic below.
-    while cursor < 0.0 { cursor += period; }
-
+    // `cursor` is the distance along the pattern, in [0, period): inside
+    // [0, on) it draws, after that it skips. Shifted back by `phase` so
+    // the dashes march forward as time goes on.
+    let mut cursor = (-phase).rem_euclid(period);
+    let mut out: Vec<Vec<egui::Pos2>> = Vec::new();
+    let mut open: Option<Vec<egui::Pos2>> = None;
     for win in pts.windows(2) {
-        let p0 = win[0];
-        let p1 = win[1];
-        let dx = p1.x - p0.x;
-        let dy = p1.y - p0.y;
-        let seg_len = (dx * dx + dy * dy).sqrt();
+        let (p0, p1) = (win[0], win[1]);
+        let d = p1 - p0;
+        let seg_len = d.length();
         if seg_len < 1e-4 { continue; }
         let mut walked = 0.0;
         while walked < seg_len {
-            // Distance from cursor to next phase boundary.
             let in_on = cursor < on;
             let remaining_in_phase = if in_on { on - cursor } else { period - cursor };
             let chunk = remaining_in_phase.min(seg_len - walked);
             if in_on {
-                let t0 = walked / seg_len;
-                let t1 = (walked + chunk) / seg_len;
-                let a = egui::pos2(p0.x + dx * t0, p0.y + dy * t0);
-                let b = egui::pos2(p0.x + dx * t1, p0.y + dy * t1);
-                paint_dash_pill(painter, a, b, stroke.width, stroke.color);
+                let a = p0 + d * (walked / seg_len);
+                let b = p0 + d * ((walked + chunk) / seg_len);
+                let run = open.get_or_insert_with(|| vec![a]);
+                // A sliver of a dash at a corner adds no point: points a
+                // hair apart give its outline no sure direction.
+                if (b - run[run.len() - 1]).length() > 0.01 {
+                    run.push(b);
+                }
             }
             walked += chunk;
             cursor += chunk;
+            if cursor >= on {
+                if let Some(run) = open.take() { out.push(run); }
+            }
             if cursor >= period { cursor -= period; }
         }
     }
+    out.extend(open);
+    out
+}
+
+/// One dash: a band `width` wide along `run` with round ends, drawn as
+/// one filled outline so its ends are exactly half its width round —
+/// a line with discs on its ends let the line's square corners poke
+/// out past them. A sharp corner splits it into pieces that meet in
+/// round joins.
+fn paint_dash(painter: &egui::Painter, run: &[egui::Pos2], width: f32, color: egui::Color32) {
+    let r = width * 0.5;
+    if run.is_empty() || r <= 0.0 { return; }
+    if run.len() == 1 {
+        painter.circle_filled(run[0], r, color);
+        return;
+    }
+    let mut start = 0;
+    for i in 1..run.len() - 1 {
+        let (u, v) = (run[i] - run[i - 1], run[i + 1] - run[i]);
+        let turn = u.normalized().dot(v.normalized());
+        // More than ~25°: the outline would fold on the inside.
+        if turn < 0.9 {
+            painter.add(capsule(&run[start..=i], r, color));
+            start = i;
+        }
+    }
+    painter.add(capsule(&run[start..], r, color));
+}
+
+/// The outline of a band `r` either side of `run` (at least two points,
+/// gently curved at most) with half-disc ends, filled.
+fn capsule(run: &[egui::Pos2], r: f32, color: egui::Color32) -> egui::Shape {
+    let n = run.len();
+    let dir = |i: usize| {
+        let (a, b) = if i == 0 { (run[0], run[1]) } else if i == n - 1 { (run[n - 2], run[n - 1]) } else { (run[i - 1], run[i + 1]) };
+        let d = b - a;
+        if d.length() > 1e-6 { d.normalized() } else { egui::vec2(1.0, 0.0) }
+    };
+    // A short arc per 2 px of cap, smooth however wide the dash is.
+    let steps = ((std::f32::consts::PI * r / 2.0).ceil() as usize).clamp(3, 24);
+    let mut outline = Vec::with_capacity(2 * n + 2 * steps);
+    let half_turn = |out: &mut Vec<egui::Pos2>, c: egui::Pos2, from: egui::Vec2| {
+        // Swing from `from` through 180° (clockwise on screen) round `c`.
+        for k in 1..steps {
+            let t = std::f32::consts::PI * k as f32 / steps as f32;
+            let (s, co) = t.sin_cos();
+            out.push(c + egui::vec2(from.x * co - from.y * s, from.x * s + from.y * co) * r);
+        }
+    };
+    // One side of the band, `sign` the side. On the inside of a bend an
+    // offset point can land behind the one before it; it is left out (the
+    // end kept), or the outline would double back on itself and egui's
+    // soft edge there would shoot out a spike.
+    let side = |sign: f32| -> Vec<egui::Pos2> {
+        let mut out: Vec<egui::Pos2> = Vec::with_capacity(n);
+        for (i, &p) in run.iter().enumerate() {
+            let t = dir(i);
+            let q = p + egui::vec2(t.y, -t.x) * (r * sign);
+            if let Some(&last) = out.last() {
+                if (q - last).dot(t) <= 0.05 {
+                    if i + 1 < n || out.len() < 2 {
+                        continue;
+                    }
+                    out.pop();
+                }
+            }
+            out.push(q);
+        }
+        out
+    };
+    // Left side forward, round the far end, right side back, round the
+    // near end.
+    outline.extend(side(1.0));
+    let t = dir(n - 1);
+    half_turn(&mut outline, run[n - 1], egui::vec2(t.y, -t.x));
+    outline.extend(side(-1.0).into_iter().rev());
+    let t = dir(0);
+    half_turn(&mut outline, run[0], egui::vec2(-t.y, t.x));
+    egui::Shape::convex_polygon(outline, color, egui::Stroke::NONE)
 }
 
 /// Specialise the polyline dash walker for an axis-aligned rectangle.
@@ -537,25 +635,79 @@ pub(super) fn paint_round_line(
     }
 }
 
-/// Round-capped dash. Tighter caps than `paint_round_line` because
-/// `circle_filled` adds ~1 px of AA halo that makes a half-stroke
-/// disc visibly larger than the line's feathered ends — at short
-/// dash lengths the caps end up reading as "dots with a thread
-/// between" rather than a pill. Scaling the cap radius by 0.42
-/// matches the line's apparent width while keeping the dash's
-/// rounded silhouette.
-pub(super) fn paint_dash_pill(
-    painter: &egui::Painter,
-    a: egui::Pos2,
-    b: egui::Pos2,
-    width: f32,
-    color: egui::Color32,
-) {
-    painter.line_segment([a, b], egui::Stroke::new(width, color));
-    let r = width * 0.42;
-    if r >= 0.5 {
-        painter.circle_filled(a, r, color);
-        painter.circle_filled(b, r, color);
+
+#[cfg(test)]
+mod dash_tests {
+    use super::*;
+
+    /// Dashes run on round a corner as one dash, and each is `on` long
+    /// (the last one cut short where the path ends).
+    #[test]
+    fn dashes_are_whole_runs_round_corners() {
+        let p = |x: f32, y: f32| egui::pos2(x, y);
+        let runs = dash_runs(&[p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0)], 6.0, 2.0, 0.0);
+        let len = |r: &Vec<egui::Pos2>| r.windows(2).map(|w| (w[1] - w[0]).length()).sum::<f32>();
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert_eq!(runs[1], vec![p(8.0, 0.0), p(10.0, 0.0), p(10.0, 4.0)], "the second dash turns the corner");
+        let lens: Vec<f32> = runs.iter().map(len).collect();
+        assert!((lens[0] - 6.0).abs() < 1e-3 && (lens[1] - 6.0).abs() < 1e-3 && (lens[2] - 4.0).abs() < 1e-3, "{lens:?}");
+    }
+
+    /// A dash's outline never steps backwards, whatever the bend or the
+    /// width, so egui's soft edge has no corner to shoot a spike from.
+    #[test]
+    fn a_curved_dash_outline_never_doubles_back() {
+        // A dash round a tight-ish curve with a sliver first piece, as an
+        // ellipse's many short sides give.
+        let run: Vec<egui::Pos2> = [0.0_f32, 0.02, 3.0, 6.0, 9.0]
+            .iter()
+            .map(|&a: &f32| {
+                let t = a / 12.0;
+                egui::pos2(20.0 * t.sin(), 20.0 - 20.0 * t.cos())
+            })
+            .collect();
+        let egui::Shape::Path(path) = capsule(&run, 7.0, egui::Color32::BLACK) else { panic!("one outline") };
+        let pts = &path.points;
+        // Each turn along the outline is less than a U-turn.
+        for i in 0..pts.len() {
+            let (a, b, c) = (pts[i], pts[(i + 1) % pts.len()], pts[(i + 2) % pts.len()]);
+            let (u, v) = (b - a, c - b);
+            if u.length() > 1e-4 && v.length() > 1e-4 {
+                assert!(u.normalized().dot(v.normalized()) > -0.5, "doubles back at {b:?}");
+            }
+        }
+    }
+
+    /// Dashed and filled shapes, thick, as in the user's report (a dashed
+    /// border's dashes had little square corners at their ends).
+    #[test]
+    #[ignore = "writes PNGs to OSN_SNAP_DIR"]
+    fn snapshot_dashed_and_filled_shapes() {
+        use crate::canvas::shape::BorderStyle::{DashedAnimated as Dashed, Solid};
+        let orange = [255, 160, 40, 255];
+        let rect = |a: [f32; 2], b: [f32; 2], border, filled, rotation| Shape::Rect {
+            a, b, color: orange, stroke_width: 14.0, border, filled, rotation, pin: 0, group: 0, tags: Vec::new(), turn: 0.0,
+        };
+        let ellipse = |a: [f32; 2], b: [f32; 2], border, filled| Shape::Ellipse {
+            a, b, color: orange, stroke_width: 14.0, border, filled, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0,
+        };
+        let shapes = vec![
+            rect([30.0, 30.0], [230.0, 170.0], Dashed, false, 0.0),
+            ellipse([270.0, 30.0], [500.0, 170.0], Dashed, false),
+            Shape::Line { a: [540.0, 40.0], b: [860.0, 160.0], color: orange, stroke_width: 14.0, border: Dashed, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
+            Shape::Arrow { a: [540.0, 120.0], b: [860.0, 200.0], color: [40, 120, 255, 140], stroke_width: 10.0, border: Dashed, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
+            rect([30.0, 230.0], [230.0, 380.0], Solid, true, 0.0),
+            ellipse([270.0, 230.0], [500.0, 380.0], Solid, true),
+            rect([560.0, 240.0], [760.0, 360.0], Solid, true, 0.3),
+            rect([780.0, 240.0], [880.0, 380.0], Dashed, true, 0.0),
+        ];
+        crate::ui::snapshot::shoot("shapes", [900.0, 410.0], 2.0, &[crate::ui::snapshot::Step::Idle], |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            painter.rect_filled(ctx.screen_rect(), 0.0, egui::Color32::WHITE);
+            for s in &shapes {
+                paint_shape(&painter, &|p: [f32; 2]| egui::pos2(p[0], p[1]), s, 1.0, 1.0, None);
+            }
+        });
     }
 }
 

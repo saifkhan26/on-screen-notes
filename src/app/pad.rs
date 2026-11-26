@@ -3,8 +3,9 @@
 //! pixels.
 //!
 //! While a pad is open the pen and eraser tools paint into it: the pen
-//! style picks the brush (pencil and airbrush draw with the pencil, the
-//! rest with the pen) and Ctrl or the eraser tool erases. Undo and redo
+//! style picks the brush (pen, pencil, marker or airbrush, which are the
+//! pad's alone) and Ctrl or the eraser tool erases. Lasso erase (X) rubs
+//! out what its loop covers, then gives the brush back. Undo and redo
 //! step through its strokes. Esc, a press outside it, another tool or
 //! another slide puts it away: its pixels go into the slide, one undo
 //! step there for the whole time it was open. Only then — nothing is
@@ -47,6 +48,11 @@ struct PadEdit {
     walk: Option<Walk>,
     /// The tool before the pad was opened, given back by Esc.
     prev_tool: ToolKind,
+    /// The pad's drawing tool last used (pen or eraser): lasso erase
+    /// gives it back once done.
+    brush_tool: ToolKind,
+    /// When the airbrush last sprayed for the pen held still.
+    last_tick: Instant,
     /// `session.edits` when the slide last got the pixels.
     saved_edits: u64,
     /// The pad's paper (straight RGBA, alpha its opacity); `None` for a
@@ -110,10 +116,19 @@ impl OnScreenNotesApp {
         if let Some(e) = self.ws.pad.edit.as_ref() {
             let leave = self.canvases.active_index() != e.slide
                 || !self.canvases.active_editable()
-                || !matches!(self.ws.tool.kind, ToolKind::Pen | ToolKind::Eraser);
+                || !matches!(self.ws.tool.kind, ToolKind::Pen | ToolKind::Eraser | ToolKind::LassoErase);
             if leave {
                 self.close_pad(false);
             }
+        }
+        if let Some(e) = self.ws.pad.edit.as_mut() {
+            if matches!(self.ws.tool.kind, ToolKind::Pen | ToolKind::Eraser) {
+                e.brush_tool = self.ws.tool.kind;
+            }
+        }
+        self.ws.tool.pad_open = self.ws.pad.is_open();
+        if !self.ws.tool.pad_open {
+            self.ws.tool.pending_pad_erase = None;
         }
         if let Some(e) = self.ws.pad.edit.as_mut() {
             let found = self
@@ -279,6 +294,8 @@ impl OnScreenNotesApp {
             frame,
             walk: None,
             prev_tool,
+            brush_tool: ToolKind::Pen,
+            last_tick: Instant::now(),
             // A lifted old pad's new pixels must reach the slide even if
             // nothing is drawn.
             saved_edits: if lifted { u64::MAX } else { 0 },
@@ -288,8 +305,9 @@ impl OnScreenNotesApp {
         if lifted {
             self.set_pad_paper(pad::WHITE, false);
         }
+        self.ws.tool.pad_open = true;
         self.overlay_cache.set_pad(self.ws.pad.shown());
-        self.toast = Some(("Drawing on the picture: pen, pencil, Ctrl to erase. Esc when done".to_string(), Instant::now()));
+        self.toast = Some(("Drawing on the picture: pen, pencil, marker, airbrush. Ctrl erases, X lasso-erases. Esc when done".to_string(), Instant::now()));
         true
     }
 
@@ -298,6 +316,8 @@ impl OnScreenNotesApp {
     /// tool it was opened from (Esc does; a tool picked to leave it stays).
     pub(super) fn close_pad(&mut self, restore_tool: bool) {
         let Some(mut e) = self.ws.pad.edit.take() else { return };
+        self.ws.tool.pad_open = false;
+        self.ws.tool.pending_pad_erase = None;
         self.ws.pad.retired.push(e.session.texture_id());
         self.overlay_cache.set_pad(None);
         let saved = self.pad_write(&mut e);
@@ -384,6 +404,11 @@ impl OnScreenNotesApp {
         if self.ws.pad.edit.is_none() {
             return false;
         }
+        // Lasso erase draws its loop as off a pad (`ActiveTool`); the
+        // shape it closes comes back through `pad_flush`.
+        if !erase && self.ws.tool.kind == ToolKind::LassoErase {
+            return false;
+        }
         if let PenEvent::Down(s) = ev {
             if !self.ws.pad.edit.as_ref().is_some_and(|e| e.frame.contains(s.pos)) {
                 self.close_pad(false);
@@ -395,8 +420,10 @@ impl OnScreenNotesApp {
             Brush::Eraser
         } else {
             match self.ws.tool.style {
-                StrokeStyle::Pencil | StrokeStyle::Airbrush => Brush::Pencil,
-                _ => Brush::Pen,
+                StrokeStyle::Pencil => Brush::Pencil,
+                StrokeStyle::Marker => Brush::Marker,
+                StrokeStyle::Airbrush => Brush::Airbrush,
+                StrokeStyle::Default => Brush::Pen,
             }
         };
         // The tool's size is on screen: a diameter, the eraser's a radius.
@@ -413,6 +440,7 @@ impl OnScreenNotesApp {
         match ev {
             PenEvent::Down(s) => {
                 let mut walk = Walk::new(brush, r_max, px);
+                e.last_tick = Instant::now();
                 e.session.begin(brush, color);
                 walk.step(e.frame.to_px(s.pos), crate::canvas::stroke::apply_curve(s.pressure, curve), &mut stamps);
                 e.walk = Some(walk);
@@ -431,10 +459,29 @@ impl OnScreenNotesApp {
         true
     }
 
-    /// Draw this frame's stamps (after the pen and mouse were handed out).
-    pub(super) fn pad_flush(&mut self) {
-        if let Some(e) = self.ws.pad.edit.as_mut() {
-            e.session.flush();
+    /// Draw this frame's stamps (after the pen and mouse were handed
+    /// out). An airbrush held still keeps spraying; a lasso closed over
+    /// the pad rubs out what it covers, and the brush is back.
+    pub(super) fn pad_flush(&mut self, ctx: &egui::Context) {
+        let lasso = self.ws.tool.pending_pad_erase.take();
+        let Some(e) = self.ws.pad.edit.as_mut() else { return };
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(e.last_tick).as_secs_f32();
+        e.last_tick = now;
+        if let Some(walk) = e.walk.as_mut().filter(|w| w.brush() == Brush::Airbrush) {
+            let mut stamps = Vec::new();
+            walk.hold(dt, &mut stamps);
+            e.session.push(&stamps);
+            // A pen held still sends nothing: wake for the spray.
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        e.session.flush();
+        if let Some(poly) = lasso {
+            let px: Vec<[f32; 2]> = poly.iter().map(|&p| e.frame.to_px(p)).collect();
+            if let Some((rect, cover)) = pad::cover(&px, e.session.size()) {
+                e.session.erase_cover(rect, &cover);
+            }
+            self.ws.tool.kind = e.brush_tool;
         }
     }
 
@@ -462,7 +509,14 @@ impl OnScreenNotesApp {
         if redo || undo {
             self.pad_undo(redo);
         }
-        if esc {
+        if esc && self.ws.tool.kind == ToolKind::LassoErase {
+            // Esc drops the lasso and gives the brush back; the next one
+            // puts the pad away.
+            self.ws.tool.lasso.clear();
+            if let Some(e) = self.ws.pad.edit.as_ref() {
+                self.ws.tool.kind = e.brush_tool;
+            }
+        } else if esc {
             self.close_pad(true);
         }
     }

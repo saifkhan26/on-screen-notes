@@ -33,8 +33,7 @@ use crate::config::AppConfig;
 use serde::{Deserialize, Serialize};
 
 /// Strip pressure variation from a sample (force to 1.0). Used by the
-/// Fill tool — the outline of a fill should be uniform width so the
-/// closed shape reads as one solid silhouette, not a tapered ribbon.
+/// laser: a pointer trail has one width, it does not taper.
 fn flatten_pressure(mut s: PenSample) -> PenSample {
     s.pressure = 1.0;
     s
@@ -60,10 +59,6 @@ pub enum ToolKind {
     Line,
     Arrow,
     FreehandArrow,
-    /// Closed-polygon fill. Behaves like Pen for input collection, but
-    /// the renderer auto-joins the stroke's start ↔ end and fills the
-    /// enclosed area. Pressure is ignored — the outline is uniform width.
-    Fill,
     /// Laser pointer. Behaves like Pen during the stroke (live preview
     /// uses the same path), but the committed stroke is appended to
     /// `ActiveTool::laser_strokes` and fades over ~1 s after pen-up.
@@ -111,7 +106,6 @@ impl ToolKind {
             ToolKind::Line          => "—",
             ToolKind::Arrow         => "A",
             ToolKind::FreehandArrow => "Shift+A",
-            ToolKind::Fill          => "F",
             ToolKind::Laser         => "L",
             ToolKind::Text          => "T",
             ToolKind::Spotlight     => "S",
@@ -175,6 +169,10 @@ pub struct ActiveTool {
     /// is `Solid`, and any previously-committed dashed shape carries
     /// its own `border` field independently.
     pub border_style: BorderStyle,
+    /// New rectangles and ellipses are filled solid with the colour
+    /// (`Shape::Rect::filled`), not just outlined. The toolbar's toggle
+    /// beside those tools; not kept across runs, like `border_style`.
+    pub fill_shapes: bool,
     /// Text labels go in a box (`Shape::Text::background`), in a colour
     /// that keeps them readable. The toolbar's toggle beside the Text
     /// tool; for the labels placed from now on.
@@ -189,12 +187,6 @@ pub struct ActiveTool {
     /// of starting a stroke. One-shot; cleared on the next click,
     /// `Esc`, or tool switch.
     pub eyedropper_pending: bool,
-    /// Pending flood-fill click position in canvas-local coords.
-    /// Set by the Fill tool on pen-down; the app loop picks it up
-    /// next frame, runs the flood with full DPI / viewport context,
-    /// and commits the resulting raster sticker onto the active
-    /// layer. Cleared once consumed.
-    pub pending_fill_at: Option<[f32; 2]>,
     /// Half-side length of the spotlight square in screen-logical
     /// pixels. Only meaningful while `ToolKind::Spotlight` is active.
     /// Adjusted by the scroll wheel; reset to a sensible default when
@@ -227,6 +219,17 @@ pub struct ActiveTool {
     pub shape_snap: bool,
     /// The hold being timed, or the morph onto a snapped shape.
     snap: SnapState,
+
+    /// A drawing pad is open (`app::pad`), set by the app each frame:
+    /// the pen's style picks the pad's brush, and lasso erase rubs out
+    /// the pad's pixels instead of ink (`pending_pad_erase`).
+    pub pad_open: bool,
+    /// Lasso erase closed a shape over an open pad: the app rubs out the
+    /// pad's pixels inside it (canvas-local points). Cleared once used.
+    pub pending_pad_erase: Option<Vec<[f32; 2]>>,
+    /// A pad's brush (pencil, marker, airbrush) was picked by its key with
+    /// no pad open: the app says where it draws. Cleared once said.
+    pub pad_only_brush: Option<StrokeStyle>,
 }
 
 /// Shape snap's progress through the stroke being drawn.
@@ -265,10 +268,10 @@ impl ActiveTool {
             position_passes: cfg.smoothing_level.position_passes(),
             laser_strokes:   Vec::new(),
             border_style:    BorderStyle::Solid,
+            fill_shapes:     false,
             text_box:        false,
             in_progress_text: None,
             eyedropper_pending: false,
-            pending_fill_at: None,
             spotlight_size: 120.0,
             lasso: lasso_tool::LassoPath::default(),
             pending_lasso_capture: None,
@@ -276,7 +279,39 @@ impl ActiveTool {
             smoothing: cfg.smoothing,
             shape_snap: cfg.shape_snap,
             snap: SnapState::default(),
+            pad_open: false,
+            pending_pad_erase: None,
+            pad_only_brush: None,
         }
+    }
+
+    /// The filled-shape switch: new rectangles and ellipses filled, or
+    /// not. A shape is filled or dashed, never both (the dashes would
+    /// vanish into the fill), so filling turns the dashes off.
+    pub fn toggle_fill(&mut self) {
+        self.fill_shapes = !self.fill_shapes;
+        if self.fill_shapes {
+            self.border_style = BorderStyle::Solid;
+        }
+    }
+
+    /// The dashed-border switch, for new shapes. Dashing turns the fill
+    /// off (`toggle_fill`).
+    pub fn toggle_dashed(&mut self) {
+        self.border_style = match self.border_style {
+            BorderStyle::Solid => BorderStyle::DashedAnimated,
+            BorderStyle::DashedAnimated => BorderStyle::Solid,
+        };
+        if self.border_style == BorderStyle::DashedAnimated {
+            self.fill_shapes = false;
+        }
+    }
+
+    /// The style the pen draws with now. Pencil, marker and airbrush
+    /// are a drawing pad's brushes; off a pad the pen draws plain ink,
+    /// and `style` waits for the next pad.
+    pub fn pen_style(&self) -> StrokeStyle {
+        if self.pad_open { self.style } else { StrokeStyle::Default }
     }
 
     /// Shape snap, once a frame while a stroke is being drawn: times the
@@ -384,31 +419,22 @@ impl ActiveTool {
         match self.kind {
             ToolKind::Select => self.select.begin(sample.pos, canvas),
             ToolKind::Pen | ToolKind::FreehandArrow => {
-                // Pen + freehand arrow honour the current stroke style
-                // (Default / Pencil / Marker / Airbrush) AND the
-                // current smoothing options so the user's choice locks
-                // in at pen-down.
-                // Every pen style draws at the size as it looks on
-                // screen (`Stroke::px`), so zooming in to add detail
-                // gives finer lines and brush strokes, not bigger ones.
-                // Once drawn the width is fixed, so the line scales with
-                // the view like everything else.
+                // Off a drawing pad the pen and the freehand arrow draw
+                // plain ink: pencil, marker and airbrush are the pad's
+                // (`pen_style`). The current smoothing options lock in
+                // at pen-down.
+                // The pen draws at the size as it looks on screen
+                // (`Stroke::px`), so zooming in to add detail gives finer
+                // lines, not bigger ones. Once drawn the width is fixed,
+                // so the line scales with the view like everything else.
                 let px = self.px(canvas);
                 let mut s = Stroke::with_style_and_smoothing(
-                    self.color, self.size * px, self.style, self.smoothing,
+                    self.color, self.size * px, StrokeStyle::Default, self.smoothing,
                 );
                 s.px = px;
                 s.push(sample);
                 self.in_progress_stroke = Some(s);
                 self.snap = SnapState { still: Some((std::time::Instant::now(), sample.pos)), ..SnapState::default() };
-            }
-            ToolKind::Fill => {
-                // Flood-fill: arm a deferred flood action at the
-                // click point. The actual rasterisation needs the
-                // viewport size and DPI, which only the app loop
-                // has — we just record the canvas-local position
-                // here and let the app pick it up next frame.
-                self.pending_fill_at = Some(sample.pos);
             }
             ToolKind::Eraser => {
                 // Eraser keeps the plain ribbon look for its visible
@@ -486,10 +512,6 @@ impl ActiveTool {
                     }
                 }
             }
-            ToolKind::Fill => {
-                // Flood-fill is a single-click action — drag has
-                // no meaning.
-            }
             ToolKind::Laser => {
                 if let Some(s) = self.in_progress_stroke.as_mut() {
                     s.push(flatten_pressure(sample));
@@ -551,13 +573,6 @@ impl ActiveTool {
                     s.build_cache_with(self.position_passes);
                     canvas.add_stroke(s);
                 }
-            }
-            ToolKind::Fill => {
-                // Flood-fill commit happens in the app loop once
-                // the deferred `pending_fill_at` is consumed; no
-                // stroke to flush here. Sample param unused.
-                let _ = sample;
-                let _ = canvas;
             }
             ToolKind::FreehandArrow => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
@@ -654,6 +669,7 @@ impl ActiveTool {
                         color: self.color,
                         stroke_width: self.size,
                         border: self.border_style,
+                        filled: self.fill_shapes,
                         rotation: 0.0,
                         pin: 0,
                         group: 0,
@@ -670,6 +686,7 @@ impl ActiveTool {
                         color: self.color,
                         stroke_width: self.size,
                         border: self.border_style,
+                        filled: self.fill_shapes,
                         rotation: 0.0,
                         pin: 0,
                         group: 0,
@@ -725,6 +742,9 @@ impl ActiveTool {
     /// is untouched here.
     fn use_lasso(&mut self, poly: Vec<[f32; 2]>, canvas: &mut Canvas) {
         match self.kind {
+            // Over an open pad the lasso rubs out its pixels; the app
+            // does that, on the GPU.
+            ToolKind::LassoErase if self.pad_open => self.pending_pad_erase = Some(poly),
             ToolKind::LassoErase => {
                 canvas.erase_in_polygon(&poly);
             }
@@ -749,8 +769,8 @@ impl ActiveTool {
     pub fn preview_shape(&self) -> Option<Shape> {
         let (a, b) = self.in_progress_shape?;
         Some(match self.kind {
-            ToolKind::Rect    => Shape::Rect    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
-            ToolKind::Ellipse => Shape::Ellipse { a, b, color: self.color, stroke_width: self.size, border: self.border_style, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
+            ToolKind::Rect    => Shape::Rect    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, filled: self.fill_shapes, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
+            ToolKind::Ellipse => Shape::Ellipse { a, b, color: self.color, stroke_width: self.size, border: self.border_style, filled: self.fill_shapes, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
             ToolKind::Line    => Shape::Line    { a, b, color: self.color, stroke_width: self.size, border: self.border_style, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
             ToolKind::Arrow   => Shape::Arrow   { a, b, color: self.color, stroke_width: self.size, border: self.border_style, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 },
             _ => return None,
@@ -773,13 +793,69 @@ mod tests {
     }
 
     #[test]
-    fn every_pen_style_draws_the_size_seen_on_screen() {
+    fn the_pen_draws_the_size_seen_on_screen() {
         assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Default, 1.0), 8.0);
         assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Default, 4.0), 2.0, "zoomed in, finer on the canvas");
-        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Pencil, 0.5), 16.0, "zoomed out, wider on the canvas");
-        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Marker, 4.0), 2.0, "the marker too");
-        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Airbrush, 0.25), 32.0, "and the airbrush");
+        assert_eq!(width_drawn(ToolKind::Pen, StrokeStyle::Default, 0.5), 16.0, "zoomed out, wider on the canvas");
         assert_eq!(width_drawn(ToolKind::FreehandArrow, StrokeStyle::Default, 4.0), 8.0);
+    }
+
+    /// Pencil, marker and airbrush are a drawing pad's brushes: off a pad
+    /// the pen draws plain ink whichever is picked, and the pick waits
+    /// for the next pad.
+    #[test]
+    fn off_a_pad_the_pen_draws_plain_ink() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        let mut canvas = Canvas::default();
+        for style in [StrokeStyle::Pencil, StrokeStyle::Marker, StrokeStyle::Airbrush] {
+            tool.style = style;
+            tool.begin(PenSample::from_pos([10.0, 10.0]), &mut canvas);
+            assert_eq!(tool.in_progress_stroke.as_ref().unwrap().style, StrokeStyle::Default);
+            assert_eq!(tool.pen_style(), StrokeStyle::Default);
+            tool.pad_open = true;
+            assert_eq!(tool.pen_style(), style, "on a pad it is the brush");
+            tool.pad_open = false;
+        }
+    }
+
+    /// A shape is outlined, dashed or filled: the two switches turn each
+    /// other off, and both off is a plain outline.
+    #[test]
+    fn filled_and_dashed_turn_each_other_off() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.toggle_dashed();
+        assert_eq!(tool.border_style, BorderStyle::DashedAnimated);
+        tool.toggle_fill();
+        assert!(tool.fill_shapes);
+        assert_eq!(tool.border_style, BorderStyle::Solid, "filling drops the dashes");
+        tool.toggle_dashed();
+        assert!(!tool.fill_shapes, "dashing drops the fill");
+        tool.toggle_dashed();
+        assert_eq!((tool.border_style, tool.fill_shapes), (BorderStyle::Solid, false), "a plain outline");
+        tool.toggle_fill();
+        tool.toggle_fill();
+        assert_eq!((tool.border_style, tool.fill_shapes), (BorderStyle::Solid, false));
+    }
+
+    /// Over an open pad lasso erase hands the shape to the app (for the
+    /// pad's pixels) and leaves ink alone.
+    #[test]
+    fn lasso_erase_over_a_pad_leaves_the_ink() {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = ToolKind::LassoErase;
+        tool.pad_open = true;
+        let mut canvas = Canvas::default();
+        let mut s = Stroke::with_style_and_smoothing([0, 0, 0, 255], 4.0, StrokeStyle::Default, SmoothingOptions::default());
+        s.push(PenSample::from_pos([30.0, 30.0]));
+        s.push(PenSample::from_pos([32.0, 30.0]));
+        canvas.add_stroke(s);
+        tool.begin(PenSample::from_pos([0.0, 0.0]), &mut canvas);
+        for p in [[100.0, 0.0], [100.0, 100.0], [0.0, 100.0], [0.0, 0.0]] {
+            tool.update(PenSample::from_pos(p), &mut canvas);
+        }
+        tool.end(PenSample::from_pos([0.0, 0.0]), &mut canvas);
+        assert!(tool.pending_pad_erase.is_some(), "the pad gets the shape");
+        assert_eq!(canvas.layers[canvas.active_layer].strokes.len(), 1, "ink is not erased");
     }
 
     /// Zoomed in 4×, an 8 px eraser reaches 2 canvas units: what it
@@ -823,7 +899,6 @@ mod tests {
     #[test]
     fn a_stroke_remembers_the_pixel_size_it_was_drawn_at() {
         let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
-        tool.style = StrokeStyle::Airbrush;
         let mut canvas = Canvas { zoom: 4.0, ..Canvas::default() };
         tool.begin(PenSample::from_pos([10.0, 10.0]), &mut canvas);
         assert_eq!(tool.in_progress_stroke.as_ref().unwrap().px, 0.25);

@@ -52,7 +52,7 @@ pub(crate) mod tests_support {
 
     /// A plain unrotated rectangle from `a` to `b`.
     pub(crate) fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, filled: false, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
     }
 }
 
@@ -303,6 +303,11 @@ pub enum Shape {
         /// before this field existed loading as plain `Solid`.
         #[serde(default)]
         border: BorderStyle,
+        /// Filled solid with its colour, not just outlined. A plain
+        /// outline is not written, so older files load and save as they
+        /// were.
+        #[serde(default, skip_serializing_if = "is_false")]
+        filled: bool,
         /// Turn about the shape's centre, radians, clockwise on screen.
         /// `#[serde(default)]` loads every shape saved before rotation
         /// existed as unrotated; a zero is not written back, so an
@@ -339,6 +344,9 @@ pub enum Shape {
         /// as solid-outlined ellipses.
         #[serde(default)]
         border: BorderStyle,
+        /// Same as `Rect::filled`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        filled: bool,
         /// Same meaning and save behaviour as `Rect::rotation`.
         #[serde(default, skip_serializing_if = "is_zero")]
         rotation: f32,
@@ -935,7 +943,7 @@ mod tests {
     use super::*;
 
     fn rect(a: [f32; 2], b: [f32; 2]) -> Shape {
-        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
+        Shape::Rect { a, b, color: [0; 4], stroke_width: 2.0, border: BorderStyle::Solid, filled: false, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
     }
 
     #[test]

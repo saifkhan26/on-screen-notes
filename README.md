@@ -49,12 +49,12 @@ layers.
   second: it springs into the straight line, triangle, rectangle, other
   polygon (up to six sides), circle or ellipse it was meant to be. See
   [Shape snap](#shape-snap)
-- **Brush styles**: Pen, Pencil (translucent graphite stamp), Marker
-  (highlighter), Airbrush (soft-cloud spray)
+- **Pen** for ink on the slide; on a **drawing pad** also Pencil (builds
+  up like graphite), Marker (see-through felt tip) and Airbrush (soft
+  spray that builds up while held still)
 - **Shapes**: rectangle, ellipse, straight line, straight arrow, freehand
-  arrow, with optional animated-dashed border
-- **Fill tool** — flood fill via lyon non-zero winding (handles
-  self-intersecting outlines)
+  arrow, with optional animated-dashed border; rectangles and ellipses
+  can be filled solid
 - **Laser pointer** — strokes fade ~1 s after pen-up
 - **Spotlight** — dims everything except a square around the cursor
 - **Lasso erase** — draw a closed loop, or click corner by corner for a
@@ -191,14 +191,13 @@ the binary on first launch.
 | Tool | Key | Notes |
 |---|---|---|
 | Pen | `P` | Smooth ribbon ink |
-| Pencil | `B` | Translucent graphite, edge-jittered stamps |
-| Marker | `M` | ~45 % alpha highlighter; overlaps darken |
-| Airbrush | `G` | Soft disc spray; hold still to build density |
-| Fill | `F` | Click → flood-fills enclosed region |
+| Pencil | `B` | Drawing pads only. Soft graphite; going over it again darkens it |
+| Marker | `M` | Drawing pads only. See-through felt tip of one width: a stroke never darkens itself, a new one over it does |
+| Airbrush | `G` | Drawing pads only. Very soft spray of one size; pressure sets how much it lays, holding still builds it up |
 | Laser pointer | `L` | Strokes fade after pen-up |
 | Text | `T` | Click anywhere, type, Enter commits. The box button beside it puts labels in a box (for selected labels too) |
 | Spotlight | `S` | Press again to exit |
-| Lasso erase | `X` | Draw closed loop, or click corners for a polygon (closes like Lasso capture's) |
+| Lasso erase | `X` | Draw closed loop, or click corners for a polygon (closes like Lasso capture's). On an open drawing pad it rubs out the pixels inside, then gives the brush back (`Esc` cancels it) |
 | Lasso capture | `Shift+X` | Draw closed loop → image object on the active layer. Or click corners for a polygon: click the first corner, double-click or `Enter` to close, `Backspace` takes back a corner |
 | Select | `V` | See [Selecting and transforming](#selecting-and-transforming) |
 | Eyedropper | `I` | One-shot — next click picks a pixel |
@@ -225,14 +224,14 @@ meant as a shape, it morphs onto it, with a little springy overshoot:
   nearly round) or an ellipse — whichever fits the stroke best, if one
   fits well. Scribbles, curves and handwriting snap to nothing.
 
-The snapped shape is still a stroke: it keeps its brush (pencil grain,
-marker, airbrush), colour and width, at the stroke's average pressure,
+The snapped shape is still a stroke: it keeps its colour and width, at
+the stroke's average pressure,
 and is one undo step like any other. Once it has snapped, moving the pen
 before lifting it changes nothing. Turn it off with **Shape snap** in the
 settings (gear button).
 
-The pen, pencil, marker, airbrush and eraser work at the chosen size as
-it looks on screen, whatever the zoom: zoomed in 4×, a new line is a
+The pen and the eraser (and a drawing pad's brushes) work at the chosen
+size as it looks on screen, whatever the zoom: zoomed in 4×, a new line is a
 quarter as wide on the canvas, so you can sketch zoomed out and zoom in
 for fine detail. Thin lines, airbrush density and smoothing feel the
 same at every zoom too, and the ring at the pointer always shows the
@@ -246,6 +245,16 @@ arrows, the laser and shapes keep their size in canvas units.
 Rect / Ellipse / Line / Arrow tools expose a contextual **dashed-border
 toggle** in the toolbar. When active, the shape commits with an
 animated marching-ants outline. Toggle is per-tool, not global.
+
+### Filled shapes
+
+Beside it, with the Rect or Ellipse tool (or rectangles and ellipses
+selected), the **filled toggle** fills new rectangles and ellipses solid
+with the colour; flipping it fills (or empties) the selected ones too.
+A shape is outlined, dashed or filled, never dashed and filled: the two
+toggles turn each other off, and filling a dashed shape makes its border
+solid. It can be bound to a key as `tool.filled_shape` (unbound by
+default).
 
 ### Selecting and transforming
 
@@ -587,7 +596,6 @@ pen        = "p"
 pencil     = "b"
 marker     = "m"
 airbrush   = "g"
-fill       = "f"
 laser      = "l"
 text       = "t"
 spotlight  = "s"
@@ -942,7 +950,6 @@ src/
 │   ├── smoothing.rs  ─ Krita-parity smoothing modes + per-mode state
 │   └── stroke.rs     ─ PenSample, Stroke, OneEuroFilter, cache build
 ├── config.rs         ─ AppConfig (RON-serialised preferences)
-├── flood_fill.rs     ─ scan-line flood, lyon outline
 ├── input/
 │   ├── filter.rs     ─ wobble + One Euro pre-conditioner
 │   ├── hotkeys.rs    ─ global hotkey bindings

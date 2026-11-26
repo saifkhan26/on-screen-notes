@@ -295,7 +295,6 @@ pub struct ToolSection {
     #[serde(default = "d_pencil")]         pub pencil: String,
     #[serde(default = "d_marker")]         pub marker: String,
     #[serde(default = "d_airbrush")]       pub airbrush: String,
-    #[serde(default = "d_fill")]           pub fill: String,
     #[serde(default = "d_laser")]          pub laser: String,
     #[serde(default = "d_text")]           pub text: String,
     #[serde(default = "d_spotlight")]      pub spotlight: String,
@@ -312,19 +311,22 @@ pub struct ToolSection {
     /// Dashed or solid border for new rectangles, ellipses, lines and
     /// arrows (the button beside those tools).
     #[serde(default)] pub dashed_border: String,
+    /// Filled or outlined rectangles and ellipses (the button beside
+    /// those tools).
+    #[serde(default)] pub filled_shape: String,
 }
 
 impl Default for ToolSection {
     fn default() -> Self {
         Self {
             pen: d_pen(), pencil: d_pencil(), marker: d_marker(),
-            airbrush: d_airbrush(), fill: d_fill(), laser: d_laser(),
+            airbrush: d_airbrush(), laser: d_laser(),
             text: d_text(), spotlight: d_spotlight(), lasso: d_lasso(),
             lasso_select: d_lasso_select(),
             select: d_select(),
             eyedropper: d_eyedropper(), rect: d_rect(), ellipse: d_ellipse(),
             arrow: d_arrow(), freehand_arrow: d_freehand_arrow(),
-            line: String::new(), dashed_border: String::new(),
+            line: String::new(), dashed_border: String::new(), filled_shape: String::new(),
         }
     }
 }
@@ -333,7 +335,6 @@ fn d_pen()            -> String { "p".into() }
 fn d_pencil()         -> String { "b".into() }
 fn d_marker()         -> String { "m".into() }
 fn d_airbrush()       -> String { "g".into() }
-fn d_fill()           -> String { "f".into() }
 fn d_laser()          -> String { "l".into() }
 fn d_text()           -> String { "t".into() }
 fn d_spotlight()      -> String { "s".into() }
@@ -758,8 +759,9 @@ fn d_media_next_frame() -> String { "period".into() }
 /// 11 select all (and lists finding like pictures and duplicates);
 /// 12 resync from PureRef; 13 hopping from object to object; 14 dimming
 /// what is not selected; 15 cropping a picture; 16 the slide window on a
-/// box or the selection.
-const FORMAT: u32 = 16;
+/// box or the selection; 17 filled shapes, and the Fill tool's key gone
+/// with the tool.
+const FORMAT: u32 = 17;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -799,7 +801,6 @@ pub struct ToolBindings {
     pub pencil: Option<Binding>,
     pub marker: Option<Binding>,
     pub airbrush: Option<Binding>,
-    pub fill: Option<Binding>,
     pub laser: Option<Binding>,
     pub text: Option<Binding>,
     pub spotlight: Option<Binding>,
@@ -813,6 +814,7 @@ pub struct ToolBindings {
     pub freehand_arrow: Option<Binding>,
     pub line: Option<Binding>,
     pub dashed_border: Option<Binding>,
+    pub filled_shape: Option<Binding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -991,7 +993,6 @@ impl HotkeysConfig {
                 pencil:         p("tool.pencil",         &self.tool.pencil),
                 marker:         p("tool.marker",         &self.tool.marker),
                 airbrush:       p("tool.airbrush",       &self.tool.airbrush),
-                fill:           p("tool.fill",           &self.tool.fill),
                 laser:          p("tool.laser",          &self.tool.laser),
                 text:           p("tool.text",           &self.tool.text),
                 spotlight:      p("tool.spotlight",      &self.tool.spotlight),
@@ -1005,6 +1006,7 @@ impl HotkeysConfig {
                 freehand_arrow: p("tool.freehand_arrow", &self.tool.freehand_arrow),
                 line:           p("tool.line",           &self.tool.line),
                 dashed_border:  p("tool.dashed_border",  &self.tool.dashed_border),
+                filled_shape:   p("tool.filled_shape",   &self.tool.filled_shape),
             },
             toolbar: ToolbarBindings {
                 colour: [
@@ -1344,6 +1346,10 @@ fn upgrade_text(text: &str, from: u32) -> String {
             version_written = true;
             continue;
         }
+        // The Fill tool is gone: its key binds nothing now, and goes.
+        if section == "tool" && from < 17 && key == Some("fill") {
+            continue;
+        }
         if section == "global" && from < 2 {
             if let Some(new) = upgrade_global_line(body) {
                 out.push_str(&new);
@@ -1403,7 +1409,6 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("tool", "pencil")         => "Pencil",
         ("tool", "marker")         => "Marker (highlighter)",
         ("tool", "airbrush")       => "Airbrush (spray)",
-        ("tool", "fill")           => "Fill",
         ("tool", "laser")          => "Laser pointer",
         ("tool", "text")           => "Text",
         ("tool", "spotlight")      => "Spotlight (again: back to the pen)",
@@ -1417,6 +1422,7 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("tool", "freehand_arrow") => "Freehand arrow",
         ("tool", "line")           => "Line",
         ("tool", "dashed_border")  => "Dashed / solid border for new rectangles, ellipses, lines, arrows",
+        ("tool", "filled_shape")   => "Filled / outlined rectangles and ellipses (the selected ones too)",
 
         ("toolbar", "size_up")            => "Pen size up a wheel notch (Spotlight: its size; resizes a selection)",
         ("toolbar", "size_down")          => "Pen size down a wheel notch (Spotlight: its size; resizes a selection)",
@@ -1779,7 +1785,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 16"));
+        assert!(up.contains("version = 17"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1788,10 +1794,10 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 16\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 17\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
-        assert!(new.contains("  # Dashed / solid border for new rectangles, ellipses, lines, arrows\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
+        assert!(new.contains("  # Filled / outlined rectangles and ellipses (the selected ones too)\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
         // Each added line says what it does, the notes lined up in each
         // block; the user's own lines get none.
         let added = |key: &str| new.lines().find(|l| l.starts_with(&format!("{key} = "))).unwrap().to_owned();
@@ -1825,7 +1831,7 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 16\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 17\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
@@ -1962,7 +1968,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 16\n\n\
+             version = 17\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1983,13 +1989,28 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 16\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 17\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 16");
-        assert_eq!(upgrade_text("", 0), "version = 16\n");
+        assert_eq!(new, "version = 17");
+        assert_eq!(upgrade_text("", 0), "version = 17\n");
+    }
+
+    /// The Fill tool is gone: a file from before 17 loses its key, so the
+    /// letter is free, and the new filled-shape key comes in unbound.
+    #[test]
+    fn format_16_files_lose_the_fill_key() {
+        let old = "version = 16\n\n[tool]\npen = \"p\"\nfill = \"f\"  # Fill\nlaser = \"l\"\n";
+        let up = upgrade_text(old, 16);
+        assert_eq!(up, "version = 17\n\n[tool]\npen = \"p\"\nlaser = \"l\"\n");
+        let new = add_missing_keys(&up);
+        assert!(new.contains("filled_shape = \"\""), "{new}");
+        let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
+        assert_eq!(cfg.tool.laser, "l");
+        // A file already at 17 keeps what it says.
+        assert_eq!(upgrade_text("version = 17\n[tool]\nfill = \"f\"\n", 17), "version = 17\n[tool]\nfill = \"f\"\n");
     }
 
     #[test]

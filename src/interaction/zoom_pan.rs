@@ -92,7 +92,7 @@ pub fn handle_scroll(
         let (pan, zoom) = canvases.active_view_mut();
         zoom_about_cursor(pan, zoom, raw_delta_y, cursor_screen);
     } else if matches!(tool.kind, ToolKind::Spotlight)
-        || !view_only && matches!(tool.kind, ToolKind::Pen | ToolKind::Eraser | ToolKind::FreehandArrow | ToolKind::Fill)
+        || !view_only && matches!(tool.kind, ToolKind::Pen | ToolKind::Eraser | ToolKind::FreehandArrow)
     {
         if notches == 0 { return; }
         nudge_size(tool, n_f);
