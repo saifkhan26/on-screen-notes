@@ -127,6 +127,37 @@ pub fn top_level_window_at(x: i32, y: i32) -> isize {
     }
 }
 
+/// Stop raw mouse input (`WM_INPUT`) coming to this app. winit asks for
+/// it at start-up, for as long as one of our windows is focused, and
+/// eframe draws a frame for every raw mouse move it brings: anywhere on
+/// screen, so with the overlay focused a mouse or pen moving over another
+/// app or screen kept the whole window redrawing at the display's rate.
+/// Nothing here uses raw mouse moves; the mouse over our windows comes
+/// as ordinary window messages, which this leaves alone, and so are the
+/// raw keyboard events winit also asked for. Returns whether Windows
+/// took it.
+pub fn stop_raw_mouse_input() -> bool {
+    use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_REMOVE};
+    // Generic desktop page, mouse (HID usage 0x01 / 0x02), as winit
+    // registered it; removing takes no target window.
+    let mouse = RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: 0x02, dwFlags: RIDEV_REMOVE, hwndTarget: HWND(0) };
+    // SAFETY: one fully initialised `RAWINPUTDEVICE`, and its size.
+    unsafe { RegisterRawInputDevices(&[mouse], std::mem::size_of::<RAWINPUTDEVICE>() as u32) }.is_ok()
+}
+
+/// Whether `hwnd` is one of this app's windows: the overlay, the slide
+/// and pins windows, any other it opened. False for 0.
+pub fn is_own_window(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let mut pid = 0u32;
+    // SAFETY: writes the id of the process owning `hwnd` into `pid`,
+    // a stack value that outlives the call.
+    unsafe { GetWindowThreadProcessId(HWND(hwnd), Some(&mut pid as *mut u32)) };
+    pid == std::process::id()
+}
+
 /// Toggle whether `hwnd_raw` is hidden from desktop-capture APIs
 /// (DXGI Desktop Duplication, BitBlt, PrintScreen, OBS, the
 /// magnifier loupe's own xcap calls — anything Windows treats as
@@ -302,5 +333,68 @@ pub fn refresh_rate_hz(hwnd_raw: isize) -> Option<u32> {
             return None;
         }
         (mode.dmDisplayFrequency > 1).then_some(mode.dmDisplayFrequency)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, GetShellWindow, HMENU, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE};
+
+    /// A message-only window of a system class; the caller destroys it.
+    fn message_window() -> HWND {
+        // SAFETY: plain values and static strings.
+        let w = unsafe {
+            CreateWindowExW(WINDOW_EX_STYLE(0), windows::core::w!("STATIC"), windows::core::w!("osn-test"), WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, HMENU(0), HINSTANCE(0), None)
+        };
+        assert_ne!(w.0, 0, "the test window was made");
+        w
+    }
+
+    /// Registered as winit does (mouse and keyboard, to a window of
+    /// ours), the mouse is taken off and the keyboard kept.
+    #[test]
+    fn raw_mouse_input_stops_and_the_keyboard_stays() {
+        use windows::Win32::UI::Input::{GetRegisteredRawInputDevices, RegisterRawInputDevices, RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RIDEV_REMOVE};
+        let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
+        let target = message_window();
+        let device = |usage: u16, flags: RAWINPUTDEVICE_FLAGS, to: HWND| RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: usage, dwFlags: flags, hwndTarget: to };
+        // SAFETY: two initialised devices and their size.
+        unsafe { RegisterRawInputDevices(&[device(0x02, RAWINPUTDEVICE_FLAGS(0), target), device(0x06, RAWINPUTDEVICE_FLAGS(0), target)], size) }.expect("registered");
+        let registered = || {
+            let mut list = [device(0, RAWINPUTDEVICE_FLAGS(0), HWND(0)); 8];
+            let mut n = list.len() as u32;
+            // SAFETY: room for `n` devices of `size` bytes each.
+            let got = unsafe { GetRegisteredRawInputDevices(Some(list.as_mut_ptr()), &mut n, size) };
+            assert_ne!(got, u32::MAX, "listed");
+            list[..got as usize].iter().map(|d| d.usUsage).collect::<Vec<_>>()
+        };
+        assert!(registered().contains(&0x02), "the mouse to start with");
+        assert!(stop_raw_mouse_input());
+        let now = registered();
+        assert!(!now.contains(&0x02), "no raw mouse: {now:?}");
+        assert!(now.contains(&0x06), "the keyboard stays: {now:?}");
+        // SAFETY: as above; removing takes no target window.
+        unsafe {
+            let _ = RegisterRawInputDevices(&[device(0x06, RIDEV_REMOVE, HWND(0))], size);
+            let _ = DestroyWindow(target);
+        }
+    }
+
+    /// A window this process made is its own; the desktop shell's, and
+    /// no window at all, are not.
+    #[test]
+    fn own_windows_are_told_from_other_apps() {
+        let mine = message_window();
+        assert!(is_own_window(mine.0));
+        // SAFETY: `mine` is the window made above.
+        unsafe {
+            let _ = DestroyWindow(mine);
+        }
+        // SAFETY: takes no arguments; 0 when no shell runs.
+        let shell = unsafe { GetShellWindow() };
+        assert!(!is_own_window(shell.0));
+        assert!(!is_own_window(0));
     }
 }

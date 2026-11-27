@@ -7,7 +7,7 @@
 pub mod win32;
 
 #[cfg(target_os = "windows")]
-pub use win32::{client_rect, cursor_pos, lmb_down, own_window_titled, paste_chord_down, reclaim_foreground, refresh_rate_hz, round_corners, set_owner, set_window_capture_excluded, top_level_window_at, window_rect};
+pub use win32::{client_rect, cursor_pos, is_own_window, lmb_down, own_window_titled, paste_chord_down, reclaim_foreground, refresh_rate_hz, round_corners, set_owner, set_window_capture_excluded, stop_raw_mouse_input, top_level_window_at, window_rect};
 
 #[cfg(not(target_os = "windows"))]
 pub fn own_window_titled(_prefix: &str, _except: isize) -> isize { 0 }
@@ -20,6 +20,12 @@ pub fn refresh_rate_hz(_hwnd: isize) -> Option<u32> { None }
 
 #[cfg(not(target_os = "windows"))]
 pub fn top_level_window_at(_x: i32, _y: i32) -> isize { 0 }
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_own_window(_hwnd: isize) -> bool { false }
+
+#[cfg(not(target_os = "windows"))]
+pub fn stop_raw_mouse_input() -> bool { false }
 
 #[cfg(not(target_os = "windows"))]
 pub fn set_window_capture_excluded(_hwnd: isize, _excluded: bool) {}

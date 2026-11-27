@@ -165,6 +165,8 @@ impl OnScreenNotesApp {
         // What the frame's hold read while it waited comes first.
         let mut raw_pen_events = std::mem::take(&mut self.early_pen);
         raw_pen_events.extend(self.pen.poll(client_origin));
+        // Frames come every refresh only while the pen is over our windows.
+        self.note_pen_place(client_origin);
         // The packets still show the pen touching, none has come for a
         // while, and the mouse moves or clicks here: the pen's lift was
         // lost, so lift it now. Until then the mouse would be ignored as
