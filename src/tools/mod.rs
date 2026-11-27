@@ -545,6 +545,14 @@ impl ActiveTool {
 
     /// Pen-up. Commits the stroke or shape into `canvas`.
     pub fn end(&mut self, sample: PenSample, canvas: &mut Canvas) {
+        // A click with a shape tool, no drag, adds nothing: the shape it
+        // would make has no size to see, and a dashed one would keep the
+        // view repainting for its marching dashes.
+        let shape_tool = matches!(self.kind, ToolKind::Rect | ToolKind::Ellipse | ToolKind::Line | ToolKind::Arrow);
+        if shape_tool && self.in_progress_shape.is_some_and(|(a, _)| too_small_to_see(a, sample.pos, canvas.zoom)) {
+            self.in_progress_shape = None;
+            return;
+        }
         match self.kind {
             ToolKind::Select => self.select.end(sample.pos, canvas),
             ToolKind::Pen => {
@@ -778,9 +786,47 @@ impl ActiveTool {
     }
 }
 
+/// Whether a shape dragged from `a` to `b` on a canvas at `zoom` spans
+/// under 2 screen points both ways: a click, or the pen's wobble in one.
+fn too_small_to_see(a: [f32; 2], b: [f32; 2], zoom: f32) -> bool {
+    let tiny = |d: f32| d.abs() * zoom < 2.0;
+    tiny(b[0] - a[0]) && tiny(b[1] - a[1])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A click with a shape tool adds nothing; a drag, even a short one
+    /// or one along a single axis, adds the shape.
+    #[test]
+    fn a_click_with_a_shape_tool_adds_nothing() {
+        for kind in [ToolKind::Rect, ToolKind::Ellipse, ToolKind::Line, ToolKind::Arrow] {
+            let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+            tool.kind = kind;
+            tool.border_style = BorderStyle::DashedAnimated;
+            let mut canvas = Canvas::default();
+            let shapes = |c: &Canvas| c.layers[c.active_layer].shapes.len();
+            tool.begin(PenSample::from_pos([10.0, 10.0]), &mut canvas);
+            tool.end(PenSample::from_pos([10.0, 10.0]), &mut canvas);
+            assert_eq!(shapes(&canvas), 0, "{kind:?}: a click");
+            assert!(tool.in_progress_shape.is_none());
+            tool.begin(PenSample::from_pos([10.0, 10.0]), &mut canvas);
+            tool.end(PenSample::from_pos([10.5, 10.8]), &mut canvas);
+            assert_eq!(shapes(&canvas), 0, "{kind:?}: a wobble");
+            tool.begin(PenSample::from_pos([10.0, 10.0]), &mut canvas);
+            tool.end(PenSample::from_pos([10.0, 14.0]), &mut canvas);
+            assert_eq!(shapes(&canvas), 1, "{kind:?}: a drag down");
+            assert!(canvas.layers[canvas.active_layer].shapes[0].animates());
+        }
+        // Zoomed in, the same tiny canvas distance is a real drag.
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = ToolKind::Rect;
+        let mut canvas = Canvas { zoom: 8.0, ..Canvas::default() };
+        tool.begin(PenSample::from_pos([10.0, 10.0]), &mut canvas);
+        tool.end(PenSample::from_pos([10.5, 10.5]), &mut canvas);
+        assert_eq!(canvas.layers[canvas.active_layer].shapes.len(), 1);
+    }
 
     fn width_drawn(kind: ToolKind, style: StrokeStyle, zoom: f32) -> f32 {
         let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());

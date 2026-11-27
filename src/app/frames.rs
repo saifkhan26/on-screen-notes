@@ -30,7 +30,6 @@ impl OnScreenNotesApp {
     /// pen is in range, something on screen changes by itself, or work
     /// in flight shows progress.
     pub(super) fn needs_steady_frames(&self, ctx: &egui::Context) -> bool {
-        let canvas = self.canvases.active();
         self.ws.mouse_gesture
             || ctx.input(|i| i.pointer.any_down())
             || self.ws.tool.select.gesture.is_some()
@@ -50,7 +49,11 @@ impl OnScreenNotesApp {
             || !self.media_imports.is_empty()
             || self.canvases.is_loading()
             || self.overlay_cache.pictures_busy()
-            || canvas.layers.iter().any(|l| l.visible && l.shapes.iter().any(crate::canvas::shape::Shape::animates))
+    }
+
+    /// Whether a marching-ants border shows on the overlay's canvas.
+    fn dashes_march(&self, ctx: &egui::Context) -> bool {
+        self.overlay_visible && marching_in_view(self.canvases.active(), self.overlay_cache.canvas_rect(ctx))
     }
 
     /// Hold every frame that is not drawing ink to the display's refresh
@@ -98,7 +101,8 @@ impl OnScreenNotesApp {
     /// going down gets every frame it can; gestures, a pen in range and
     /// things that move get one per display refresh; a playing GIF or
     /// video gets its own frame times, never above the refresh rate;
-    /// otherwise a slow idle tick.
+    /// marching dashes on screen get `MARCH_FRAME`; otherwise a slow
+    /// idle tick.
     pub(super) fn next_frame_in(&self, ctx: &egui::Context) -> Option<Duration> {
         if self.needs_live_frames() {
             return None;
@@ -107,6 +111,9 @@ impl OnScreenNotesApp {
         let mut wait = IDLE_TICK;
         if self.needs_steady_frames(ctx) {
             wait = wait.min(refresh);
+        }
+        if self.dashes_march(ctx) {
+            wait = wait.min(MARCH_FRAME.max(refresh));
         }
         if let Some(media) = self.media.next_frame_in() {
             wait = wait.min(media.max(refresh));
@@ -143,5 +150,69 @@ impl OnScreenNotesApp {
                 ctx.request_repaint_after(wait + predicted);
             }
         }
+    }
+}
+
+/// Frame interval while marching-ants borders show and nothing else
+/// moves: about 30 a second. The dashes march 30 canvas pixels a second,
+/// so this still moves them a pixel a frame at 100 %. Each frame redraws
+/// the whole window: at the display's rate (99 Hz here) one dashed shape
+/// kept the GPU a quarter busy, invisible or off screen alike.
+const MARCH_FRAME: Duration = Duration::from_millis(33);
+
+/// Whether `canvas` has a marching-ants border, on a shown layer, with
+/// any of it inside `view` (the canvas area, where `canvas`'s pan and
+/// zoom place it).
+fn marching_in_view(canvas: &crate::canvas::canvas::Canvas, view: egui::Rect) -> bool {
+    let (pan, zoom) = (canvas.pan, canvas.zoom);
+    let at = |x: f32, y: f32| egui::pos2(view.min.x + pan[0] + x * zoom, view.min.y + pan[1] + y * zoom);
+    canvas.layers.iter().any(|l| {
+        l.visible
+            && l.shapes.iter().any(|s| {
+                s.animates() && {
+                    let b = crate::canvas::canvas::shape_bounds(s);
+                    egui::Rect::from_two_pos(at(b[0], b[1]), at(b[2], b[3])).intersects(view)
+                }
+            })
+    })
+}
+
+#[cfg(test)]
+mod march_tests {
+    use super::*;
+    use crate::canvas::canvas::Canvas;
+    use crate::canvas::shape::{BorderStyle, Shape};
+
+    fn ellipse(a: [f32; 2], b: [f32; 2], border: BorderStyle) -> Shape {
+        Shape::Ellipse { a, b, color: [255; 4], stroke_width: 4.0, border, filled: false, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
+    }
+
+    /// Only a dashed shape that shows keeps frames coming: not a solid
+    /// one, not one with no size, not one panned out of view or on a
+    /// hidden layer.
+    #[test]
+    fn only_dashes_that_show_march() {
+        let view = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 600.0));
+        let with = |s: Shape| {
+            let mut c = Canvas::default();
+            c.add_shape(s);
+            c
+        };
+        let dashed = with(ellipse([100.0, 100.0], [200.0, 160.0], BorderStyle::DashedAnimated));
+        assert!(marching_in_view(&dashed, view));
+        assert!(!marching_in_view(&with(ellipse([100.0, 100.0], [200.0, 160.0], BorderStyle::Solid)), view));
+        // The one found on a real slide: an ellipse from a click.
+        assert!(!marching_in_view(&with(ellipse([382.5, 779.0], [382.5, 779.0], BorderStyle::DashedAnimated)), view));
+        let mut away = with(ellipse([100.0, 100.0], [200.0, 160.0], BorderStyle::DashedAnimated));
+        away.pan = [-5000.0, 0.0];
+        assert!(!marching_in_view(&away, view), "panned out of view");
+        away.pan = [0.0, 0.0];
+        away.zoom = 2.0;
+        assert!(marching_in_view(&away, view), "zoomed, still in view");
+        let mut hidden = with(ellipse([100.0, 100.0], [200.0, 160.0], BorderStyle::DashedAnimated));
+        for l in &mut hidden.layers {
+            l.visible = false;
+        }
+        assert!(!marching_in_view(&hidden, view), "on a hidden layer");
     }
 }

@@ -697,15 +697,18 @@ impl Shape {
     }
 
     /// Whether the shape moves by itself on screen — a marching-ants
-    /// border — so the view has to keep repainting while it shows.
+    /// border — so the view has to keep repainting while it shows. One
+    /// with no size (a click with the tool once made these) has no dashes
+    /// to march: it drew nothing, yet kept the view repainting at the
+    /// display's rate for good.
     pub fn animates(&self) -> bool {
-        matches!(
-            self,
-            Shape::Rect { border: BorderStyle::DashedAnimated, .. }
-                | Shape::Ellipse { border: BorderStyle::DashedAnimated, .. }
-                | Shape::Line { border: BorderStyle::DashedAnimated, .. }
-                | Shape::Arrow { border: BorderStyle::DashedAnimated, .. }
-        )
+        match self {
+            Shape::Rect { a, b, border: BorderStyle::DashedAnimated, .. }
+            | Shape::Ellipse { a, b, border: BorderStyle::DashedAnimated, .. }
+            | Shape::Line { a, b, border: BorderStyle::DashedAnimated, .. }
+            | Shape::Arrow { a, b, border: BorderStyle::DashedAnimated, .. } => a != b,
+            _ => false,
+        }
     }
 
     /// The media-folder file this shape needs, if any: a video or GIF,
