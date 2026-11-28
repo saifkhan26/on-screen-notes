@@ -155,6 +155,24 @@ impl Canvas {
         self.edit_objects(li, &[], &shapes, |_, _| {}, boxed)
     }
 
+    /// Give the label at `index` on layer `li` new text. One undo step.
+    /// Returns false when there is no label there or the text is the same.
+    pub fn set_label_text(&mut self, li: usize, index: usize, text: String) -> bool {
+        let differs = matches!(
+            self.layers.get(li).and_then(|l| l.shapes.get(index)),
+            Some(Shape::Text { content, .. }) if *content != text
+        );
+        if !differs {
+            return false;
+        }
+        let mut text = Some(text);
+        self.edit_objects(li, &[], &[index], |_, _| {}, |_, s| {
+            if let (Shape::Text { content, .. }, Some(t)) = (s, text.take()) {
+                *content = t;
+            }
+        })
+    }
+
     /// Fill the chosen rectangles and ellipses solid with their colour,
     /// or take the fill out. A filled shape has a solid border: dashes
     /// would vanish into the fill. One undo step; other shapes, and ones

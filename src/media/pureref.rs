@@ -39,7 +39,7 @@
 use super::import::{encode_png, fit_side, media_name, shrink, store_bytes_into, IMAGE_SIDE};
 use crate::canvas::board_link::{fresh_link, BoardLink, Fnv, ItemState, LinkedItem};
 use crate::canvas::canvas::Canvas;
-use crate::canvas::shape::{fresh_media_id, text_extent, MediaKind, MediaMeta, MediaRef, PictureRef, RasterKind, Shape};
+use crate::canvas::shape::{estimated_text_extent, fresh_media_id, MediaKind, MediaMeta, MediaRef, PictureRef, RasterKind, Shape};
 use crate::error::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -299,7 +299,7 @@ impl BoardItem {
                 ([center[0], center[1]], [[-half[0], -half[1]], [half[0], -half[1]], [half[0], half[1]], [-half[0], half[1]]], *rotation)
             }
             BoardItem::Note { text, pos, font_size, rotation, .. } => {
-                let [w, h] = text_extent(text, *font_size as f32).map(f64::from);
+                let [w, h] = estimated_text_extent(text, *font_size as f32).map(f64::from);
                 (*pos, [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]], *rotation)
             }
         };
@@ -2072,7 +2072,7 @@ fn place_note(n: &RawNote) -> Option<BoardItem> {
         Some(width) => wrap_note(&n.text, width, n.font_px),
         None => n.text.clone(),
     };
-    let [w, h] = text_extent(&text, n.font_px as f32).map(f64::from);
+    let [w, h] = estimated_text_extent(&text, n.font_px as f32).map(f64::from);
     let w = n.width.unwrap_or(w);
     let local = if n.centred { [-w * 0.5, -h * 0.5] } else { [0.0, 0.0] };
     let pos = n.to_scene.apply(local);
@@ -2098,7 +2098,7 @@ fn place_note(n: &RawNote) -> Option<BoardItem> {
 /// `font_px`, as PureRef wraps a note given a fixed width. Text shapes
 /// do not wrap themselves, so the breaks go into the text. Character
 /// widths are estimated (a little over half the font size), like
-/// `text_extent` does; a word longer than a line is broken.
+/// `estimated_text_extent` does; a word longer than a line is broken.
 fn wrap_note(text: &str, width: f64, font_px: f64) -> String {
     let per_line = ((width / (font_px * 0.55)).floor() as usize).max(1);
     let mut lines = Vec::new();
@@ -2620,7 +2620,7 @@ mod tests {
         // The picture moves with its group; the note, on its own, alone.
         assert_eq!((board.items[0].group(), board.items[1].group()), (10, 2));
         // A 2.x note is centred on its origin.
-        let [w, h] = text_extent(text, 30.0).map(f64::from);
+        let [w, h] = estimated_text_extent(text, 30.0).map(f64::from);
         assert_close(pos, [-w / 2.0, -h / 2.0]);
     }
 

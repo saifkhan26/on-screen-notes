@@ -58,6 +58,9 @@ pub fn paint_canvas_egui(
     // the transform; like `layer_xform`, nothing is written back until
     // the gesture ends and `Canvas::transform_objects` bakes it in.
     sel_preview: Option<(usize, &Selection, Affine)>,
+    // A shape left out: `(layer, index)` of the label whose text is being
+    // edited, which the caller paints with the new text instead.
+    hidden: Option<(usize, usize)>,
 ) {
     // Pre-compute the pan-zoom transform as a closure so we don't
     // recompute the same maths inside every loop.
@@ -139,6 +142,9 @@ pub fn paint_canvas_egui(
         let dragged = sel_preview.filter(|(l, _, _)| *l == li);
         let shape_tex_for_layer = shape_textures.get(li);
         for (si, shape) in layer.shapes.iter().enumerate() {
+            if hidden == Some((li, si)) {
+                continue;
+            }
             let tex = shape_tex_for_layer
                 .and_then(|v| v.get(si))
                 .copied()

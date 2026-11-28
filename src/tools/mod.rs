@@ -137,6 +137,66 @@ pub struct TextEdit {
     pub font_size: f32,
     /// Colour captured at begin for the same reason.
     pub color: [u8; 4],
+    /// The label whose text this is, when an existing one is being
+    /// changed rather than a new one typed.
+    pub editing: Option<LabelEdit>,
+}
+
+/// An existing label being changed (`ActiveTool::edit_label`). While it
+/// is, the slide shows the buffer in its place, in its own box and turn.
+#[derive(Debug, Clone)]
+pub struct LabelEdit {
+    /// Where it is: layer and index on the slide.
+    pub layer: usize,
+    pub index: usize,
+    /// Its text before. The change only lands on a label that still says
+    /// this, so it never lands on another label or another slide.
+    pub before: String,
+    pub rotation: f32,
+    pub background: Option<[u8; 4]>,
+    /// The tool to go back to once done: the Select tool, after a
+    /// double-click there.
+    pub return_to: Option<ToolKind>,
+}
+
+impl TextEdit {
+    /// The label as it will be once this is done: the edited label with
+    /// the buffer as its text, for painting in its place on `canvas`.
+    /// `None` for a new label, which has its own preview, and when that
+    /// label is not on `canvas` (another slide is shown).
+    pub fn edited_label(&self, canvas: &Canvas) -> Option<(usize, usize, Shape)> {
+        let e = self.editing.as_ref()?;
+        let here = canvas.layers.get(e.layer).and_then(|l| l.shapes.get(e.index));
+        if !matches!(here, Some(Shape::Text { content, .. }) if *content == e.before) {
+            return None;
+        }
+        let label = Shape::Text {
+            pos: self.pos,
+            content: self.buffer.clone(),
+            font_size: self.font_size,
+            color: self.color,
+            rotation: e.rotation,
+            pin: 0,
+            background: e.background,
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
+            link: 0,
+        };
+        Some((e.layer, e.index, label))
+    }
+}
+
+/// How long apart two clicks on a label may be for a double-click.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(500);
+/// How far apart (screen px) they may be.
+const DOUBLE_CLICK_PX: f32 = 8.0;
+
+/// The topmost label on layer `li` under `p` (canvas units).
+fn label_at(canvas: &Canvas, li: usize, p: [f32; 2]) -> Option<usize> {
+    let layer = canvas.layers.get(li)?;
+    let tol = 3.0 / canvas.zoom.max(1e-3);
+    layer.shapes.iter().rposition(|s| matches!(s, Shape::Text { .. }) && crate::canvas::hit::shape_hit(s, p, tol))
 }
 
 /// Holds the *current* tool plus any in-progress stroke/shape.
@@ -230,6 +290,12 @@ pub struct ActiveTool {
     /// A pad's brush (pencil, marker, airbrush) was picked by its key with
     /// no pad open: the app says where it draws. Cleared once said.
     pub pad_only_brush: Option<StrokeStyle>,
+    /// Where the Select tool's press in flight went down, to tell a click
+    /// from a drag.
+    select_press: Option<[f32; 2]>,
+    /// The last click with the Select tool that landed on a label: when,
+    /// where, and which label. A second one on it soon after edits it.
+    label_click: Option<(std::time::Instant, [f32; 2], usize)>,
 }
 
 /// Shape snap's progress through the stroke being drawn.
@@ -282,6 +348,108 @@ impl ActiveTool {
             pad_open: false,
             pending_pad_erase: None,
             pad_only_brush: None,
+            select_press: None,
+            label_click: None,
+        }
+    }
+
+    /// Start changing the text of the label at `index` on layer `li`: its
+    /// text goes into the Text tool's buffer, caret at the end, and the
+    /// slide shows the label as it is typed. `return_to` is the tool to
+    /// go back to once done. False when there is no label there.
+    pub fn edit_label(&mut self, canvas: &Canvas, li: usize, index: usize, return_to: Option<ToolKind>) -> bool {
+        let Some(Shape::Text { pos, content, font_size, color, rotation, background, .. }) =
+            canvas.layers.get(li).and_then(|l| l.shapes.get(index))
+        else {
+            return false;
+        };
+        self.in_progress_text = Some(TextEdit {
+            pos: *pos,
+            buffer: content.clone(),
+            caret: content.len(),
+            font_size: *font_size,
+            color: *color,
+            editing: Some(LabelEdit {
+                layer: li,
+                index,
+                before: content.clone(),
+                rotation: *rotation,
+                background: *background,
+                return_to,
+            }),
+        });
+        self.kind = ToolKind::Text;
+        true
+    }
+
+    /// Put what was typed on the slide: a new label, or the edited
+    /// label's new text, each one undo step. An edited label emptied of
+    /// text goes. Then back to the tool an edit started from.
+    pub fn commit_text(&mut self, canvas: &mut Canvas) {
+        let Some(t) = self.in_progress_text.take() else { return };
+        let Some(e) = t.editing else {
+            if !t.buffer.is_empty() {
+                canvas.add_shape(Shape::Text {
+                    pos: t.pos,
+                    content: t.buffer,
+                    font_size: t.font_size,
+                    color: t.color,
+                    rotation: 0.0,
+                    pin: 0,
+                    background: self.text_box.then(|| crate::canvas::shape::auto_text_box(t.color)),
+                    group: 0,
+                    tags: Vec::new(),
+                    turn: 0.0,
+                    link: 0,
+                });
+            }
+            return;
+        };
+        let still_there = matches!(
+            canvas.layers.get(e.layer).and_then(|l| l.shapes.get(e.index)),
+            Some(Shape::Text { content, .. }) if *content == e.before
+        );
+        let mut kept = still_there;
+        if still_there && t.buffer.is_empty() {
+            canvas.delete_objects(e.layer, &[], &[e.index]);
+            kept = false;
+        } else if still_there && t.buffer != e.before {
+            canvas.set_label_text(e.layer, e.index, t.buffer);
+        }
+        // Unless another tool was picked meanwhile.
+        if let Some(k) = e.return_to.filter(|_| self.kind == ToolKind::Text) {
+            self.kind = k;
+            self.select.sel.clear();
+            if k == ToolKind::Select && kept && canvas.active_layer == e.layer {
+                self.select.sel.set_only(crate::canvas::hit::ObjRef::Shape(e.index));
+            }
+        }
+    }
+
+    /// Drop what was typed: no new label, and an edited label keeps its
+    /// text. Back to the tool an edit started from.
+    pub fn cancel_text(&mut self) {
+        let Some(t) = self.in_progress_text.take() else { return };
+        if let Some(k) = t.editing.and_then(|e| e.return_to).filter(|_| self.kind == ToolKind::Text) {
+            self.kind = k;
+        }
+    }
+
+    /// A click (no drag) with the Select tool at `p`: the label to edit
+    /// when it is the second click on the same label in a short while.
+    fn label_double_click(&mut self, p: [f32; 2], canvas: &Canvas) -> Option<usize> {
+        let zoom = canvas.zoom.max(1e-3);
+        let near = |a: [f32; 2], b: [f32; 2]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt() * zoom <= DOUBLE_CLICK_PX;
+        let clicked = self.select_press.take().is_some_and(|down| near(down, p));
+        let label = clicked.then(|| label_at(canvas, canvas.active_layer, p)).flatten();
+        let now = std::time::Instant::now();
+        let before = self.label_click.take();
+        match (label, before) {
+            (Some(i), Some((t, at, j))) if i == j && now.duration_since(t) <= DOUBLE_CLICK && near(at, p) => Some(i),
+            _ => {
+                self.label_click = label.map(|i| (now, p, i));
+                None
+            }
         }
     }
 
@@ -417,7 +585,10 @@ impl ActiveTool {
     /// pen and eraser read its zoom.
     pub fn begin(&mut self, sample: PenSample, canvas: &mut Canvas) {
         match self.kind {
-            ToolKind::Select => self.select.begin(sample.pos, canvas),
+            ToolKind::Select => {
+                self.select_press = Some(sample.pos);
+                self.select.begin(sample.pos, canvas);
+            }
             ToolKind::Pen | ToolKind::FreehandArrow => {
                 // Off a drawing pad the pen and the freehand arrow draw
                 // plain ink: pencil, marker and airbrush are the pad's
@@ -554,7 +725,14 @@ impl ActiveTool {
             return;
         }
         match self.kind {
-            ToolKind::Select => self.select.end(sample.pos, canvas),
+            ToolKind::Select => {
+                self.select.end(sample.pos, canvas);
+                // A double-click on a label edits its text.
+                if let Some(i) = self.label_double_click(sample.pos, canvas) {
+                    let li = canvas.active_layer;
+                    self.edit_label(canvas, li, i, Some(ToolKind::Select));
+                }
+            }
             ToolKind::Pen => {
                 if let Some(mut s) = self.in_progress_stroke.take() {
                     match std::mem::take(&mut self.snap).morph {
@@ -627,22 +805,17 @@ impl ActiveTool {
                 // buffered text into the canvas (so the user does not
                 // lose what they typed before clicking elsewhere) and
                 // open a fresh caret at the click point.
-                if let Some(prev) = self.in_progress_text.take() {
-                    if !prev.buffer.is_empty() {
-                        canvas.add_shape(Shape::Text {
-                            pos: prev.pos,
-                            content: prev.buffer,
-                            font_size: prev.font_size,
-                            color: prev.color,
-                            rotation: 0.0,
-                            pin: 0,
-                            background: self.text_box.then(|| crate::canvas::shape::auto_text_box(prev.color)),
-                            group: 0,
-                            tags: Vec::new(),
-                            turn: 0.0,
-                            link: 0,
-                        });
-                    }
+                self.commit_text(canvas);
+                // An edit begun with a double-click in the Select tool
+                // ends with this click, back in that tool.
+                if self.kind != ToolKind::Text {
+                    return;
+                }
+                // A click on a label edits it.
+                let li = canvas.active_layer;
+                if let Some(i) = label_at(canvas, li, sample.pos) {
+                    self.edit_label(canvas, li, i, None);
+                    return;
                 }
                 // Font size scales with the toolbar's "pen size" slider
                 // (× 3 so a 6-px pen ≈ 18-px text). Captured at click
@@ -655,6 +828,7 @@ impl ActiveTool {
                     caret: 0,
                     font_size,
                     color: self.color,
+                    editing: None,
                 });
             }
             ToolKind::Spotlight => {
@@ -796,6 +970,146 @@ fn too_small_to_see(a: [f32; 2], b: [f32; 2], zoom: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slide with one boxed label "hello" at (100, 100), and a tool.
+    fn label_slide(kind: ToolKind) -> (ActiveTool, Canvas) {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = kind;
+        let mut canvas = Canvas::default();
+        canvas.layers[0].shapes.push(Shape::Text {
+            pos: [100.0, 100.0],
+            content: "hello".into(),
+            font_size: 20.0,
+            color: [255; 4],
+            rotation: 0.3,
+            pin: 0,
+            background: Some([24, 24, 28, 215]),
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
+            link: 0,
+        });
+        (tool, canvas)
+    }
+
+    fn text_of(canvas: &Canvas) -> Option<&str> {
+        match canvas.layers[0].shapes.first()? {
+            Shape::Text { content, .. } => Some(content),
+            _ => None,
+        }
+    }
+
+    /// A point on the "hello" label (it is turned about its top-left).
+    fn on_label(canvas: &Canvas) -> [f32; 2] {
+        canvas.layers[0].shapes[0].obb().center
+    }
+
+    fn click(tool: &mut ActiveTool, canvas: &mut Canvas, p: [f32; 2]) {
+        tool.begin(PenSample::from_pos(p), canvas);
+        tool.end(PenSample::from_pos(p), canvas);
+    }
+
+    #[test]
+    fn an_edited_label_takes_the_new_text_in_one_undo_step() {
+        let (mut tool, mut canvas) = label_slide(ToolKind::Text);
+        assert!(tool.edit_label(&canvas, 0, 0, None));
+        let t = tool.in_progress_text.as_mut().expect("editing");
+        assert_eq!((t.buffer.as_str(), t.caret), ("hello", 5));
+        t.buffer.push_str(" there");
+        // Shown in place: its box and turn kept, the new text in it.
+        let (li, i, shown) = tool.in_progress_text.as_ref().unwrap().edited_label(&canvas).expect("shown in place");
+        assert_eq!((li, i), (0, 0));
+        assert!(matches!(shown, Shape::Text { ref content, rotation, background: Some(_), .. } if content == "hello there" && rotation == 0.3));
+        let undo = canvas.undo_log.len();
+        tool.commit_text(&mut canvas);
+        assert_eq!(text_of(&canvas), Some("hello there"));
+        assert_eq!(canvas.layers[0].shapes.len(), 1, "changed, not added");
+        assert_eq!(canvas.undo_log.len(), undo + 1);
+        canvas.undo();
+        assert_eq!(text_of(&canvas), Some("hello"));
+    }
+
+    #[test]
+    fn esc_leaves_an_edited_label_as_it_was_and_emptying_one_removes_it() {
+        let (mut tool, mut canvas) = label_slide(ToolKind::Select);
+        tool.edit_label(&canvas, 0, 0, Some(ToolKind::Select));
+        tool.in_progress_text.as_mut().unwrap().buffer.clear();
+        tool.cancel_text();
+        assert_eq!(text_of(&canvas), Some("hello"));
+        assert_eq!(tool.kind, ToolKind::Select, "back to the tool it came from");
+        assert!(canvas.undo_log.is_empty());
+
+        tool.edit_label(&canvas, 0, 0, None);
+        tool.in_progress_text.as_mut().unwrap().buffer.clear();
+        tool.commit_text(&mut canvas);
+        assert!(canvas.layers[0].shapes.is_empty());
+        canvas.undo();
+        assert_eq!(text_of(&canvas), Some("hello"));
+    }
+
+    /// Text typed for a label that is no longer there (another slide is
+    /// shown, or it was undone) never lands on what is there now.
+    #[test]
+    fn an_edit_never_lands_on_another_label() {
+        let (mut tool, mut canvas) = label_slide(ToolKind::Text);
+        tool.edit_label(&canvas, 0, 0, None);
+        tool.in_progress_text.as_mut().unwrap().buffer = "changed".into();
+        if let Shape::Text { content, .. } = &mut canvas.layers[0].shapes[0] {
+            *content = "another label".into();
+        }
+        assert!(tool.in_progress_text.as_ref().unwrap().edited_label(&canvas).is_none(), "not hidden either");
+        tool.commit_text(&mut canvas);
+        assert_eq!(text_of(&canvas), Some("another label"));
+    }
+
+    #[test]
+    fn a_double_click_on_a_label_edits_it_and_enter_goes_back_to_select() {
+        let (mut tool, mut canvas) = label_slide(ToolKind::Select);
+        let p = on_label(&canvas);
+        click(&mut tool, &mut canvas, p);
+        assert!(tool.in_progress_text.is_none(), "one click selects");
+        click(&mut tool, &mut canvas, [p[0] + 2.0, p[1]]);
+        assert_eq!(tool.kind, ToolKind::Text);
+        assert!(tool.in_progress_text.as_ref().is_some_and(|t| t.editing.is_some()));
+        tool.in_progress_text.as_mut().unwrap().buffer.push('!');
+        tool.commit_text(&mut canvas);
+        assert_eq!(text_of(&canvas), Some("hello!"));
+        assert_eq!(tool.kind, ToolKind::Select);
+        assert_eq!(tool.select.sel.shapes, vec![0], "the label stays selected");
+    }
+
+    #[test]
+    fn slow_clicks_or_a_drag_do_not_edit() {
+        let (mut tool, mut canvas) = label_slide(ToolKind::Select);
+        let p = on_label(&canvas);
+        click(&mut tool, &mut canvas, p);
+        if let Some(c) = tool.label_click.as_mut() {
+            c.0 -= DOUBLE_CLICK * 2;
+        }
+        click(&mut tool, &mut canvas, p);
+        assert!(tool.in_progress_text.is_none(), "too slow");
+        // A press that moves the label is a drag, not a click.
+        tool.begin(PenSample::from_pos(p), &mut canvas);
+        tool.end(PenSample::from_pos([p[0] + 40.0, p[1]]), &mut canvas);
+        assert!(tool.in_progress_text.is_none());
+        // Off any label, nothing.
+        click(&mut tool, &mut canvas, [600.0, 600.0]);
+        click(&mut tool, &mut canvas, [600.0, 600.0]);
+        assert!(tool.in_progress_text.is_none());
+    }
+
+    #[test]
+    fn the_text_tool_edits_a_label_it_clicks_and_starts_one_elsewhere() {
+        let (mut tool, mut canvas) = label_slide(ToolKind::Text);
+        let p = on_label(&canvas);
+        click(&mut tool, &mut canvas, p);
+        assert!(tool.in_progress_text.as_ref().is_some_and(|t| t.editing.is_some() && t.buffer == "hello"));
+        tool.in_progress_text.as_mut().unwrap().buffer.push('?');
+        click(&mut tool, &mut canvas, [600.0, 600.0]);
+        assert_eq!(text_of(&canvas), Some("hello?"), "clicking away keeps the change");
+        assert!(tool.in_progress_text.as_ref().is_some_and(|t| t.editing.is_none() && t.pos == [600.0, 600.0]));
+        assert_eq!(tool.kind, ToolKind::Text);
+    }
 
     /// A click with a shape tool adds nothing; a drag, even a short one
     /// or one along a single axis, adds the shape.

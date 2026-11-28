@@ -512,7 +512,11 @@ pub fn show(
             // Paint canvas content directly via egui Painter (GPU triangles).
             // Origin = top-left of the canvas rect; canvas's own pan/zoom is
             // applied inside `paint_canvas_egui`.
-            let preview_shape = tool.preview_shape();
+            // A label whose text is being edited shows the new text in
+            // its place: left out of the slide, painted as a preview.
+            let edited = tool.in_progress_text.as_ref().and_then(|t| t.edited_label(manager.active()));
+            let hidden = edited.as_ref().map(|(li, i, _)| (*li, *i));
+            let preview_shape = tool.preview_shape().or(edited.map(|(_, _, s)| s));
 
             // Pen prediction: build a "look-ahead" extension of the live
             // stroke so the visible ink reaches slightly *past* the most
@@ -551,6 +555,7 @@ pub fn show(
                 None,
                 layer_xform,
                 sel_preview,
+                hidden,
             );
 
             // Pins, over the slide and in the order they were last
@@ -592,7 +597,11 @@ pub fn show(
                     * size * 0.55)
                     .max(size * 0.6);
                 let guide_h = line_h * lines.len().max(1) as f32;
-                if tool.text_box {
+                // An edited label is painted with the slide (`edited`), in
+                // its own box and turn; only its caret is drawn here.
+                let angle = text_edit.editing.as_ref().map_or(0.0, |e| e.rotation);
+                let new_label = text_edit.editing.is_none();
+                if new_label && tool.text_box {
                     // The box the label will have, already.
                     let widest = lines
                         .iter()
@@ -601,7 +610,7 @@ pub fn show(
                     let fill = crate::canvas::shape::auto_text_box(text_edit.color);
                     let fill = egui::Color32::from_rgba_unmultiplied(fill[0], fill[1], fill[2], fill[3]);
                     crate::canvas::render::paint_text_box(ui.painter(), top_left, [widest, guide_h], size, 0.0, fill);
-                } else {
+                } else if new_label {
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(top_left, egui::vec2(guide_w, guide_h)),
                         egui::Rounding::same(2.0),
@@ -610,9 +619,11 @@ pub fn show(
                 }
 
                 // Paint the typed lines.
-                for (i, line) in lines.iter().enumerate() {
-                    let lp = egui::pos2(top_left.x, top_left.y + i as f32 * line_h);
-                    ui.painter().text(lp, egui::Align2::LEFT_TOP, *line, font_id.clone(), color);
+                if new_label {
+                    for (i, line) in lines.iter().enumerate() {
+                        let lp = egui::pos2(top_left.x, top_left.y + i as f32 * line_h);
+                        ui.painter().text(lp, egui::Align2::LEFT_TOP, *line, font_id.clone(), color);
+                    }
                 }
 
                 // Blinking caret at the end of the last line. Use a
@@ -628,17 +639,13 @@ pub fn show(
                 };
                 if visible {
                     let last_line = lines.last().copied().unwrap_or("");
-                    // Approximate caret x via character count × 0.55 ×
-                    // font size — close enough for a blinking bar.
-                    let caret_x = top_left.x + last_line.chars().count() as f32 * size * 0.55;
-                    let caret_y = top_left.y + (lines.len().saturating_sub(1)) as f32 * line_h;
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(caret_x, caret_y),
-                            egui::pos2(caret_x, caret_y + size),
-                        ],
-                        egui::Stroke::new(1.6, color),
-                    );
+                    // The end of the last line, in the label's own turned
+                    // frame from its top-left corner.
+                    let x = ui.painter().layout_no_wrap(last_line.to_string(), font_id.clone(), color).size().x;
+                    let y = lines.len().saturating_sub(1) as f32 * line_h;
+                    let (s, c) = angle.sin_cos();
+                    let at = |dx: f32, dy: f32| egui::pos2(top_left.x + c * dx - s * dy, top_left.y + s * dx + c * dy);
+                    ui.painter().line_segment([at(x, y), at(x, y + size)], egui::Stroke::new(1.6, color));
                 }
             }
 
@@ -811,6 +818,7 @@ pub fn show(
                             Some(([pan_x_new, pan_y_new], new_zoom)),
                             layer_xform,
                             sel_preview,
+                            None,
                         );
                     }
                     ctx.request_repaint();

@@ -258,11 +258,61 @@ impl Obb {
     }
 }
 
-/// Coarse `[width, height]` of a text label. The real layout only
-/// happens at paint time, so this is an estimate: each line is taken as
-/// `0.6 × font_size` per character and `1.25 × font_size` tall. Good
-/// enough for hit-testing and framing.
+/// `[width, height]` of a text label: its widest line measured in the
+/// font labels are drawn in, and `1.25 × font_size` per line, as they
+/// are painted. So the label's frame, the area that picks it and its box
+/// end where its text does.
 pub fn text_extent(content: &str, font_size: f32) -> [f32; 2] {
+    let mut lines = 0usize;
+    let mut widest = 0.0_f32;
+    for l in content.split('\n') {
+        lines += 1;
+        widest = widest.max(line_width_per_size(l));
+    }
+    [
+        (font_size * widest).max(font_size * 0.25),
+        (font_size * 1.25 * lines.max(1) as f32).max(font_size),
+    ]
+}
+
+/// How wide one line of a label is per unit of font size. Labels are
+/// drawn in the "handwritten" family, which is egui's own proportional
+/// chain (`ui::theme::install_fonts`), so the same fonts lay the line out
+/// here, once per line text; it is remembered after that. Width grows
+/// with the size in step, give or take the rounding to pixels.
+fn line_width_per_size(line: &str) -> f32 {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    const REF_SIZE: f32 = 64.0;
+    const ATLAS_SIDE: usize = 8192;
+    static FONTS: OnceLock<egui::epaint::text::Fonts> = OnceLock::new();
+    static WIDTHS: OnceLock<Mutex<HashMap<String, f32>>> = OnceLock::new();
+    if line.is_empty() {
+        return 0.0;
+    }
+    let widths = WIDTHS.get_or_init(Default::default);
+    if let Some(&w) = widths.lock().unwrap_or_else(|e| e.into_inner()).get(line) {
+        return w;
+    }
+    let fonts = FONTS.get_or_init(|| egui::epaint::text::Fonts::new(1.0, ATLAS_SIDE, egui::FontDefinitions::default()));
+    let w = fonts.layout_no_wrap(line.to_owned(), egui::FontId::proportional(REF_SIZE), egui::Color32::WHITE).size().x / REF_SIZE;
+    let mut widths = widths.lock().unwrap_or_else(|e| e.into_inner());
+    // Text typed into a label is measured at every step; let the old
+    // ones go now and then, here and in the fonts' own layout cache.
+    if widths.len() >= 4096 {
+        widths.clear();
+        fonts.begin_pass(1.0, ATLAS_SIDE);
+        fonts.begin_pass(1.0, ATLAS_SIDE);
+    }
+    widths.insert(line.to_owned(), w);
+    w
+}
+
+/// The old coarse `[width, height]` of a text label: `0.6 × font_size`
+/// per character of its longest line, `1.25 × font_size` per line. Kept
+/// for placing PureRef notes, which were imported and are matched up
+/// again on a resync by this measure.
+pub fn estimated_text_extent(content: &str, font_size: f32) -> [f32; 2] {
     let mut lines = 0usize;
     let mut max_chars = 0usize;
     for l in content.split('\n') {
@@ -1256,5 +1306,35 @@ mod tests {
         own.restyle(Some([255; 4]), None);
         assert!(matches!(own, Shape::Text { background: Some([1, 2, 3, 200]), .. }));
         assert!(!ron::to_string(&plain).unwrap().contains("background"));
+    }
+
+    /// A label's frame ends where its text does: narrow letters make a
+    /// narrow label (the user's URL label had a long empty tail).
+    #[test]
+    fn a_label_is_as_wide_as_its_text() {
+        assert!(text_extent("WWWWWWWWWW", 20.0)[0] > text_extent("iiiiiiiiii", 20.0)[0] * 2.0);
+        assert!((text_extent("hello", 40.0)[0] - 2.0 * text_extent("hello", 20.0)[0]).abs() < 0.5, "twice the size, twice as wide");
+        assert_eq!(text_extent("hi\nhello", 20.0)[0], text_extent("hello", 20.0)[0], "the widest line counts");
+        assert_eq!(text_extent("hi\nhello", 20.0)[1], 50.0);
+        let url = "https://filmstories.co.uk/news/why-tron-didnt-get-a-vfx-oscar-nomination-in-1982/";
+        assert!(text_extent(url, 17.0)[0] < estimated_text_extent(url, 17.0)[0] * 0.8);
+    }
+
+    /// The width matches what the slide paints labels with: the
+    /// "handwritten" family of the app's own fonts. Small text is laid
+    /// out with each glyph rounded to whole pixels, a few percent off
+    /// (20 px: 2.5 %); this size is what a label shows at, zoomed in.
+    #[test]
+    fn a_label_is_measured_in_the_font_it_is_painted_in() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        let line = "https://filmstories.co.uk/news/why-tron-didnt";
+        let mut painted = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let font = egui::FontId::new(48.0, egui::FontFamily::Name("handwritten".into()));
+            painted = ctx.fonts(|f| f.layout_no_wrap(line.to_owned(), font, egui::Color32::WHITE).size().x);
+        });
+        let measured = text_extent(line, 48.0)[0];
+        assert!((measured - painted).abs() < painted * 0.01, "measured {measured}, painted {painted}");
     }
 }

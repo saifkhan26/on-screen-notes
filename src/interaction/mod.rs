@@ -5,7 +5,6 @@ pub mod action_keys;
 pub mod zoom_pan;
 
 use crate::canvas::CanvasManager;
-use crate::canvas::shape::Shape;
 use crate::canvas::stroke::{PenSample, StrokeStyle};
 use crate::config::SlideTabOrder;
 use crate::input::hotkeys_config::ParsedHotkeys;
@@ -206,14 +205,21 @@ pub fn react_layer_nav(
 /// * `Event::Paste(s)` (Ctrl+V) → append the clipboard's text.
 /// * `Backspace` → pop the last char.
 /// * `Shift+Enter` → append `\n` (multi-line label).
-/// * `Enter` → commit buffer as a `Shape::Text` on the active layer.
-/// * `Escape` → discard buffer without committing.
+/// * `Enter` → commit buffer (`ActiveTool::commit_text`): a new label on
+///   the active layer, or the edited label's new text.
+/// * `Escape` → discard buffer without committing; an edited label keeps
+///   its text.
 pub fn route_text_input(
     ctx: &egui::Context,
     tool: &mut ActiveTool,
     manager: &mut CanvasManager,
 ) -> bool {
     if tool.in_progress_text.is_none() {
+        return false;
+    }
+    // Another tool picked while typing: what was typed is kept.
+    if tool.kind != ToolKind::Text {
+        manager.edit_active(|c| tool.commit_text(c));
         return false;
     }
     let mut consumed = false;
@@ -274,25 +280,9 @@ pub fn route_text_input(
     });
 
     if commit {
-        if let Some(t) = tool.in_progress_text.take() {
-            if !t.buffer.is_empty() {
-                manager.active_mut().add_shape(Shape::Text {
-                    pos: t.pos,
-                    content: t.buffer,
-                    font_size: t.font_size,
-                    color: t.color,
-                    rotation: 0.0,
-                    pin: 0,
-                    background: tool.text_box.then(|| crate::canvas::shape::auto_text_box(t.color)),
-                    group: 0,
-                    tags: Vec::new(),
-                    turn: 0.0,
-                    link: 0,
-                });
-            }
-        }
+        manager.edit_active(|c| tool.commit_text(c));
     } else if cancel {
-        tool.in_progress_text = None;
+        tool.cancel_text();
     }
 
     consumed
@@ -319,6 +309,7 @@ mod tests {
             caret: 3,
             font_size: 18.0,
             color: [0, 0, 0, 255],
+            editing: None,
         });
         (tool, CanvasManager::for_tests(vec![crate::canvas::canvas::Canvas::default()]))
     }
