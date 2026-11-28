@@ -453,17 +453,40 @@ pub fn blank_png(size: [u32; 2]) -> Option<Vec<u8>> {
 
 /// The pixels as they show on `paper` (both straight RGBA): what copying
 /// a pad puts on the clipboard.
+#[cfg(test)]
 pub fn on_paper(img: &mut image::RgbaImage, paper: [u8; 4]) {
+    on_grained_paper(img, paper, None, [img.width() as f32, img.height() as f32]);
+}
+
+/// `on_paper`, with the paper grained by `g` (`canvas::grain`) as it
+/// shows when the pad, `size` slide units big, is seen at its pixels'
+/// own size: what copying a pad puts on the clipboard.
+pub fn on_grained_paper(img: &mut image::RgbaImage, paper: [u8; 4], g: Option<crate::canvas::grain::Grain>, size: [f32; 2]) {
+    use crate::canvas::grain;
     if paper[3] == 0 {
         return;
     }
     let pa = paper[3] as f32 / 255.0;
-    for p in img.pixels_mut() {
+    let (w, h) = img.dimensions();
+    // Slide units per image pixel, each way.
+    let unit = [size[0].abs() / w.max(1) as f32, size[1].abs() / h.max(1) as f32];
+    let plans = match g {
+        Some(g) if unit[0] > 0.0 && unit[1] > 0.0 => grain::plan(&g, 1.0 / unit[0].max(unit[1])),
+        _ => Vec::new(),
+    };
+    let rgb = [paper[0], paper[1], paper[2]];
+    for (i, p) in img.pixels_mut().enumerate() {
         let a = p[3] as f32 / 255.0;
         let out_a = a + pa * (1.0 - a);
         if out_a <= 0.0 {
             continue;
         }
+        let paper = if plans.is_empty() || a >= 1.0 {
+            rgb
+        } else {
+            let (x, y) = ((i as u32 % w) as f32 + 0.5, (i as u32 / w) as f32 + 0.5);
+            grain::shaded(rgb, grain::shade_at(&plans, [x * unit[0], y * unit[1]]))
+        };
         for c in 0..3 {
             let v = (p[c] as f32 * a + paper[c] as f32 * pa * (1.0 - a)) / out_a;
             p[c] = v.round().clamp(0.0, 255.0) as u8;
@@ -532,6 +555,7 @@ mod tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         }
     }
 

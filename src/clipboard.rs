@@ -98,9 +98,9 @@ fn picture_pixels(shape: &Shape, frames: &MediaFrames, media_dir: Option<&Path>)
     if matches!(shape, Shape::Raster { flip: true, .. }) {
         image::imageops::flip_horizontal_in_place(&mut img);
     }
-    // A drawing pad copies as it shows: on its paper.
-    if let Shape::Raster { paper: Some(p), .. } = shape {
-        crate::canvas::pad::on_paper(&mut img, *p);
+    // A drawing pad copies as it shows: on its paper, with its grain.
+    if let Shape::Raster { paper: Some(p), grain, size, .. } = shape {
+        crate::canvas::pad::on_grained_paper(&mut img, *p, *grain, *size);
     }
     Some(img)
 }
@@ -155,6 +155,7 @@ mod tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         }
     }
 

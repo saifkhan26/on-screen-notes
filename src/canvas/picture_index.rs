@@ -186,6 +186,7 @@ mod tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         }
     }
 

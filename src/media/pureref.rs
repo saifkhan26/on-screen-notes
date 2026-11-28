@@ -275,6 +275,7 @@ impl BoardItem {
                     turn: 0.0,
                     link: link_id,
                     paper: None,
+                    grain: None,
                 }
             }
             BoardItem::Note { text, pos, font_size, color, rotation, background, tags, .. } => Shape::Text {

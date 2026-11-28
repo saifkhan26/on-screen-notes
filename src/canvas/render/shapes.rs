@@ -19,6 +19,70 @@ pub(super) fn col(c: [u8; 4], layer_opacity: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], a)
 }
 
+/// A pad's paper grain `g` (`canvas::grain`) over its paper, one textured
+/// quad per layer: the paper's four screen corners (in `Obb::corners`
+/// order), its width and height in slide units, the view's zoom and the
+/// paper's opacity as drawn.
+fn paint_grain(
+    painter: &egui::Painter,
+    corners: &[egui::Pos2],
+    size: [f32; 2],
+    g: &crate::canvas::grain::Grain,
+    zoom: f32,
+    paper_a: f32,
+) {
+    if corners.len() != 4 {
+        return;
+    }
+    let plans = crate::canvas::grain::plan(g, zoom * painter.ctx().pixels_per_point());
+    if plans.is_empty() {
+        return;
+    }
+    let textures = grain_textures(painter.ctx());
+    for p in plans {
+        let k8 = ((p.alpha * paper_a).clamp(0.0, 1.0) * 255.0).round() as u8;
+        let Some(tex) = textures.get(p.level).map(|t| t.id()) else { continue };
+        if k8 == 0 {
+            continue;
+        }
+        // Texture coordinates count tiles from the paper's corner, so the
+        // grain is fixed to the sheet: it moves and turns with it.
+        let (tile, off) = (p.tile_units(), [p.offset[0] / TILE_F, p.offset[1] / TILE_F]);
+        let (u0, v0, u1, v1) = (off[0], off[1], off[0] + size[0] / tile, off[1] + size[1] / tile);
+        let uvs = [egui::pos2(u0, v0), egui::pos2(u1, v0), egui::pos2(u1, v1), egui::pos2(u0, v1)];
+        let tint = egui::Color32::from_rgba_premultiplied(k8, k8, k8, k8);
+        let mut mesh = egui::Mesh::with_texture(tex);
+        for (&pos, uv) in corners.iter().zip(uvs) {
+            mesh.vertices.push(egui::epaint::Vertex { pos, uv, color: tint });
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+const TILE_F: f32 = crate::canvas::grain::TILE as f32;
+
+/// The grain's levels as repeating textures, made once and kept for the
+/// app's life (both windows share the context, so these too).
+fn grain_textures(ctx: &egui::Context) -> std::sync::Arc<Vec<egui::TextureHandle>> {
+    let id = egui::Id::new("osn_paper_grain");
+    if let Some(t) = ctx.data(|d| d.get_temp::<std::sync::Arc<Vec<egui::TextureHandle>>>(id)) {
+        return t;
+    }
+    let made: Vec<egui::TextureHandle> = crate::canvas::grain::levels()
+        .iter()
+        .enumerate()
+        .map(|(k, l)| {
+            let img = egui::ColorImage::from_rgba_premultiplied([l.size, l.size], &l.rgba);
+            ctx.load_texture(format!("osn_paper_grain_{k}"), img, egui::TextureOptions::LINEAR_REPEAT)
+        })
+        .collect();
+    let made = std::sync::Arc::new(made);
+    ctx.data_mut(|d| d.insert_temp(id, made.clone()));
+    made
+}
+
 pub(super) fn paint_shape(
     painter: &egui::Painter,
     to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
@@ -31,13 +95,17 @@ pub(super) fn paint_shape(
     // Premultiplied in the stored values, as its ink is and as copies and
     // thumbnails blend it (`col` premultiplies in linear light, which
     // shows see-through paper lighter than it saves).
-    if let Shape::Raster { paper: Some(p), .. } = shape {
+    if let Shape::Raster { paper: Some(p), grain, .. } = shape {
         let a = p[3] as f32 / 255.0 * layer_opacity.clamp(0.0, 1.0);
         if a > 0.0 {
             let pm = |c: u8| (c as f32 * a).round() as u8;
             let fill = egui::Color32::from_rgba_premultiplied(pm(p[0]), pm(p[1]), pm(p[2]), (a * 255.0).round() as u8);
-            let corners: Vec<egui::Pos2> = shape.obb().corners().into_iter().map(to_screen).collect();
-            painter.add(egui::Shape::convex_polygon(corners, fill, egui::Stroke::NONE));
+            let o = shape.obb();
+            let corners: Vec<egui::Pos2> = o.corners().into_iter().map(to_screen).collect();
+            painter.add(egui::Shape::convex_polygon(corners.clone(), fill, egui::Stroke::NONE));
+            if let Some(g) = grain {
+                paint_grain(painter, &corners, [o.half[0] * 2.0, o.half[1] * 2.0], g, zoom, a);
+            }
         }
     }
     match shape {

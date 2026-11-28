@@ -307,6 +307,7 @@ pub(super) fn promote_plate_in(layers: &mut [Layer], li: usize) -> Option<f32> {
         turn: 0.0,
         link: 0,
         paper: None,
+        grain: None,
     });
     layer.rev += 1;
     Some(img.capture_zoom)

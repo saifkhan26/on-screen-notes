@@ -659,6 +659,11 @@ pub enum Shape {
         /// `None` for every other picture, and not written then.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         paper: Option<[u8; 4]>,
+        /// The grain on a drawing pad's paper (`canvas::grain`), drawn
+        /// over the paper and under the pixels. `None` for no grain, and
+        /// for every picture that is not a pad; not written then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grain: Option<crate::canvas::grain::Grain>,
     },
 }
 
@@ -1097,6 +1102,7 @@ mod tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         };
         let text = ron::to_string(&raster).unwrap();
         assert!(!text.contains("rotation") && !text.contains("kind") && !text.contains("media"), "{text}");
@@ -1115,6 +1121,7 @@ mod tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         };
         let back: Shape = ron::from_str(&ron::to_string(&raster).unwrap()).unwrap();
         assert!(matches!(back, Shape::Raster { rotation, kind: RasterKind::Image, .. } if (rotation - 0.5).abs() < 1e-6));
@@ -1139,6 +1146,7 @@ mod tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         }
     }
 
@@ -1192,6 +1200,7 @@ mod tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         }
     }
 

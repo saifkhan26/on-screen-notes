@@ -400,6 +400,7 @@ fn with_shown(item: &BoardItem, shown: Shown, link: &BoardLink, group: u64, id: 
         turn: 0.0,
         link: id,
         paper: None,
+        grain: None,
     };
     place(&mut s, item, link);
     show(&mut s, &shown);

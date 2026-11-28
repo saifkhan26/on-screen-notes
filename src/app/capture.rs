@@ -305,6 +305,7 @@ impl OnScreenNotesApp {
                     turn: 0.0,
                     link: 0,
                     paper: None,
+                    grain: None,
                 };
                 let c = self.canvases.active_mut();
                 c.add_shape(shape);

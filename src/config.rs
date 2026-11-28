@@ -232,6 +232,15 @@ pub struct AppConfig {
     #[serde(default = "default_pad_paper")]
     pub pad_paper: [u8; 4],
 
+    /// The paper grain last picked on a pad (`canvas::grain`): its size
+    /// and strength, which a pad gets when its grain is switched on…
+    #[serde(default)]
+    pub pad_grain: crate::canvas::grain::Grain,
+
+    /// …and whether a new pad starts with it. Off to start.
+    #[serde(default)]
+    pub pad_grain_on: bool,
+
     /// How big the UI is drawn — toolbar, panels, bars, popups — as a
     /// multiple of the system's own scaling (1.0 = 100 %). The slides
     /// keep their size on screen: the views are rescaled with it. One of
@@ -389,6 +398,8 @@ impl Default for AppConfig {
             beside_fit: BesideFit::default(),
             beside_side: BesideSide::default(),
             pad_paper: default_pad_paper(),
+            pad_grain: crate::canvas::grain::Grain::DEFAULT,
+            pad_grain_on: false,
         }
     }
 }

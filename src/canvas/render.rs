@@ -120,6 +120,7 @@ mod rotation_tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         };
         // Where `Obb` says the red (left) and blue (right) halves went.
         let o = shape.obb();
@@ -135,6 +136,53 @@ mod rotation_tests {
         assert!(b.blue() > 200 && b.red() < 60, "expected blue at {blue_at:?}, got {b:?}");
         // Nothing left behind where the unrotated image used to reach.
         assert_eq!(at([33.0, 50.0]).alpha(), 0);
+    }
+}
+
+#[cfg(test)]
+mod grain_tests {
+    use super::*;
+    use crate::canvas::grain::Grain;
+    use crate::canvas::shape::RasterKind;
+    use std::sync::Arc;
+
+    /// A 120 × 90 drawing pad on white paper, its pixels `px` big and
+    /// clear (no ink), drawn at 1 pixel a slide unit.
+    fn pad(px: [u32; 2], grain: Option<Grain>) -> Vec<u8> {
+        let png = crate::canvas::pad::blank_png(px).unwrap();
+        let shape = Shape::Raster {
+            pos: [0.0, 0.0], size: [120.0, 90.0], png: Arc::new(png), px_size: px,
+            color: [0; 4], rotation: 0.0, kind: RasterKind::Image, media: None,
+            picture: None,
+            pin: 0,
+            flip: false,
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
+            link: 0,
+            paper: Some([200, 200, 200, 255]),
+            grain,
+        };
+        let mut pixmap = tiny_skia::Pixmap::new(120, 90).unwrap();
+        draw_shape(&mut pixmap.as_mut(), &shape, Transform::identity(), 1.0, None);
+        pixmap.data().to_vec()
+    }
+
+    #[test]
+    fn grain_shows_only_on_pads_that_have_it() {
+        let plain = pad([240, 180], None);
+        assert!(plain.chunks_exact(4).all(|p| p == [200, 200, 200, 255]), "no grain: flat paper");
+        let grained = pad([240, 180], Some(Grain { scale: 1.0, strength: 1.0 }));
+        let differ = grained.chunks_exact(4).filter(|p| *p != [200, 200, 200, 255]).count();
+        assert!(differ > grained.len() / 4 / 2, "grain on: most of the paper shaded ({differ})");
+    }
+
+    #[test]
+    fn grain_is_the_same_whatever_the_pads_pixels() {
+        // A pad stored as a picture keeps only a small preview inline, its
+        // `px_size` the preview's: the grain must not grow with that.
+        let g = Some(Grain { scale: 1.0, strength: 1.0 });
+        assert_eq!(pad([240, 180], g), pad([60, 45], g));
     }
 }
 

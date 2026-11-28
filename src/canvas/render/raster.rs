@@ -315,6 +315,47 @@ pub(super) fn color_image_pixmap(img: &egui::ColorImage) -> Option<tiny_skia::Pi
     Some(src)
 }
 
+/// A pad's paper grain `g` (`canvas::grain`) over its paper `rect` (slide
+/// units), drawn through `t`, the paper at opacity `paper_a`. Off screen
+/// what `paint_shape`'s grain is on it: the same levels for the same size
+/// in pixels, so a screenshot matches the view and a small thumbnail
+/// shows little of it.
+fn draw_grain(pixmap: &mut PixmapMut<'_>, rect: tiny_skia::Rect, g: &crate::canvas::grain::Grain, t: Transform, paper_a: f32) {
+    // Output pixels per slide unit (`t` is a turn, a uniform scale and a
+    // move).
+    let out = (t.sx * t.sx + t.ky * t.ky).sqrt();
+    for p in crate::canvas::grain::plan(g, out) {
+        let Some(tile) = grain_pixmaps().get(p.level) else { continue };
+        // Texel (i, j) of the level drawn lands `level_texel` slide units
+        // apart, the tile starting `offset` texels before the corner.
+        let lt = p.level_texel();
+        let origin = [rect.x() - p.offset[0] * p.texel, rect.y() - p.offset[1] * p.texel];
+        let shader = tiny_skia::Pattern::new(
+            tile.as_ref(),
+            tiny_skia::SpreadMode::Repeat,
+            tiny_skia::FilterQuality::Bilinear,
+            (p.alpha * paper_a).clamp(0.0, 1.0),
+            Transform::from_row(lt, 0.0, 0.0, lt, origin[0], origin[1]),
+        );
+        let paint = Paint { shader, anti_alias: true, ..Paint::default() };
+        pixmap.fill_rect(rect, &paint, t, None);
+    }
+}
+
+/// The grain's levels as pixmaps, made once.
+fn grain_pixmaps() -> &'static [tiny_skia::Pixmap] {
+    static MADE: std::sync::OnceLock<Vec<tiny_skia::Pixmap>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        crate::canvas::grain::levels()
+            .iter()
+            .filter_map(|l| {
+                let n = l.size as u32;
+                tiny_skia::Pixmap::from_vec(l.rgba.clone(), tiny_skia::IntSize::from_wh(n, n)?)
+            })
+            .collect()
+    })
+}
+
 /// `image_opacity` is the opacity to draw picture rasters at — the
 /// layer's, so a plate image that has been turned into an object still
 /// fades with its layer in a screenshot the way the plate did. Nothing
@@ -445,7 +486,7 @@ pub(super) fn draw_shape(
             draw_line(pixmap, *b, [b[0] + h1x, b[1] + h1y], *color, *stroke_width, t);
             draw_line(pixmap, *b, [b[0] + h2x, b[1] + h2y], *color, *stroke_width, t);
         }
-        Shape::Raster { pos, size, png, rotation, kind, media, picture, flip, paper, .. } => {
+        Shape::Raster { pos, size, png, rotation, kind, media, picture, flip, paper, grain, .. } => {
             let t = turned(t, *rotation, pos[0] + size[0] * 0.5, pos[1] + size[1] * 0.5);
             let opacity = match kind {
                 crate::canvas::shape::RasterKind::Image => image_opacity.clamp(0.0, 1.0),
@@ -456,6 +497,9 @@ pub(super) fn draw_shape(
                 let a = (p[3] as f32 * opacity).round() as u8;
                 if let Some(rect) = tiny_skia::Rect::from_xywh(pos[0], pos[1], size[0], size[1]) {
                     pixmap.fill_rect(rect, &rgba_paint([p[0], p[1], p[2], a]), t, None);
+                    if let Some(g) = grain {
+                        draw_grain(pixmap, rect, g, t, a as f32 / 255.0);
+                    }
                 }
             }
             // A video or GIF draws the frame it is showing when there is

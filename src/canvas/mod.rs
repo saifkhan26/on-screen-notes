@@ -16,6 +16,7 @@ pub mod board_link;
 #[allow(clippy::module_inception)]
 pub mod canvas;
 pub mod cover;
+pub mod grain;
 pub mod hit;
 pub mod ink_gpu;
 pub mod pad;
@@ -2085,6 +2086,7 @@ mod media_cleanup_tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         }
     }
 
@@ -3106,6 +3108,7 @@ mod pin_tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         });
         c.layers[0].opacity = 0.25;
         let mut m = CanvasManager::for_tests(vec![c]);

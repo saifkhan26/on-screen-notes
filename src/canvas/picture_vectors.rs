@@ -746,6 +746,7 @@ mod tests {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         });
         let mut v = PictureVectors::default();
         let start = Instant::now();

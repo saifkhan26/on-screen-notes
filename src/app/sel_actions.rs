@@ -254,6 +254,7 @@ impl OnScreenNotesApp {
             turn: 0.0,
             link: 0,
             paper: None,
+            grain: None,
         };
         if let Some((a, b)) = self.beside_selection(crate::canvas::canvas::shape_bounds(&shape)) {
             shape.transform(a, b);

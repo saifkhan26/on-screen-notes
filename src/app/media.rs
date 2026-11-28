@@ -515,5 +515,6 @@ pub(super) fn media_shape(
         turn: 0.0,
         link: 0,
         paper: None,
+        grain: None,
     }
 }

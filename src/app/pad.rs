@@ -58,7 +58,10 @@ struct PadEdit {
     /// The pad's paper (straight RGBA, alpha its opacity); `None` for a
     /// picture that is not a pad. Changed with the paper bar.
     paper: Option<[u8; 4]>,
-    /// The paper changed while open: the slide's undo step covers it.
+    /// The pad's paper grain; `None` for none. Changed with the paper bar.
+    grain: Option<crate::canvas::grain::Grain>,
+    /// The paper or its grain changed while open: the slide's undo step
+    /// covers it.
     paper_changed: bool,
 }
 
@@ -210,6 +213,7 @@ impl OnScreenNotesApp {
             turn: 0.0,
             link: 0,
             paper: Some(self.config.pad_paper),
+            grain: self.config.pad_grain_on.then_some(self.config.pad_grain),
         };
         self.insert_and_select(Vec::new(), vec![shape], [0.0, 0.0]);
         let layer = self.canvases.active().active_layer;
@@ -245,10 +249,11 @@ impl OnScreenNotesApp {
         let Some(s) = self.canvases.active().layers.get(layer).and_then(|l| l.shapes.get(shape)).cloned() else {
             return false;
         };
-        let Shape::Raster { png, media, link, paper, color, kind, .. } = &s else {
+        let Shape::Raster { png, media, link, paper, grain, color, kind, .. } = &s else {
             return say(self, "Only a picture can be drawn on");
         };
         let mut paper = *paper;
+        let grain = *grain;
         // Pads made before they had paper of their own: white pictures
         // with ink drawn into them, told apart by the colour they were
         // made with. Their ink is lifted off the white once, and white
@@ -300,6 +305,7 @@ impl OnScreenNotesApp {
             // nothing is drawn.
             saved_edits: if lifted { u64::MAX } else { 0 },
             paper,
+            grain,
             paper_changed: false,
         });
         if lifted {
@@ -564,10 +570,17 @@ impl OnScreenNotesApp {
         let top_left = corners.iter().fold(egui::pos2(f32::MAX, f32::MAX), |a, p| egui::pos2(a.x.min(p.x), a.y.min(p.y)));
         let above = egui::pos2(top_left.x, top_left.y - 44.0);
         let mut at = if above.y >= canvas_rect.min.y + 56.0 { above } else { top_left + egui::vec2(8.0, 8.0) };
-        at.x = at.x.clamp(canvas_rect.min.x + 8.0, (canvas_rect.max.x - 400.0).max(canvas_rect.min.x + 8.0));
+        // As wide as it was last frame (the grain's sliders come and go).
+        let bar_id = egui::Id::new("osn_pad_paper");
+        let bar_w = ctx.memory(|m| m.area_rect(bar_id)).map_or(400.0, |r| r.width());
+        at.x = at.x.clamp(canvas_rect.min.x + 8.0, (canvas_rect.max.x - bar_w - 8.0).max(canvas_rect.min.x + 8.0));
         at.y = at.y.clamp(canvas_rect.min.y + 8.0, (canvas_rect.max.y - 48.0).max(canvas_rect.min.y + 8.0));
         let mut picked: Option<[u8; 4]> = None;
-        egui::Area::new(egui::Id::new("osn_pad_paper"))
+        // This pad's grain; switched on, it gets the last one picked.
+        let mut grain_on = e.grain.is_some();
+        let mut grain = e.grain.unwrap_or(self.config.pad_grain);
+        let mut grain_changed = false;
+        egui::Area::new(bar_id)
             .order(egui::Order::Middle)
             .fixed_pos(at)
             .show(ctx, |ui| {
@@ -603,11 +616,53 @@ impl OnScreenNotesApp {
                         if ui.add(slider).on_hover_text("Paper opacity: 0% is no paper, only the ink").changed() {
                             picked = Some([paper[0], paper[1], paper[2], (pct * 2.55).round().clamp(0.0, 255.0) as u8]);
                         }
+                        ui::theme::divider(ui, 20.0);
+                        ui.label(egui::RichText::new("Grain").color(ui::theme::TEXT_PRIMARY))
+                            .on_hover_text("Paper grain on this pad, under the ink");
+                        grain_changed |= ui::theme::switch(ui, &mut grain_on).on_hover_text("Paper grain on or off").changed();
+                        if grain_on {
+                            ui.spacing_mut().slider_width = 80.0;
+                            let size = egui::Slider::new(&mut grain.scale, crate::canvas::grain::SCALES)
+                                .step_by(0.25)
+                                .suffix("×")
+                                .fixed_decimals(2);
+                            grain_changed |= ui.add(size).on_hover_text("Grain size").changed();
+                            let mut pct = (grain.strength * 100.0).round();
+                            let strength = egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%").integer();
+                            if ui.add(strength).on_hover_text("Grain strength").changed() {
+                                grain.strength = pct / 100.0;
+                                grain_changed = true;
+                            }
+                        }
                     });
                 });
             });
         if let Some(p) = picked {
             self.set_pad_paper(p, true);
+        }
+        if grain_changed {
+            self.set_pad_grain(grain_on.then_some(grain));
+        }
+    }
+
+    /// Give the open pad grain `g` (`None`: none), in its slide at once,
+    /// and keep it for the next new pad.
+    fn set_pad_grain(&mut self, g: Option<crate::canvas::grain::Grain>) {
+        let Some(e) = self.ws.pad.edit.as_mut() else { return };
+        e.grain = g;
+        e.paper_changed = true;
+        let (slide, layer, key, hint) = (e.slide, e.layer, e.key, e.shape);
+        self.edit_pad_slide(slide, |c| {
+            let Some(l) = c.layers.get_mut(layer) else { return };
+            let Some(i) = find(l, key, hint) else { return };
+            if let Shape::Raster { grain, .. } = &mut l.shapes[i] {
+                *grain = g;
+            }
+            l.rev = l.rev.wrapping_add(1);
+        });
+        self.config.pad_grain_on = g.is_some();
+        if let Some(g) = g {
+            self.config.pad_grain = g;
         }
     }
 }
