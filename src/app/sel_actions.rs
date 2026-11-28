@@ -32,14 +32,20 @@ impl OnScreenNotesApp {
             SelAction::Copy | SelAction::Cut if has_selection => {
                 self.obj_clipboard = self.selected_objects();
                 self.paste_count = 0;
-                // Mark the OS clipboard so a later paste knows this copy
-                // is newer than whatever another app put there before.
-                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(CLIP_MARKER)) {
+                // Only labels: their words go on the OS clipboard, to
+                // paste as text anywhere. Anything else: a marker, so a
+                // later paste knows this copy is newer than whatever
+                // another app put there before, and a picture of it.
+                self.clip_text = crate::clipboard::text_of(&self.obj_clipboard.0, &self.obj_clipboard.1);
+                let text = self.clip_text.as_deref().unwrap_or(CLIP_MARKER);
+                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
                     Ok(()) => {}
                     Err(e) => log::warn!("could not mark the clipboard: {e}"),
                 }
                 #[cfg(target_os = "windows")]
-                self.copy_image_to_clipboard(pixels_per_point);
+                if self.clip_text.is_none() {
+                    self.copy_image_to_clipboard(pixels_per_point);
+                }
                 if matches!(action, SelAction::Cut) {
                     let c = self.canvases.active_mut();
                     let li = c.active_layer;
@@ -49,6 +55,7 @@ impl OnScreenNotesApp {
             }
             SelAction::PasteObjects => self.paste_objects(step),
             SelAction::PasteImage => self.paste_clipboard_image(canvas_rect, pixels_per_point, step),
+            SelAction::PasteText(text) => self.paste_text_label(&text, canvas_rect),
             // A selection command with nothing selected.
             _ => {}
         }
@@ -139,6 +146,54 @@ impl OnScreenNotesApp {
         let anchor = beside::anchor(picked.into_iter().filter_map(media), side)?;
         let others: Vec<[f32; 4]> = (0..layer.shapes.len()).filter_map(media).collect();
         beside::place(incoming, anchor, self.config.beside_fit, side, &others, 1.0 / c.zoom.max(1e-3))
+    }
+
+    /// Paste text from the clipboard as a new label in the middle of the
+    /// view: at the size the Text tool's labels show at on screen, in the
+    /// pen colour, boxed when the Text tool boxes its labels. Lines wider
+    /// than most of the view are wrapped at spaces. Selected once placed.
+    /// A picture on the clipboard as well wins: it pastes as a picture
+    /// (`paste_clipboard_image`), as before.
+    pub(super) fn paste_text_label(&mut self, text: &str, canvas_rect: egui::Rect) {
+        /// More than this is cut, so a stray paste of a whole document
+        /// does not make a label too big to draw.
+        const MAX_CHARS: usize = 20_000;
+        if arboard::Clipboard::new().and_then(|mut cb| cb.get_image()).is_ok() {
+            return;
+        }
+        let mut text = crate::interaction::pasted_text(text.trim());
+        if text.is_empty() {
+            return;
+        }
+        let cut = text.chars().count() > MAX_CHARS;
+        if cut {
+            text = text.chars().take(MAX_CHARS).collect();
+        }
+        let (pan, zoom) = {
+            let c = self.canvases.active();
+            (c.pan, c.zoom.max(1e-3))
+        };
+        let tool = &self.ws.tool;
+        let font_size = tool.label_font_size() / zoom;
+        let text = crate::canvas::shape::wrap_label_text(&text, font_size, canvas_rect.width() / zoom * 0.6);
+        let [w, h] = crate::canvas::shape::text_extent(&text, font_size);
+        let center = [(canvas_rect.width() * 0.5 - pan[0]) / zoom, (canvas_rect.height() * 0.5 - pan[1]) / zoom];
+        let label = crate::canvas::shape::Shape::Text {
+            pos: [center[0] - w * 0.5, center[1] - h * 0.5],
+            content: text,
+            font_size,
+            color: tool.color,
+            rotation: 0.0,
+            pin: 0,
+            background: tool.text_box.then(|| crate::canvas::shape::auto_text_box(tool.color)),
+            group: 0,
+            tags: Vec::new(),
+            turn: 0.0,
+            link: 0,
+        };
+        self.insert_and_select(Vec::new(), vec![label], [0.0, 0.0]);
+        let said = if cut { format!("Text pasted as a label (its first {MAX_CHARS} characters)") } else { "Text pasted as a label".to_string() };
+        self.toast = Some((said, std::time::Instant::now()));
     }
 
     /// Paste an image from the OS clipboard onto the active layer as an

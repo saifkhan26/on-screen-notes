@@ -107,6 +107,9 @@ impl OnScreenNotesApp {
         // a text field has the keyboard.
         let mut media_keys: Vec<crate::media::Cmd> = Vec::new();
         let media_keys_live = !ctx.wants_keyboard_input();
+        // An egui text field (settings, a dialog) has the keyboard: a
+        // paste is its, not a new label's.
+        let text_field = ctx.wants_keyboard_input();
         // Shift+P, applied after the input closure.
         let mut toggle_pins = false;
         // F2 (name the active slide), likewise.
@@ -193,15 +196,24 @@ impl OnScreenNotesApp {
                     // presses and hands us these instead.
                     egui::Event::Copy => sel_actions.push(SelAction::Copy),
                     egui::Event::Cut => sel_actions.push(SelAction::Cut),
-                    egui::Event::Paste(text) if text == CLIP_MARKER => {
+                    // Our own copy is the newest: the marker, or the
+                    // words of the labels copied.
+                    egui::Event::Paste(text) if text == CLIP_MARKER || self.clip_text.as_ref() == Some(text) => {
                         sel_actions.push(SelAction::PasteObjects);
                     }
-                    // Elsewhere there is no key-state fallback (see
-                    // `platform::paste_chord_down`), so a paste of
-                    // anything that is not our own marker is the
-                    // only cue to look for an image.
-                    #[cfg(not(target_os = "windows"))]
-                    egui::Event::Paste(_) => sel_actions.push(SelAction::PasteImage),
+                    // Text from anywhere else: a new label, unless an egui
+                    // text field has the keyboard (it takes the paste).
+                    egui::Event::Paste(text) => {
+                        // Elsewhere there is no key-state fallback (see
+                        // `platform::paste_chord_down`), so a paste of
+                        // anything that is not our own marker is the
+                        // only cue to look for an image.
+                        #[cfg(not(target_os = "windows"))]
+                        sel_actions.push(SelAction::PasteImage);
+                        if !text_field {
+                            sel_actions.push(SelAction::PasteText(text.clone()));
+                        }
+                    }
                     egui::Event::Key { key, pressed: true, .. } => {
                         let c = &keys.canvas;
                         let hit = |b: Option<crate::input::hotkeys_config::Binding>| {

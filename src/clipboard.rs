@@ -33,6 +33,25 @@ pub fn fingerprint(width: usize, height: usize, rgba: &[u8]) -> Fingerprint {
     (width, height, h.finish())
 }
 
+/// The text to put on the clipboard for these objects when they are
+/// only text labels: their words, in reading order (top to bottom, then
+/// left to right), one label a line. `None` for anything else, which
+/// goes over as a picture (`image_of`).
+pub fn text_of(strokes: &[Stroke], shapes: &[Shape]) -> Option<String> {
+    if !strokes.is_empty() || shapes.is_empty() {
+        return None;
+    }
+    let mut labels = shapes
+        .iter()
+        .map(|s| match s {
+            Shape::Text { pos, content, .. } => Some((*pos, content.as_str())),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    labels.sort_by(|a, b| a.0[1].total_cmp(&b.0[1]).then(a.0[0].total_cmp(&b.0[0])));
+    Some(labels.iter().map(|l| l.1).collect::<Vec<_>>().join("\n"))
+}
+
 /// The picture to put on the clipboard for these objects. `zoom` and
 /// `pixels_per_point` are the view's, so drawn objects come out at their
 /// on-screen sharpness; `frames` holds the videos' and GIFs' current
@@ -157,6 +176,17 @@ mod tests {
         assert_eq!(img.dimensions(), (150, 200), "the file's pixels, not the preview or the on-screen size");
         assert!(img.pixels().all(|px| px.0 == [0, 0, 0, 255]), "the right half, as cropped");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copied_labels_go_over_as_their_words_in_reading_order() {
+        let label = |x: f32, y: f32, text: &str| Shape::Text { pos: [x, y], content: text.into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0, background: None, group: 0, tags: Vec::new(), turn: 0.0, link: 0 };
+        let shapes = vec![label(0.0, 50.0, "second"), label(300.0, 0.0, "first, right"), label(0.0, 0.0, "first")];
+        assert_eq!(text_of(&[], &shapes).as_deref(), Some("first\nfirst, right\nsecond"));
+        // With anything else in the copy it goes over as a picture.
+        let rect = Shape::Rect { a: [0.0, 0.0], b: [9.0, 9.0], color: [255; 4], stroke_width: 2.0, border: BorderStyle::Solid, filled: false, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 };
+        assert_eq!(text_of(&[], &[label(0.0, 0.0, "a"), rect]), None);
+        assert_eq!(text_of(&[], &[]), None);
     }
 
     #[test]

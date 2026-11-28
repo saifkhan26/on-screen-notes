@@ -626,7 +626,27 @@ pub fn show(
                     }
                 }
 
-                // Blinking caret at the end of the last line. Use a
+                // A point in the label's own turned frame, from its
+                // top-left corner, on screen; and how far along a line
+                // some of its text reaches, as the slide paints it.
+                let (s, c) = angle.sin_cos();
+                let at = |dx: f32, dy: f32| egui::pos2(top_left.x + c * dx - s * dy, top_left.y + s * dx + c * dy);
+                let family = egui::FontFamily::Name("handwritten".into());
+                let reach = |text: &str| render::text_line_width(ui.painter(), text, size, &family);
+
+                // The selected text, line by line, under a see-through
+                // highlight.
+                let highlight = egui::Color32::from_rgba_unmultiplied(90, 150, 255, 80);
+                for (row, before, picked) in text_edit.selected_rows() {
+                    let x0 = reach(before);
+                    // A selected line break shows as a sliver.
+                    let x1 = if picked.is_empty() { x0 + size * 0.3 } else { x0 + reach(picked) };
+                    let y = row as f32 * line_h;
+                    let quad = vec![at(x0, y), at(x1, y), at(x1, y + line_h), at(x0, y + line_h)];
+                    ui.painter().add(egui::Shape::convex_polygon(quad, highlight, egui::Stroke::NONE));
+                }
+
+                // Blinking caret where it is in the text. Use a
                 // 500-ms duty cycle reading the system clock so the
                 // blink doesn't rely on per-frame state.
                 let visible = {
@@ -638,13 +658,9 @@ pub fn show(
                     (ms / 500) % 2 == 0
                 };
                 if visible {
-                    let last_line = lines.last().copied().unwrap_or("");
-                    // The end of the last line, in the label's own turned
-                    // frame from its top-left corner.
-                    let x = ui.painter().layout_no_wrap(last_line.to_string(), font_id.clone(), color).size().x;
-                    let y = lines.len().saturating_sub(1) as f32 * line_h;
-                    let (s, c) = angle.sin_cos();
-                    let at = |dx: f32, dy: f32| egui::pos2(top_left.x + c * dx - s * dy, top_left.y + s * dx + c * dy);
+                    let (row, before) = text_edit.caret_row();
+                    let x = reach(before);
+                    let y = row as f32 * line_h;
                     ui.painter().line_segment([at(x, y), at(x, y + size)], egui::Stroke::new(1.6, color));
                 }
             }

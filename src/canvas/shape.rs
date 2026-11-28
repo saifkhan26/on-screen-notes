@@ -283,9 +283,6 @@ pub fn text_extent(content: &str, font_size: f32) -> [f32; 2] {
 fn line_width_per_size(line: &str) -> f32 {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    const REF_SIZE: f32 = 64.0;
-    const ATLAS_SIDE: usize = 8192;
-    static FONTS: OnceLock<egui::epaint::text::Fonts> = OnceLock::new();
     static WIDTHS: OnceLock<Mutex<HashMap<String, f32>>> = OnceLock::new();
     if line.is_empty() {
         return 0.0;
@@ -294,18 +291,81 @@ fn line_width_per_size(line: &str) -> f32 {
     if let Some(&w) = widths.lock().unwrap_or_else(|e| e.into_inner()).get(line) {
         return w;
     }
-    let fonts = FONTS.get_or_init(|| egui::epaint::text::Fonts::new(1.0, ATLAS_SIDE, egui::FontDefinitions::default()));
-    let w = fonts.layout_no_wrap(line.to_owned(), egui::FontId::proportional(REF_SIZE), egui::Color32::WHITE).size().x / REF_SIZE;
+    let fonts = label_fonts();
+    let w = label_line(line).size().x / LABEL_REF_SIZE;
     let mut widths = widths.lock().unwrap_or_else(|e| e.into_inner());
     // Text typed into a label is measured at every step; let the old
     // ones go now and then, here and in the fonts' own layout cache.
     if widths.len() >= 4096 {
         widths.clear();
-        fonts.begin_pass(1.0, ATLAS_SIDE);
-        fonts.begin_pass(1.0, ATLAS_SIDE);
+        fonts.begin_pass(1.0, LABEL_ATLAS_SIDE);
+        fonts.begin_pass(1.0, LABEL_ATLAS_SIDE);
     }
     widths.insert(line.to_owned(), w);
     w
+}
+
+/// `text` broken at spaces so no line of a label at `font_size` is wider
+/// than `max_width`; its own line breaks stay, and a word longer than
+/// that stays whole on its line.
+pub fn wrap_label_text(text: &str, font_size: f32, max_width: f32) -> String {
+    let fits = |s: &str| line_width_per_size(s) * font_size <= max_width;
+    let wrap = |line: &str| {
+        if fits(line) {
+            return line.to_owned();
+        }
+        let mut out = String::new();
+        let mut row = String::new();
+        for word in line.split(' ') {
+            let longer = if row.is_empty() { word.to_owned() } else { format!("{row} {word}") };
+            if row.is_empty() || fits(&longer) {
+                row = longer;
+            } else {
+                out.push_str(&row);
+                out.push('\n');
+                row = word.to_owned();
+            }
+        }
+        out.push_str(&row);
+        out
+    };
+    text.split('\n').map(wrap).collect::<Vec<_>>().join("\n")
+}
+
+/// The size label lines are laid out at for measuring.
+const LABEL_REF_SIZE: f32 = 64.0;
+const LABEL_ATLAS_SIDE: usize = 8192;
+
+/// egui's own fonts, which labels are painted in, for measuring them
+/// away from any frame.
+fn label_fonts() -> &'static egui::epaint::text::Fonts {
+    static FONTS: std::sync::OnceLock<egui::epaint::text::Fonts> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| egui::epaint::text::Fonts::new(1.0, LABEL_ATLAS_SIDE, egui::FontDefinitions::default()))
+}
+
+/// One label line laid out at `LABEL_REF_SIZE`.
+fn label_line(line: &str) -> std::sync::Arc<egui::Galley> {
+    label_fonts().layout_no_wrap(line.to_owned(), egui::FontId::proportional(LABEL_REF_SIZE), egui::Color32::WHITE)
+}
+
+/// How far along one line of a label, at `font_size`, the caret sits
+/// before its `chars`-th character.
+pub fn line_caret_x(line: &str, chars: usize, font_size: f32) -> f32 {
+    if chars == 0 || line.is_empty() {
+        return 0.0;
+    }
+    let ccursor = egui::epaint::text::cursor::CCursor::new(chars);
+    label_line(line).pos_from_ccursor(ccursor).min.x / LABEL_REF_SIZE * font_size
+}
+
+/// Which character boundary of one line of a label, at `font_size`, is
+/// nearest `x` along it: the caret goes there on a click.
+pub fn line_char_at(line: &str, x: f32, font_size: f32) -> usize {
+    if line.is_empty() {
+        return 0;
+    }
+    let at = egui::vec2(x / font_size.max(1e-3) * LABEL_REF_SIZE, 0.0);
+    label_line(line).cursor_from_pos(at).ccursor.index.min(line.chars().count())
 }
 
 /// The old coarse `[width, height]` of a text label: `0.6 × font_size`
@@ -1318,6 +1378,18 @@ mod tests {
         assert_eq!(text_extent("hi\nhello", 20.0)[1], 50.0);
         let url = "https://filmstories.co.uk/news/why-tron-didnt-get-a-vfx-oscar-nomination-in-1982/";
         assert!(text_extent(url, 17.0)[0] < estimated_text_extent(url, 17.0)[0] * 0.8);
+    }
+
+    /// Pasted text wider than the view breaks at spaces; its own lines,
+    /// short lines and over-long words stay as they are.
+    #[test]
+    fn long_pasted_lines_wrap_at_spaces() {
+        let max = text_extent("one two three", 20.0)[0] + 1.0;
+        let wrapped = wrap_label_text("one two three four five six\nshort", 20.0, max);
+        assert_eq!(wrapped, "one two three\nfour five six\nshort");
+        assert!(wrapped.split('\n').all(|l| text_extent(l, 20.0)[0] <= max));
+        assert_eq!(wrap_label_text("averyveryverylongword x", 20.0, 10.0), "averyveryverylongword\nx");
+        assert_eq!(wrap_label_text("fits", 20.0, 1000.0), "fits");
     }
 
     /// The width matches what the slide paints labels with: the

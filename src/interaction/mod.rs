@@ -200,15 +200,23 @@ pub fn react_layer_nav(
 /// skip tool-shortcut + canvas-navigation handlers — that way `t`
 /// typed mid-sentence becomes part of the label, not a tool switch.
 ///
-/// Behaviour:
-/// * `Event::Text(s)` → append to buffer.
-/// * `Event::Paste(s)` (Ctrl+V) → append the clipboard's text.
-/// * `Backspace` → pop the last char.
-/// * `Shift+Enter` → append `\n` (multi-line label).
+/// Behaviour, as in any text field (`tools::text_caret`):
+/// * typing and `Event::Paste` (Ctrl+V) go in at the caret, over any
+///   selection; `Event::Copy` / `Event::Cut` (Ctrl+C / X) put the
+///   selected text on the clipboard.
+/// * arrows move the caret (Ctrl: by word), Home / End to the line's
+///   ends (Ctrl: the text's), Shift with any of them selects, Ctrl+A
+///   selects everything.
+/// * `Backspace` / `Delete` take the selection, else a character (Ctrl:
+///   a word) before / after the caret.
+/// * `Shift+Enter` → a new line.
 /// * `Enter` → commit buffer (`ActiveTool::commit_text`): a new label on
 ///   the active layer, or the edited label's new text.
 /// * `Escape` → discard buffer without committing; an edited label keeps
 ///   its text.
+///
+/// Every key is the label's while it is typed: none reaches the slide's
+/// shortcuts, so Ctrl+Z, say, never undoes an edit to the slide behind it.
 pub fn route_text_input(
     ctx: &egui::Context,
     tool: &mut ActiveTool,
@@ -225,18 +233,17 @@ pub fn route_text_input(
     let mut consumed = false;
     let mut commit = false;
     let mut cancel = false;
+    let mut copied: Option<String> = None;
 
     ctx.input(|i| {
+        let Some(t) = tool.in_progress_text.as_mut() else { return };
         for ev in &i.events {
             match ev {
+                // egui sends Tab / Enter via Key events, not Event::Text
+                // on Windows — so any Text event here is genuinely a
+                // printable character.
                 egui::Event::Text(s) => {
-                    if let Some(t) = tool.in_progress_text.as_mut() {
-                        // egui sends Tab / Enter via Key events, not
-                        // Event::Text on Windows — so any Text event
-                        // here is genuinely a printable character.
-                        t.buffer.push_str(s);
-                        t.caret = t.buffer.len();
-                    }
+                    t.insert(s);
                     consumed = true;
                 }
                 // egui-winit hands Ctrl+V over as the clipboard's text,
@@ -244,34 +251,36 @@ pub fn route_text_input(
                 // on the clipboard is not text to type.
                 egui::Event::Paste(s) => {
                     if s != crate::app::CLIP_MARKER {
-                        if let Some(t) = tool.in_progress_text.as_mut() {
-                            push_pasted(&mut t.buffer, s);
-                            t.caret = t.buffer.len();
-                        }
+                        t.insert(&pasted_text(s));
                     }
                     consumed = true;
                 }
-                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
-                    if let Some(t) = tool.in_progress_text.as_mut() {
-                        // Drop the last char (UTF-8 aware via pop()).
-                        t.buffer.pop();
-                        t.caret = t.buffer.len();
-                    }
+                egui::Event::Copy => {
+                    copied = t.selected_text().map(str::to_owned).or(copied.take());
                     consumed = true;
                 }
-                egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } => {
-                    if modifiers.shift {
-                        if let Some(t) = tool.in_progress_text.as_mut() {
-                            t.buffer.push('\n');
-                            t.caret = t.buffer.len();
-                        }
-                    } else {
-                        commit = true;
-                    }
+                egui::Event::Cut => {
+                    copied = t.cut().or(copied.take());
                     consumed = true;
                 }
-                egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
-                    cancel = true;
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    let word = modifiers.ctrl || modifiers.command;
+                    let extend = modifiers.shift;
+                    match key {
+                        egui::Key::Backspace => t.backspace(word),
+                        egui::Key::Delete => t.delete_forward(word),
+                        egui::Key::ArrowLeft => t.left(word, extend),
+                        egui::Key::ArrowRight => t.right(word, extend),
+                        egui::Key::ArrowUp => t.up(extend),
+                        egui::Key::ArrowDown => t.down(extend),
+                        egui::Key::Home => t.home(word, extend),
+                        egui::Key::End => t.end(word, extend),
+                        egui::Key::A if word => t.select_all(),
+                        egui::Key::Enter if modifiers.shift => t.insert("\n"),
+                        egui::Key::Enter => commit = true,
+                        egui::Key::Escape => cancel = true,
+                        _ => {}
+                    }
                     consumed = true;
                 }
                 _ => {}
@@ -279,6 +288,9 @@ pub fn route_text_input(
         }
     });
 
+    if let Some(text) = copied {
+        ctx.copy_text(text);
+    }
     if commit {
         manager.edit_active(|c| tool.commit_text(c));
     } else if cancel {
@@ -288,11 +300,12 @@ pub fn route_text_input(
     consumed
 }
 
-/// Pasted text added to a label: Windows line ends become the plain
-/// newlines Shift+Enter types, other control characters are dropped.
-fn push_pasted(buffer: &mut String, pasted: &str) {
+/// Pasted text as it goes into a label: Windows line ends become the
+/// plain newlines Shift+Enter types, other control characters are
+/// dropped.
+pub(crate) fn pasted_text(pasted: &str) -> String {
     let text = pasted.replace("\r\n", "\n").replace('\r', "\n");
-    buffer.extend(text.chars().filter(|c| matches!(c, '\n' | '\t') || !c.is_control()));
+    text.chars().filter(|c| matches!(c, '\n' | '\t') || !c.is_control()).collect()
 }
 
 #[cfg(test)]
@@ -307,6 +320,7 @@ mod tests {
             pos: [0.0, 0.0],
             buffer: "Hi ".into(),
             caret: 3,
+            anchor: None,
             font_size: 18.0,
             color: [0, 0, 0, 255],
             editing: None,
@@ -316,12 +330,40 @@ mod tests {
 
     /// One frame with `events`; true when the label took them.
     fn frame(events: Vec<egui::Event>, tool: &mut ActiveTool, manager: &mut CanvasManager) -> bool {
+        frame_copying(events, tool, manager).0
+    }
+
+    /// `frame`, and what it put on the clipboard.
+    fn frame_copying(events: Vec<egui::Event>, tool: &mut ActiveTool, manager: &mut CanvasManager) -> (bool, String) {
         let ctx = egui::Context::default();
         let mut consumed = false;
-        let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+        let out = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
             consumed = route_text_input(ctx, tool, manager);
         });
-        consumed
+        (consumed, out.platform_output.copied_text)
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn keys_move_the_caret_and_copy_and_cut_take_the_selection() {
+        let (mut tool, mut manager) = typing();
+        let none = egui::Modifiers::NONE;
+        let shift = egui::Modifiers::SHIFT;
+        assert!(frame(vec![key(egui::Key::Home, none), egui::Event::Text("Oh, ".into())], &mut tool, &mut manager));
+        assert_eq!(tool.in_progress_text.as_ref().unwrap().buffer, "Oh, Hi ");
+        frame(vec![key(egui::Key::ArrowRight, shift), key(egui::Key::ArrowRight, shift)], &mut tool, &mut manager);
+        let (_, copied) = frame_copying(vec![egui::Event::Copy], &mut tool, &mut manager);
+        assert_eq!(copied, "Hi");
+        let (_, cut) = frame_copying(vec![egui::Event::Cut], &mut tool, &mut manager);
+        assert_eq!(cut, "Hi");
+        assert_eq!(tool.in_progress_text.as_ref().unwrap().buffer, "Oh,  ");
+        // Nothing selected: Ctrl+C copies nothing.
+        assert_eq!(frame_copying(vec![egui::Event::Copy], &mut tool, &mut manager).1, "");
+        // Every key is the label's: Ctrl+Z does not reach the slide.
+        assert!(frame(vec![key(egui::Key::Z, egui::Modifiers::CTRL)], &mut tool, &mut manager));
     }
 
     #[test]

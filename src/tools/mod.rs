@@ -24,6 +24,7 @@ pub mod shape_snap;
 pub mod similar;
 pub mod tag_suggest;
 pub mod shape_tool;
+mod text_caret;
 
 use crate::canvas::canvas::Canvas;
 use crate::canvas::shape::{BorderStyle, Shape};
@@ -118,19 +119,19 @@ impl ToolKind {
 
 /// One in-progress text-tool buffer. Lives on `ActiveTool` while the
 /// user is typing and is taken on `Enter` to produce a committed
-/// `Shape::Text`. `caret` is a byte offset into `buffer`; we keep it
-/// even though the simple input dispatcher only ever appends and
-/// backspaces, because the field leaves room for arrow-key cursor
-/// movement without another struct change.
+/// `Shape::Text`. The caret and selection move as in any text field
+/// (`text_caret`).
 #[derive(Debug, Clone)]
 pub struct TextEdit {
     /// Canvas-local position of the top-left of the first line.
     pub pos: [f32; 2],
     /// Text typed so far, including embedded `\n` for newlines.
     pub buffer: String,
-    /// Byte offset of the caret within `buffer`. Equal to
-    /// `buffer.len()` while the user is appending.
+    /// Byte offset of the caret within `buffer`, on a character boundary.
     pub caret: usize,
+    /// Where the selection started, when there is one: the selection
+    /// runs from here to the caret.
+    pub anchor: Option<usize>,
     /// Font size in canvas-local logical pixels. Captured from
     /// `ActiveTool::size` at begin so changing the slider mid-typing
     /// doesn't resize the live caret.
@@ -296,6 +297,14 @@ pub struct ActiveTool {
     /// The last click with the Select tool that landed on a label: when,
     /// where, and which label. A second one on it soon after edits it.
     label_click: Option<(std::time::Instant, [f32; 2], usize)>,
+    /// The Text tool's press in flight landed on the text being typed:
+    /// it moves the caret (a drag selects), and its pen-up leaves the
+    /// text open. `true` while dragging, `false` after a double-click
+    /// took a word.
+    caret_press: Option<bool>,
+    /// The last press that put the caret in the text: when, and where in
+    /// it. A second one there soon after takes the word.
+    caret_click: Option<(std::time::Instant, usize)>,
 }
 
 /// Shape snap's progress through the stroke being drawn.
@@ -350,7 +359,15 @@ impl ActiveTool {
             pad_only_brush: None,
             select_press: None,
             label_click: None,
+            caret_press: None,
+            caret_click: None,
         }
+    }
+
+    /// The font size of a new label: it scales with the toolbar's "pen
+    /// size" slider (× 3 so a 6-px pen ≈ 18-px text).
+    pub fn label_font_size(&self) -> f32 {
+        (self.size.max(6.0) * 3.0).clamp(12.0, 240.0)
     }
 
     /// Start changing the text of the label at `index` on layer `li`: its
@@ -367,6 +384,7 @@ impl ActiveTool {
             pos: *pos,
             buffer: content.clone(),
             caret: content.len(),
+            anchor: None,
             font_size: *font_size,
             color: *color,
             editing: Some(LabelEdit {
@@ -634,9 +652,22 @@ impl ActiveTool {
                 self.in_progress_stroke = Some(s);
             }
             ToolKind::Text => {
-                // Caret placement happens on pen-up (see `end` below) so
-                // we have canvas access for committing any prior buffer.
-                // `begin` is a no-op for the Text tool.
+                // A press on the text being typed puts the caret there
+                // (Shift: selects up to there), a second one soon after
+                // takes the word. Anywhere else the pen-up commits the
+                // text and opens a new caret (see `end` below).
+                let Some(t) = self.in_progress_text.as_mut() else { return };
+                let Some(at) = t.offset_at(sample.pos) else { return };
+                let now = std::time::Instant::now();
+                let double = self.caret_click.is_some_and(|(when, i)| i == at && now.duration_since(when) <= DOUBLE_CLICK);
+                if double {
+                    t.select_word(at);
+                    self.caret_click = None;
+                } else {
+                    t.move_caret(at, self.select.shift);
+                    self.caret_click = Some((now, at));
+                }
+                self.caret_press = Some(!double);
             }
             ToolKind::Spotlight => {
                 // Tap on canvas deactivates the spotlight: switch
@@ -689,8 +720,13 @@ impl ActiveTool {
                 }
             }
             ToolKind::Text => {
-                // Text drag-while-down has no meaning. The caret moves
-                // only on a fresh click (handled in `end`).
+                // A drag from a press in the text selects up to the pointer.
+                if self.caret_press == Some(true) {
+                    if let Some(t) = self.in_progress_text.as_mut() {
+                        let at = t.offset_near(sample.pos);
+                        t.move_caret(at, true);
+                    }
+                }
             }
             ToolKind::Spotlight => {
                 // Spotlight follows the cursor passively. Nothing to
@@ -801,6 +837,16 @@ impl ActiveTool {
                 }
             }
             ToolKind::Text => {
+                // A press that placed the caret in the text keeps it open.
+                if self.caret_press.take().is_some() {
+                    if let Some(t) = self.in_progress_text.as_mut() {
+                        // A click (no drag) leaves no selection.
+                        if t.anchor == Some(t.caret) {
+                            t.anchor = None;
+                        }
+                    }
+                    return;
+                }
                 // Pen-up = the click is complete. Commit any prior
                 // buffered text into the canvas (so the user does not
                 // lose what they typed before clicking elsewhere) and
@@ -817,15 +863,15 @@ impl ActiveTool {
                     self.edit_label(canvas, li, i, None);
                     return;
                 }
-                // Font size scales with the toolbar's "pen size" slider
-                // (× 3 so a 6-px pen ≈ 18-px text). Captured at click
-                // time so the user can keep editing while the slider
-                // moves without resizing what they already typed.
-                let font_size = (self.size.max(6.0) * 3.0).clamp(12.0, 240.0);
+                // Captured at click time so the user can keep editing
+                // while the slider moves without resizing what they
+                // already typed.
+                let font_size = self.label_font_size();
                 self.in_progress_text = Some(TextEdit {
                     pos: sample.pos,
                     buffer: String::new(),
                     caret: 0,
+                    anchor: None,
                     font_size,
                     color: self.color,
                     editing: None,
@@ -1109,6 +1155,41 @@ mod tests {
         assert_eq!(text_of(&canvas), Some("hello?"), "clicking away keeps the change");
         assert!(tool.in_progress_text.as_ref().is_some_and(|t| t.editing.is_none() && t.pos == [600.0, 600.0]));
         assert_eq!(tool.kind, ToolKind::Text);
+    }
+
+    /// While a label is open, a click in its text moves the caret there,
+    /// a drag selects, a double-click takes the word; none of them close
+    /// it.
+    #[test]
+    fn clicks_in_the_open_label_move_the_caret_and_select() {
+        let (mut tool, mut canvas) = label_slide(ToolKind::Text);
+        canvas.layers[0].shapes[0] = Shape::Text {
+            pos: [100.0, 100.0], content: "hello world".into(), font_size: 20.0, color: [255; 4], rotation: 0.0, pin: 0,
+            background: None, group: 0, tags: Vec::new(), turn: 0.0, link: 0,
+        };
+        tool.edit_label(&canvas, 0, 0, None);
+        // A point in the text just after "hel", on the first line.
+        let x = |chars: usize| 100.0 + crate::canvas::shape::line_caret_x("hello world", chars, 20.0);
+        let at = |chars: usize| [x(chars) + 0.5, 110.0];
+        click(&mut tool, &mut canvas, at(3));
+        let t = tool.in_progress_text.as_ref().expect("still open");
+        assert_eq!((t.caret, t.selection()), (3, None));
+        tool.in_progress_text.as_mut().unwrap().insert("p");
+        assert_eq!(tool.in_progress_text.as_ref().unwrap().buffer, "helplo world", "typed in the middle");
+
+        // A drag from "w" to the end selects "world".
+        tool.caret_click = None;
+        tool.begin(PenSample::from_pos(at(7)), &mut canvas);
+        tool.update(PenSample::from_pos([x(12) + 40.0, 112.0]), &mut canvas);
+        tool.end(PenSample::from_pos([x(12) + 40.0, 112.0]), &mut canvas);
+        assert_eq!(tool.in_progress_text.as_ref().unwrap().selected_text(), Some("world"));
+
+        // A double-click takes the word under it.
+        tool.caret_click = None;
+        click(&mut tool, &mut canvas, at(1));
+        click(&mut tool, &mut canvas, at(1));
+        assert_eq!(tool.in_progress_text.as_ref().unwrap().selected_text(), Some("helplo"));
+        assert_eq!(text_of(&canvas), Some("hello world"), "nothing committed yet");
     }
 
     /// A click with a shape tool adds nothing; a drag, even a short one

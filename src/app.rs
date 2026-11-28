@@ -248,6 +248,10 @@ pub struct OnScreenNotesApp {
     /// paste that finds it there pastes the objects instead. Set by the
     /// thread that builds it.
     clip_image: std::sync::Arc<std::sync::Mutex<Option<crate::clipboard::Fingerprint>>>,
+    /// The text the last in-app copy of labels put on the OS clipboard
+    /// (their words, for other apps), so a paste that finds it there
+    /// pastes the labels themselves.
+    clip_text: Option<String>,
 
     /// Since when the slide-loading bar has had something to show, so a
     /// quick load does not flash it.
@@ -309,7 +313,7 @@ fn union_box(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
 
 /// A Select-tool command picked out of this frame's key events, run
 /// after egui's input lock is released.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SelAction {
     Delete,
     Duplicate,
@@ -321,6 +325,8 @@ enum SelAction {
     Cut,
     PasteObjects,
     PasteImage,
+    /// Text from the clipboard, to become a new label.
+    PasteText(String),
 }
 
 /// State held while a screenshot is in flight.
@@ -622,6 +628,7 @@ impl OnScreenNotesApp {
             pen_near_at: None,
             pen_place_read: None,
             clip_image: Default::default(),
+            clip_text: None,
             progress_since: None,
         }
     }

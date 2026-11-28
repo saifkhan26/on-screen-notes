@@ -320,7 +320,7 @@ pub(super) fn glyph_px(px: f32) -> f32 {
 
 /// How wide one line of a text label `size` logical px tall is drawn,
 /// in logical px — the width `paint_text_line` gives it.
-pub(super) fn text_line_width(painter: &egui::Painter, line: &str, size: f32, family: &egui::FontFamily) -> f32 {
+pub(crate) fn text_line_width(painter: &egui::Painter, line: &str, size: f32, family: &egui::FontFamily) -> f32 {
     let ppp = painter.ctx().pixels_per_point();
     let px = size * ppp;
     let glyph = glyph_px(px);
