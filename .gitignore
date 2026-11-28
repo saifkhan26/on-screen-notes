@@ -20,3 +20,5 @@ Thumbs.db
 
 # Signed browser extension builds (browser-extension/sign-firefox.ps1)
 browser-extension/web-ext-artifacts/
+# web-ext sign's last-upload state (upload id + package hash), rewritten each run
+browser-extension/.amo-upload-uuid
