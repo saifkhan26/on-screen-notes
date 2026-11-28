@@ -203,6 +203,7 @@ pub fn react_layer_nav(
 ///
 /// Behaviour:
 /// * `Event::Text(s)` → append to buffer.
+/// * `Event::Paste(s)` (Ctrl+V) → append the clipboard's text.
 /// * `Backspace` → pop the last char.
 /// * `Shift+Enter` → append `\n` (multi-line label).
 /// * `Enter` → commit buffer as a `Shape::Text` on the active layer.
@@ -229,6 +230,18 @@ pub fn route_text_input(
                         // here is genuinely a printable character.
                         t.buffer.push_str(s);
                         t.caret = t.buffer.len();
+                    }
+                    consumed = true;
+                }
+                // egui-winit hands Ctrl+V over as the clipboard's text,
+                // not as a key press. The marker an in-app copy leaves
+                // on the clipboard is not text to type.
+                egui::Event::Paste(s) => {
+                    if s != crate::app::CLIP_MARKER {
+                        if let Some(t) = tool.in_progress_text.as_mut() {
+                            push_pasted(&mut t.buffer, s);
+                            t.caret = t.buffer.len();
+                        }
                     }
                     consumed = true;
                 }
@@ -283,4 +296,56 @@ pub fn route_text_input(
     }
 
     consumed
+}
+
+/// Pasted text added to a label: Windows line ends become the plain
+/// newlines Shift+Enter types, other control characters are dropped.
+fn push_pasted(buffer: &mut String, pasted: &str) {
+    let text = pasted.replace("\r\n", "\n").replace('\r', "\n");
+    buffer.extend(text.chars().filter(|c| matches!(c, '\n' | '\t') || !c.is_control()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A label being typed on a fresh slide, "Hi " so far.
+    fn typing() -> (ActiveTool, CanvasManager) {
+        let mut tool = ActiveTool::from_config(&crate::config::AppConfig::default());
+        tool.kind = ToolKind::Text;
+        tool.in_progress_text = Some(crate::tools::TextEdit {
+            pos: [0.0, 0.0],
+            buffer: "Hi ".into(),
+            caret: 3,
+            font_size: 18.0,
+            color: [0, 0, 0, 255],
+        });
+        (tool, CanvasManager::for_tests(vec![crate::canvas::canvas::Canvas::default()]))
+    }
+
+    /// One frame with `events`; true when the label took them.
+    fn frame(events: Vec<egui::Event>, tool: &mut ActiveTool, manager: &mut CanvasManager) -> bool {
+        let ctx = egui::Context::default();
+        let mut consumed = false;
+        let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+            consumed = route_text_input(ctx, tool, manager);
+        });
+        consumed
+    }
+
+    #[test]
+    fn ctrl_v_pastes_text_into_the_label() {
+        let (mut tool, mut manager) = typing();
+        assert!(frame(vec![egui::Event::Paste("two\r\nlines\u{0}".into())], &mut tool, &mut manager));
+        let t = tool.in_progress_text.as_ref().expect("still typing");
+        assert_eq!(t.buffer, "Hi two\nlines");
+        assert_eq!(t.caret, t.buffer.len());
+    }
+
+    #[test]
+    fn an_in_app_copy_is_not_typed_into_the_label() {
+        let (mut tool, mut manager) = typing();
+        assert!(frame(vec![egui::Event::Paste(crate::app::CLIP_MARKER.into())], &mut tool, &mut manager));
+        assert_eq!(tool.in_progress_text.expect("still typing").buffer, "Hi ");
+    }
 }

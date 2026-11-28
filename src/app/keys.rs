@@ -477,9 +477,14 @@ impl OnScreenNotesApp {
         // When the clipboard holds our own marker text this fires
         // alongside `PasteObjects` and finds no image — harmless.
         let chord = crate::platform::paste_chord_down() && ctx.input(|i| i.focused);
-        // Not into a text field (find, the tag row, …): Ctrl+V pastes
-        // text there.
-        if chord && !self.ws.paste_chord_prev && !text_consumed && !ctx.wants_keyboard_input() {
+        // Not into a text field (find, the tag row, a label being
+        // typed, …): Ctrl+V pastes text there, or nothing.
+        if chord
+            && !self.ws.paste_chord_prev
+            && !text_consumed
+            && !ctx.wants_keyboard_input()
+            && self.ws.tool.in_progress_text.is_none()
+        {
             sel_actions.push(SelAction::PasteImage);
         }
         self.ws.paste_chord_prev = chord;

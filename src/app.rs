@@ -286,7 +286,7 @@ fn refresh_period(hwnd: isize) -> Duration {
 
 /// Text put on the OS clipboard by an in-app copy. Seeing it come back
 /// in a paste means the newest thing the user copied is `obj_clipboard`.
-const CLIP_MARKER: &str = "on-screen-notes:selection";
+pub(crate) const CLIP_MARKER: &str = "on-screen-notes:selection";
 
 /// The view the peek key goes back to (`OnScreenNotesApp::update_peek`).
 struct Peek {
