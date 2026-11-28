@@ -88,6 +88,16 @@ impl OnScreenNotesApp {
             }
             K::Hop(dir) => {
                 if selecting {
+                    // The way it looks, in a flipped view too.
+                    use crate::tools::hop::Dir;
+                    let f = self.ws.view_flip;
+                    let dir = match dir {
+                        Dir::Left if f.x => Dir::Right,
+                        Dir::Right if f.x => Dir::Left,
+                        Dir::Up if f.y => Dir::Down,
+                        Dir::Down if f.y => Dir::Up,
+                        d => d,
+                    };
                     self.hop_selection(dir, ctx);
                 }
             }
@@ -179,10 +189,14 @@ impl OnScreenNotesApp {
             }
             K::Nudge(px) => {
                 if selecting && self.may_edit() {
-                    self.nudge_selection(px, ctx.pixels_per_point());
+                    // The way it looks: a flipped view moves it the
+                    // other way on the slide.
+                    let d = self.ws.view_flip.delta(egui::vec2(px[0], px[1]));
+                    self.nudge_selection([d.x, d.y], ctx.pixels_per_point());
                 }
             }
             K::ZoomToFit => self.zoom_to_fit(ctx),
+            K::FlipView(upside_down) => self.toggle_view_flip(upside_down),
             K::ZoomToSelection => self.zoom_to_selection(ctx),
             K::Flip(vertical) => {
                 if selecting {

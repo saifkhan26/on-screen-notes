@@ -830,6 +830,7 @@ fn fixed_help_sections(keys: &ParsedHotkeys) -> Vec<HelpSection> {
             ("Undo / redo",                 k2(c.undo, c.redo)),
             ("Delete the slide (asks first)", k(c.delete_canvas)),
             ("Zoom to fit / selection / while held", format!("{} / hold {}", k2(c.zoom_to_fit, c.zoom_to_selection), k(c.hold_zoom_to_selection))),
+            ("Flip the view: mirror / upside down", k2(c.flip_view_x, c.flip_view_y)),
         ]),
         ("Layers (the active one)", vec![
             ("Previous / next layer",       k2(c.prev_layer, c.next_layer)),

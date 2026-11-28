@@ -56,6 +56,9 @@ pub enum KeyAction {
     Nudge([f32; 2]),
     /// Glide the view to show the whole slide.
     ZoomToFit,
+    /// Mirror the view left to right (`false`) or upside down, or back
+    /// (`ui::view_flip`; the slide is not changed).
+    FlipView(bool),
     /// Glide the view to show the selection.
     ZoomToSelection,
     /// Mirror the selection left to right (`false`) or top to bottom.
@@ -164,6 +167,8 @@ pub fn collect(key: egui::Key, mods: egui::Modifiers, keys: &ParsedHotkeys, out:
         (t.reset_background, KeyAction::ResetBackground),
         (t.text_box, KeyAction::TextBox),
         (c.zoom_to_fit, KeyAction::ZoomToFit),
+        (c.flip_view_x, KeyAction::FlipView(false)),
+        (c.flip_view_y, KeyAction::FlipView(true)),
         (c.zoom_to_selection, KeyAction::ZoomToSelection),
         (c.media_onion, KeyAction::Onion),
         (c.command_palette, KeyAction::CommandPalette),

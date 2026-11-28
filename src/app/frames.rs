@@ -27,10 +27,9 @@ impl OnScreenNotesApp {
 
     /// Whether frames should come every display refresh: a button is
     /// held or a gesture is under way (a drag, a pan, a selection), the
-    /// pen is in range, something on screen changes by itself, or work
-    /// in flight shows progress.
+    /// pen is near (`pen_near`), something on screen changes by itself,
+    /// or work in flight shows progress.
     pub(super) fn needs_steady_frames(&self, ctx: &egui::Context) -> bool {
-        let canvas = self.canvases.active();
         self.ws.mouse_gesture
             || ctx.input(|i| i.pointer.any_down())
             || self.ws.tool.select.gesture.is_some()
@@ -42,7 +41,7 @@ impl OnScreenNotesApp {
             // Polls the mouse button itself while the overlay is
             // click-through, so it gets no input events.
             || self.pin_picking
-            || self.pen.seen_within(PEN_NEARBY)
+            || self.pen_near()
             || !self.ws.tool.laser_strokes.is_empty()
             // The lasso's dashes march.
             || !self.ws.tool.lasso.points().is_empty()
@@ -50,7 +49,37 @@ impl OnScreenNotesApp {
             || !self.media_imports.is_empty()
             || self.canvases.is_loading()
             || self.overlay_cache.pictures_busy()
-            || canvas.layers.iter().any(|l| l.visible && l.shapes.iter().any(crate::canvas::shape::Shape::animates))
+    }
+
+    /// Whether the pen was over one of this app's windows within
+    /// `PEN_NEARBY`. Wintab hands over the pen's packets wherever it is,
+    /// so going by any packet drew every refresh, the whole window each
+    /// time, while the pen was used in another app.
+    pub(super) fn pen_near(&self) -> bool {
+        self.pen_near_at.is_some_and(|t| t.elapsed() <= PEN_NEARBY)
+    }
+
+    /// Look at where the pen's newest packet landed, once per packet: over
+    /// one of this app's windows (not covered there by another app's), the
+    /// pen is near. `origin` is the client origin, in screen pixels, of
+    /// the `poll` that read it.
+    pub(super) fn note_pen_place(&mut self, origin: [i32; 2]) {
+        let Some((at, pos)) = self.pen.last_packet() else { return };
+        if self.pen_place_read == Some(at) {
+            return;
+        }
+        self.pen_place_read = Some(at);
+        let (x, y) = ((pos[0] + origin[0] as f32).round() as i32, (pos[1] + origin[1] as f32).round() as i32);
+        let ours = crate::platform::is_own_window(crate::platform::top_level_window_at(x, y));
+        log::trace!("pen packet at ({x}, {y}) on screen: {}", if ours { "over this app" } else { "elsewhere" });
+        if ours {
+            self.pen_near_at = Some(at);
+        }
+    }
+
+    /// Whether a marching-ants border shows on the overlay's canvas.
+    fn dashes_march(&self, ctx: &egui::Context) -> bool {
+        self.overlay_visible && marching_in_view(self.canvases.active(), self.overlay_cache.canvas_rect(ctx))
     }
 
     /// Hold every frame that is not drawing ink to the display's refresh
@@ -71,7 +100,7 @@ impl OnScreenNotesApp {
         let pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { pressed: true, .. })));
         if !pressed && !self.needs_live_frames() {
             if let Some(due) = self.last_frame_at.map(|t| t + self.idle_frame) {
-                if self.pen.seen_within(PEN_NEARBY) {
+                if self.pen_near() {
                     let origin = self.client_origin(ctx);
                     loop {
                         let now = Instant::now();
@@ -98,7 +127,8 @@ impl OnScreenNotesApp {
     /// going down gets every frame it can; gestures, a pen in range and
     /// things that move get one per display refresh; a playing GIF or
     /// video gets its own frame times, never above the refresh rate;
-    /// otherwise a slow idle tick.
+    /// marching dashes on screen get `MARCH_FRAME`; otherwise a slow
+    /// idle tick.
     pub(super) fn next_frame_in(&self, ctx: &egui::Context) -> Option<Duration> {
         if self.needs_live_frames() {
             return None;
@@ -107,6 +137,9 @@ impl OnScreenNotesApp {
         let mut wait = IDLE_TICK;
         if self.needs_steady_frames(ctx) {
             wait = wait.min(refresh);
+        }
+        if self.dashes_march(ctx) {
+            wait = wait.min(MARCH_FRAME.max(refresh));
         }
         if let Some(media) = self.media.next_frame_in() {
             wait = wait.min(media.max(refresh));
@@ -143,5 +176,69 @@ impl OnScreenNotesApp {
                 ctx.request_repaint_after(wait + predicted);
             }
         }
+    }
+}
+
+/// Frame interval while marching-ants borders show and nothing else
+/// moves: about 30 a second. The dashes march 30 canvas pixels a second,
+/// so this still moves them a pixel a frame at 100 %. Each frame redraws
+/// the whole window: at the display's rate (99 Hz here) one dashed shape
+/// kept the GPU a quarter busy, invisible or off screen alike.
+const MARCH_FRAME: Duration = Duration::from_millis(33);
+
+/// Whether `canvas` has a marching-ants border, on a shown layer, with
+/// any of it inside `view` (the canvas area, where `canvas`'s pan and
+/// zoom place it).
+fn marching_in_view(canvas: &crate::canvas::canvas::Canvas, view: egui::Rect) -> bool {
+    let (pan, zoom) = (canvas.pan, canvas.zoom);
+    let at = |x: f32, y: f32| egui::pos2(view.min.x + pan[0] + x * zoom, view.min.y + pan[1] + y * zoom);
+    canvas.layers.iter().any(|l| {
+        l.visible
+            && l.shapes.iter().any(|s| {
+                s.animates() && {
+                    let b = crate::canvas::canvas::shape_bounds(s);
+                    egui::Rect::from_two_pos(at(b[0], b[1]), at(b[2], b[3])).intersects(view)
+                }
+            })
+    })
+}
+
+#[cfg(test)]
+mod march_tests {
+    use super::*;
+    use crate::canvas::canvas::Canvas;
+    use crate::canvas::shape::{BorderStyle, Shape};
+
+    fn ellipse(a: [f32; 2], b: [f32; 2], border: BorderStyle) -> Shape {
+        Shape::Ellipse { a, b, color: [255; 4], stroke_width: 4.0, border, filled: false, rotation: 0.0, pin: 0, group: 0, tags: Vec::new(), turn: 0.0 }
+    }
+
+    /// Only a dashed shape that shows keeps frames coming: not a solid
+    /// one, not one with no size, not one panned out of view or on a
+    /// hidden layer.
+    #[test]
+    fn only_dashes_that_show_march() {
+        let view = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 600.0));
+        let with = |s: Shape| {
+            let mut c = Canvas::default();
+            c.add_shape(s);
+            c
+        };
+        let dashed = with(ellipse([100.0, 100.0], [200.0, 160.0], BorderStyle::DashedAnimated));
+        assert!(marching_in_view(&dashed, view));
+        assert!(!marching_in_view(&with(ellipse([100.0, 100.0], [200.0, 160.0], BorderStyle::Solid)), view));
+        // The one found on a real slide: an ellipse from a click.
+        assert!(!marching_in_view(&with(ellipse([382.5, 779.0], [382.5, 779.0], BorderStyle::DashedAnimated)), view));
+        let mut away = with(ellipse([100.0, 100.0], [200.0, 160.0], BorderStyle::DashedAnimated));
+        away.pan = [-5000.0, 0.0];
+        assert!(!marching_in_view(&away, view), "panned out of view");
+        away.pan = [0.0, 0.0];
+        away.zoom = 2.0;
+        assert!(marching_in_view(&away, view), "zoomed, still in view");
+        let mut hidden = with(ellipse([100.0, 100.0], [200.0, 160.0], BorderStyle::DashedAnimated));
+        for l in &mut hidden.layers {
+            l.visible = false;
+        }
+        assert!(!marching_in_view(&hidden, view), "on a hidden layer");
     }
 }

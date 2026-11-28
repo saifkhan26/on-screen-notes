@@ -238,6 +238,12 @@ pub struct OnScreenNotesApp {
     /// Pen events `hold_to_refresh_rate` read while it waited, handed on
     /// with the frame's own (`smoothed_pen_events`).
     early_pen: Vec<crate::input::pen::PenEvent>,
+    /// When the pen's newest packet over one of this app's windows came
+    /// (`note_pen_place`): "the pen is near" goes by it, not by packets
+    /// from the pen over other apps.
+    pen_near_at: Option<Instant>,
+    /// The packet `note_pen_place` last looked at.
+    pen_place_read: Option<Instant>,
     /// The picture the last in-app copy put on the OS clipboard, so a
     /// paste that finds it there pastes the objects instead. Set by the
     /// thread that builds it.
@@ -254,9 +260,10 @@ pub struct OnScreenNotesApp {
 /// releasing the mouse button it was holding down for it.
 const PEN_OWNS_POINTER: Duration = Duration::from_millis(250);
 
-/// How long after its last Wintab packet the pen still counts as in
-/// range, keeping frames coming at full speed. A hovering pen sends
-/// packets as it moves; this bridges the pauses of a hand held still.
+/// How long after its last Wintab packet over one of this app's windows
+/// the pen still counts as near, keeping frames coming every refresh. A
+/// hovering pen sends packets as it moves; this bridges the pauses of a
+/// hand held still.
 const PEN_NEARBY: Duration = Duration::from_secs(1);
 
 /// How often a frame held to the refresh rate looks for the pen touching
@@ -612,6 +619,8 @@ impl OnScreenNotesApp {
             pureref_jobs: Vec::new(),
             last_frame_at: None,
             early_pen: Vec::new(),
+            pen_near_at: None,
+            pen_place_read: None,
             clip_image: Default::default(),
             progress_since: None,
         }
@@ -648,6 +657,8 @@ impl eframe::App for OnScreenNotesApp {
                 (self.ws.tool.in_progress_stroke.is_some(), "stroke"),
                 (self.pending_screenshot.is_some() || self.pending_freeze.is_some() || self.pending_lasso.is_some(), "capture"),
                 (self.recorder.is_recording(), "recording"),
+                (self.pen_near(), "pen-near"),
+                (!self.pen_near() && self.pen.seen_within(PEN_NEARBY), "pen-elsewhere"),
             ]
             .iter()
             .filter(|(on, _)| *on)
@@ -692,6 +703,11 @@ impl eframe::App for OnScreenNotesApp {
             // Rounded corners, like any Windows 11 window (DWM squares
             // a window without a title bar unless asked).
             crate::platform::round_corners(self.osn_hwnd);
+            // No frame for every mouse move elsewhere on screen while
+            // focused (`platform::stop_raw_mouse_input`).
+            if !crate::platform::stop_raw_mouse_input() {
+                log::warn!("raw mouse input could not be turned off: frames follow the mouse anywhere while focused");
+            }
             self.idle_frame = refresh_period(self.osn_hwnd);
             self.first_frame = false;
             log::info!("on-screen-notes started: overlay visible, input enabled");
@@ -759,6 +775,22 @@ fn size_label(bytes: u64) -> String {
         b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
         b if b >= 10 << 20 => format!("{} MB", b >> 20),
         b => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+    }
+}
+
+/// `ev` (window-client points) as it lands on the slide's own, unmirrored
+/// view: mirrored back the way the view is flipped (`ui::view_flip`).
+fn unflip_pen_event(ev: crate::input::pen::PenEvent, flip: ui::view_flip::ViewFlip, canvas_rect: egui::Rect) -> crate::input::pen::PenEvent {
+    use crate::input::pen::PenEvent;
+    let m = |mut s: crate::canvas::stroke::PenSample| {
+        let p = flip.point(canvas_rect, egui::pos2(s.pos[0], s.pos[1]));
+        s.pos = [p.x, p.y];
+        s
+    };
+    match ev {
+        PenEvent::Down(s) => PenEvent::Down(m(s)),
+        PenEvent::Move(s) => PenEvent::Move(m(s)),
+        PenEvent::Up(s) => PenEvent::Up(m(s)),
     }
 }
 

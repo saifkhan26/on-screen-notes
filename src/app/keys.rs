@@ -425,7 +425,7 @@ impl OnScreenNotesApp {
                     // one notch is ≈ ±10 % either way.
                     if raw_delta_y.abs() >= 0.001 {
                         let c = self.canvases.active();
-                        let cursor = i.pointer.hover_pos().unwrap_or_default();
+                        let cursor = self.ws.view_flip.point(canvas_rect, i.pointer.hover_pos().unwrap_or_default());
                         let pivot = [
                             ((cursor.x - canvas_rect.min.x) - c.pan[0]) / c.zoom,
                             ((cursor.y - canvas_rect.min.y) - c.pan[1]) / c.zoom,
@@ -433,7 +433,8 @@ impl OnScreenNotesApp {
                         self.apply_layer_zoom(1.10_f32.powf(raw_delta_y), pivot);
                     }
                 } else {
-                    let cursor = i.pointer.hover_pos().unwrap_or_default();
+                    // About the point under the pointer as it shows.
+                    let cursor = self.ws.view_flip.point(canvas_rect, i.pointer.hover_pos().unwrap_or_default());
                     let cursor_screen = [
                         (cursor.x - canvas_rect.min.x).max(0.0),
                         (cursor.y - canvas_rect.min.y).max(0.0),

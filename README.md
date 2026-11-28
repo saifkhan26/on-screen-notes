@@ -76,6 +76,11 @@ layers.
   the slide, `Ctrl+2` the selection; hold `C` to look at the selection
   (or the whole slide) and let go to glide back. The view glides there
   rather than jumping
+- **Flip the view** — `F` shows the whole slide mirrored left to right,
+  `Shift+F` upside down, to check a drawing with fresh eyes; press again
+  to go back. Only the view: nothing on the slide changes or is saved,
+  it goes back on its own on another slide, and drawing, selecting and
+  drawing pads all work while it is flipped
 - **Flip** the selection left to right or top to bottom, pictures,
   videos and GIFs included (text moves but keeps reading forwards)
 - **A picture's colours** — select one picture and the palette button on
@@ -529,6 +534,7 @@ All hotkeys (globals + in-overlay shortcuts) are configurable via
 | Zoom to fit everything on the slide | `Ctrl+1` |
 | Zoom to the selection (nothing selected: the whole slide) | `Ctrl+2` |
 | Look at the selection while held, back when let go (a quick tap stays) | hold `C` |
+| Flip the view left to right / upside down, and back (view only) | `F` / `Shift+F` |
 | Reset active layer position | `Ctrl+Shift+0` |
 | Reset active layer zoom | `Ctrl+Shift+9` |
 | Freeze frame → layer | `Ctrl+Shift+F` |
@@ -617,6 +623,8 @@ reset_view    = "ctrl+0"
 zoom_to_fit   = "ctrl+1"
 zoom_to_selection = "ctrl+2"
 hold_zoom_to_selection = "c"
+flip_view_x   = "f"
+flip_view_y   = "shift+f"
 reset_layer_pos = "ctrl+shift+0"
 reset_layer_zoom = "ctrl+shift+9"
 freeze_frame  = "ctrl+shift+f"

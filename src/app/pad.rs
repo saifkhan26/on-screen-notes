@@ -556,6 +556,9 @@ impl OnScreenNotesApp {
         painter.add(egui::Shape::closed_line(corners.clone(), egui::Stroke::new(1.5, ui::theme::chrome_line())));
 
         let Some(paper) = e.paper else { return };
+        // Where the pad shows (the outline above is mirrored with the
+        // rest of the canvas in a flipped view).
+        let corners: Vec<egui::Pos2> = corners.iter().map(|&p| self.ws.view_flip.point(canvas_rect, p)).collect();
         // Just above the pad's top-left corner, or inside it when the
         // toolbar is in the way; always on screen.
         let top_left = corners.iter().fold(egui::pos2(f32::MAX, f32::MAX), |a, p| egui::pos2(a.x.min(p.x), a.y.min(p.y)));

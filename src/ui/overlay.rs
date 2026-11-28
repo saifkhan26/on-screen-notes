@@ -434,6 +434,10 @@ pub fn show(
     // The arrange bar's "dim the rest": while the Select tool has
     // objects selected, everything else fades back.
     dim_unselected: bool,
+    // The view shown mirrored (`ui::view_flip`). The app mirrors what is
+    // painted here at the end of the frame; this side keeps the GPU ink
+    // and what follows the pointer in step with it.
+    flip: crate::ui::view_flip::ViewFlip,
 ) -> egui::Rect {
     // Select-tool gesture in flight: the selected objects preview under
     // its transform until pen-up commits it.
@@ -474,6 +478,16 @@ pub fn show(
             let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
             canvas_rect = rect;
             cache.last_canvas_rect = Some(rect);
+            // GPU ink mirrors itself; the rest is mirrored afterwards.
+            if flip.any() {
+                crate::canvas::ink_gpu::set_view_flip(Some(([flip.x, flip.y], [rect.center().x, rect.center().y])));
+            }
+            // What follows the real pointer (the size ring, the spotlight)
+            // goes on a layer of its own, just above the canvas, which a
+            // flipped view leaves alone.
+            let pointer_painter = ctx
+                .layer_painter(egui::LayerId::new(egui::Order::PanelResizeLine, egui::Id::new("osn_pointer")))
+                .with_clip_rect(rect);
 
             // Empty-canvas hint — appears only when the canvas has no
             // strokes / no shapes. Disappears the moment the user starts
@@ -484,7 +498,7 @@ pub fn show(
                 .iter()
                 .any(|l| !l.strokes.is_empty() || !l.shapes.is_empty());
             // Nor on a slide still opening, which only looks empty.
-            if !any_content && chrome_visible && manager.opening().is_none() {
+            if !any_content && chrome_visible && manager.opening().is_none() && !flip.any() {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -658,8 +672,7 @@ pub fn show(
                     mesh.add_triangle(base, base + 1, next);
                     mesh.add_triangle(base + 1, next + 1, next);
                 }
-                let p = ui.painter_at(rect);
-                p.add(egui::Shape::mesh(mesh));
+                pointer_painter.add(egui::Shape::mesh(mesh));
                 // No repaint request needed to track the pointer: every
                 // pointer move is an input event, which repaints at once.
             }
@@ -686,7 +699,9 @@ pub fn show(
                     let mut pts: Vec<egui::Pos2> = lasso.points().iter().map(|p| to_screen(*p)).collect();
                     let mut ring = None;
                     if lasso.is_polygon() && !lasso.pressing() {
-                        if let Some(h) = ctx.input(|i| i.pointer.hover_pos()) {
+                        // Where the pointer is on the slide, a flipped
+                        // view mirrored back.
+                        if let Some(h) = ctx.input(|i| i.pointer.hover_pos()).map(|h| flip.point(rect, h)) {
                             ring = lasso.closes_at([(h.x - ox) / zoom, (h.y - oy) / zoom], zoom);
                             if ring.is_none() {
                                 pts.push(h);
@@ -757,7 +772,9 @@ pub fn show(
             // and the magnified canvas paint are kept in sync by
             // sharing the same pan/zoom override path.
             if let Some(loupe) = loupe {
-                let cursor = ctx.input(|i| i.pointer.hover_pos());
+                // In a flipped view the loupe is mirrored with the canvas,
+                // so it is drawn where that puts it under the pointer.
+                let cursor = ctx.input(|i| i.pointer.hover_pos()).map(|c| flip.point(rect, c));
                 if let Some(c) = cursor {
                     let ppp = ctx.pixels_per_point();
                     let r = loupe.radius_px;
@@ -831,10 +848,11 @@ pub fn show(
                         // The pen and eraser work at their size on
                         // screen, so their ring keeps its size at any zoom.
                         let r = tool.cursor_radius(manager.active().zoom);
-                        ui.painter().circle_stroke(p, r, egui::Stroke::new(1.2, color));
+                        pointer_painter.circle_stroke(p, r, egui::Stroke::new(1.2, color));
                     }
                 }
             }
+            crate::canvas::ink_gpu::set_view_flip(None);
         });
     canvas_rect
 }

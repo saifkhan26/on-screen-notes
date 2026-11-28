@@ -142,6 +142,11 @@ pub(super) struct Workspace {
     pub(super) pad: pad::PadState,
     /// The picture being cropped, if any (`app::crop`).
     pub(super) crop: crop::CropState,
+    /// The view shown mirrored (`ui::view_flip`): never saved, and back
+    /// to normal when the slide changes.
+    pub(super) view_flip: ui::view_flip::ViewFlip,
+    /// The slide the flip was made on.
+    pub(super) flip_slide: usize,
 }
 
 impl Workspace {
@@ -188,6 +193,8 @@ impl Workspace {
             slide_panel: Default::default(),
             pad: Default::default(),
             crop: Default::default(),
+            view_flip: Default::default(),
+            flip_slide: 0,
         }
     }
 }

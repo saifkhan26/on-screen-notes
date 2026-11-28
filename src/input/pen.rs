@@ -133,6 +133,17 @@ impl PenInput {
         }
     }
 
+    /// When the newest packet arrived and where, in the window-client
+    /// pixels of the `poll` that read it. The packets come from the pen
+    /// anywhere on screen, over other apps too.
+    pub fn last_packet(&self) -> Option<(std::time::Instant, [f32; 2])> {
+        match &self.backend {
+            Backend::Disabled => None,
+            #[cfg(target_os = "windows")]
+            Backend::Wintab(w) => w.track.last_packet(),
+        }
+    }
+
     /// True if the pen pressed or visibly moved within the last
     /// `window`. A tablet driver also moves the system cursor and
     /// presses the left mouse button on the pen's behalf, so the mouse
@@ -248,6 +259,10 @@ impl Tracker {
     fn seen_within(&self, window: std::time::Duration, now: std::time::Instant) -> bool {
         self.last_packet.is_some_and(|t| now.saturating_duration_since(t) <= window)
     }
+
+    fn last_packet(&self) -> Option<(std::time::Instant, [f32; 2])> {
+        self.last_packet.zip(self.last_sample.map(|s| s.pos))
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +283,19 @@ mod tests {
         assert!(matches!(t.feed(at(5.0, 0.5), now), Some(PenEvent::Move(_))));
         assert!(matches!(t.feed(at(6.0, 0.0), now), Some(PenEvent::Up(_))));
         assert!(!t.is_down);
+    }
+
+    /// The newest packet, hovering ones too, says when and where the pen
+    /// was last: what tells the pen over this app from the pen elsewhere.
+    #[test]
+    fn the_last_packet_is_the_newest_hovering_or_not() {
+        let mut t = Tracker::default();
+        assert!(t.last_packet().is_none());
+        let t0 = Instant::now();
+        t.feed(at(3.0, 0.5), t0);
+        let t1 = t0 + Duration::from_millis(5);
+        t.feed(at(40.0, 0.0), t1);
+        assert_eq!(t.last_packet(), Some((t1, [40.0, 10.0])));
     }
 
     /// The lift packet can be lost: the queue was full, or another app's

@@ -36,6 +36,8 @@ impl OnScreenNotesApp {
     /// Routes to the layer transform or the canvas viewport depending on
     /// which gesture is in flight.
     pub(super) fn apply_pan_delta(&mut self, dx: f32, dy: f32) {
+        // A drag moves what shows with it, in a flipped view too.
+        let egui::Vec2 { x: dx, y: dy } = self.ws.view_flip.delta(egui::vec2(dx, dy));
         let zoom = self.canvases.active().zoom.max(1e-6);
         if let Some(x) = self.ws.layer_xform.as_mut() {
             // A layer delta ends up added to canvas-local geometry, so

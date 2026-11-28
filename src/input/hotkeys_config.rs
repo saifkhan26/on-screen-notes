@@ -362,6 +362,10 @@ pub struct CanvasSection {
     /// Held: the view goes to the selection (the whole slide with
     /// nothing selected), and back when let go. A quick tap stays.
     #[serde(default = "d_hold_zoom_to_selection")] pub hold_zoom_to_selection: String,
+    /// Show the slide mirrored left to right, and back (`ui::view_flip`).
+    #[serde(default = "d_flip_view_x")] pub flip_view_x: String,
+    /// Show the slide upside down, and back.
+    #[serde(default = "d_flip_view_y")] pub flip_view_y: String,
     /// Undoes every per-layer pan applied to the active layer. Must be
     /// a strict superset of `reset_view`'s modifiers (it is checked
     /// first) or `reset_view` swallows it — see the dispatch site.
@@ -613,6 +617,7 @@ impl Default for CanvasSection {
             reset_view: d_reset_view(), reset_layer_pos: d_reset_layer_pos(),
             zoom_to_fit: d_zoom_to_fit(), zoom_to_selection: d_zoom_to_selection(),
             hold_zoom_to_selection: d_hold_zoom_to_selection(),
+            flip_view_x: d_flip_view_x(), flip_view_y: d_flip_view_y(),
             reset_layer_zoom: d_reset_layer_zoom(),
             freeze_frame: d_freeze_frame(),
             prev_canvas: d_prev_canvas(), next_canvas: d_next_canvas(),
@@ -692,6 +697,8 @@ fn d_reset_view()    -> String { "ctrl+0".into() }
 fn d_zoom_to_fit()   -> String { "ctrl+1".into() }
 fn d_zoom_to_selection() -> String { "ctrl+2".into() }
 fn d_hold_zoom_to_selection() -> String { "c".into() }
+fn d_flip_view_x() -> String { "f".into() }
+fn d_flip_view_y() -> String { "shift+f".into() }
 fn d_reset_layer_pos() -> String { "ctrl+shift+0".into() }
 fn d_reset_layer_zoom() -> String { "ctrl+shift+9".into() }
 fn d_freeze_frame()  -> String { "ctrl+shift+f".into() }
@@ -760,8 +767,8 @@ fn d_media_next_frame() -> String { "period".into() }
 /// 12 resync from PureRef; 13 hopping from object to object; 14 dimming
 /// what is not selected; 15 cropping a picture; 16 the slide window on a
 /// box or the selection; 17 filled shapes, and the Fill tool's key gone
-/// with the tool.
-const FORMAT: u32 = 17;
+/// with the tool; 18 flipping the view.
+const FORMAT: u32 = 18;
 
 /// Top-level hotkeys file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -877,6 +884,8 @@ pub struct CanvasBindings {
     pub zoom_to_fit: Option<Binding>,
     pub zoom_to_selection: Option<Binding>,
     pub hold_zoom_to_selection: Option<Binding>,
+    pub flip_view_x: Option<Binding>,
+    pub flip_view_y: Option<Binding>,
     pub reset_layer_pos: Option<Binding>,
     pub reset_layer_zoom: Option<Binding>,
     pub freeze_frame: Option<Binding>,
@@ -1074,6 +1083,8 @@ impl HotkeysConfig {
                 zoom_to_fit:   p("canvas.zoom_to_fit",   &cv.zoom_to_fit),
                 zoom_to_selection: p("canvas.zoom_to_selection", &cv.zoom_to_selection),
                 hold_zoom_to_selection: p("canvas.hold_zoom_to_selection", &cv.hold_zoom_to_selection),
+                flip_view_x:   p("canvas.flip_view_x",   &cv.flip_view_x),
+                flip_view_y:   p("canvas.flip_view_y",   &cv.flip_view_y),
                 reset_layer_pos: p("canvas.reset_layer_pos", &self.canvas.reset_layer_pos),
                 reset_layer_zoom: p("canvas.reset_layer_zoom", &self.canvas.reset_layer_zoom),
                 freeze_frame:  p("canvas.freeze_frame",  &self.canvas.freeze_frame),
@@ -1475,6 +1486,8 @@ fn note(section: &str, key: &str) -> Option<String> {
         ("canvas", "zoom_to_fit")          => "Zoom to fit everything on the slide",
         ("canvas", "zoom_to_selection")    => "Zoom to the selection",
         ("canvas", "hold_zoom_to_selection") => "Hold: look at the selection (or the whole slide), back when let go",
+        ("canvas", "flip_view_x")          => "Show the slide mirrored left to right, and back (the view only)",
+        ("canvas", "flip_view_y")          => "Show the slide upside down, and back (the view only)",
         ("canvas", "reset_layer_pos")      => "Undo the active layer's moves",
         ("canvas", "reset_layer_zoom")     => "Undo the active layer's zooms",
         ("canvas", "freeze_frame")         => "Freeze the screen into a new layer",
@@ -1785,7 +1798,7 @@ mod tests {
         // user's choice by now.
         let up = upgrade_text(FORMAT_2, 2);
         assert!(up.contains("toggle_overlay = \"ctrl+shift+n\""));
-        assert!(up.contains("version = 17"));
+        assert!(up.contains("version = 18"));
 
         let new = add_missing_keys(&up);
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
@@ -1794,7 +1807,7 @@ mod tests {
         assert_eq!(cfg.tool.pen, "q");
         // What was there stays as written, the new lines go at the end of
         // their section and new sections at the end of the file.
-        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 17\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
+        assert!(new.starts_with("# On-Screen Notes — hotkeys.toml\n\nversion = 18\n\n[global]\ntoggle_overlay = \"ctrl+shift+n\"\n"));
         assert!(new.contains("pencil = \"b\"\n# Added by an update; \"\" leaves an action unbound.\nmarker = \"m\" "));
         assert!(new.contains("pen = \"q\"  # mine\n"));
         assert!(new.contains("  # Filled / outlined rectangles and ellipses (the selected ones too)\n\n[canvas]\nundo = \"ctrl+z\"\n# Added"));
@@ -1831,7 +1844,7 @@ mod tests {
     fn format_3_files_gain_the_nudge_keys() {
         let old = "version = 3\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n\n[arrange]\nalign_left = \"ctrl+arrowleft\"\n";
         let new = add_missing_keys(&upgrade_text(old, 3));
-        assert!(new.starts_with("version = 17\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
+        assert!(new.starts_with("version = 18\n\n[canvas]\nprev_canvas = \"alt+a\"\nsend_back = \"\"\n# Added by an update"));
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.version, FORMAT);
         assert_eq!((cfg.canvas.prev_canvas.as_str(), cfg.canvas.send_back.as_str()), ("alt+a", ""));
@@ -1968,7 +1981,7 @@ mod tests {
         assert_eq!(
             new,
             "# On-Screen Notes — hotkeys.toml\n\n\
-             version = 17\n\n\
+             version = 18\n\n\
              [global]\n\
              toggle_overlay = \"ctrl+alt+shift+n\"\n\
              screenshot = \"F9\"\n\
@@ -1989,13 +2002,13 @@ mod tests {
     #[test]
     fn upgrade_without_a_global_section_records_the_format() {
         let new = upgrade_text("[canvas]\r\nundo = \"ctrl+z\"\r\n", 0);
-        assert_eq!(new, "version = 17\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
+        assert_eq!(new, "version = 18\r\n\r\n[canvas]\r\nundo = \"ctrl+z\"\r\n");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.global.toggle_overlay, "ctrl+alt+shift+n");
 
         let new = upgrade_text("version = 1", 1);
-        assert_eq!(new, "version = 17");
-        assert_eq!(upgrade_text("", 0), "version = 17\n");
+        assert_eq!(new, "version = 18");
+        assert_eq!(upgrade_text("", 0), "version = 18\n");
     }
 
     /// The Fill tool is gone: a file from before 17 loses its key, so the
@@ -2004,13 +2017,13 @@ mod tests {
     fn format_16_files_lose_the_fill_key() {
         let old = "version = 16\n\n[tool]\npen = \"p\"\nfill = \"f\"  # Fill\nlaser = \"l\"\n";
         let up = upgrade_text(old, 16);
-        assert_eq!(up, "version = 17\n\n[tool]\npen = \"p\"\nlaser = \"l\"\n");
+        assert_eq!(up, "version = 18\n\n[tool]\npen = \"p\"\nlaser = \"l\"\n");
         let new = add_missing_keys(&up);
         assert!(new.contains("filled_shape = \"\""), "{new}");
         let cfg: HotkeysConfig = toml::from_str(&new).unwrap();
         assert_eq!(cfg.tool.laser, "l");
         // A file already at 17 keeps what it says.
-        assert_eq!(upgrade_text("version = 17\n[tool]\nfill = \"f\"\n", 17), "version = 17\n[tool]\nfill = \"f\"\n");
+        assert_eq!(upgrade_text("version = 17\n[tool]\nfill = \"f\"\n", 17), "version = 18\n[tool]\nfill = \"f\"\n");
     }
 
     #[test]
